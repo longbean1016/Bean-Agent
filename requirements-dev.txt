@@ -1,0 +1,12 @@
+# 开发环境同时安装项目运行依赖
+-r requirements.txt
+
+# 测试框架与异步测试支持
+pytest>=9.0.0
+pytest-asyncio>=1.3.0
+
+# FastAPI 接口与 WebSocket 测试客户端
+httpx>=0.28.0
+
+# 前端端到端测试
+playwright>=1.52.0

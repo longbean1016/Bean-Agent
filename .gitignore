@@ -1,0 +1,56 @@
+# Python 字节码与缓存
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.pytest_artifacts/
+test-results/
+playwright-report/
+
+# Python 虚拟环境
+.venv/
+venv/
+env/
+
+# 构建与打包产物
+build/
+dist/
+*.egg-info/
+
+# Node.js 与前端构建产物
+node_modules/
+frontend/chat/dist/
+static/chat/
+
+# 环境变量与本地密钥
+.env
+.env.*
+!.env.example
+
+# IDE 与操作系统文件
+.agents/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 本地 Agent 规范与实现参考文档
+AGENTS.md
+refrence/
+
+# 运行期数据（默认位于用户目录；防止自定义路径指向仓库）
+.beanagent/
+workspace/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# 日志
+*.log
+logs/

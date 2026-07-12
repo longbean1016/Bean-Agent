@@ -1,0 +1,12 @@
+# LLM 与嵌入客户端
+openai>=2.0.0
+
+# Web 服务
+fastapi>=0.134.0
+uvicorn>=0.41.0
+
+# 异步文件操作
+aiofiles>=25.1.0
+
+# 向量检索
+sqlite-vec>=0.1.6
