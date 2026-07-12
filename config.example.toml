@@ -1,0 +1,51 @@
+# BeanAgent 配置模板。复制为 config.toml 后填写本地配置。
+
+[llm]
+provider = "deepseek"
+model = "deepseek-v4-flash" # 主对话模型
+api_key = "${DEEPSEEK_API_KEY}"
+base_url = "https://api.deepseek.com/v1"
+max_tokens = 8192 # 单次回复允许生成的最大 token 数
+max_iterations = 40 # 单轮 ReAct 最大迭代次数，0 表示不限制
+system_prompt = "You are BeanAgent, a helpful AI assistant with access to tools. Always respond in the same language the user uses."
+request_timeout_s = 90.0 # 单次模型请求的超时秒数
+
+[memory]
+enabled = true # 是否启用长期记忆
+engine_name = "default" # 当前最小版本使用的记忆引擎
+
+[memory.embedding]
+model = "text-embedding-v3"
+api_key = "${DASHSCOPE_API_KEY}" # text-embedding-v3 使用 DashScope 密钥
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+dimensions = 1024 # BeanAgent 记忆表的固定向量维度
+
+[memory.optimizer]
+enabled = true # 是否启用记忆后台整理
+interval_seconds = 64800 # 默认每 18 小时整理一次
+merge_max_tokens = 16384 # 合并记忆时允许的最大 token 数
+self_update_max_tokens = 2048 # 更新自我认知记忆时的最大 token 数
+step_delay_seconds = 15 # 连续整理步骤之间的延迟秒数
+
+[memory.retrieval]
+hotness_alpha = 0.20 # 最终排序中的热度权重
+half_life_days = 14.0 # 记忆热度的半衰期天数
+rrf_k = 60 # RRF 融合的平滑常数
+keyword_rrf_weight = 0.5 # 关键词检索的融合权重
+
+[memory.dedup]
+supersede_threshold = 0.90 # 新事实替代旧事实的相似度阈值
+event_dedup_threshold = 0.92 # 重复事件的相似度阈值
+event_dedup_window_days = 7 # 事件去重的时间窗口天数
+
+[session]
+history_window = 40 # 每轮加载的最近历史消息数量
+
+[agent]
+workdir = "." # 工具相对工作目录，实际根路径由 workspace 注入
+
+[channels.chat]
+enabled = true # 是否启用网页聊天通道
+host = "127.0.0.1" # 默认仅监听本机
+port = 6322 # Web 服务监听端口
+channel_name = "web" # session_key 使用的通道前缀

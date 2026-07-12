@@ -1,0 +1,140 @@
+"""BeanAgent 配置数据模型。
+
+集中定义各模块接收的配置结构，下游模块不直接读取 TOML。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class LLMConfig:
+    """主语言模型及 Agent 调用参数。"""
+
+    provider: str = ""  # OpenAI 兼容服务商，用于选择默认接口地址
+    model: str = "deepseek-v4-flash"  # 主对话模型
+    api_key: str = ""  # 服务商密钥，推荐通过环境变量注入
+    base_url: str | None = None  # 自定义兼容接口地址，空值时按 provider 推断
+    max_tokens: int = 8192  # 单次模型回复允许生成的最大 token 数
+    max_iterations: int = 10  # 单轮 ReAct 最大迭代次数，0 表示不限制
+    system_prompt: str = ""  # 额外系统提示词，空值时由 PromptBlock 组装
+    request_timeout_s: float = 90.0  # 单次模型请求超时秒数
+
+
+@dataclass
+class EmbeddingConfig:
+    """记忆向量化模型参数。"""
+
+    model: str = "text-embedding-v3"  # 向量模型
+    api_key: str = ""  # 向量服务密钥，空值时由组装层复用主模型密钥
+    base_url: str = ""  # 向量服务的 OpenAI 兼容接口地址
+    dimensions: int = 1024  # BeanAgent 记忆表使用的固定向量维度
+
+
+@dataclass
+class OptimizerConfig:
+    """长期记忆后台整理参数。"""
+
+    enabled: bool = True  # 是否启动长期记忆整理任务
+    interval_seconds: int = 64800  # 两次完整整理之间的间隔，默认 18 小时
+    merge_max_tokens: int = 16384  # 合并记忆时允许使用的最大 token 数
+    self_update_max_tokens: int = 2048  # 更新自我认知记忆时的最大 token 数
+    step_delay_seconds: int = 15  # 连续整理步骤之间的延迟，避免请求过密
+
+
+@dataclass
+class RetrievalConfig:
+    """记忆检索与融合排序参数。"""
+
+    hotness_alpha: float = 0.20  # 最终排序中记忆热度的权重
+    half_life_days: float = 14.0  # 记忆热度随时间衰减的半衰期天数
+    rrf_k: int = 60  # 双路检索进行 RRF 融合时的平滑常数
+    keyword_rrf_weight: float = 0.5  # 关键词检索在 RRF 融合中的权重
+
+
+@dataclass
+class DedupConfig:
+    """记忆去重与替代阈值。"""
+
+    supersede_threshold: float = 0.90  # 新事实替代旧事实的相似度阈值
+    event_dedup_threshold: float = 0.92  # 相似事件判定为重复的阈值
+    event_dedup_window_days: int = 7  # 事件去重时向前检查的天数
+
+
+@dataclass
+class MemoryConfig:
+    """记忆模块总配置。"""
+
+    enabled: bool = False  # 是否启用长期记忆闭环
+    engine_name: str = "default"  # 记忆引擎名称，当前最小版本仅支持 default
+    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)  # 向量配置
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)  # 整理配置
+    retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)  # 检索配置
+    dedup: DedupConfig = field(default_factory=DedupConfig)  # 去重配置
+
+
+@dataclass
+class SessionConfig:
+    """会话历史加载参数。"""
+
+    history_window: int = 40  # 每轮加载的最近历史消息数量
+
+
+@dataclass
+class WebChatConfig:
+    """网页聊天服务参数。"""
+
+    enabled: bool = True  # 是否随主进程启动网页聊天通道
+    host: str = "127.0.0.1"  # 默认仅监听本机，避免无意暴露服务
+    port: int = 6322  # Web 服务监听端口
+    channel_name: str = "web"  # 生成 session_key 时使用的通道前缀
+
+
+@dataclass
+class AgentConfig:
+    """Agent 运行目录参数。"""
+
+    workdir: str = "."  # 工具执行的相对工作目录，由 workspace 约束实际根路径
+
+
+@dataclass
+class ChannelsConfig:
+    """消息通道配置集合。"""
+
+    chat: WebChatConfig = field(default_factory=WebChatConfig)  # 网页聊天通道
+
+
+@dataclass
+class Config:
+    """应用根配置。"""
+
+    llm: LLMConfig = field(default_factory=LLMConfig)  # 主模型与循环参数
+    memory: MemoryConfig = field(default_factory=MemoryConfig)  # 长期记忆参数
+    session: SessionConfig = field(default_factory=SessionConfig)  # 会话参数
+    agent: AgentConfig = field(default_factory=AgentConfig)  # Agent 运行参数
+    channels: ChannelsConfig = field(default_factory=ChannelsConfig)  # 通道参数
+
+    @classmethod
+    def load(cls, path: str | Path = "config.toml") -> Config:
+        """从 TOML 文件创建根配置。"""
+
+        from agent.config import load_config
+
+        return load_config(path)
+
+
+__all__ = [
+    "AgentConfig",
+    "ChannelsConfig",
+    "Config",
+    "DedupConfig",
+    "EmbeddingConfig",
+    "LLMConfig",
+    "MemoryConfig",
+    "OptimizerConfig",
+    "RetrievalConfig",
+    "SessionConfig",
+    "WebChatConfig",
+]

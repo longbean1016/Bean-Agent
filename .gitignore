@@ -30,6 +30,7 @@ static/chat/
 .env
 .env.*
 !.env.example
+/config.toml
 
 # IDE 与操作系统文件
 .agents/
