@@ -65,6 +65,7 @@ def load_config(path: str | Path = "config.toml") -> Config:
         max_iterations=int(llm_raw.get("max_iterations", 10)),
         system_prompt=str(llm_raw.get("system_prompt", "") or ""),
         request_timeout_s=float(llm_raw.get("request_timeout_s", 90.0)),
+        extra_body=_load_llm_extra_body(llm_raw),
     )
 
     session_raw = _as_dict(data.get("session"))
@@ -96,6 +97,28 @@ def _resolve(value: str) -> str:
         lambda match: os.environ.get(match.group(1), match.group(0)),
         value,
     )
+
+
+def _load_llm_extra_body(llm_raw: dict[str, Any]) -> dict[str, object]:
+    """把 DeepSeek 专属配置整理为 Provider 可消费的扩展参数。
+
+    配置层保留用户熟悉的 ``enable_thinking`` 写法，真正的 DeepSeek 请求
+    格式由 ``DeepSeekStrategy`` 转换。这样 config.py 不承担供应商协议逻辑。
+    """
+
+    extra_body: dict[str, object] = {}
+    if "enable_thinking" in llm_raw:
+        extra_body["enable_thinking"] = bool(llm_raw["enable_thinking"])
+
+    # 同时接受 DeepSeek 原生 thinking 表，便于显式配置 enabled/disabled。
+    thinking = llm_raw.get("thinking")
+    if isinstance(thinking, dict):
+        extra_body["thinking"] = dict(thinking)
+
+    reasoning_effort = str(llm_raw.get("reasoning_effort", "") or "").strip()
+    if reasoning_effort:
+        extra_body["reasoning_effort"] = reasoning_effort
+    return extra_body
 
 
 def _as_dict(value: object) -> dict[str, Any]:
@@ -184,7 +207,7 @@ def _load_memory_config(data: dict[str, Any]) -> MemoryConfig:
 def _load_channels_config(data: dict[str, Any]) -> ChannelsConfig:
     """加载当前最小闭环唯一支持的网页聊天通道。
 
-    BeanAgent 暂不加载 akashic 的 Telegram、QQ 和 CLI 配置，避免把非闭环
+    BeanAgent 暂不加载 Telegram、QQ 和 CLI 配置，避免把非闭环
     能力提前带入项目。channel_name 用于生成 ``web:<chat_id>`` session_key。
     """
 

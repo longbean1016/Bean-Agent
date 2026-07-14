@@ -21,6 +21,9 @@ class LLMConfig:
     max_iterations: int = 10  # 单轮 ReAct 最大迭代次数，0 表示不限制
     system_prompt: str = ""  # 额外系统提示词，空值时由 PromptBlock 组装
     request_timeout_s: float = 90.0  # 单次模型请求超时秒数
+    # DeepSeek 的 thinking 等扩展参数不属于标准 OpenAI 字段，需要放入
+    # extra_body。default_factory 保证不同 Config 实例不会共享可变字典。
+    extra_body: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass

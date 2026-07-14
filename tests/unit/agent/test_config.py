@@ -49,6 +49,8 @@ max_tokens = 2048
 max_iterations = 6
 system_prompt = "测试助手"
 request_timeout_s = 45.5
+enable_thinking = true
+reasoning_effort = "xhigh"
 
 [memory]
 enabled = true
@@ -97,6 +99,10 @@ port = 8000
     assert config.llm.api_key == "llm-secret"
     assert config.llm.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
     assert config.llm.request_timeout_s == 45.5
+    assert config.llm.extra_body == {
+        "enable_thinking": True,
+        "reasoning_effort": "xhigh",
+    }
     assert config.memory.embedding.api_key == "embedding-secret"
     assert config.memory.embedding.dimensions == 768
     assert config.memory.optimizer.enabled is False
@@ -143,12 +149,13 @@ def test_load_config_rejects_non_toml_file(tmp_path: Path) -> None:
         load_config(config_path)
 
 
-def test_config_template_uses_akashic_runtime_defaults() -> None:
+def test_config_template_uses_project_runtime_defaults() -> None:
     config = load_config("config.example.toml")
 
     assert config.llm.model == "deepseek-v4-flash"
     assert config.llm.max_tokens == 8192
     assert config.llm.max_iterations == 40
+    assert config.llm.extra_body == {"enable_thinking": True}
     assert config.memory.embedding.model == "text-embedding-v3"
     assert (
         config.memory.embedding.base_url

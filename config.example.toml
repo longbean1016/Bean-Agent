@@ -9,6 +9,8 @@ max_tokens = 8192 # 单次回复允许生成的最大 token 数
 max_iterations = 40 # 单轮 ReAct 最大迭代次数，0 表示不限制
 system_prompt = "You are BeanAgent, a helpful AI assistant with access to tools. Always respond in the same language the user uses."
 request_timeout_s = 90.0 # 单次模型请求的超时秒数
+enable_thinking = true # 开启 DeepSeek 推理模式，Provider 会转换为 thinking.type
+# reasoning_effort = "high" # 可选推理强度；xhigh 会按 DeepSeek 协议转换为 max
 
 [memory]
 enabled = true # 是否启用长期记忆
