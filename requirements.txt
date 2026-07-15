@@ -5,6 +5,11 @@ openai>=2.0.0
 fastapi>=0.134.0
 uvicorn>=0.41.0
 
+# 网页搜索、抓取与 HTML 内容转换
+httpx>=0.28.0
+html2text>=2025.4.15
+lxml>=5.3.0
+
 # 异步文件操作
 aiofiles>=25.1.0
 
