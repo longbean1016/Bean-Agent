@@ -11,9 +11,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent.config_models import LLMConfig
+from agent.config_models import LLMConfig, VisionConfig
 import agent.provider as provider_module
-from agent.provider import ContentSafetyError, ContextLengthError, LLMProvider
+from agent.provider import (
+    ContentSafetyError,
+    ContextLengthError,
+    LLMProvider,
+    create_vision_provider,
+)
 
 
 def _ns(**values: Any) -> SimpleNamespace:
@@ -93,6 +98,35 @@ def test_constructor_injects_llm_config_into_openai_client(
         "api_key": "secret",
         "base_url": "https://proxy.example/v1",
     }
+
+
+def test_create_vision_provider_builds_independent_configured_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[dict[str, Any]] = []
+
+    def create_client(**kwargs: Any) -> _Client:
+        clients.append(kwargs)
+        return _Client()
+
+    monkeypatch.setattr("agent.provider.AsyncOpenAI", create_client)
+    provider = create_vision_provider(
+        VisionConfig(
+            provider="qwen",
+            model="qwen-vl-max",
+            api_key="vl-secret",
+            base_url="https://vl.example/v1",
+            request_timeout_s=35,
+        )
+    )
+
+    assert provider is not None
+    assert provider._model == "qwen-vl-max"
+    assert provider._request_timeout_s == 35
+    assert clients == [
+        {"api_key": "vl-secret", "base_url": "https://vl.example/v1"}
+    ]
+    assert create_vision_provider(None) is None
 
 
 @pytest.mark.asyncio

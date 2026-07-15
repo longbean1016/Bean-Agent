@@ -45,12 +45,20 @@ def test_load_config_maps_nested_values_and_resolves_environment(
 provider = "qwen"
 model = "qwen-plus"
 api_key = "${BEAN_LLM_KEY}"
+multimodal = false
 max_tokens = 2048
 max_iterations = 6
 system_prompt = "测试助手"
 request_timeout_s = 45.5
 enable_thinking = true
 reasoning_effort = "xhigh"
+
+[llm.vl]
+provider = "qwen"
+model = "qwen-vl-max"
+api_key = "${BEAN_LLM_KEY}"
+base_url = "https://vl.example/v1"
+max_tokens = 2048
 
 [memory]
 enabled = true
@@ -103,6 +111,12 @@ port = 8000
         "enable_thinking": True,
         "reasoning_effort": "xhigh",
     }
+    assert config.llm.multimodal is False
+    assert config.llm.vl is not None
+    assert config.llm.vl.model == "qwen-vl-max"
+    assert config.llm.vl.api_key == "llm-secret"
+    assert config.llm.vl.base_url == "https://vl.example/v1"
+    assert config.llm.vl.max_tokens == 2048
     assert config.memory.embedding.api_key == "embedding-secret"
     assert config.memory.embedding.dimensions == 768
     assert config.memory.optimizer.enabled is False

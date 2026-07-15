@@ -22,7 +22,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from openai import AsyncOpenAI
 
-from agent.config_models import LLMConfig
+from agent.config_models import LLMConfig, VisionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -994,6 +994,25 @@ def _extract_cache_usage(usage: Any) -> tuple[int | None, int | None]:
     return prompt_tokens, cached_tokens
 
 
+def create_vision_provider(config: VisionConfig | None) -> LLMProvider | None:
+    """为独立 VL 配置创建专用 Provider；未配置模型时不启用视觉工具。"""
+
+    if config is None or not config.model.strip():
+        return None
+    # VL 使用独立客户端，避免视觉模型的地址、密钥和超时污染主对话模型。
+    # system_prompt 留空且 extra_body 独立，视觉工具每次通过 prompt 明确任务。
+    return LLMProvider(
+        LLMConfig(
+            provider=config.provider,
+            model=config.model,
+            api_key=config.api_key,
+            base_url=config.base_url,
+            max_tokens=config.max_tokens,
+            request_timeout_s=config.request_timeout_s,
+        )
+    )
+
+
 __all__ = [
     "ContentSafetyError",
     "ContextLengthError",
@@ -1003,4 +1022,5 @@ __all__ = [
     "LLMResponse",
     "ProviderStrategy",
     "ToolCall",
+    "create_vision_provider",
 ]

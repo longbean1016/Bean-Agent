@@ -9,8 +9,18 @@ max_tokens = 8192 # 单次回复允许生成的最大 token 数
 max_iterations = 40 # 单轮 ReAct 最大迭代次数，0 表示不限制
 system_prompt = "You are BeanAgent, a helpful AI assistant with access to tools. Always respond in the same language the user uses."
 request_timeout_s = 90.0 # 单次模型请求的超时秒数
+multimodal = false # 主模型是否能直接接收图片；false 时可配置独立 VL 模型
 enable_thinking = true # 开启 DeepSeek 推理模式，Provider 会转换为 thinking.type
 # reasoning_effort = "high" # 可选推理强度；xhigh 会按 DeepSeek 协议转换为 max
+
+# 可选：主模型不支持图片时取消注释，启用独立视觉模型
+# [llm.vl]
+# provider = "qwen"
+# model = "qwen-vl-max"
+# api_key = "${DASHSCOPE_API_KEY}"
+# base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# max_tokens = 2048
+# request_timeout_s = 90.0
 
 [memory]
 enabled = true # 是否启用长期记忆

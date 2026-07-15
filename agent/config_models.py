@@ -10,6 +10,18 @@ from pathlib import Path
 
 
 @dataclass
+class VisionConfig:
+    """独立视觉模型配置；model 为空表示不启用 VL 工具。"""
+
+    provider: str = ""
+    model: str = ""
+    api_key: str = ""
+    base_url: str | None = None
+    max_tokens: int = 2048
+    request_timeout_s: float = 90.0
+
+
+@dataclass
 class LLMConfig:
     """主语言模型及 Agent 调用参数。"""
 
@@ -21,6 +33,8 @@ class LLMConfig:
     max_iterations: int = 10  # 单轮 ReAct 最大迭代次数，0 表示不限制
     system_prompt: str = ""  # 额外系统提示词，空值时由 PromptBlock 组装
     request_timeout_s: float = 90.0  # 单次模型请求超时秒数
+    multimodal: bool = True  # 主模型是否能直接接收 image_url 内容块
+    vl: VisionConfig | None = None  # 主模型不支持图片时使用的独立视觉模型
     # DeepSeek 的 thinking 等扩展参数不属于标准 OpenAI 字段，需要放入
     # extra_body。default_factory 保证不同 Config 实例不会共享可变字典。
     extra_body: dict[str, object] = field(default_factory=dict)
@@ -140,4 +154,5 @@ __all__ = [
     "RetrievalConfig",
     "SessionConfig",
     "WebChatConfig",
+    "VisionConfig",
 ]

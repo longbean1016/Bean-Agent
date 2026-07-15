@@ -23,6 +23,7 @@ from agent.config_models import (
     RetrievalConfig,
     SessionConfig,
     WebChatConfig,
+    VisionConfig,
 )
 
 _PRESETS: dict[str, str] = {
@@ -65,6 +66,8 @@ def load_config(path: str | Path = "config.toml") -> Config:
         max_iterations=int(llm_raw.get("max_iterations", 10)),
         system_prompt=str(llm_raw.get("system_prompt", "") or ""),
         request_timeout_s=float(llm_raw.get("request_timeout_s", 90.0)),
+        multimodal=bool(llm_raw.get("multimodal", True)),
+        vl=_load_vision_config(llm_raw),
         extra_body=_load_llm_extra_body(llm_raw),
     )
 
@@ -119,6 +122,25 @@ def _load_llm_extra_body(llm_raw: dict[str, Any]) -> dict[str, object]:
     if reasoning_effort:
         extra_body["reasoning_effort"] = reasoning_effort
     return extra_body
+
+
+def _load_vision_config(llm_raw: dict[str, Any]) -> VisionConfig | None:
+    """加载可选 `[llm.vl]`；未配置 model 时不创建无效 Provider。"""
+
+    raw = _as_dict(llm_raw.get("vl"))
+    model = str(raw.get("model", "") or "").strip()
+    if not model:
+        return None
+    provider = str(raw.get("provider", "") or "")
+    base_url = raw.get("base_url") or _PRESETS.get(provider)
+    return VisionConfig(
+        provider=provider,
+        model=model,
+        api_key=_resolve(str(raw.get("api_key", ""))),
+        base_url=str(base_url) if base_url else None,
+        max_tokens=int(raw.get("max_tokens", 2048)),
+        request_timeout_s=float(raw.get("request_timeout_s", 90.0)),
+    )
 
 
 def _as_dict(value: object) -> dict[str, Any]:
