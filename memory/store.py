@@ -14,6 +14,8 @@ from typing import Any
 
 import sqlite_vec
 
+from memory.ranker import combine_scores, hotness_score
+
 
 class MemoryStore2:
     """保存结构化记忆，并为向量与关键词检索提供同一数据源。"""
@@ -150,10 +152,19 @@ class MemoryStore2:
             similarity = _cosine(query, vector if isinstance(vector, list) else [])
             if similarity < float(score_threshold):
                 continue
-            hotness = _hotness(item, hotness_half_life_days)
+            try:
+                updated_at = datetime.fromisoformat(str(item["updated_at"]))
+            except ValueError:
+                updated_at = datetime.now(timezone.utc)
+            hotness = hotness_score(
+                int(item["reinforcement"]),
+                updated_at,
+                half_life_days=hotness_half_life_days,
+                emotional_weight=int(item["emotional_weight"]),
+            )
             item["vector_score"] = similarity
             item["hotness"] = hotness
-            item["score"] = (1.0 - hotness_alpha) * similarity + hotness_alpha * hotness
+            item["score"] = combine_scores(similarity, hotness, alpha=hotness_alpha)
             hits.append(item)
         hits.sort(key=lambda value: (-float(value["score"]), str(value["id"])))
         return hits[: max(1, int(top_k))]
@@ -338,20 +349,6 @@ def _cosine(left: list[float], right: list[float]) -> float:
         return 0.0
     denominator = math.sqrt(sum(v * v for v in left)) * math.sqrt(sum(v * v for v in right))
     return sum(a * b for a, b in zip(left, right)) / denominator if denominator else 0.0
-
-
-def _hotness(item: dict[str, object], half_life_days: float) -> float:
-    reinforcement = max(1, int(item.get("reinforcement", 1)))
-    emotional = max(0, min(int(item.get("emotional_weight", 0)), 10))
-    try:
-        updated = datetime.fromisoformat(str(item.get("updated_at")))
-        if updated.tzinfo is None:
-            updated = updated.replace(tzinfo=timezone.utc)
-        age_days = max(0.0, (datetime.now(timezone.utc) - updated).total_seconds() / 86400)
-    except ValueError:
-        age_days = 0.0
-    decay = 0.5 ** (age_days / max(float(half_life_days), 0.001))
-    return min(1.0, decay * (1.0 + math.log1p(reinforcement - 1) * 0.15 + emotional * 0.03))
 
 
 __all__ = ["MemoryStore2"]
