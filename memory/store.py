@@ -90,13 +90,13 @@ class MemoryStore2:
         with self._lock:
             self._ensure_open()
             row = self._db.execute(
-                "SELECT id FROM memory_items WHERE content_hash=? AND memory_type=?",
+                "SELECT id,status FROM memory_items WHERE content_hash=? AND memory_type=?",
                 (digest, memory_type),
             ).fetchone()
             if row is not None:
                 item_id = str(row["id"])
                 self._db.execute(
-                    "UPDATE memory_items SET reinforcement=reinforcement+1, emotional_weight=MAX(emotional_weight, ?), updated_at=? WHERE id=?",
+                    "UPDATE memory_items SET status='active', reinforcement=reinforcement+1, emotional_weight=MAX(emotional_weight, ?), updated_at=? WHERE id=?",
                     (max(0, min(int(emotional_weight), 10)), now, item_id),
                 )
                 self._db.commit()
@@ -238,10 +238,46 @@ class MemoryStore2:
             )
             self._db.commit()
 
+    def merge_item_raw(self, item_id: str, new_summary: str, new_embedding: list[float], new_extra: dict[str, object]) -> None:
+        """原子更新合并目标，并同步主表与 vec 索引。"""
+
+        vector = self._validate_vector(new_embedding)
+        with self._lock:
+            self._ensure_open()
+            row = self._db.execute(
+                "SELECT rowid,memory_type FROM memory_items WHERE id=?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"记忆不存在: {item_id}")
+            digest = hashlib.sha256(new_summary.strip().encode("utf-8")).hexdigest()[:16]
+            self._db.execute(
+                """UPDATE memory_items SET summary=?,content_hash=?,embedding=?,extra_json=?,
+                   reinforcement=reinforcement+1,updated_at=? WHERE id=?""",
+                (new_summary.strip(), digest, json.dumps(vector), json.dumps(new_extra, ensure_ascii=False), datetime.now(timezone.utc).isoformat(), item_id),
+            )
+            self._vec_delete([int(row["rowid"])])
+            self._vec_insert(int(row["rowid"]), vector)
+            self._db.commit()
+
     def find_similar_recent_events(self, embedding: list[float], *, days_back: int = 7, threshold: float = 0.92, top_k: int = 3) -> list[str]:
         cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days_back)))
-        hits = self.vector_search(embedding, top_k=max(1, int(top_k)), memory_types=["event"], score_threshold=threshold, time_start=cutoff, hotness_alpha=0.0)
-        return [str(item["id"]) for item in hits]
+        query = self._validate_vector(embedding)
+        scored: list[tuple[str, float]] = []
+        for row in self._active_rows(["event"]):
+            item = self._row_to_item(row)
+            try:
+                created_at = datetime.fromisoformat(str(item["created_at"]))
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if created_at < cutoff:
+                continue
+            score = _cosine(query, item["embedding"] if isinstance(item["embedding"], list) else [])
+            if score >= float(threshold):
+                scored.append((str(item["id"]), score))
+        scored.sort(key=lambda value: (-value[1], value[0]))
+        return [item_id for item_id, _ in scored[: max(1, int(top_k))]]
 
     def get_items_by_ids(self, ids: list[str]) -> list[dict[str, object]]:
         clean = list(dict.fromkeys(ids))
