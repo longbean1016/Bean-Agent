@@ -1,11 +1,7 @@
-"""会话与消息的 SQLite 持久化。
-
-公开接口均为异步，sqlite3 同步操作集中在私有方法并通过工作线程执行。
-"""
+"""对齐 akashic-agent 的同步 SQLite 会话持久化。"""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import sqlite3
@@ -34,6 +30,7 @@ class NewMessage:
     status: str = "ok"
     timestamp: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 class SessionStore:
@@ -53,30 +50,58 @@ class SessionStore:
         self._has_fts = False
         self._init_schema()
 
-    async def create_session(self, session_key: str) -> dict[str, Any]:
+    def create_session(self, session_key: str) -> dict[str, Any]:
         """幂等创建会话并返回当前元数据。"""
 
-        return await asyncio.to_thread(self._create_session_sync, session_key)
+        return self._create_session_sync(session_key)
 
-    async def add_message(self, message: NewMessage) -> dict[str, Any]:
+    def add_message(self, message: NewMessage) -> dict[str, Any]:
         """原子分配 seq、写入消息并推进会话 next_seq。"""
 
-        return await asyncio.to_thread(self._add_message_sync, message)
+        return self._add_message_sync(message)
 
-    async def load_history(
+    def get_session_meta(self, session_key: str) -> dict[str, Any] | None:
+        """读取会话元数据；不存在时返回 None。"""
+
+        return self._get_session_meta_sync(session_key)
+
+    def fetch_session_messages(
+        self,
+        session_key: str,
+    ) -> list[dict[str, Any]]:
+        """按 seq 升序读取会话的全部持久化消息。"""
+
+        return self._fetch_session_messages_sync(session_key)
+
+    def upsert_session(
+        self,
+        session_key: str,
+        *,
+        created_at: str,
+        updated_at: str,
+        last_consolidated: int,
+        metadata: dict[str, Any],
+    ) -> None:
+        """创建或更新 Session 元数据，不改动消息和 next_seq。"""
+
+        self._upsert_session_sync(
+            session_key,
+            created_at,
+            updated_at,
+            last_consolidated,
+            metadata,
+        )
+
+    def load_history(
         self,
         session_key: str,
         limit: int = 40,
     ) -> list[dict[str, Any]]:
         """加载最近的持久化消息，并转换成模型可消费的标准消息。"""
 
-        return await asyncio.to_thread(
-            self._load_history_sync,
-            session_key,
-            limit,
-        )
+        return self._load_history_sync(session_key, limit)
 
-    async def fetch_messages(
+    def fetch_messages(
         self,
         session_key: str,
         ids: list[str],
@@ -84,14 +109,9 @@ class SessionStore:
     ) -> list[dict[str, Any]]:
         """按 ID 获取消息，并可扩展同一会话内前后若干条上下文。"""
 
-        return await asyncio.to_thread(
-            self._fetch_messages_sync,
-            session_key,
-            ids,
-            context,
-        )
+        return self._fetch_messages_sync(session_key, ids, context)
 
-    async def search_messages(
+    def search_messages(
         self,
         session_key: str,
         query: str,
@@ -99,27 +119,22 @@ class SessionStore:
     ) -> list[dict[str, Any]]:
         """在指定会话内搜索消息正文。"""
 
-        return await asyncio.to_thread(
-            self._search_messages_sync,
-            session_key,
-            query,
-            limit,
-        )
+        return self._search_messages_sync(session_key, query, limit)
 
-    async def set_cursor(self, session_key: str, value: int) -> None:
+    def set_cursor(self, session_key: str, value: int) -> None:
         """设置该会话已完成记忆归档的消息序号。"""
 
-        await asyncio.to_thread(self._set_cursor_sync, session_key, value)
+        self._set_cursor_sync(session_key, value)
 
-    async def get_cursor(self, session_key: str) -> int:
+    def get_cursor(self, session_key: str) -> int:
         """读取记忆归档 cursor；会话不存在时返回 0。"""
 
-        return await asyncio.to_thread(self._get_cursor_sync, session_key)
+        return self._get_cursor_sync(session_key)
 
-    async def close(self) -> None:
+    def close(self) -> None:
         """幂等关闭 SQLite 连接。"""
 
-        await asyncio.to_thread(self._close_sync)
+        self._close_sync()
 
     def _init_schema(self) -> None:
         """创建基础表，并在环境支持时启用 FTS5 trigram 索引。"""
@@ -235,6 +250,7 @@ class SessionStore:
         )
         extra_payload = json.dumps(
             {
+                **message.extra,
                 "turn_id": message.turn_id,
                 "reasoning_content": message.reasoning_content,
                 "status": message.status,
@@ -244,7 +260,7 @@ class SessionStore:
         )
 
         # next_seq 的读取、消息插入和递增必须属于同一个写事务。否则多个
-        # asyncio.to_thread 工作线程可能读到相同 MAX(seq)，造成唯一键冲突。
+        # 线程调用者可能读到相同序号，造成消息 ID 或唯一键冲突。
         with self._lock:
             self._ensure_open()
             self._conn.execute("BEGIN IMMEDIATE")
@@ -311,6 +327,73 @@ class SessionStore:
             "metadata": dict(message.metadata),
         }
 
+    def _get_session_meta_sync(self, session_key: str) -> dict[str, Any] | None:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                """
+                SELECT key, created_at, updated_at, last_consolidated,
+                       next_seq, metadata
+                FROM sessions WHERE key = ?
+                """,
+                (key,),
+            ).fetchone()
+        return self._row_to_session(row) if row is not None else None
+
+    def _fetch_session_messages_sync(
+        self,
+        session_key: str,
+    ) -> list[dict[str, Any]]:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                f"""
+                SELECT {_MESSAGE_COLUMNS}
+                FROM messages
+                WHERE session_key = ?
+                ORDER BY seq ASC
+                """,
+                (key,),
+            ).fetchall()
+        return [self._row_to_message(row) for row in rows]
+
+    def _upsert_session_sync(
+        self,
+        session_key: str,
+        created_at: str,
+        updated_at: str,
+        last_consolidated: int,
+        metadata: dict[str, Any],
+    ) -> None:
+        key = self._validate_session_key(session_key)
+        payload = json.dumps(metadata or {}, ensure_ascii=False)
+        with self._lock:
+            self._ensure_open()
+            # next_seq 由 add_message 的事务独立维护；元数据刷新绝不能把它
+            # 覆盖回旧值，否则后续消息可能获得重复 ID。
+            self._conn.execute(
+                """
+                INSERT INTO sessions (
+                    key, created_at, updated_at, last_consolidated,
+                    next_seq, metadata
+                ) VALUES (?, ?, ?, ?, 0, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    last_consolidated = excluded.last_consolidated,
+                    metadata = excluded.metadata
+                """,
+                (
+                    key,
+                    created_at,
+                    updated_at,
+                    int(last_consolidated),
+                    payload,
+                ),
+            )
+            self._conn.commit()
+
     def _load_history_sync(
         self,
         session_key: str,
@@ -333,6 +416,31 @@ class SessionStore:
                 """,
                 (key, safe_limit),
             ).fetchall()
+
+            # limit 只决定基础窗口大小。若窗口从 assistant 开始，继续向前
+            # 补到最近的 user，避免把同一 Turn 的 user/assistant/tool_chain
+            # 拆开。补齐查询与基础查询共用数据库锁，保证看到一致的历史快照。
+            if rows and str(rows[-1]["role"]) != "user":
+                boundary = self._conn.execute(
+                    """
+                    SELECT seq
+                    FROM messages
+                    WHERE session_key = ? AND role = ? AND seq < ?
+                    ORDER BY seq DESC
+                    LIMIT 1
+                    """,
+                    (key, "user", int(rows[-1]["seq"])),
+                ).fetchone()
+                if boundary is not None:
+                    rows = self._conn.execute(
+                        f"""
+                        SELECT {_MESSAGE_COLUMNS}
+                        FROM messages
+                        WHERE session_key = ? AND seq >= ?
+                        ORDER BY seq DESC
+                        """,
+                        (key, int(boundary["seq"])),
+                    ).fetchall()
         persisted = [self._row_to_message(row) for row in reversed(rows)]
 
         history: list[dict[str, Any]] = []
@@ -567,7 +675,7 @@ class SessionStore:
     def _row_to_message(row: sqlite3.Row) -> dict[str, Any]:
         extra = _load_json_object(row["extra"])
         metadata = extra.get("metadata")
-        return {
+        message = {
             "id": str(row["id"]),
             "session_key": str(row["session_key"]),
             "seq": int(row["seq"]),
@@ -580,6 +688,12 @@ class SessionStore:
             "status": str(extra.get("status", "ok")),
             "metadata": metadata if isinstance(metadata, dict) else {},
         }
+        # akashic 的 Session 消息允许携带 media、llm_user_content 等扩展字段。
+        # 固定字段由数据库列和上方兼容转换决定，extra 不能反向覆盖它们。
+        for key, value in extra.items():
+            if key not in message and key != "metadata":
+                message[key] = value
+        return message
 
     @staticmethod
     def _validate_session_key(session_key: str) -> str:

@@ -20,13 +20,13 @@ async def store(tmp_path: Path) -> AsyncIterator[SessionStore]:
     try:
         yield session_store
     finally:
-        await session_store.close()
+        session_store.close()
 
 
 @pytest.mark.asyncio
 async def test_create_session_is_idempotent(store: SessionStore) -> None:
-    first = await store.create_session("web:chat-1")
-    second = await store.create_session("web:chat-1")
+    first = store.create_session("web:chat-1")
+    second = store.create_session("web:chat-1")
 
     assert first["key"] == "web:chat-1"
     assert first["created_at"] == second["created_at"]
@@ -38,7 +38,7 @@ async def test_create_session_is_idempotent(store: SessionStore) -> None:
 async def test_add_message_allocates_seq_and_preserves_turn_fields(
     store: SessionStore,
 ) -> None:
-    first = await store.add_message(
+    first = store.add_message(
         NewMessage(
             session_key="web:chat-1",
             role="user",
@@ -47,7 +47,7 @@ async def test_add_message_allocates_seq_and_preserves_turn_fields(
             metadata={"request_id": "request-1"},
         )
     )
-    second = await store.add_message(
+    second = store.add_message(
         NewMessage(
             session_key="web:chat-1",
             role="assistant",
@@ -64,7 +64,7 @@ async def test_add_message_allocates_seq_and_preserves_turn_fields(
     assert second["reasoning_content"] == "先礼貌回应"
     assert first["metadata"] == {"request_id": "request-1"}
 
-    fetched = await store.fetch_messages(
+    fetched = store.fetch_messages(
         "web:chat-1", [first["id"], second["id"]]
     )
     assert [item["seq"] for item in fetched] == [0, 1]
@@ -75,16 +75,17 @@ async def test_add_message_allocates_seq_and_preserves_turn_fields(
 async def test_concurrent_add_message_keeps_unique_contiguous_seq(
     store: SessionStore,
 ) -> None:
-    await store.create_session("web:concurrent")
+    store.create_session("web:concurrent")
 
     rows = await asyncio.gather(
         *[
-            store.add_message(
+            asyncio.to_thread(
+                store.add_message,
                 NewMessage(
                     session_key="web:concurrent",
                     role="user",
                     content=f"消息 {index}",
-                )
+                ),
             )
             for index in range(20)
         ]
@@ -97,10 +98,10 @@ async def test_concurrent_add_message_keeps_unique_contiguous_seq(
 async def test_load_history_expands_tool_chain_and_reasoning(
     store: SessionStore,
 ) -> None:
-    await store.add_message(
+    store.add_message(
         NewMessage(session_key="web:chat-1", role="user", content="查询天气")
     )
-    await store.add_message(
+    store.add_message(
         NewMessage(
             session_key="web:chat-1",
             role="assistant",
@@ -125,7 +126,7 @@ async def test_load_history_expands_tool_chain_and_reasoning(
         )
     )
 
-    history = await store.load_history("web:chat-1", limit=40)
+    history = store.load_history("web:chat-1", limit=40)
 
     assert history == [
         {"role": "user", "content": "查询天气"},
@@ -154,19 +155,44 @@ async def test_load_history_expands_tool_chain_and_reasoning(
 
 
 @pytest.mark.asyncio
-async def test_load_history_limit_applies_before_tool_chain_expansion(
+async def test_load_history_limit_expands_to_complete_user_turn(
     store: SessionStore,
 ) -> None:
-    await store.add_message(
+    store.add_message(
         NewMessage(session_key="web:chat-1", role="user", content="旧消息")
     )
-    await store.add_message(
+    store.add_message(
         NewMessage(session_key="web:chat-1", role="assistant", content="新回复")
     )
 
-    history = await store.load_history("web:chat-1", limit=1)
+    history = store.load_history("web:chat-1", limit=1)
 
-    assert history == [{"role": "assistant", "content": "新回复"}]
+    assert history == [
+        {"role": "user", "content": "旧消息"},
+        {"role": "assistant", "content": "新回复"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_load_history_aligns_only_to_nearest_user_boundary(
+    store: SessionStore,
+) -> None:
+    for role, content in [
+        ("user", "第一问"),
+        ("assistant", "第一答"),
+        ("user", "第二问"),
+        ("assistant", "第二答"),
+    ]:
+        store.add_message(
+            NewMessage(session_key="web:chat-1", role=role, content=content)
+        )
+
+    history = store.load_history("web:chat-1", limit=1)
+
+    assert history == [
+        {"role": "user", "content": "第二问"},
+        {"role": "assistant", "content": "第二答"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -176,7 +202,7 @@ async def test_fetch_messages_expands_context_and_marks_source(
     rows = []
     for index in range(5):
         rows.append(
-            await store.add_message(
+            store.add_message(
                 NewMessage(
                     session_key="web:chat-1",
                     role="user",
@@ -184,11 +210,11 @@ async def test_fetch_messages_expands_context_and_marks_source(
                 )
             )
         )
-    await store.add_message(
+    store.add_message(
         NewMessage(session_key="web:other", role="user", content="其他会话")
     )
 
-    fetched = await store.fetch_messages(
+    fetched = store.fetch_messages(
         "web:chat-1", [rows[2]["id"]], context=1
     )
 
@@ -199,17 +225,17 @@ async def test_fetch_messages_expands_context_and_marks_source(
 
 @pytest.mark.asyncio
 async def test_search_messages_is_scoped_and_limited(store: SessionStore) -> None:
-    await store.add_message(
+    store.add_message(
         NewMessage(session_key="web:chat-1", role="user", content="今天学习 Python")
     )
-    await store.add_message(
+    store.add_message(
         NewMessage(session_key="web:chat-1", role="assistant", content="Python 很适合入门")
     )
-    await store.add_message(
+    store.add_message(
         NewMessage(session_key="web:other", role="assistant", content="Python 其他会话")
     )
 
-    results = await store.search_messages("web:chat-1", "Python", limit=1)
+    results = store.search_messages("web:chat-1", "Python", limit=1)
 
     assert len(results) == 1
     assert results[0]["session_key"] == "web:chat-1"
@@ -218,18 +244,18 @@ async def test_search_messages_is_scoped_and_limited(store: SessionStore) -> Non
 
 @pytest.mark.asyncio
 async def test_cursor_defaults_to_zero_and_can_advance(store: SessionStore) -> None:
-    assert await store.get_cursor("web:chat-1") == 0
+    assert store.get_cursor("web:chat-1") == 0
 
-    await store.create_session("web:chat-1")
-    await store.set_cursor("web:chat-1", 12)
+    store.create_session("web:chat-1")
+    store.set_cursor("web:chat-1", 12)
 
-    assert await store.get_cursor("web:chat-1") == 12
+    assert store.get_cursor("web:chat-1") == 12
 
 
 @pytest.mark.asyncio
 async def test_add_message_rejects_invalid_role(store: SessionStore) -> None:
     with pytest.raises(ValueError, match="role"):
-        await store.add_message(
+        store.add_message(
             NewMessage(session_key="web:chat-1", role="system", content="非法")
         )
 
@@ -238,20 +264,20 @@ async def test_add_message_rejects_invalid_role(store: SessionStore) -> None:
 async def test_reopen_keeps_messages_and_close_is_idempotent(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     first = SessionStore(db_path)
-    await first.add_message(
+    first.add_message(
         NewMessage(session_key="web:chat-1", role="user", content="持久化消息")
     )
-    await first.close()
-    await first.close()
+    first.close()
+    first.close()
 
     second = SessionStore(db_path)
     try:
-        history = await second.load_history("web:chat-1")
-        added = await second.add_message(
+        history = second.load_history("web:chat-1")
+        added = second.add_message(
             NewMessage(session_key="web:chat-1", role="assistant", content="继续")
         )
     finally:
-        await second.close()
+        second.close()
 
     assert history == [{"role": "user", "content": "持久化消息"}]
     assert added["seq"] == 1
