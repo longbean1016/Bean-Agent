@@ -336,12 +336,14 @@ class ReadFileTool(Tool):
                 if self._vl_available:
                     return (
                         f"[检测到图片文件 {file_path.name}（{image_mime}）]\n"
-                        "当前主模型不支持多模态，无法直接查看图片内容。\n"
-                        f"请使用 read_image_vision(path='{path}', prompt='描述图片')"
+                        f"当前主模型不支持多模态，无法直接查看图片内容。\n"
+                        f"请使用 read_image_vision 工具来分析此图片：\n"
+                        f"read_image_vision(path='{path}', prompt='描述你想从图片中了解什么')"
                     )
                 return (
                     f"[检测到图片文件 {file_path.name}（{image_mime}）]\n"
-                    "当前主模型不支持多模态，且未配置 VL 视觉模型。"
+                    f"当前主模型不支持多模态，且未配置 VL 视觉模型（llm.vl），无法处理图片。\n"
+                    f"请在 config.toml 中配置 llm.vl 以启用图片识别能力。"
                 )
             if _looks_binary(head):
                 return (

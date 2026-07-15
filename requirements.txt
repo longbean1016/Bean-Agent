@@ -8,5 +8,8 @@ uvicorn>=0.41.0
 # 异步文件操作
 aiofiles>=25.1.0
 
+# 图片校验、EXIF 旋转、缩放和大图压缩
+Pillow>=11.0.0
+
 # 向量检索
 sqlite-vec>=0.1.6
