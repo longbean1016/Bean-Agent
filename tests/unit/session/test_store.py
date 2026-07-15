@@ -243,6 +243,48 @@ async def test_search_messages_is_scoped_and_limited(store: SessionStore) -> Non
 
 
 @pytest.mark.asyncio
+async def test_fetch_by_ids_preserves_requested_order_across_sessions(
+    store: SessionStore,
+) -> None:
+    first = store.add_message(
+        NewMessage(session_key="web:first", role="user", content="第一条")
+    )
+    second = store.add_message(
+        NewMessage(session_key="web:second", role="assistant", content="第二条")
+    )
+
+    fetched = store.fetch_by_ids([second["id"], first["id"]])
+
+    assert [message["id"] for message in fetched] == [second["id"], first["id"]]
+
+
+@pytest.mark.asyncio
+async def test_search_messages_supports_role_filter_and_pagination(
+    store: SessionStore,
+) -> None:
+    for role, content in [
+        ("user", "Python asyncio 入门"),
+        ("assistant", "Python asyncio 示例"),
+        ("assistant", "Python 进阶"),
+    ]:
+        store.add_message(
+            NewMessage(session_key="web:chat-1", role=role, content=content)
+        )
+
+    messages, total = store.search_messages(
+        "Python asyncio",
+        session_key="web:chat-1",
+        role="assistant",
+        limit=1,
+        offset=0,
+    )
+
+    assert total == 2
+    assert len(messages) == 1
+    assert messages[0]["content"] == "Python asyncio 示例"
+
+
+@pytest.mark.asyncio
 async def test_cursor_defaults_to_zero_and_can_advance(store: SessionStore) -> None:
     assert store.get_cursor("web:chat-1") == 0
 

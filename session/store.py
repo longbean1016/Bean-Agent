@@ -111,15 +111,117 @@ class SessionStore:
 
         return self._fetch_messages_sync(session_key, ids, context)
 
+    def fetch_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+        """跨会话按消息 ID 查询，并保持调用方给出的 ID 顺序。"""
+
+        clean_ids = list(dict.fromkeys(str(item).strip() for item in ids if str(item).strip()))
+        if not clean_ids:
+            return []
+        placeholders = ",".join("?" for _ in clean_ids)
+        order_expression = " ".join(
+            f"WHEN ? THEN {index}" for index in range(len(clean_ids))
+        )
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                f"""
+                SELECT {_MESSAGE_COLUMNS}
+                FROM messages
+                WHERE id IN ({placeholders})
+                ORDER BY CASE id {order_expression} END
+                """,
+                (*clean_ids, *clean_ids),
+            ).fetchall()
+        return [self._row_to_message(row) for row in rows]
+
+    def fetch_by_ids_with_context(
+        self,
+        ids: list[str],
+        context: int,
+    ) -> list[dict[str, Any]]:
+        """跨会话读取命中消息，并在各自 Session 内扩展前后文。"""
+
+        clean_ids = list(dict.fromkeys(str(item).strip() for item in ids if str(item).strip()))
+        if not clean_ids:
+            return []
+        safe_context = max(0, int(context))
+        if safe_context == 0:
+            messages = self.fetch_by_ids(clean_ids)
+            for message in messages:
+                message["in_source_ref"] = True
+            return messages
+
+        # 消息 ID 的最后一段是 seq，前缀完整保留为 session_key；无效引用静默忽略。
+        session_sequences: dict[str, set[int]] = {}
+        for message_id in clean_ids:
+            parts = message_id.rsplit(":", 1)
+            if len(parts) != 2:
+                continue
+            try:
+                sequence = int(parts[1])
+            except ValueError:
+                continue
+            session_sequences.setdefault(parts[0], set()).add(sequence)
+
+        source_ids = set(clean_ids)
+        results: list[dict[str, Any]] = []
+        with self._lock:
+            self._ensure_open()
+            for session_key, sequences in session_sequences.items():
+                expanded = {
+                    value
+                    for sequence in sequences
+                    for value in range(
+                        max(0, sequence - safe_context),
+                        sequence + safe_context + 1,
+                    )
+                }
+                placeholders = ",".join("?" for _ in expanded)
+                rows = self._conn.execute(
+                    f"""
+                    SELECT {_MESSAGE_COLUMNS}
+                    FROM messages
+                    WHERE session_key = ? AND seq IN ({placeholders})
+                    ORDER BY seq ASC
+                    """,
+                    (session_key, *sorted(expanded)),
+                ).fetchall()
+                for row in rows:
+                    message = self._row_to_message(row)
+                    message["in_source_ref"] = message["id"] in source_ids
+                    results.append(message)
+        return results
+
     def search_messages(
         self,
-        session_key: str,
         query: str,
-        limit: int = 20,
-    ) -> list[dict[str, Any]]:
-        """在指定会话内搜索消息正文。"""
+        *legacy_args: object,
+        session_key: str | None = None,
+        role: str | None = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int] | list[dict[str, Any]]:
+        """搜索原始消息；旧的 ``(session_key, query)`` 调用仍返回消息列表。"""
 
-        return self._search_messages_sync(session_key, query, limit)
+        if legacy_args:
+            # 兼容已发布的最小契约，待上层全部迁移后再单独移除。
+            legacy_session_key = query
+            legacy_query = str(legacy_args[0])
+            messages, _ = self._search_messages_sync(
+                legacy_query,
+                session_key=legacy_session_key,
+                role=role,
+                limit=limit,
+                offset=offset,
+            )
+            return messages
+        return self._search_messages_sync(
+            query,
+            session_key=session_key,
+            role=role,
+            limit=limit,
+            offset=offset,
+        )
 
     def set_cursor(self, session_key: str, value: int) -> None:
         """设置该会话已完成记忆归档的消息序号。"""
@@ -499,49 +601,110 @@ class SessionStore:
 
     def _search_messages_sync(
         self,
-        session_key: str,
         query: str,
+        *,
+        session_key: str | None,
+        role: str | None,
         limit: int,
-    ) -> list[dict[str, Any]]:
-        key = self._validate_session_key(session_key)
-        term = str(query).strip()
-        if not term:
-            return []
+        offset: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        terms = [term for term in str(query).split() if term]
+        if not terms:
+            return [], 0
         safe_limit = max(1, min(int(limit), 100))
+        safe_offset = max(0, int(offset))
+
+        filters: list[str] = []
+        filter_values: list[object] = []
+        if session_key:
+            filters.append("session_key = ?")
+            filter_values.append(self._validate_session_key(session_key))
+        if role:
+            filters.append("role = ?")
+            filter_values.append(str(role))
+
+        term_filter = " OR ".join("content LIKE ?" for _ in terms)
+        score_expression = " + ".join(
+            "(CASE WHEN content LIKE ? THEN 1 ELSE 0 END)" for _ in terms
+        )
+        where = " AND ".join([*filters, f"({term_filter})"])
+        patterns = [f"%{term}%" for term in terms]
+
+        # 长词走 FTS，短词仍走 LIKE，再将两路候选合并去重。FTS 在部分 SQLite
+        # 构建中不可用或可能拒绝特殊查询词，此时必须无损降级到下方 LIKE 路径。
+        fts_terms = [term for term in terms if len(term) >= 3]
+        if self._has_fts and fts_terms:
+            fts_query = " OR ".join(fts_terms)
+            alias_filters = [
+                condition.replace("session_key", "m.session_key").replace(
+                    "role", "m.role"
+                )
+                for condition in filters
+            ]
+            alias_term_filter = " OR ".join("m.content LIKE ?" for _ in terms)
+            alias_score = " + ".join(
+                "(CASE WHEN m.content LIKE ? THEN 1 ELSE 0 END)" for _ in terms
+            )
+            base_where = " AND ".join(alias_filters)
+            connector = "AND" if base_where else "WHERE"
+            where_prefix = f"WHERE {base_where}" if base_where else ""
+            count_sql = (
+                "SELECT COUNT(1) AS count FROM messages m "
+                "LEFT JOIN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?) fts "
+                "ON m.rowid = fts.rowid "
+                f"{where_prefix} {connector} (fts.rowid IS NOT NULL OR ({alias_term_filter}))"
+            )
+            query_sql = (
+                f"SELECT {_select_columns('m')}, ({alias_score}) AS match_score, "
+                "fts.rank_score AS rank_score FROM messages m "
+                "LEFT JOIN (SELECT rowid, bm25(messages_fts) AS rank_score "
+                "FROM messages_fts WHERE messages_fts MATCH ?) fts ON m.rowid = fts.rowid "
+                f"{where_prefix} {connector} (fts.rowid IS NOT NULL OR ({alias_term_filter})) "
+                "ORDER BY match_score DESC, "
+                "CASE WHEN rank_score IS NULL THEN 1 ELSE 0 END, rank_score ASC, m.seq DESC "
+                "LIMIT ? OFFSET ?"
+            )
+            try:
+                with self._lock:
+                    self._ensure_open()
+                    count_row = self._conn.execute(
+                        count_sql,
+                        (fts_query, *filter_values, *patterns),
+                    ).fetchone()
+                    rows = self._conn.execute(
+                        query_sql,
+                        (
+                            *patterns,
+                            fts_query,
+                            *filter_values,
+                            *patterns,
+                            safe_limit,
+                            safe_offset,
+                        ),
+                    ).fetchall()
+                total = int((count_row["count"] if count_row else 0) or 0)
+                return [self._row_to_message(row) for row in rows], total
+            except sqlite3.OperationalError:
+                pass
 
         with self._lock:
             self._ensure_open()
-            rows: list[sqlite3.Row] = []
-            if self._has_fts and len(term) >= 3:
-                # FTS 查询使用引号包裹用户文本，避免 AND/OR 等字符改变语义。
-                fts_query = f'"{term.replace(chr(34), chr(34) * 2)}"'
-                try:
-                    rows = self._conn.execute(
-                        f"""
-                        SELECT {_select_columns('m')}
-                        FROM messages_fts
-                        JOIN messages m ON m.rowid = messages_fts.rowid
-                        WHERE messages_fts MATCH ? AND m.session_key = ?
-                        ORDER BY bm25(messages_fts), m.seq DESC
-                        LIMIT ?
-                        """,
-                        (fts_query, key, safe_limit),
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    rows = []
-
-            if not rows:
-                rows = self._conn.execute(
-                    f"""
-                    SELECT {_MESSAGE_COLUMNS}
-                    FROM messages
-                    WHERE session_key = ? AND content LIKE ?
-                    ORDER BY seq DESC
-                    LIMIT ?
-                    """,
-                    (key, f"%{term}%", safe_limit),
-                ).fetchall()
-        return [self._row_to_message(row) for row in rows]
+            count_row = self._conn.execute(
+                f"SELECT COUNT(1) AS count FROM messages WHERE {where}",
+                (*filter_values, *patterns),
+            ).fetchone()
+            rows = self._conn.execute(
+                f"""
+                SELECT {_MESSAGE_COLUMNS}, ({score_expression}) AS match_score
+                FROM messages
+                WHERE {where}
+                ORDER BY match_score DESC, seq DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*patterns, *filter_values, *patterns, safe_limit, safe_offset),
+            ).fetchall()
+        total = int((count_row["count"] if count_row else 0) or 0)
+        return [self._row_to_message(row) for row in rows], total
 
     def _set_cursor_sync(self, session_key: str, value: int) -> None:
         key = self._validate_session_key(session_key)
