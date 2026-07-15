@@ -34,6 +34,7 @@ class MarkdownMemoryStore:
         self.recent_context_file = self.memory_dir / "RECENT_CONTEXT.md"
         self.consolidation_db = self.memory_dir / "consolidation_writes.db"
         self._lock = threading.RLock()
+        self._closed = False
         self.pending_file.touch(exist_ok=True)
         self.recent_context_file.touch(exist_ok=True)
         self._db = sqlite3.connect(str(self.consolidation_db), check_same_thread=False)
@@ -111,7 +112,10 @@ class MarkdownMemoryStore:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
             self._db.close()
+            self._closed = True
 
     def _recover_pending_snapshot(self) -> None:
         # 遗留 snapshot 表示上次 Optimizer 未 commit，启动时必须先回滚再接受新任务。
