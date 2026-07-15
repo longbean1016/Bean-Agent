@@ -1,1 +1,3 @@
-"""长期记忆、检索与整理模块。"""
+"""BeanAgent 记忆子系统。"""
+
+from __future__ import annotations

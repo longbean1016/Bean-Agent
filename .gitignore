@@ -42,6 +42,7 @@ Thumbs.db
 # 本地 Agent 规范与实现参考文档
 AGENTS.md
 refrence/
+docs/
 
 # 运行期数据（默认位于用户目录；防止自定义路径指向仓库）
 .beanagent/
