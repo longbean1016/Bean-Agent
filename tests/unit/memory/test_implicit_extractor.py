@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from memory.implicit_extractor import ImplicitLongTermExtractor
+from memory.implicit_extractor import ImplicitLongTermExtractor, _build_prompt
 
 
 class Provider:
@@ -39,3 +39,17 @@ async def test_rejects_non_object_json() -> None:
 
     with pytest.raises(ValueError, match="JSON object"):
         await ImplicitLongTermExtractor(ListProvider()).extract("[user] 普通对话")
+
+
+def test_prompt_contains_full_evidence_gates_and_counterexamples() -> None:
+    prompt = _build_prompt("[USER] 对话", "用户住在上海")
+
+    assert "检查 0 — 元讨论/举例说明" in prompt
+    assert "检查 A — USER 原话锚点" in prompt
+    assert "检查 B — 时效性" in prompt
+    assert "检查 C — 来源方向" in prompt
+    assert "你还记得我什么时候开始戴 fitbit 手环的吗" in prompt
+    assert "ASSISTANT 建议得再具体再合理" in prompt
+    assert "那就直接写个脚本绕过去吧" in prompt
+    assert "用户住在上海" in prompt
+    assert '"rule_schema"' in prompt
