@@ -36,6 +36,26 @@ const markdownControls = {
 };
 const markdownTranslations = { copyCode: "复制代码", copied: "已复制" };
 
+function prepareMessageMarkdown(markdown: string): string {
+  let fenced = false;
+  return markdown.split(/(\n)/).map((line) => {
+    if (line === "\n") return line;
+    if (/^\s*(```|~~~)/.test(line)) {
+      fenced = !fenced;
+      return line;
+    }
+    if (fenced) return line;
+    return line.replace(
+      /\*\*\s+(https?:\/\/[^\s*]+)\s*\*\*([。！？；，、,.!;:]?)/gu,
+      (_match, rawUrl: string, trailing: string) => {
+        const url = rawUrl.replace(/[。！？；，、,.!;:]+$/gu, "");
+        const punctuation = rawUrl.slice(url.length) + trailing;
+        return `**<${url}>**${punctuation}`;
+      },
+    );
+  }).join("");
+}
+
 export function App() {
   const [chat, dispatch] = useReducer(reduceChatFrame, {
     ...initialChatState,
@@ -288,7 +308,7 @@ function MessageView({ message }: { message: ChatMessage }) {
             lineNumbers={false}
             translations={markdownTranslations}
           >
-            {message.content}
+            {prepareMessageMarkdown(message.content)}
           </Streamdown>
         ) : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
         {message.status === "interrupted" ? <span className="interrupted-label">已停止</span> : null}

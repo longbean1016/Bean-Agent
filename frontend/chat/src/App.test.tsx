@@ -35,6 +35,10 @@ beforeEach(() => {
   localStorage.clear();
   FakeWebSocket.instances = [];
   vi.stubGlobal("WebSocket", FakeWebSocket);
+  Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+    configurable: true,
+    value: vi.fn(),
+  });
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     const payload = url.includes("/messages") ? { items: [], total: 0 } : { items: [], total: 0 };
@@ -61,4 +65,29 @@ it("首次连接创建 Session 并发送用户消息", async () => {
 
   await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send" && frame.text === "组件测试消息")).toBe(true));
   expect(screen.getByText("组件测试消息")).toBeVisible();
+});
+
+it("修正粗体包裹的裸链接边界", async () => {
+  localStorage.setItem("beanagent.session_id", "web:links");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    const payload = url.includes("/messages") ? {
+      items: [{
+        id: "web:links:0",
+        role: "assistant",
+        content: "记下了，你的 GitHub 地址是 ** https://github.com/longbean1016/**。",
+        turn_id: "turn-links",
+        tool_chain: [],
+        timestamp: "2026-07-16T20:00:00+08:00",
+      }],
+      total: 1,
+    } : { items: [], total: 0 };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  render(<App />);
+
+  const link = await screen.findByRole("button", { name: "https://github.com/longbean1016/" });
+  expect(link).toHaveTextContent("https://github.com/longbean1016/");
+  expect(screen.queryByText(/longbean1016\/\*\*/)).not.toBeInTheDocument();
 });
