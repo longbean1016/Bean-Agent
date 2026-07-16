@@ -132,11 +132,21 @@ class PostResponseMemoryWorker:
         allowed, token_budget = self._consume_budget(token_budget, self.TOKENS_EXTRACT_INVALIDATION)
         if not allowed:
             return [], token_budget
-        prompt = f"""判断用户消息是否明确声明 agent 某个现有行为或流程有误并要求废弃。
-必须同时有明确否定词（错了、不对、不要再、忘掉、废弃、过时）且对象是 agent 行为。
-询问流程、用户自己的操作、疑问或不确定猜测返回 []。
-若触发，只返回受影响的行为主题 JSON 数组；大多数消息应返回 []。
+        prompt = f"""判断用户消息是否在明确声明 agent 某个现有行为/流程有误，且希望废弃它。
+
 用户消息：{user_msg}
+
+【必须同时满足才触发】
+1. 有明确否定、纠错或废弃意图，如“错了/不对/不要再/忘掉/废弃/过时/改掉”。
+2. 否定对象是 agent 的操作行为，不是用户自己的事或第三方信息。
+
+【以下情况绝对不触发，返回 []】
+- 用户在询问/确认 agent 的流程，如“你的流程是什么”“你怎么做的”。
+- 用户在描述/回顾自己的操作。
+- 用户提问句、疑问句，即使涉及 agent 行为。
+- 含“也许/可能/猜测”等不确定措辞且无明确废弃指令。
+
+若触发，只返回受影响行为主题的 JSON 字符串数组；大多数消息应返回 []。
 受影响的行为主题："""
         try:
             return _string_list(await self._complete(prompt)), token_budget

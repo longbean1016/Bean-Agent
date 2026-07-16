@@ -34,10 +34,12 @@ class Retriever:
 class Provider:
     def __init__(self) -> None:
         self.calls = 0
+        self.prompts: list[str] = []
 
     async def complete(self, messages, tools=None):
         self.calls += 1
         prompt = messages[0]["content"]
+        self.prompts.append(prompt)
         if "受影响的行为主题" in prompt:
             return SimpleNamespace(content='["下载流程"]')
         return SimpleNamespace(content='["old-rule", "new-rule"]')
@@ -86,3 +88,18 @@ def test_collect_explicit_memorized_supports_item_id_and_legacy_formats() -> Non
 
     assert summaries == ["A", "B"]
     assert protected == {"legacy_1", "modern:2"}
+
+
+@pytest.mark.asyncio
+async def test_invalidation_prompt_rejects_questions_and_uncertain_guesses() -> None:
+    provider = Provider()
+    worker = PostResponseMemoryWorker(Memorizer(), Retriever(), provider)
+
+    await worker._extract_invalidation_topics("你的流程是什么？", 1000)
+
+    prompt = provider.prompts[0]
+    assert "必须同时满足才触发" in prompt
+    assert "用户在询问/确认 agent 的流程" in prompt
+    assert "用户在描述/回顾自己的操作" in prompt
+    assert "也许/可能/猜测" in prompt
+    assert "大多数消息应返回 []" in prompt
