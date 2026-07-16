@@ -99,14 +99,14 @@ it("粗体包裹的裸链接不显示星号并可直接跳转", async () => {
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 
-it("代码复制成功后显示已复制", async () => {
+it("代码复制保留原始格式并将按钮图标切换为勾选", async () => {
   localStorage.setItem("beanagent.session_id", "web:code-copy");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages") ? {
       items: [{
         id: "web:code-copy:0",
         role: "assistant",
-        content: "```ts\nconst ready = true;\n```",
+        content: "```ts\nfunction demo() {\n  const ready = true;\n\n  return ready;\n}\n```",
         turn_id: "turn-code",
         tool_chain: [],
         timestamp: "2026-07-16T20:00:00+08:00",
@@ -119,7 +119,10 @@ it("代码复制成功后显示已复制", async () => {
   render(<App />);
 
   const copy = await screen.findByRole("button", { name: "复制代码" });
+  const copyIcon = copy.innerHTML;
   fireEvent.click(copy);
-  expect(await screen.findByRole("status")).toHaveTextContent("已复制");
-  expect(navigator.clipboard.writeText).toHaveBeenCalledWith("const ready = true;");
+  await waitFor(() => expect(copy.innerHTML).not.toBe(copyIcon));
+  expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+    "function demo() {\n  const ready = true;\n\n  return ready;\n}\n",
+  );
 });

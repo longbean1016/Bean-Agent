@@ -19,7 +19,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { Streamdown } from "streamdown";
 
 import { fetchMessages, fetchSessions, mediaUrl, uploadAttachment } from "./api";
@@ -304,32 +304,11 @@ function ConnectionControl({ status, onReconnect }: { status: ConnectionStatus; 
 
 function MessageView({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
-  const [copyFeedback, setCopyFeedback] = useState(false);
-  const copyFeedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => () => {
-    if (copyFeedbackTimer.current) clearTimeout(copyFeedbackTimer.current);
-  }, []);
-
-  const handleCopyCapture = (event: ReactMouseEvent<HTMLDivElement>) => {
-    const target = event.target instanceof Element ? event.target : null;
-    const button = target?.closest<HTMLButtonElement>('[data-streamdown="code-block-copy-button"]');
-    if (!button) return;
-    const codeText = button.closest('[data-streamdown="code-block"]')?.querySelector("code")?.textContent ?? "";
-    event.preventDefault();
-    event.stopPropagation();
-    void navigator.clipboard.writeText(codeText).then(() => {
-      setCopyFeedback(true);
-      if (copyFeedbackTimer.current) clearTimeout(copyFeedbackTimer.current);
-      copyFeedbackTimer.current = setTimeout(() => setCopyFeedback(false), 1800);
-    }).catch(() => setCopyFeedback(false));
-  };
 
   return (
     <article className={`message ${isUser ? "user-message" : "assistant-message"}`}>
       <div className="message-label">{isUser ? "你" : "BeanAgent"}</div>
-      <div className="message-body" onClickCapture={handleCopyCapture}>
-        {copyFeedback ? <span className="copy-feedback" role="status"><Check size={14} />已复制</span> : null}
+      <div className="message-body">
         {message.media.length ? <AttachmentGallery paths={message.media} /> : null}
         {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} /> : null}
         {message.tools.length ? <div className="tool-timeline">{message.tools.map((tool) => <ToolStep key={tool.callId} tool={tool} />)}</div> : null}

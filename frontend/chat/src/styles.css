@@ -74,7 +74,6 @@ button { color: inherit; }
 [data-streamdown="code-block-actions"] { position: absolute; z-index: 1; top: 5px; right: 8px; display: flex; align-items: center; }
 [data-streamdown="code-block-copy-button"] { display: inline-grid; width: 26px; height: 26px; padding: 0; place-items: center; border: 0; border-radius: 4px; color: #53615c; background: transparent; cursor: pointer; }
 [data-streamdown="code-block-copy-button"]:hover { background: #dfe8e4; color: #0b655f; }
-.copy-feedback { position: absolute; z-index: 3; top: -5px; right: 0; display: inline-flex; min-height: 28px; align-items: center; gap: 5px; padding: 0 9px; border: 1px solid #bcd3ca; border-radius: 5px; color: #075f59; background: #edf7f3; box-shadow: 0 6px 18px rgb(25 61 49 / 12%); font-size: 12px; font-weight: 700; }
 [data-streamdown="code-block-body"] { width: 100%; min-width: 0; overflow-x: auto; padding: 14px 16px; background: #fbfcfb; }
 [data-streamdown="code-block-body"] pre { width: max-content; min-width: 100%; margin: 0; overflow: visible; background: transparent; }
 [data-streamdown="code-block-body"] code { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 13px; line-height: 1.65; white-space: pre; }
