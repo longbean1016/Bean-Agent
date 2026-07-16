@@ -6,7 +6,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from fastapi import FastAPI, WebSocket
+
 from agent.agent_loop import AgentLoop
+from agent.channel import WebChannel
 from agent.config_models import Config
 from agent.event_bus import EventBus
 from agent.message_bus import MessageBus
@@ -119,4 +122,21 @@ def build_core_runtime(
     )
 
 
-__all__ = ["CoreRuntime", "build_core_runtime"]
+def create_fastapi_app(runtime: CoreRuntime) -> FastAPI:
+    """为已组装 Runtime 暴露 WebSocket 路由，不复制或隐式替换依赖。"""
+
+    app = FastAPI()
+    channel = WebChannel(runtime.message_bus, runtime.event_bus, runtime.agent_loop)
+    # 测试、lifespan 和后续前端静态服务都从 app.state 读取同一实例，不能在路由
+    # 函数中按连接重新创建 Channel，否则连接池无法按 session_key 广播。
+    app.state.core_runtime = runtime
+    app.state.web_channel = channel
+
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket) -> None:
+        await channel.handle_websocket(websocket)
+
+    return app
+
+
+__all__ = ["CoreRuntime", "build_core_runtime", "create_fastapi_app"]
