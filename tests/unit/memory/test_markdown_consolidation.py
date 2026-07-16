@@ -85,6 +85,29 @@ async def test_consolidation_failure_keeps_cursor(tmp_path: Path) -> None:
     assert cursor == 0
 
 
+@pytest.mark.asyncio
+async def test_below_threshold_refreshes_recent_turns_without_llm(tmp_path: Path) -> None:
+    class ForbiddenExtractor:
+        async def extract(self, messages, previous_recent_context):
+            raise AssertionError("未达到阈值时不应调用归档 LLM")
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    markdown = MarkdownMemoryStore(tmp_path)
+    try:
+        sessions.add_message(NewMessage(session_key="web:c", role="user", content="新问题"))
+        sessions.add_message(NewMessage(session_key="web:c", role="assistant", content="新回答"))
+        consolidator = Consolidator(sessions, markdown, ForbiddenExtractor(), keep_count=20, threshold=5)
+
+        result = await consolidator.consolidate("web:c")
+    finally:
+        sessions.close()
+
+    assert result is None
+    assert "## Recent Turns" in markdown.read_recent_context()
+    assert "[user] 新问题" in markdown.read_recent_context()
+    assert "[assistant] 新回答" in markdown.read_recent_context()
+
+
 class OptimizerLLM:
     def __init__(self, *, fail_second: bool = False) -> None:
         self.calls = 0

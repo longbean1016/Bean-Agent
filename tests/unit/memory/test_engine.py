@@ -253,3 +253,66 @@ async def test_committed_turn_invalidates_old_preference_through_engine_queue(tm
 
     assert old.item_id
     assert recalled.records == []
+
+
+@pytest.mark.asyncio
+async def test_consolidation_maintenance_runs_different_sessions_concurrently(tmp_path: Path) -> None:
+    import asyncio
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    started: set[str] = set()
+
+    async def slow(event):
+        started.add(event.session_key)
+        if len(started) == 2:
+            both_started.set()
+        await release.wait()
+
+    engine._run_consolidation = slow
+    try:
+        await engine.on_turn_committed({"session_key": "web:a"})
+        await engine.on_turn_committed({"session_key": "web:b"})
+        await asyncio.wait_for(both_started.wait(), timeout=0.05)
+        release.set()
+        await engine.drain()
+    finally:
+        release.set()
+        await engine.close()
+        sessions.close()
+
+    assert started == {"web:a", "web:b"}
+
+
+@pytest.mark.asyncio
+async def test_consolidation_maintenance_serializes_same_session(tmp_path: Path) -> None:
+    import asyncio
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    active = 0
+    max_active = 0
+
+    async def observe(_event):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+
+    engine._run_consolidation = observe
+    try:
+        await engine.on_turn_committed({"session_key": "web:a"})
+        await engine.on_turn_committed({"session_key": "web:a"})
+        await engine.drain()
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert max_active == 1

@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import logging
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -62,9 +63,12 @@ class MemoryEngine:
         # 构造函数可能运行在事件循环之外，因此这里只创建惰性绑定的队列；常驻任务在
         # 第一次摄入 Turn 时启动，避免初始化阶段错误捕获不存在的 event loop。
         self._post_response_queue: asyncio.Queue[TurnIngested] = asyncio.Queue()
-        self._consolidation_queue: asyncio.Queue[TurnIngested] = asyncio.Queue()
         self._post_response_task: asyncio.Task[None] | None = None
-        self._consolidation_task: asyncio.Task[None] | None = None
+        # 参考实现按 session_key 隔离维护队列：同一会话严格串行，不同会话各自拥有
+        # asyncio Task，可以并行等待 LLM/IO，避免慢会话阻塞全部用户。
+        self._maintenance_queues: dict[str, deque[TurnIngested]] = {}
+        self._maintenance_locks: dict[str, asyncio.Lock] = {}
+        self._maintenance_tasks: dict[str, asyncio.Task[None]] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._accepting = True
         self._closed = False
@@ -167,7 +171,7 @@ class MemoryEngine:
         # put_nowait 是 Turn 提交边界的关键：回复发送与 Session 提交不等待 LLM 提取、
         # 向量化或 Markdown IO，后台失败也不会回滚已经落库的对话。
         self._post_response_queue.put_nowait(snapshot)
-        self._consolidation_queue.put_nowait(snapshot)
+        self._enqueue_maintenance(snapshot)
 
     async def _run_consolidation(self, event: TurnIngested) -> ConsolidationResult | None:
         result = await self._consolidator.consolidate(event.session_key)
@@ -186,17 +190,15 @@ class MemoryEngine:
         """等待当前已接收的两类后台任务全部完成，主要用于关闭和确定性测试。"""
 
         await self._post_response_queue.join()
-        await self._consolidation_queue.join()
+        # 新任务可能在一次 gather 快照完成前被追加，因此循环到任务表真正为空。
+        while self._maintenance_tasks:
+            await asyncio.gather(*list(self._maintenance_tasks.values()), return_exceptions=True)
 
     async def _ensure_workers(self) -> None:
         async with self._lifecycle_lock:
             if self._post_response_task is None:
                 self._post_response_task = asyncio.create_task(
                     self._post_response_loop(), name="memory-post-response"
-                )
-            if self._consolidation_task is None:
-                self._consolidation_task = asyncio.create_task(
-                    self._consolidation_loop(), name="memory-consolidation"
                 )
 
     async def _post_response_loop(self) -> None:
@@ -211,17 +213,39 @@ class MemoryEngine:
             finally:
                 self._post_response_queue.task_done()
 
-    async def _consolidation_loop(self) -> None:
-        while True:
-            event = await self._consolidation_queue.get()
-            try:
-                await self._run_consolidation(event)
-            except Exception:
-                # Consolidation 属于提交后的派生数据处理，失败保留 cursor，下一次仍可
-                # 从同一窗口重试，但绝不能破坏另一条 invalidation 处理链。
-                logger.exception("会话记忆归档失败: session_key=%s", event.session_key)
-            finally:
-                self._consolidation_queue.task_done()
+    def _enqueue_maintenance(self, event: TurnIngested) -> None:
+        queue = self._maintenance_queues.setdefault(event.session_key, deque())
+        queue.append(event)
+        if event.session_key in self._maintenance_tasks:
+            return
+        task = asyncio.create_task(
+            self._run_maintenance_queue(event.session_key),
+            name=f"memory-maintenance:{event.session_key}",
+        )
+        self._maintenance_tasks[event.session_key] = task
+
+    async def _run_maintenance_queue(self, session_key: str) -> None:
+        lock = self._maintenance_locks.setdefault(session_key, asyncio.Lock())
+        try:
+            async with lock:
+                while True:
+                    queue = self._maintenance_queues.get(session_key)
+                    if not queue:
+                        return
+                    event = queue.popleft()
+                    try:
+                        await self._run_consolidation(event)
+                    except Exception:
+                        # Session 已提交，维护失败只保留 cursor 供后续重试，不能终止其它
+                        # Session 的独立任务，也不能回滚正常回复。
+                        logger.exception("会话记忆归档失败: session_key=%s", session_key)
+        finally:
+            current = asyncio.current_task()
+            if self._maintenance_tasks.get(session_key) is current:
+                self._maintenance_tasks.pop(session_key, None)
+            if not self._maintenance_queues.get(session_key):
+                self._maintenance_queues.pop(session_key, None)
+                self._maintenance_locks.pop(session_key, None)
 
     def _build_turn_snapshot(self, event: Any) -> TurnIngested:
         def value(name: str, default: Any = "") -> Any:
@@ -273,7 +297,7 @@ class MemoryEngine:
         # 先完成已接收任务，再取消等待新消息的常驻消费者；否则 SQLite/Markdown
         # 可能先关闭，造成尾部 Turn 丢失。取消仅发生在队列清空之后。
         await self.drain()
-        tasks = [task for task in (self._post_response_task, self._consolidation_task) if task is not None]
+        tasks = [task for task in (self._post_response_task,) if task is not None]
         for task in tasks:
             task.cancel()
         if tasks:

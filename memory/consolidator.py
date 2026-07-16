@@ -42,6 +42,10 @@ class Consolidator:
         end = max(cursor, len(messages) - self._keep_count)
         window = messages[cursor:end]
         if len(window) < self._threshold:
+            # 未达到归档阈值时不消耗 LLM，只刷新最近对话的可读窗口；cursor 保持不变，
+            # 后续消息累计到阈值后仍从同一位置进入 Consolidation。
+            recent = messages[-self._keep_count:] if self._keep_count else messages
+            self._markdown.refresh_recent_turns(recent)
             return None
 
         draft = await self._extractor.extract(window, self._markdown.read_recent_context())

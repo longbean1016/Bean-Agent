@@ -6,6 +6,7 @@ import os
 import shutil
 import sqlite3
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 
 DEFAULT_SELF_MD = """# BeanAgent 的自我认知
@@ -50,6 +51,25 @@ class MarkdownMemoryStore:
     def write_long_term(self, content: str) -> None: self._atomic_write(self.memory_file, content)
     def write_self(self, content: str) -> None: self._atomic_write(self.self_file, content)
     def write_recent_context(self, content: str) -> None: self._atomic_write(self.recent_context_file, content)
+
+    def refresh_recent_turns(self, messages: Sequence[dict[str, object]]) -> None:
+        """不调用 LLM，只用最新持久化消息替换 Recent Turns 区块。"""
+
+        lines = [
+            f"- [{str(item.get('role') or 'unknown')}] {str(item.get('content') or '').strip()}"
+            for item in messages
+            if str(item.get("content") or "").strip()
+        ]
+        if not lines:
+            return
+        with self._lock:
+            current = self.read_recent_context().rstrip()
+            # Recent Turns 始终是文件末尾的易变区块。每轮整体替换而不是追加，可以避免
+            # 同一个 Turn 因任务重试被重复写入，同时不破坏前面的 Compression/Ongoing Threads。
+            stable, marker, _ = current.partition("## Recent Turns")
+            prefix = stable.rstrip() if marker else current
+            content = f"{prefix}\n\n## Recent Turns\n".lstrip() + "\n".join(lines) + "\n"
+            self._atomic_write(self.recent_context_file, content)
 
     def get_memory_context(self) -> str:
         value = self.read_long_term().strip()
