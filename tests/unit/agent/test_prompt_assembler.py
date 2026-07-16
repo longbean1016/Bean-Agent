@@ -50,7 +50,8 @@ def test_envelope_order_is_system_history_reminder_current_message() -> None:
 
     assert [item["role"] for item in envelope] == ["system", "assistant", "user", "user"]
     assert envelope[-1]["content"] == (
-        "[当前消息时间: 2026-07-16T01:02:03Z]\n"
+        "[当前消息时间: 2026-07-16T09:02:03+08:00]\n"
+        "[当前时区: Asia/Shanghai]\n"
         "[语言要求: 默认用简体中文完成最终回复和可见思考过程；用户明确要求其他语言时遵循用户要求。]\n"
         "当前问题"
     )

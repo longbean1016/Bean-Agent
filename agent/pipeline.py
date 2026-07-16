@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 from agent.attachment_content import build_current_user_content
 from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted
@@ -33,6 +34,7 @@ _LOW_PRIORITY_SECTIONS = (
     "session_context",
     "self_model",
 )
+_LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class Pipeline:
@@ -61,7 +63,7 @@ class Pipeline:
         )
         context = TurnContext(self._workspace, message.channel, message.chat_id, self._memory, retrieved, summary, names)
         current_content = await build_current_user_content(message.content, message.media)
-        message_timestamp = datetime.now(timezone.utc)
+        message_timestamp = datetime.now(_LOCAL_TZ)
         disabled_sections: set[str] = set()
         react_messages: list[dict[str, Any]] = []
         tool_chain: list[dict[str, Any]] = []

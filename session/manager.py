@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from session.store import NewMessage, SessionStore
 
@@ -19,6 +20,11 @@ _TEXT_ATTACHMENT_SUFFIXES = {
     ".txt", ".md", ".markdown", ".py", ".json", ".toml", ".yaml", ".yml",
     ".csv", ".log", ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".xml",
 }
+_LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _now_local() -> datetime:
+    return datetime.now(_LOCAL_TZ)
 
 
 def _truncate_tool_result(content: object) -> str:
@@ -91,8 +97,8 @@ class Session:
 
     session_key: str
     messages: list[dict[str, Any]] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.now)
-    updated_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=_now_local)
+    updated_at: datetime = field(default_factory=_now_local)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0
 
@@ -114,13 +120,13 @@ class Session:
         message: dict[str, Any] = {
             "role": role,
             "content": content,
-            "timestamp": datetime.now().astimezone().isoformat(),
+            "timestamp": _now_local().isoformat(),
             **kwargs,
         }
         if media:
             message["media"] = list(media)
         self.messages.append(message)
-        self.updated_at = datetime.now()
+        self.updated_at = _now_local()
         return message
 
     def get_history(
@@ -210,7 +216,7 @@ class Session:
         """清空内存会话并重置记忆归档 cursor。"""
 
         self.messages = []
-        self.updated_at = datetime.now()
+        self.updated_at = _now_local()
         self.last_consolidated = 0
 
 
@@ -268,7 +274,7 @@ class SessionManager:
             if meta is None and not messages:
                 # 新会话先落元数据，确保随后第一条消息可以满足外键约束。
                 meta = self._store.create_session(key)
-            now = datetime.now()
+            now = _now_local()
             session = Session(
                 session_key=key,
                 messages=messages,
@@ -393,7 +399,7 @@ class SessionManager:
             # 原地更新很关键：调用方持有的消息字典立即获得稳定 ID，后续
             # TurnCommitted 和重复保存都以同一对象为准。
             message.update(row)
-        session.updated_at = datetime.now()
+        session.updated_at = _now_local()
 
     async def _save_metadata(self, session: Session) -> None:
         # 消息写入和 Session 元数据是两个明确步骤：Store.add_message 原子维护

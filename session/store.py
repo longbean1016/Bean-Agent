@@ -10,9 +10,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
+_LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 _MESSAGE_ROLES = {"user", "assistant", "tool"}
 _MESSAGE_COLUMNS = "id, session_key, seq, role, content, tool_chain, extra, ts"
 
@@ -951,7 +953,9 @@ class SessionStore:
 
 
 def _now_iso() -> str:
-    return datetime.now().astimezone().isoformat()
+    # Session 时间直接面向用户和前端展示，显式固定业务时区，避免服务进程
+    # 在 UTC 容器或 Windows 时区数据缺失时写出不一致的偏移。
+    return datetime.now(_LOCAL_TZ).isoformat()
 
 
 def _select_columns(alias: str) -> str:

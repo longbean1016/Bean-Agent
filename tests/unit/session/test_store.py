@@ -32,6 +32,7 @@ async def test_create_session_is_idempotent(store: SessionStore) -> None:
     assert first["created_at"] == second["created_at"]
     assert second["last_consolidated"] == 0
     assert second["next_seq"] == 0
+    assert first["created_at"].endswith("+08:00")
 
 
 @pytest.mark.asyncio
@@ -63,6 +64,7 @@ async def test_add_message_allocates_seq_and_preserves_turn_fields(
     assert second["seq"] == 1
     assert second["reasoning_content"] == "先礼貌回应"
     assert first["metadata"] == {"request_id": "request-1"}
+    assert first["timestamp"].endswith("+08:00")
 
     fetched = store.fetch_messages(
         "web:chat-1", [first["id"], second["id"]]

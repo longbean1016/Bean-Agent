@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from agent.prompt_block import PromptSectionMeta, PromptSectionRender, SystemPromptBuilder, TurnContext
 
 _FRAME_SECTIONS = {"recent_context", "active_tools", "retrieved_memory"}
 _FRAME_START = '<system-reminder data-system-context-frame="true">'
+_LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(slots=True)
@@ -34,9 +36,11 @@ class MessageEnvelopeBuilder:
         messages: list[dict[str, object]] = [{"role": "system", "content": system_prompt}, *history]
         if context_frame.strip():
             messages.append({"role": "user", "content": context_frame})
-        timestamp = message_timestamp or datetime.now(timezone.utc)
+        timestamp = message_timestamp or datetime.now(_LOCAL_TZ)
+        local_timestamp = timestamp.astimezone(_LOCAL_TZ)
         stamp = (
-            f"[当前消息时间: {timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}]\n"
+            f"[当前消息时间: {local_timestamp.isoformat(timespec='seconds')}]\n"
+            "[当前时区: Asia/Shanghai]\n"
             "[语言要求: 默认用简体中文完成最终回复和可见思考过程；用户明确要求其他语言时遵循用户要求。]"
         )
         if isinstance(current_message, list):

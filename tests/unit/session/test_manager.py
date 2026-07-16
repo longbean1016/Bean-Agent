@@ -39,6 +39,8 @@ async def test_get_or_create_caches_complete_session_and_reloads_after_invalidat
     assert reloaded is not first
     assert reloaded.messages == first.messages
     assert reloaded.messages[0]["turn_id"] == "turn-1"
+    assert user["timestamp"].endswith("+08:00")
+    assert first.created_at.utcoffset().total_seconds() == 8 * 60 * 60
 
 
 def test_manager_creates_akashic_workspace_layout(tmp_path: Path) -> None:
