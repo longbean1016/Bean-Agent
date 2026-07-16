@@ -52,7 +52,8 @@ async def test_retriever_fuses_vector_and_keyword_with_rrf() -> None:
     items = await Retriever(Store(), Embedder()).retrieve("上海 Python", top_k=2)
 
     assert [item["id"] for item in items] == ["both", "keyword"]
-    assert items[0]["score"] > items[1]["score"]
+    assert items[0]["score"] == 0.9
+    assert items[0]["rrf_score"] > items[1]["rrf_score"]
 
 
 @pytest.mark.asyncio

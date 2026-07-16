@@ -133,16 +133,26 @@ def extract_query_terms(query: str) -> list[str]:
 def rrf_merge(vector_hits: list[dict[str, object]], keyword_hits: list[dict[str, object]], *, top_n: int = 8, k: int = 60, keyword_weight: float = 0.5) -> list[dict[str, object]]:
     vector_ranks = {str(item["id"]): index + 1 for index, item in enumerate(vector_hits)}
     keyword_ranks = {str(item["id"]): index + 1 for index, item in enumerate(keyword_hits)}
-    by_id = {str(item["id"]): item for item in [*vector_hits, *keyword_hits]}
+    by_id: dict[str, dict[str, object]] = {}
+    for item in keyword_hits:
+        normalized = dict(item)
+        # 关键词独有候选没有向量相似度，使用关键词分数作为公开 score；若同一条记忆
+        # 也被向量命中，下面会以包含真实相似度的向量结果覆盖它。
+        normalized.setdefault("score", float(item.get("keyword_score", 0) or 0))
+        by_id[str(item["id"])] = normalized
+    for item in vector_hits:
+        by_id[str(item["id"])] = dict(item)
     result: list[dict[str, object]] = []
     for item_id in vector_ranks.keys() | keyword_ranks.keys():
-        score = 0.0
+        rrf_score = 0.0
         if item_id in vector_ranks:
-            score += 1.0 / (k + vector_ranks[item_id])
+            rrf_score += 1.0 / (k + vector_ranks[item_id])
         if item_id in keyword_ranks:
-            score += keyword_weight / (k + keyword_ranks[item_id])
-        result.append({**by_id[item_id], "score": score})
-    result.sort(key=lambda item: (-float(item["score"]), str(item["id"])))
+            rrf_score += keyword_weight / (k + keyword_ranks[item_id])
+        # RRF 只负责跨 lane 排序，不能覆盖 worker 用来执行 0.82 阈值判断的原始
+        # 相似度 score；这与参考实现的 score/rrf_score 双字段契约一致。
+        result.append({**by_id[item_id], "rrf_score": rrf_score})
+    result.sort(key=lambda item: (-float(item["rrf_score"]), -float(item.get("score", 0) or 0), str(item["id"])))
     return result[: max(1, int(top_n))]
 
 

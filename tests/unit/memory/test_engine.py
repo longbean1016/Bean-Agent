@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -209,3 +210,46 @@ async def test_close_drains_pending_work_and_is_idempotent(tmp_path: Path) -> No
 
     assert sessions.get_cursor("web:c") == 3
     sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_committed_turn_invalidates_old_preference_through_engine_queue(tmp_path: Path) -> None:
+    class InvalidationProvider:
+        async def complete(self, messages, tools=None):
+            prompt = messages[0]["content"]
+            if "受影响的行为主题" in prompt:
+                return SimpleNamespace(content='["回答格式"]')
+            if "候选规则" in prompt:
+                # 候选 ID 由引擎生成，因此从确认提示中提取，模拟 LLM 精确选择旧规则。
+                candidate_id = prompt.split("id=", 1)[1].split(" |", 1)[0]
+                return SimpleNamespace(content=f'["{candidate_id}"]')
+            return SimpleNamespace(content="[]")
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), InvalidationProvider(), sessions, config=config)
+    try:
+        old = await engine.mutate(MemoryMutation(
+            kind="remember",
+            summary="回答必须使用表格格式",
+            memory_kind="preference",
+            source_ref="web:c:0",
+            scope=MemoryScope(channel="web", chat_id="c"),
+        ))
+        await engine.on_turn_committed({
+            "session_key": "web:c",
+            "channel": "web",
+            "chat_id": "c",
+            "input_message": "之前的回答格式错了，不要再使用表格",
+            "assistant_response": "明白",
+            "source_ref": "web:c@turn-2",
+        })
+        await engine.drain()
+        recalled = await engine.query(MemoryQuery("回答格式"))
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert old.item_id
+    assert recalled.records == []
