@@ -8,6 +8,8 @@ import {
   Check,
   ChevronDown,
   CircleStop,
+  Copy,
+  ExternalLink,
   FileText,
   Image as ImageIcon,
   Menu,
@@ -19,7 +21,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { Streamdown } from "streamdown";
 
 import { fetchMessages, fetchSessions, mediaUrl, uploadAttachment } from "./api";
@@ -34,7 +36,26 @@ const markdownControls = {
   mermaid: false,
   table: false,
 };
-const markdownTranslations = { copyCode: "复制代码", copied: "已复制" };
+const markdownTranslations = {
+  copied: "已复制",
+  copyCode: "复制代码",
+  copyLink: "复制链接",
+  externalLinkWarning: "即将访问外部网站",
+  openExternalLink: "打开外部链接",
+  openLink: "打开链接",
+};
+
+interface ExternalLinkDialogProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+  url: string;
+}
+
+const markdownLinkSafety = {
+  enabled: true,
+  renderModal: (props: ExternalLinkDialogProps) => <ExternalLinkDialog {...props} />,
+};
 
 function prepareMessageMarkdown(markdown: string): string {
   let fenced = false;
@@ -54,6 +75,63 @@ function prepareMessageMarkdown(markdown: string): string {
       },
     );
   }).join("");
+}
+
+function ExternalLinkDialog({ isOpen, onClose, onConfirm, url }: ExternalLinkDialogProps) {
+  const [copied, setCopied] = useState(false);
+  const hostname = useMemo(() => {
+    try {
+      return new URL(url).hostname;
+    } catch {
+      return url;
+    }
+  }, [url]);
+
+  useEffect(() => {
+    if (!isOpen) setCopied(false);
+  }, [isOpen, url]);
+
+  const copyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <Dialog.Root open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="external-link-overlay" />
+        <Dialog.Content className="external-link-dialog">
+          <div className="external-link-heading">
+            <span className="external-link-mark"><ExternalLink size={18} /></span>
+            <div>
+              <Dialog.Title className="external-link-title">打开外部链接</Dialog.Title>
+              <Dialog.Description className="external-link-description">即将离开 BeanAgent 并访问外部网站</Dialog.Description>
+            </div>
+            <Dialog.Close asChild>
+              <button className="icon-button external-link-close" aria-label="关闭"><X size={18} /></button>
+            </Dialog.Close>
+          </div>
+          <div className="external-link-target">
+            <strong>{hostname}</strong>
+            <span>{url}</span>
+          </div>
+          <div className="external-link-actions">
+            <button className="secondary-action" onClick={() => void copyLink()} aria-label={copied ? "已复制" : "复制链接"}>
+              {copied ? <Check size={16} /> : <Copy size={16} />}
+              <span>{copied ? "已复制" : "复制链接"}</span>
+            </button>
+            <button className="primary-action" onClick={onConfirm} aria-label="打开链接">
+              <ExternalLink size={16} /><span>打开链接</span>
+            </button>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
 }
 
 export function App() {
@@ -292,10 +370,32 @@ function ConnectionControl({ status, onReconnect }: { status: ConnectionStatus; 
 
 function MessageView({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
+  const [copyFeedback, setCopyFeedback] = useState(false);
+  const copyFeedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (copyFeedbackTimer.current) clearTimeout(copyFeedbackTimer.current);
+  }, []);
+
+  const handleCopyCapture = (event: ReactMouseEvent<HTMLDivElement>) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const button = target?.closest<HTMLButtonElement>('[data-streamdown="code-block-copy-button"]');
+    if (!button) return;
+    const codeText = button.closest('[data-streamdown="code-block"]')?.querySelector("code")?.textContent ?? "";
+    event.preventDefault();
+    event.stopPropagation();
+    void navigator.clipboard.writeText(codeText).then(() => {
+      setCopyFeedback(true);
+      if (copyFeedbackTimer.current) clearTimeout(copyFeedbackTimer.current);
+      copyFeedbackTimer.current = setTimeout(() => setCopyFeedback(false), 1800);
+    }).catch(() => setCopyFeedback(false));
+  };
+
   return (
     <article className={`message ${isUser ? "user-message" : "assistant-message"}`}>
       <div className="message-label">{isUser ? "你" : "BeanAgent"}</div>
-      <div className="message-body">
+      <div className="message-body" onClickCapture={handleCopyCapture}>
+        {copyFeedback ? <span className="copy-feedback" role="status"><Check size={14} />已复制</span> : null}
         {message.media.length ? <AttachmentGallery paths={message.media} /> : null}
         {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} /> : null}
         {message.tools.length ? <div className="tool-timeline">{message.tools.map((tool) => <ToolStep key={tool.callId} tool={tool} />)}</div> : null}
@@ -306,6 +406,7 @@ function MessageView({ message }: { message: ChatMessage }) {
             controls={markdownControls}
             isAnimating={Boolean(message.streaming)}
             lineNumbers={false}
+            linkSafety={markdownLinkSafety}
             translations={markdownTranslations}
           >
             {prepareMessageMarkdown(message.content)}
@@ -326,7 +427,9 @@ function Thinking({ content, streaming }: { content: string; streaming: boolean 
         <ChevronDown size={14} />
       </Collapsible.Trigger>
       <Collapsible.Content className="thinking-content">
-        <Streamdown controls={false} lineNumbers={false}>{content}</Streamdown>
+        <Streamdown controls={false} lineNumbers={false} linkSafety={markdownLinkSafety} translations={markdownTranslations}>
+          {prepareMessageMarkdown(content)}
+        </Streamdown>
       </Collapsible.Content>
     </Collapsible.Root>
   );

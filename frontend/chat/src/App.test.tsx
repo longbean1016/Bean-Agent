@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -39,6 +39,11 @@ beforeEach(() => {
     configurable: true,
     value: vi.fn(),
   });
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: vi.fn().mockResolvedValue(undefined) },
+  });
+  vi.spyOn(window, "open").mockImplementation(() => null);
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     const payload = url.includes("/messages") ? { items: [], total: 0 } : { items: [], total: 0 };
@@ -90,4 +95,42 @@ it("修正粗体包裹的裸链接边界", async () => {
   const link = await screen.findByRole("button", { name: "https://github.com/longbean1016/" });
   expect(link).toHaveTextContent("https://github.com/longbean1016/");
   expect(screen.queryByText(/longbean1016\/\*\*/)).not.toBeInTheDocument();
+
+  fireEvent.click(link);
+  const dialog = await screen.findByRole("dialog", { name: "打开外部链接" });
+  expect(dialog).toBeVisible();
+  expect(within(dialog).getByText("github.com")).toBeVisible();
+  expect(within(dialog).getByText("https://github.com/longbean1016/")).toBeVisible();
+
+  fireEvent.click(within(dialog).getByRole("button", { name: "复制链接" }));
+  await within(dialog).findByRole("button", { name: "已复制" });
+  expect(navigator.clipboard.writeText).toHaveBeenCalledWith("https://github.com/longbean1016/");
+
+  fireEvent.click(within(dialog).getByRole("button", { name: "打开链接" }));
+  expect(window.open).toHaveBeenCalled();
+});
+
+it("代码复制成功后显示已复制", async () => {
+  localStorage.setItem("beanagent.session_id", "web:code-copy");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const payload = String(input).includes("/messages") ? {
+      items: [{
+        id: "web:code-copy:0",
+        role: "assistant",
+        content: "```ts\nconst ready = true;\n```",
+        turn_id: "turn-code",
+        tool_chain: [],
+        timestamp: "2026-07-16T20:00:00+08:00",
+      }],
+      total: 1,
+    } : { items: [], total: 0 };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  render(<App />);
+
+  const copy = await screen.findByRole("button", { name: "复制代码" });
+  fireEvent.click(copy);
+  expect(await screen.findByRole("status")).toHaveTextContent("已复制");
+  expect(navigator.clipboard.writeText).toHaveBeenCalledWith("const ready = true;");
 });
