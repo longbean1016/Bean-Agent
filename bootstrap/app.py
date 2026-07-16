@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,54 @@ from memory.embedder import Embedder
 from memory.engine import MemoryEngine
 from session.manager import SessionManager
 from tools import ToolRegistry, register_all
+
+logger = logging.getLogger(__name__)
+
+
+class MemoryMaintenanceLoop:
+    """启动恢复与周期 Optimizer；不包含主动任务或插件调度。"""
+
+    def __init__(self, memory: Any, *, enabled: bool, interval_seconds: float) -> None:
+        self._memory = memory
+        self._enabled = bool(enabled)
+        self._interval = max(0.001, float(interval_seconds))
+        self._stop_event = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._started = False
+        self._closed = False
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        if self._closed:
+            raise RuntimeError("MemoryMaintenanceLoop 已关闭")
+        # 先重放 outbox，再允许服务接受新 Turn，避免旧窗口长期滞留并与新写入交错。
+        await self._memory.replay_pending_consolidations()
+        self._started = True
+        if self._enabled:
+            self._task = asyncio.create_task(self._run(), name="memory-optimizer")
+
+    async def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self._interval)
+                return
+            except TimeoutError:
+                pass
+            try:
+                await self._memory.optimize()
+            except Exception:
+                # 周期整理失败不能终止对话服务；PENDING snapshot 自身负责回滚，
+                # 下一周期会重新尝试。
+                logger.exception("记忆 Optimizer 周期执行失败")
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_event.set()
+        if self._task is not None:
+            await asyncio.gather(self._task, return_exceptions=True)
 
 
 @dataclass(slots=True)
@@ -139,4 +189,4 @@ def create_fastapi_app(runtime: CoreRuntime) -> FastAPI:
     return app
 
 
-__all__ = ["CoreRuntime", "build_core_runtime", "create_fastapi_app"]
+__all__ = ["CoreRuntime", "MemoryMaintenanceLoop", "build_core_runtime", "create_fastapi_app"]

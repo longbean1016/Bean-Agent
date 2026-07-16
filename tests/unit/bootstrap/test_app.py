@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
+import pytest
+
 from agent.config_models import Config
-from bootstrap.app import build_core_runtime, create_fastapi_app
+from bootstrap.app import MemoryMaintenanceLoop, build_core_runtime, create_fastapi_app
 from fastapi.testclient import TestClient
 
 
@@ -55,3 +58,21 @@ def test_fastapi_exposes_real_websocket_route(tmp_path: Path) -> None:
             created = websocket.receive_json()
             assert created["type"] == "session.created"
             assert created["session_id"].startswith("web:")
+
+
+@pytest.mark.asyncio
+async def test_memory_maintenance_replays_outbox_and_runs_optimizer() -> None:
+    class Memory:
+        def __init__(self): self.replayed = 0; self.optimized = 0
+        async def replay_pending_consolidations(self): self.replayed += 1
+        async def optimize(self): self.optimized += 1; return {}
+
+    memory = Memory()
+    loop = MemoryMaintenanceLoop(memory, enabled=True, interval_seconds=0.01)
+
+    await loop.start()
+    await asyncio.sleep(0.03)
+    await loop.close()
+
+    assert memory.replayed == 1
+    assert memory.optimized >= 1
