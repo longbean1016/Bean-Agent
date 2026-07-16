@@ -8,8 +8,6 @@ import {
   Check,
   ChevronDown,
   CircleStop,
-  Copy,
-  ExternalLink,
   FileText,
   Image as ImageIcon,
   Menu,
@@ -45,16 +43,8 @@ const markdownTranslations = {
   openLink: "打开链接",
 };
 
-interface ExternalLinkDialogProps {
-  isOpen: boolean;
-  onClose: () => void;
-  onConfirm: () => void;
-  url: string;
-}
-
 const markdownLinkSafety = {
-  enabled: true,
-  renderModal: (props: ExternalLinkDialogProps) => <ExternalLinkDialog {...props} />,
+  enabled: false,
 };
 
 function prepareMessageMarkdown(markdown: string): string {
@@ -67,71 +57,15 @@ function prepareMessageMarkdown(markdown: string): string {
     }
     if (fenced) return line;
     return line.replace(
-      /\*\*\s+(https?:\/\/[^\s*]+)\s*\*\*([。！？；，、,.!;:]?)/gu,
+      /\*\*\s*(https?:\/\/[^\s*]+)\s*\*\*([。！？；，、,.!;:]?)/gu,
       (_match, rawUrl: string, trailing: string) => {
         const url = rawUrl.replace(/[。！？；，、,.!;:]+$/gu, "");
         const punctuation = rawUrl.slice(url.length) + trailing;
-        return `**<${url}>**${punctuation}`;
+        // 模型常把裸链接包进粗体标记；统一转成自动链接，避免星号泄露到界面。
+        return `<${url}>${punctuation}`;
       },
     );
   }).join("");
-}
-
-function ExternalLinkDialog({ isOpen, onClose, onConfirm, url }: ExternalLinkDialogProps) {
-  const [copied, setCopied] = useState(false);
-  const hostname = useMemo(() => {
-    try {
-      return new URL(url).hostname;
-    } catch {
-      return url;
-    }
-  }, [url]);
-
-  useEffect(() => {
-    if (!isOpen) setCopied(false);
-  }, [isOpen, url]);
-
-  const copyLink = async () => {
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopied(true);
-    } catch {
-      setCopied(false);
-    }
-  };
-
-  return (
-    <Dialog.Root open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="external-link-overlay" />
-        <Dialog.Content className="external-link-dialog">
-          <div className="external-link-heading">
-            <span className="external-link-mark"><ExternalLink size={18} /></span>
-            <div>
-              <Dialog.Title className="external-link-title">打开外部链接</Dialog.Title>
-              <Dialog.Description className="external-link-description">即将离开 BeanAgent 并访问外部网站</Dialog.Description>
-            </div>
-            <Dialog.Close asChild>
-              <button className="icon-button external-link-close" aria-label="关闭"><X size={18} /></button>
-            </Dialog.Close>
-          </div>
-          <div className="external-link-target">
-            <strong>{hostname}</strong>
-            <span>{url}</span>
-          </div>
-          <div className="external-link-actions">
-            <button className="secondary-action" onClick={() => void copyLink()} aria-label={copied ? "已复制" : "复制链接"}>
-              {copied ? <Check size={16} /> : <Copy size={16} />}
-              <span>{copied ? "已复制" : "复制链接"}</span>
-            </button>
-            <button className="primary-action" onClick={onConfirm} aria-label="打开链接">
-              <ExternalLink size={16} /><span>打开链接</span>
-            </button>
-          </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
-  );
 }
 
 export function App() {

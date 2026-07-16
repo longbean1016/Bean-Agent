@@ -83,18 +83,6 @@ button { color: inherit; }
 @keyframes blink { 50% { opacity: 0; } }
 .interrupted-label { display: inline-block; margin-top: 10px; color: #8c4f24; font-size: 12px; }
 
-.external-link-overlay { position: fixed; z-index: 100; inset: 0; background: rgb(18 29 25 / 42%); backdrop-filter: blur(2px); animation: fade-in .14s ease-out; }
-.external-link-dialog { position: fixed; z-index: 101; top: 50%; left: 50%; width: min(520px, calc(100vw - 32px)); transform: translate(-50%, -50%); padding: 20px; border: 1px solid #cad5d1; border-radius: 7px; background: #fbfcfb; box-shadow: 0 20px 55px rgb(20 38 32 / 24%); color: #1f2825; animation: dialog-in .16s ease-out; }
-.external-link-heading { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 11px; }
-.external-link-title { margin: 0; font-size: 16px; line-height: 1.35; }
-.external-link-description { margin: 4px 0 0; color: #68746f; font-size: 13px; line-height: 1.45; }
-.external-link-mark { display: inline-grid; width: 34px; height: 34px; place-items: center; border-radius: 6px; color: #076f68; background: #e3efeb; }
-.external-link-close { margin: -5px -5px 0 0; color: #66736e; }
-.external-link-target { display: grid; gap: 5px; margin: 18px 0; padding: 12px 13px; border: 1px solid #d6dfdc; border-radius: 6px; background: #f1f5f3; }
-.external-link-target strong { font-size: 13px; font-weight: 700; }
-.external-link-target span { color: #53615c; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
-.external-link-actions { display: flex; justify-content: flex-end; gap: 8px; }
-.external-link-actions button { display: inline-flex; min-height: 36px; align-items: center; justify-content: center; gap: 7px; padding: 0 13px; border-radius: 6px; font: inherit; font-size: 13px; font-weight: 650; cursor: pointer; }
 .secondary-action { border: 1px solid #cad5d1; color: #35433e; background: #fff; }
 .secondary-action:hover { background: #edf2f0; }
 .primary-action { border: 1px solid #0b6d66; color: #fff; background: #0b766e; }

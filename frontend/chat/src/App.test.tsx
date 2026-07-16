@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -72,7 +72,7 @@ it("首次连接创建 Session 并发送用户消息", async () => {
   expect(screen.getByText("组件测试消息")).toBeVisible();
 });
 
-it("修正粗体包裹的裸链接边界", async () => {
+it("粗体包裹的裸链接不显示星号并可直接跳转", async () => {
   localStorage.setItem("beanagent.session_id", "web:links");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
@@ -80,7 +80,7 @@ it("修正粗体包裹的裸链接边界", async () => {
       items: [{
         id: "web:links:0",
         role: "assistant",
-        content: "记下了，你的 GitHub 地址是 ** https://github.com/longbean1016/**。",
+        content: "记下了，你的 GitHub 地址是 **https://github.com/longbean1016/**。",
         turn_id: "turn-links",
         tool_chain: [],
         timestamp: "2026-07-16T20:00:00+08:00",
@@ -92,22 +92,11 @@ it("修正粗体包裹的裸链接边界", async () => {
 
   render(<App />);
 
-  const link = await screen.findByRole("button", { name: "https://github.com/longbean1016/" });
+  const link = await screen.findByRole("link", { name: "https://github.com/longbean1016/" });
   expect(link).toHaveTextContent("https://github.com/longbean1016/");
   expect(screen.queryByText(/longbean1016\/\*\*/)).not.toBeInTheDocument();
-
-  fireEvent.click(link);
-  const dialog = await screen.findByRole("dialog", { name: "打开外部链接" });
-  expect(dialog).toBeVisible();
-  expect(within(dialog).getByText("github.com")).toBeVisible();
-  expect(within(dialog).getByText("https://github.com/longbean1016/")).toBeVisible();
-
-  fireEvent.click(within(dialog).getByRole("button", { name: "复制链接" }));
-  await within(dialog).findByRole("button", { name: "已复制" });
-  expect(navigator.clipboard.writeText).toHaveBeenCalledWith("https://github.com/longbean1016/");
-
-  fireEvent.click(within(dialog).getByRole("button", { name: "打开链接" }));
-  expect(window.open).toHaveBeenCalled();
+  expect(link).toHaveAttribute("href", "https://github.com/longbean1016/");
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 
 it("代码复制成功后显示已复制", async () => {
