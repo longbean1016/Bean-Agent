@@ -29,6 +29,12 @@ import { BeanWebSocketClient } from "./websocketClient";
 
 const SESSION_STORAGE_KEY = "beanagent.session_id";
 const markdownPlugins = { code, mermaid };
+const markdownControls = {
+  code: { copy: true, download: false },
+  mermaid: false,
+  table: false,
+};
+const markdownTranslations = { copyCode: "复制代码", copied: "已复制" };
 
 export function App() {
   const [chat, dispatch] = useReducer(reduceChatFrame, {
@@ -42,6 +48,7 @@ export function App() {
   const [sending, setSending] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const clientRef = useRef<BeanWebSocketClient | null>(null);
+  const conversationRef = useRef<HTMLElement | null>(null);
   const chatRef = useRef(chat);
   chatRef.current = chat;
 
@@ -83,6 +90,17 @@ export function App() {
     // 首次恢复只随 session_id 变化触发，避免流式消息到达时重复加载历史。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat.sessionId]);
+
+  useEffect(() => {
+    const conversation = conversationRef.current;
+    if (!conversation || chat.messages.length === 0) return;
+    // 对齐 Akashic 的 stick-to-bottom：流式 delta、thinking 和工具状态改变 DOM
+    // 后再滚动，保证新内容始终出现在编辑器上方的可视区域。
+    const frame = requestAnimationFrame(() => {
+      conversation.scrollTo({ top: conversation.scrollHeight, behavior: "smooth" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [chat.messages]);
 
   const loadSession = async (sessionId: string, closeSidebar = true) => {
     try {
@@ -193,7 +211,7 @@ export function App() {
           </div>
         ) : null}
 
-        <section className="conversation" aria-live="polite">
+        <section className="conversation" aria-live="polite" ref={conversationRef}>
           {chat.messages.length === 0 ? <EmptyConversation onExample={setInput} /> : chat.messages.map((message) => (
             <MessageView key={message.id} message={message} />
           ))}
@@ -265,9 +283,10 @@ function MessageView({ message }: { message: ChatMessage }) {
           <Streamdown
             key={`${message.id}-${message.streaming ? "stream" : "final"}`}
             plugins={markdownPlugins}
-            controls={false}
+            controls={markdownControls}
             isAnimating={Boolean(message.streaming)}
             lineNumbers={false}
+            translations={markdownTranslations}
           >
             {message.content}
           </Streamdown>

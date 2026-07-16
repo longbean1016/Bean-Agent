@@ -35,7 +35,10 @@ class MessageEnvelopeBuilder:
         if context_frame.strip():
             messages.append({"role": "user", "content": context_frame})
         timestamp = message_timestamp or datetime.now(timezone.utc)
-        stamp = f"[当前消息时间: {timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}]"
+        stamp = (
+            f"[当前消息时间: {timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}]\n"
+            "[语言要求: 默认用简体中文完成最终回复和可见思考过程；用户明确要求其他语言时遵循用户要求。]"
+        )
         if isinstance(current_message, list):
             # 多模态消息保持图片块原序，只在最后的文本块前写入动态时间戳。
             stamped_blocks = [dict(item) for item in current_message if isinstance(item, dict)]

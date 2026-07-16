@@ -68,8 +68,11 @@ button { color: inherit; }
 
 /* Streamdown 与 Akashic 使用相同的 Shiki token 结构。BeanAgent 不引入整套
    Tailwind，只对稳定 data 属性补齐等价的代码容器、逐行和滚动样式。 */
-[data-streamdown="code-block"] { display: flex; width: 100%; min-width: 0; flex-direction: column; gap: 0; margin: 16px 0; overflow: hidden; border: 1px solid #d6dfdc; border-radius: 6px; background: #f6f8f7; }
+[data-streamdown="code-block"] { position: relative; display: flex; width: 100%; min-width: 0; flex-direction: column; gap: 0; margin: 16px 0; overflow: hidden; border: 1px solid #d6dfdc; border-radius: 6px; background: #f6f8f7; }
 [data-streamdown="code-block-header"] { display: flex; min-height: 34px; align-items: center; padding: 0 12px; border-bottom: 1px solid #d6dfdc; color: #63706c; background: #edf2f0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+[data-streamdown="code-block-actions"] { position: absolute; z-index: 1; top: 5px; right: 8px; display: flex; align-items: center; }
+[data-streamdown="code-block-copy-button"] { display: inline-grid; width: 26px; height: 26px; padding: 0; place-items: center; border: 0; border-radius: 4px; color: #53615c; background: transparent; cursor: pointer; }
+[data-streamdown="code-block-copy-button"]:hover { background: #dfe8e4; color: #0b655f; }
 [data-streamdown="code-block-body"] { width: 100%; min-width: 0; overflow-x: auto; padding: 14px 16px; background: #fbfcfb; }
 [data-streamdown="code-block-body"] pre { width: max-content; min-width: 100%; margin: 0; overflow: visible; background: transparent; }
 [data-streamdown="code-block-body"] code { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 13px; line-height: 1.65; white-space: pre; }
@@ -80,7 +83,7 @@ button { color: inherit; }
 
 .thinking { margin-bottom: 11px; border-left: 2px solid #b8c7c2; padding-left: 12px; }
 .thinking-trigger, .tool-trigger { display: flex; align-items: center; gap: 7px; width: 100%; padding: 5px 0; border: 0; background: transparent; cursor: pointer; color: #64716c; font-size: 12px; text-align: left; }
-.thinking-trigger svg, .tool-trigger > svg:last-child { margin-left: auto; transition: transform .15s ease; }
+.thinking-trigger > svg:last-child, .tool-trigger > svg:last-child { margin-left: auto; transition: transform .15s ease; }
 [data-state="open"] > .thinking-trigger svg, [data-state="open"] > .tool-trigger > svg:last-child { transform: rotate(180deg); }
 .thinking-content { color: #5d6965; font-size: 13px; }
 .tool-timeline { margin: 12px 0; border-left: 1px solid #ccd6d2; }

@@ -36,6 +36,11 @@ test("聚合流式回复、工具状态并用 final 覆盖草稿", async ({ page
   expect(codeLayout.fontFamily.toLowerCase()).toMatch(/mono|consolas|menlo/);
   expect(codeLayout.lineDisplays.length).toBeGreaterThan(1);
   expect(codeLayout.lineDisplays.every((display) => display === "block")).toBe(true);
+  await expect(page.getByTitle("复制代码")).toBeVisible();
+  const thinkingIconMargin = await page.locator(".thinking-trigger > svg").first().evaluate(
+    (icon) => getComputedStyle(icon).marginLeft,
+  );
+  expect(thinkingIconMargin).toBe("0px");
   await expect(page.getByRole("img", { name: "Mermaid chart" })).toBeVisible();
   if (page.viewportSize()?.width === 1440) {
     await page.screenshot({ path: ".pytest_artifacts/frontend-desktop.png", fullPage: true });
@@ -113,11 +118,16 @@ test("长回答只滚动消息区并始终保留输入框", async ({ page }) => 
   expect(layout.conversationScrollable).toBe(true);
   expect(layout.composerTop).toBeGreaterThan(0);
   expect(layout.composerBottom).toBeLessThanOrEqual(layout.viewportHeight);
+  await expect.poll(() => page.locator(".conversation").evaluate((element) => (
+    element.scrollTop + element.clientHeight >= element.scrollHeight - 2
+  ))).toBe(true);
   await page.locator(".conversation").evaluate((element) => {
     element.scrollTop = element.scrollHeight;
   });
   await expect(page.getByRole("img", { name: "Mermaid chart" })).toBeAttached();
   await expect(
     page.locator(".assistant-message button").filter({ hasNotText: "https://example.com" }),
-  ).toHaveCount(0);
+  ).toHaveCount(1);
+  await expect(page.getByTitle("复制代码")).toBeVisible();
+  await expect(page.locator('[data-streamdown="mermaid-block-actions"]')).toHaveCount(0);
 });
