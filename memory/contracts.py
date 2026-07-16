@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 MemoryQueryIntent = Literal["context", "answer", "timeline", "interest", "procedure"]
 
@@ -80,6 +80,25 @@ class MemoryMutationResult:
     items: list[dict[str, object]] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class MemoryIngestRequest:
+    """外部模块交给记忆引擎的统一摄入请求。"""
+
+    source_kind: str
+    content: dict[str, Any]
+    scope: MemoryScope = field(default_factory=MemoryScope)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class MemoryIngestResult:
+    """摄入请求是否已被后台处理链接受。"""
+
+    accepted: bool
+    summary: str = ""
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryToolSpec:
     description: str
@@ -102,7 +121,7 @@ class MemoryWriteApi(Protocol):
 
 
 __all__ = [
-    "EvidenceRef", "MemoryMutation", "MemoryMutationResult", "MemoryQuery",
+    "EvidenceRef", "MemoryIngestRequest", "MemoryIngestResult", "MemoryMutation", "MemoryMutationResult", "MemoryQuery",
     "MemoryQueryFilters", "MemoryQueryIntent", "MemoryQueryResult", "MemoryRecord",
     "MemoryRetrievalApi", "MemoryScope", "MemoryToolProfile", "MemoryToolSpec",
     "MemoryWriteApi",

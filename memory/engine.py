@@ -2,23 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from agent.config_models import MemoryConfig
 from memory.consolidator import ConsolidationDraft, ConsolidationExtractor, ConsolidationResult, Consolidator
 from memory.contracts import (
-    EvidenceRef, MemoryMutation, MemoryMutationResult, MemoryQuery, MemoryQueryResult,
-    MemoryRecord, MemoryToolProfile, MemoryToolSpec,
+    EvidenceRef, MemoryIngestRequest, MemoryIngestResult, MemoryMutation,
+    MemoryMutationResult, MemoryQuery, MemoryQueryResult, MemoryRecord,
+    MemoryToolProfile, MemoryToolSpec,
 )
+from memory.events import TurnIngested
 from memory.md_store import MarkdownMemoryStore
 from memory.memorizer import Memorizer
 from memory.optimizer import MemoryOptimizer
+from memory.post_response_worker import PostResponseMemoryWorker
 from memory.query_rewriter import QueryRewriter
 from memory.retriever import Retriever
 from memory.store import MemoryStore2
 from session.store import SessionStore
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryEngine:
@@ -46,6 +54,19 @@ class MemoryEngine:
             consolidation_extractor or _LLMConsolidationExtractor(provider),
             keep_count=keep_count, threshold=consolidation_threshold,
         )
+        self._post_response = PostResponseMemoryWorker(
+            self._memorizer,
+            self._retriever,
+            provider,
+        )
+        # 构造函数可能运行在事件循环之外，因此这里只创建惰性绑定的队列；常驻任务在
+        # 第一次摄入 Turn 时启动，避免初始化阶段错误捕获不存在的 event loop。
+        self._post_response_queue: asyncio.Queue[TurnIngested] = asyncio.Queue()
+        self._consolidation_queue: asyncio.Queue[TurnIngested] = asyncio.Queue()
+        self._post_response_task: asyncio.Task[None] | None = None
+        self._consolidation_task: asyncio.Task[None] | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._accepting = True
         self._closed = False
 
     async def query(self, request: MemoryQuery) -> MemoryQueryResult:
@@ -120,20 +141,127 @@ class MemoryEngine:
         result = await self.query(MemoryQuery(" ".join(queries), scope=_scope(channel, chat_id)))
         return _injection_block(result.records)
 
-    async def on_turn_committed(self, event: Any) -> ConsolidationResult | None:
-        result = await self._consolidator.consolidate(str(event.session_key))
+    async def ingest(self, request: MemoryIngestRequest) -> MemoryIngestResult:
+        """接受标准化摄入请求；当前最小闭环只处理完整 Turn。"""
+
+        if request.source_kind != "turn":
+            return MemoryIngestResult(
+                accepted=False,
+                summary=f"不支持的记忆摄入类型: {request.source_kind}",
+            )
+        event = dict(request.content)
+        event.setdefault("session_key", request.scope.session_key)
+        event.setdefault("channel", request.scope.channel)
+        event.setdefault("chat_id", request.scope.chat_id)
+        event.update({key: value for key, value in request.metadata.items() if key not in event})
+        await self.on_turn_committed(event)
+        return MemoryIngestResult(accepted=True, summary="Turn 已进入记忆后台处理队列")
+
+    async def on_turn_committed(self, event: Any) -> None:
+        """将已持久化 Turn 快照投递给两条独立后台处理链。"""
+
+        if not self._accepting or self._closed:
+            raise RuntimeError("MemoryEngine 已停止接收新的 Turn")
+        snapshot = self._build_turn_snapshot(event)
+        await self._ensure_workers()
+        # put_nowait 是 Turn 提交边界的关键：回复发送与 Session 提交不等待 LLM 提取、
+        # 向量化或 Markdown IO，后台失败也不会回滚已经落库的对话。
+        self._post_response_queue.put_nowait(snapshot)
+        self._consolidation_queue.put_nowait(snapshot)
+
+    async def _run_consolidation(self, event: TurnIngested) -> ConsolidationResult | None:
+        result = await self._consolidator.consolidate(event.session_key)
         if result is None:
             return None
-        channel = str(getattr(event, "channel", "") or "")
-        chat_id = str(getattr(event, "chat_id", "") or "")
         for index, entry in enumerate(result.history_entries):
             summary = str(entry.get("summary") or "").strip()
             if summary:
                 await self._memorizer.save_from_consolidation(
-                    summary, [], f"{result.source_ref}#{index}", channel, chat_id,
+                    summary, [], f"{result.source_ref}#{index}", event.channel, event.chat_id,
                     emotional_weight=int(entry.get("emotional_weight", 0) or 0),
                 )
         return result
+
+    async def drain(self) -> None:
+        """等待当前已接收的两类后台任务全部完成，主要用于关闭和确定性测试。"""
+
+        await self._post_response_queue.join()
+        await self._consolidation_queue.join()
+
+    async def _ensure_workers(self) -> None:
+        async with self._lifecycle_lock:
+            if self._post_response_task is None:
+                self._post_response_task = asyncio.create_task(
+                    self._post_response_loop(), name="memory-post-response"
+                )
+            if self._consolidation_task is None:
+                self._consolidation_task = asyncio.create_task(
+                    self._consolidation_loop(), name="memory-consolidation"
+                )
+
+    async def _post_response_loop(self) -> None:
+        while True:
+            event = await self._post_response_queue.get()
+            try:
+                # worker 内部也会隔离 LLM/检索异常；此处再设任务级边界，防止未来实现
+                # 变更时一次异常终止常驻消费者，导致 queue.join() 永久等待。
+                await self._post_response.handle(event)
+            except Exception:
+                logger.exception("每轮记忆失效处理失败")
+            finally:
+                self._post_response_queue.task_done()
+
+    async def _consolidation_loop(self) -> None:
+        while True:
+            event = await self._consolidation_queue.get()
+            try:
+                await self._run_consolidation(event)
+            except Exception:
+                # Consolidation 属于提交后的派生数据处理，失败保留 cursor，下一次仍可
+                # 从同一窗口重试，但绝不能破坏另一条 invalidation 处理链。
+                logger.exception("会话记忆归档失败: session_key=%s", event.session_key)
+            finally:
+                self._consolidation_queue.task_done()
+
+    def _build_turn_snapshot(self, event: Any) -> TurnIngested:
+        def value(name: str, default: Any = "") -> Any:
+            if isinstance(event, dict):
+                return event.get(name, default)
+            return getattr(event, name, default)
+
+        session_key = str(value("session_key") or "").strip()
+        if not session_key:
+            raise ValueError("TurnCommitted.session_key 不能为空")
+        user_message = str(value("input_message") or value("user_message") or "")
+        assistant_response = str(value("assistant_response") or "")
+        tool_chain = value("tool_chain_raw", value("tool_chain", []))
+        user_id = str(value("user_message_id") or "")
+        assistant_id = str(value("assistant_message_id") or "")
+
+        # Batch 5 的事件契约可以只携带持久化消息 ID。这里从 SessionStore 重建原文，
+        # 保证后台 worker 读取的永远是提交成功的数据，而不是上游仍可能修改的对象。
+        if (not user_message or not assistant_response) and (user_id or assistant_id):
+            persisted = {item["id"]: item for item in self._sessions.fetch_by_ids([user_id, assistant_id])}
+            user = persisted.get(user_id, {})
+            assistant = persisted.get(assistant_id, {})
+            user_message = user_message or str(user.get("content") or "")
+            assistant_response = assistant_response or str(assistant.get("content") or "")
+            if not tool_chain:
+                tool_chain = assistant.get("tool_chain") or []
+
+        safe_tool_chain = copy.deepcopy(tool_chain) if isinstance(tool_chain, list) else []
+        source_ref = str(value("source_ref") or "")
+        if not source_ref:
+            source_ref = ",".join(item for item in (user_id, assistant_id) if item)
+        return TurnIngested(
+            session_key=session_key,
+            channel=str(value("channel") or ""),
+            chat_id=str(value("chat_id") or ""),
+            user_message=user_message,
+            assistant_response=assistant_response,
+            tool_chain=safe_tool_chain,
+            source_ref=source_ref or session_key,
+        )
 
     async def optimize(self) -> dict[str, int]:
         return await self._optimizer.optimize()
@@ -141,7 +269,16 @@ class MemoryEngine:
     async def close(self) -> None:
         if self._closed:
             return
-        # 先关闭本地数据库，最后关闭 Embedder HTTP 客户端；Provider 由应用组装层共享。
+        self._accepting = False
+        # 先完成已接收任务，再取消等待新消息的常驻消费者；否则 SQLite/Markdown
+        # 可能先关闭，造成尾部 Turn 丢失。取消仅发生在队列清空之后。
+        await self.drain()
+        tasks = [task for task in (self._post_response_task, self._consolidation_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # 最后关闭本地数据库和 Embedder HTTP 客户端；Provider 由应用组装层共享。
         self._store.close()
         self._markdown.close()
         close = getattr(self._embedder, "close", None)

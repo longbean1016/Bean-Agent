@@ -8,7 +8,7 @@ import pytest
 
 from agent.config_models import MemoryConfig
 from memory.consolidator import ConsolidationDraft
-from memory.contracts import MemoryMutation, MemoryQuery, MemoryScope
+from memory.contracts import MemoryIngestRequest, MemoryMutation, MemoryQuery, MemoryScope
 from memory.engine import MemoryEngine
 from session.store import NewMessage, SessionStore
 
@@ -58,15 +58,154 @@ async def test_turn_committed_consolidates_and_syncs_vector_event(tmp_path: Path
     config.embedding.dimensions = 2
     engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config, consolidation_extractor=Extractor(), keep_count=2, consolidation_threshold=4)
     try:
-        result = await engine.on_turn_committed(type("Event", (), {"session_key": "web:c", "channel": "web", "chat_id": "c"})())
+        await engine.on_turn_committed(type("Event", (), {"session_key": "web:c", "channel": "web", "chat_id": "c", "input_message": "消息 4", "assistant_response": "消息 5", "tool_chain_raw": []})())
+        await engine.drain()
         recalled = await engine.query(MemoryQuery("完成项目"))
         cursor = sessions.get_cursor("web:c")
     finally:
         await engine.close()
         sessions.close()
 
-    assert result is not None
     assert cursor == 4
     assert any(record.summary == "完成项目" for record in recalled.records)
     assert engine.tool_profile().recall is not None
     assert engine.tool_profile().forget.parameters["required"] == ["ids"]
+
+
+@pytest.mark.asyncio
+async def test_turn_committed_only_enqueues_background_memory_work(tmp_path: Path) -> None:
+    import asyncio
+
+    class SlowExtractor:
+        async def extract(self, messages, previous_recent_context):
+            await asyncio.sleep(0.05)
+            return ConsolidationDraft()
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(4):
+        sessions.add_message(NewMessage(session_key="web:c", role="user", content=f"消息 {index}"))
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config, consolidation_extractor=SlowExtractor(), keep_count=1, consolidation_threshold=3)
+    try:
+        await asyncio.wait_for(
+            engine.on_turn_committed(type("Event", (), {"session_key": "web:c", "channel": "web", "chat_id": "c", "input_message": "u", "assistant_response": "a", "tool_chain_raw": []})()),
+            timeout=0.01,
+        )
+        assert sessions.get_cursor("web:c") == 0
+        await engine.drain()
+        assert sessions.get_cursor("web:c") == 3
+    finally:
+        await engine.close()
+        sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_rejects_unknown_source_kind(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    try:
+        result = await engine.ingest(MemoryIngestRequest(source_kind="file", content={}))
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert result.accepted is False
+    assert "file" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_turn_snapshot_can_be_rebuilt_from_persisted_message_ids(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    user = sessions.add_message(NewMessage(session_key="web:c", role="user", content="原始问题"))
+    assistant = sessions.add_message(NewMessage(
+        session_key="web:c",
+        role="assistant",
+        content="原始回答",
+        tool_chain=[{"calls": [{"name": "read_file", "result": "ok"}]}],
+    ))
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    engine._post_response.handle = capture
+    try:
+        await engine.on_turn_committed({
+            "session_key": "web:c",
+            "channel": "web",
+            "chat_id": "c",
+            "user_message_id": user["id"],
+            "assistant_message_id": assistant["id"],
+        })
+        await engine.drain()
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert captured[0].user_message == "原始问题"
+    assert captured[0].assistant_response == "原始回答"
+    assert captured[0].tool_chain == assistant["tool_chain"]
+    assert captured[0].source_ref == f'{user["id"]},{assistant["id"]}'
+
+
+@pytest.mark.asyncio
+async def test_post_response_failure_does_not_block_consolidation(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(4):
+        sessions.add_message(NewMessage(session_key="web:c", role="user", content=f"消息 {index}"))
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path,
+        Embedder(),
+        Provider(),
+        sessions,
+        config=config,
+        consolidation_extractor=Extractor(),
+        keep_count=1,
+        consolidation_threshold=3,
+    )
+
+    async def fail(_event):
+        raise RuntimeError("模拟失效处理失败")
+
+    engine._post_response.handle = fail
+    try:
+        await engine.on_turn_committed({"session_key": "web:c", "channel": "web", "chat_id": "c"})
+        await engine.drain()
+        assert sessions.get_cursor("web:c") == 3
+    finally:
+        await engine.close()
+        sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_close_drains_pending_work_and_is_idempotent(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(4):
+        sessions.add_message(NewMessage(session_key="web:c", role="user", content=f"消息 {index}"))
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path,
+        Embedder(),
+        Provider(),
+        sessions,
+        config=config,
+        consolidation_extractor=Extractor(),
+        keep_count=1,
+        consolidation_threshold=3,
+    )
+
+    await engine.on_turn_committed({"session_key": "web:c", "channel": "web", "chat_id": "c"})
+    await engine.close()
+    await engine.close()
+
+    assert sessions.get_cursor("web:c") == 3
+    sessions.close()
