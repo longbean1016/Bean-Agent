@@ -24,6 +24,18 @@ test("聚合流式回复、工具状态并用 final 覆盖草稿", async ({ page
   await expect(page.getByText("最终内容", { exact: true })).toBeVisible();
   await expect(page.getByText("流式草稿", { exact: true })).toHaveCount(0);
   await expect(page.locator("pre code")).toContainText("print");
+  await page.getByRole("button", { name: /思考完成/ }).click();
+  await expect(page.getByText("已经分析用户请求")).toBeVisible();
+  const codeLayout = await page.locator("pre code").evaluate((codeElement) => {
+    const lines = Array.from(codeElement.children);
+    return {
+      fontFamily: getComputedStyle(codeElement).fontFamily,
+      lineDisplays: lines.map((line) => getComputedStyle(line).display),
+    };
+  });
+  expect(codeLayout.fontFamily.toLowerCase()).toMatch(/mono|consolas|menlo/);
+  expect(codeLayout.lineDisplays.length).toBeGreaterThan(1);
+  expect(codeLayout.lineDisplays.every((display) => display === "block")).toBe(true);
   await expect(page.getByRole("img", { name: "Mermaid chart" })).toBeVisible();
   if (page.viewportSize()?.width === 1440) {
     await page.screenshot({ path: ".pytest_artifacts/frontend-desktop.png", fullPage: true });

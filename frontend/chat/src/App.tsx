@@ -4,6 +4,7 @@ import { code } from "@streamdown/code";
 import { mermaid } from "@streamdown/mermaid";
 import {
   AlertCircle,
+  Brain,
   Check,
   ChevronDown,
   CircleStop,
@@ -266,6 +267,7 @@ function MessageView({ message }: { message: ChatMessage }) {
             plugins={markdownPlugins}
             controls={false}
             isAnimating={Boolean(message.streaming)}
+            lineNumbers={false}
           >
             {message.content}
           </Streamdown>
@@ -279,8 +281,14 @@ function MessageView({ message }: { message: ChatMessage }) {
 function Thinking({ content, streaming }: { content: string; streaming: boolean }) {
   return (
     <Collapsible.Root className="thinking" defaultOpen={streaming}>
-      <Collapsible.Trigger className="thinking-trigger">思考过程 <ChevronDown size={14} /></Collapsible.Trigger>
-      <Collapsible.Content className="thinking-content"><Streamdown>{content}</Streamdown></Collapsible.Content>
+      <Collapsible.Trigger className="thinking-trigger">
+        <Brain size={14} />
+        <span>{streaming ? "正在思考…" : "思考完成"}</span>
+        <ChevronDown size={14} />
+      </Collapsible.Trigger>
+      <Collapsible.Content className="thinking-content">
+        <Streamdown controls={false} lineNumbers={false}>{content}</Streamdown>
+      </Collapsible.Content>
     </Collapsible.Root>
   );
 }

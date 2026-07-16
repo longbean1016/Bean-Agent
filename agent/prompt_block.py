@@ -84,6 +84,7 @@ class BehaviorRulesPromptBlock(_Block):
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str:
         return (
             "## 行为规则\n"
+            "- 除非用户明确要求其他语言，最终回复与思考过程使用简体中文。\n"
             "- 文件和命令工具必须遵守工作目录与安全校验。\n"
             "- 只在用户明确要求或信息确有长期价值时使用记忆工具。\n"
             "- 工具失败时说明原因，不得编造执行结果。"

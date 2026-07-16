@@ -65,6 +65,15 @@ button { color: inherit; }
 .message-body a { color: #076f68; text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .message-body table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
 .message-body th, .message-body td { padding: 7px 10px; border: 1px solid #d6dfdc; }
+
+/* Streamdown 与 Akashic 使用相同的 Shiki token 结构。BeanAgent 不引入整套
+   Tailwind，只对稳定 data 属性补齐等价的代码容器、逐行和滚动样式。 */
+[data-streamdown="code-block"] { display: flex; width: 100%; min-width: 0; flex-direction: column; gap: 0; margin: 16px 0; overflow: hidden; border: 1px solid #d6dfdc; border-radius: 6px; background: #f6f8f7; }
+[data-streamdown="code-block-header"] { display: flex; min-height: 34px; align-items: center; padding: 0 12px; border-bottom: 1px solid #d6dfdc; color: #63706c; background: #edf2f0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+[data-streamdown="code-block-body"] { width: 100%; min-width: 0; overflow-x: auto; padding: 14px 16px; background: #fbfcfb; }
+[data-streamdown="code-block-body"] pre { width: max-content; min-width: 100%; margin: 0; overflow: visible; background: transparent; }
+[data-streamdown="code-block-body"] code { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 13px; line-height: 1.65; white-space: pre; }
+[data-streamdown="code-block-body"] code > span { display: block; min-height: 1.65em; }
 .stream-caret { display: inline-block; width: 7px; height: 18px; background: #0b766e; animation: blink .85s steps(1) infinite; vertical-align: text-bottom; }
 @keyframes blink { 50% { opacity: 0; } }
 .interrupted-label { display: inline-block; margin-top: 10px; color: #8c4f24; font-size: 12px; }

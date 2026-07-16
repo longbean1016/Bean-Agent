@@ -119,11 +119,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "message.final", "request_id": request_id, "session_id": session_id, "turn_id": active_turn, "content": content, "thinking": "", "media": []})
                 active_turn = ""
                 continue
+            await websocket.send_json({"type": "react.thinking.delta", "session_id": session_id, "turn_id": active_turn, "delta": "正在分析用户请求"})
             await websocket.send_json({"type": "answer.delta", "session_id": session_id, "turn_id": active_turn, "delta": "流式草稿"})
             await websocket.send_json({"type": "react.tool.started", "session_id": session_id, "turn_id": active_turn, "call_id": "call-1", "tool_name": "list_dir", "arguments": {"path": "."}})
             await websocket.send_json({"type": "react.tool.completed", "session_id": session_id, "turn_id": active_turn, "call_id": "call-1", "tool_name": "list_dir", "status": "ok", "result_preview": "agent, tests"})
-            content = "最终内容\n\n```python\nprint('ok')\n```\n\n```mermaid\ngraph LR\n  A[WebSocket] --> B[Agent]\n```"
-            await websocket.send_json({"type": "message.final", "request_id": request_id, "session_id": session_id, "turn_id": active_turn, "content": content, "thinking": "", "media": []})
+            content = "最终内容\n\n```python\ndef greet(name: str) -> str:\n    message = f'你好，{name}'\n    return message\n\nprint(greet('BeanAgent'))\n```\n\n```mermaid\ngraph LR\n  A[WebSocket] --> B[Agent]\n```"
+            await websocket.send_json({"type": "message.final", "request_id": request_id, "session_id": session_id, "turn_id": active_turn, "content": content, "thinking": "已经分析用户请求", "media": []})
             active_turn = ""
             if text == "附件测试":
                 # final 到达后主动断开，验证客户端保留完成消息并自动重连。

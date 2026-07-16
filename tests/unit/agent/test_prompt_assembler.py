@@ -50,3 +50,18 @@ def test_envelope_order_is_system_history_reminder_current_message() -> None:
 
     assert [item["role"] for item in envelope] == ["system", "assistant", "user", "user"]
     assert envelope[-1]["content"] == "[当前消息时间: 2026-07-16T01:02:03Z]\n当前问题"
+
+
+def test_stable_behavior_rules_request_chinese_answer_and_reasoning() -> None:
+    assembler = PromptAssembler(
+        SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
+        MessageEnvelopeBuilder(),
+    )
+    result = assembler.assemble(
+        turn_ctx=TurnContext(workspace="D:/workspace", channel="web", chat_id="c"),
+        history=[],
+        current_message="请分析问题",
+    )
+
+    system_prompt = str(result.messages[0]["content"])
+    assert "最终回复与思考过程使用简体中文" in system_prompt
