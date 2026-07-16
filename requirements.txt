@@ -4,6 +4,10 @@ openai>=2.0.0
 # Web 服务
 fastapi>=0.134.0
 uvicorn>=0.41.0
+websockets>=15.0
+
+# Windows 不自带 IANA 时区数据库，ZoneInfo("Asia/Shanghai") 依赖此包。
+tzdata>=2025.2
 
 # 网页搜索、抓取与 HTML 内容转换
 httpx>=0.28.0
