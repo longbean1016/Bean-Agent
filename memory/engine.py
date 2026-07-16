@@ -126,7 +126,10 @@ class MemoryEngine:
         if actual_kind == "procedure" and not str(metadata.get("tool_requirement") or "").strip():
             # procedure 没有可执行工具约束时无法安全拦截，参考实现降级为 preference。
             actual_kind = "preference"
-        metadata.update({"scope_channel": mutation.scope.channel, "scope_chat_id": mutation.scope.chat_id})
+        # 对齐 Akashic：显式 memorize 是 workspace 级长期记忆。Turn scope 只参与调用
+        # 上下文，不持久化为条目过滤条件；原始来源仍由 source_ref 审计。
+        metadata.pop("scope_channel", None)
+        metadata.pop("scope_chat_id", None)
         result = await self._memorizer.save_item_with_supersede(
             summary, actual_kind, metadata, mutation.source_ref,
             emotional_weight=int(metadata.get("emotional_weight", 0) or 0),

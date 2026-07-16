@@ -41,9 +41,9 @@ async def test_engine_remember_query_evidence_and_forget(tmp_path: Path) -> None
     engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config, consolidation_extractor=Extractor())
     try:
         written = await engine.mutate(MemoryMutation(kind="remember", summary="用户喜欢简洁回答", memory_kind="preference", source_ref="web:c:0", scope=MemoryScope(channel="web", chat_id="c")))
-        recalled = await engine.query(MemoryQuery("回答风格", scope=MemoryScope(channel="web", chat_id="c")))
+        recalled = await engine.query(MemoryQuery("回答风格"))
         forgotten = await engine.mutate(MemoryMutation(kind="forget", ids=(written.item_id,)))
-        after = await engine.query(MemoryQuery("回答风格", scope=MemoryScope(channel="web", chat_id="c")))
+        after = await engine.query(MemoryQuery("回答风格"))
     finally:
         await engine.close()
         sessions.close()
@@ -51,6 +51,35 @@ async def test_engine_remember_query_evidence_and_forget(tmp_path: Path) -> None
     assert recalled.records[0].evidence[0].source_ref == "web:c:0"
     assert forgotten.affected_ids == [written.item_id]
     assert after.records == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_remember_does_not_persist_session_scope(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    try:
+        written = await engine.mutate(MemoryMutation(
+            kind="remember",
+            summary="用户的名字是长豆角",
+            memory_kind="profile",
+            source_ref="web:session-a:0",
+            scope=MemoryScope(
+                session_key="web:session-a",
+                channel="web",
+                chat_id="session-a",
+            ),
+        ))
+        item = engine._store.get_items_by_ids([written.item_id])[0]
+    finally:
+        await engine.close()
+        sessions.close()
+
+    # 对齐 Akashic：显式记忆属于 workspace，source_ref 仍保留来源证据。
+    assert item["source_ref"] == "web:session-a:0"
+    assert "scope_channel" not in item["extra_json"]
+    assert "scope_chat_id" not in item["extra_json"]
 
 
 @pytest.mark.asyncio
