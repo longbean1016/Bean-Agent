@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,68 @@ class MemoryMaintenanceLoop:
         self._stop_event.set()
         if self._task is not None:
             await asyncio.gather(self._task, return_exceptions=True)
+
+
+class AppRuntime:
+    """对齐参考实现的启动/关闭容器，只保留 BeanAgent 最小闭环资源。"""
+
+    def __init__(self, core: CoreRuntime) -> None:
+        self.core = core
+        self.channel = WebChannel(core.message_bus, core.event_bus, core.agent_loop)
+        self.maintenance = (
+            MemoryMaintenanceLoop(
+                core.memory,
+                enabled=core.config.memory.optimizer.enabled,
+                interval_seconds=core.config.memory.optimizer.interval_seconds,
+            )
+            if core.memory is not None
+            else None
+        )
+        self.agent_task: asyncio.Task[None] | None = None
+        self._started = False
+        self._shutdown = False
+        self._lifecycle_lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        async with self._lifecycle_lock:
+            if self._started:
+                return
+            if self._shutdown:
+                raise RuntimeError("AppRuntime 已关闭")
+            # 恢复旧 outbox 必须先于 AgentLoop 接受新消息，保持事件顺序可审计。
+            if self.maintenance is not None:
+                await self.maintenance.start()
+            self.agent_task = asyncio.create_task(self.core.agent_loop.run(), name="beanagent-loop")
+            self._started = True
+
+    async def shutdown(self) -> None:
+        async with self._lifecycle_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+
+            # 顺序与参考 AppRuntime 一致：先阻止新工作进入，再等待/取消执行任务，
+            # 最后按所有权从上层服务向底层 HTTP/SQLite 资源释放。
+            await _cleanup_step("web_channel.close", self.channel.close)
+            self.core.agent_loop.stop()
+            if self.agent_task is not None and not self.agent_task.done():
+                self.agent_task.cancel()
+                await asyncio.gather(self.agent_task, return_exceptions=True)
+            if self.maintenance is not None:
+                await _cleanup_step("memory_maintenance.close", self.maintenance.close)
+            if self.core.memory is not None:
+                await _cleanup_step("memory.close", self.core.memory.close)
+            await _cleanup_step("sessions.close", self.core.sessions.close)
+            if self.core.vision_provider is not None:
+                await _cleanup_step("vision_provider.close", self.core.vision_provider.close)
+            await _cleanup_step("provider.close", self.core.provider.close)
+
+
+async def _cleanup_step(name: str, callback: Any) -> None:
+    try:
+        await callback()
+    except Exception:
+        logger.exception("应用关闭步骤失败: %s", name)
 
 
 @dataclass(slots=True)
@@ -172,14 +235,25 @@ def build_core_runtime(
     )
 
 
-def create_fastapi_app(runtime: CoreRuntime) -> FastAPI:
+def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
     """为已组装 Runtime 暴露 WebSocket 路由，不复制或隐式替换依赖。"""
 
-    app = FastAPI()
-    channel = WebChannel(runtime.message_bus, runtime.event_bus, runtime.agent_loop)
+    application = runtime if isinstance(runtime, AppRuntime) else AppRuntime(runtime)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        await application.start()
+        try:
+            yield
+        finally:
+            await application.shutdown()
+
+    app = FastAPI(lifespan=lifespan)
+    channel = application.channel
     # 测试、lifespan 和后续前端静态服务都从 app.state 读取同一实例，不能在路由
     # 函数中按连接重新创建 Channel，否则连接池无法按 session_key 广播。
-    app.state.core_runtime = runtime
+    app.state.core_runtime = application.core
+    app.state.app_runtime = application
     app.state.web_channel = channel
 
     @app.websocket("/ws")
@@ -189,4 +263,4 @@ def create_fastapi_app(runtime: CoreRuntime) -> FastAPI:
     return app
 
 
-__all__ = ["CoreRuntime", "MemoryMaintenanceLoop", "build_core_runtime", "create_fastapi_app"]
+__all__ = ["AppRuntime", "CoreRuntime", "MemoryMaintenanceLoop", "build_core_runtime", "create_fastapi_app"]

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent.config_models import Config
-from bootstrap.app import MemoryMaintenanceLoop, build_core_runtime, create_fastapi_app
+from bootstrap.app import AppRuntime, MemoryMaintenanceLoop, build_core_runtime, create_fastapi_app
 from fastapi.testclient import TestClient
 
 
@@ -76,3 +76,26 @@ async def test_memory_maintenance_replays_outbox_and_runs_optimizer() -> None:
 
     assert memory.replayed == 1
     assert memory.optimized >= 1
+
+
+@pytest.mark.asyncio
+async def test_app_runtime_shutdown_is_ordered_and_idempotent(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = True
+    config.memory.embedding.dimensions = 2
+    config.memory.optimizer.enabled = False
+    config.agent.workdir = str(tmp_path / "workdir")
+    provider = Provider()
+    embedder = Embedder()
+    core = build_core_runtime(config, tmp_path / "workspace", provider=provider, embedder=embedder)
+    runtime = AppRuntime(core)
+
+    await runtime.start()
+    await runtime.shutdown()
+    await runtime.shutdown()
+
+    assert runtime.agent_task is not None and runtime.agent_task.done()
+    assert provider.closed is True
+    assert embedder.closed is True
+    with pytest.raises(RuntimeError, match="SessionManager 已关闭"):
+        await core.sessions.get_or_create("web:c")
