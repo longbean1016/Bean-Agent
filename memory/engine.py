@@ -438,18 +438,102 @@ class _LLMConsolidationExtractor:
 
     async def extract(self, messages: list[dict[str, object]], previous_recent_context: str) -> ConsolidationDraft:
         conversation = "\n".join(f"[{item.get('role')}] {item.get('content')}" for item in messages)
-        response = await self._provider.complete([{"role": "user", "content": "从对话提取 JSON：history_entries、pending_items、recent_context。不要编造。\n" + conversation + "\n旧近期语境：\n" + previous_recent_context}], tools=[])
+        event_data = await self._complete_json(_event_extraction_prompt(conversation, previous_recent_context))
+        recent_data = await self._complete_json(_recent_context_prompt(conversation, previous_recent_context))
+        history_entries = []
+        for item in event_data.get("history_entries") or []:
+            if not isinstance(item, dict) or not str(item.get("summary") or "").strip():
+                continue
+            history_entries.append({
+                "summary": str(item["summary"]).strip(),
+                "emotional_weight": _emotional_weight(item.get("emotional_weight")),
+            })
+        allowed_tags = {"identity", "preference", "key_info", "health_long_term", "requested_memory", "correction", "agent_context"}
+        pending_items = [
+            {"tag": str(item.get("tag")), "content": str(item.get("content") or "").strip()}
+            for item in event_data.get("pending_items") or []
+            if isinstance(item, dict)
+            and str(item.get("tag")) in allowed_tags
+            and str(item.get("content") or "").strip()
+        ]
+        return ConsolidationDraft(
+            history_entries=history_entries,
+            pending_items=pending_items,
+            recent_context=_render_recent_context(recent_data),
+        )
+
+    async def _complete_json(self, prompt: str) -> dict[str, object]:
+        response = await self._provider.complete([{"role": "user", "content": prompt}], tools=[])
         text = str(getattr(response, "content", response) or "").strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         data = json.loads(text)
         if not isinstance(data, dict):
             raise ValueError("Consolidation LLM 必须返回 JSON object")
-        return ConsolidationDraft(
-            history_entries=list(data.get("history_entries") or []),
-            pending_items=list(data.get("pending_items") or []),
-            recent_context=str(data.get("recent_context") or ""),
-        )
+        return data
+
+
+def _event_extraction_prompt(conversation: str, recent_context: str) -> str:
+    return f"""你是记忆提取代理。从对话中精确提取 history_entries 和 pending_items，只返回合法 JSON。
+
+history_entries：每个独立主题一条，summary 用第三人称并以 [YYYY-MM-DD HH:MM] 开头，emotional_weight 为 0-10。
+- 只写 USER 明确表达的行动、经历、计划和状态；ASSISTANT 的建议、解释和推荐不作证据。
+- 保留地点、人名、数量、价格、型号等细节，不复制 USER:/ASSISTANT: 标记。
+- 若 USER 展示外部聊天记录或 transcript，默认 speaker 身份不明确，只允许一条“用户展示了一段聊天记录”的高层 event；禁止把材料中的人物事实归给当前用户。
+
+pending_items：只保存跨对话有价值的长期候选，格式为 {{"tag":"...","content":"..."}}。合法 tag：identity、preference、key_info、health_long_term、requested_memory、correction、agent_context。
+- 不写 agent SOP、工具顺序、输出规范；这些属于 procedure。
+- 不写最近/这周/目前等临时状态、日程、动态健康指标、Star 数、增长率和瞬时情绪。
+- requested_memory 仅在 USER 明确要求长期记住时使用。
+- agent_context 只保存已部署、当前有效且明确授权助手使用的配置；架构方案、网络诊断、内网 IP、路由模式和假设端口不提取。
+- 工程路径、配置文件名、环境变量名可在明确长期有效时提取。
+
+当前 RECENT_CONTEXT 只用于理解话题延续，不能作为身份、关系或事实归属证据；发生冲突时以当前窗口 USER 原文为准。
+{recent_context or '（空）'}
+
+待处理对话：
+{conversation}
+
+返回：{{"history_entries": [], "pending_items": []}}"""
+
+
+def _recent_context_prompt(conversation: str, old_context: str) -> str:
+    return f"""你是近期语境压缩代理，只返回合法 JSON，不自由总结。
+只依据 USER 明确表达，提取 active_topics、user_preferences、follow_ups、avoidances、ongoing_threads，每项最多 3 条。
+- user_preferences 必须能找到“喜欢/偏好/希望”等明确锚点；技术方案讨论、为什么不、能不能不算稳定偏好。
+- avoidances 必须能找到“不要/别/避免/不想”等明确否定；ASSISTANT 建议不算。
+- ongoing_threads 只保存持续影响生活、情绪、工作、学习、关系或健康的重要现实线索；普通技术讨论和一次性提问不进入。
+- 话题已切换时，不把较早技术方案升级为偏好或避免事项。
+- 宁可数组为空，也不要脑补。
+
+上一版：
+{old_context or '（空）'}
+
+待压缩窗口：
+{conversation}
+
+返回：{{"active_topics": [], "user_preferences": [], "follow_ups": [], "avoidances": [], "ongoing_threads": []}}"""
+
+
+def _render_recent_context(data: dict[str, object]) -> str:
+    labels = (
+        ("active_topics", "最近持续关注"),
+        ("user_preferences", "最近明确偏好"),
+        ("follow_ups", "最近待延续话题"),
+        ("avoidances", "最近避免事项"),
+    )
+    lines = ["# Recent Context", "", "## Compression"]
+    for key, label in labels:
+        values = data.get(key)
+        items = [str(item).strip() for item in values if str(item).strip()][:3] if isinstance(values, list) else []
+        lines.append(f"- {label}：{'；'.join(items) if items else 'none'}")
+    lines.extend(["", "## Ongoing Threads"])
+    ongoing = data.get("ongoing_threads")
+    items = [str(item).strip() for item in ongoing if str(item).strip()][:3] if isinstance(ongoing, list) else []
+    lines.extend(f"- {item}" for item in items)
+    if not items:
+        lines.append("- none")
+    return "\n".join(lines) + "\n"
 
 
 def _scope(channel: str, chat_id: str):
