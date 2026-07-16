@@ -72,6 +72,11 @@ class MemoryStore2:
                     item_id TEXT,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS consolidation_outbox (
+                    source_ref TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
             """)
             if self._vec_available:
                 self._db.execute(
@@ -137,6 +142,31 @@ class MemoryStore2:
             return self._db.execute(
                 "SELECT 1 FROM consolidation_events WHERE source_ref=?", (source_ref,)
             ).fetchone() is not None
+
+    def enqueue_consolidation(self, source_ref: str, payload: dict[str, object]) -> None:
+        """在 cursor 推进前持久化待同步事件，重复 source_ref 保留首次快照。"""
+
+        with self._lock:
+            self._ensure_open()
+            self._db.execute(
+                "INSERT OR IGNORE INTO consolidation_outbox(source_ref,payload_json,created_at) VALUES(?,?,?)",
+                (source_ref, json.dumps(payload, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+            )
+            self._db.commit()
+
+    def list_pending_consolidations(self) -> list[dict[str, object]]:
+        with self._lock:
+            self._ensure_open()
+            rows = self._db.execute(
+                "SELECT source_ref,payload_json FROM consolidation_outbox ORDER BY created_at,source_ref"
+            ).fetchall()
+        return [json.loads(str(row["payload_json"])) for row in rows]
+
+    def complete_consolidation(self, source_ref: str) -> None:
+        with self._lock:
+            self._ensure_open()
+            self._db.execute("DELETE FROM consolidation_outbox WHERE source_ref=?", (source_ref,))
+            self._db.commit()
 
     def vector_search(self, query_vec: list[float], top_k: int = 8, memory_types: list[str] | None = None, score_threshold: float = 0.0, scope_channel: str | None = None, scope_chat_id: str | None = None, require_scope_match: bool = False, hotness_alpha: float = 0.20, hotness_half_life_days: float = 14.0, time_start: datetime | None = None, time_end: datetime | None = None) -> list[dict[str, object]]:
         query = self._validate_vector(query_vec)

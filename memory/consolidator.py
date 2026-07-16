@@ -65,12 +65,10 @@ class Consolidator:
             f"[{str(item.get('role') or 'unknown')}] {str(item.get('content') or '')}"
             for item in window
         )
+        # 对齐参考实现：cursor 表示 Markdown 归档已经提交，而不是所有向量派生数据
+        # 已同步。后者由 ConsolidationCommitted/outbox 作为独立事务恢复。
+        self._sessions.set_cursor(session_key, end)
         return ConsolidationResult(session_key, source_ref, end, draft.history_entries, conversation)
-
-    def commit_cursor(self, result: ConsolidationResult) -> None:
-        """在所有派生记忆成功后提交窗口游标。"""
-
-        self._sessions.set_cursor(result.session_key, result.cursor)
 
 
 __all__ = ["ConsolidationDraft", "ConsolidationResult", "Consolidator"]

@@ -322,7 +322,7 @@ async def test_consolidation_maintenance_serializes_same_session(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_implicit_memory_failure_keeps_consolidation_cursor(tmp_path: Path) -> None:
+async def test_implicit_memory_failure_keeps_outbox_for_recovery(tmp_path: Path) -> None:
     class FailingImplicitExtractor:
         async def extract(self, conversation, existing_profile=""):
             raise RuntimeError("隐式提取失败")
@@ -341,11 +341,23 @@ async def test_implicit_memory_failure_keeps_consolidation_cursor(tmp_path: Path
         await engine.on_turn_committed({"session_key": "web:c", "channel": "web", "chat_id": "c"})
         await engine.drain()
         cursor = sessions.get_cursor("web:c")
+        pending_before = engine._store.list_pending_consolidations()
+        engine._implicit_extractor = type("Recovered", (), {
+            "extract": lambda self, conversation, existing_profile="": _empty_implicit()
+        })()
+        await engine.replay_pending_consolidations()
+        pending_after = engine._store.list_pending_consolidations()
     finally:
         await engine.close()
         sessions.close()
 
-    assert cursor == 0
+    assert cursor == 3
+    assert len(pending_before) == 1
+    assert pending_after == []
+
+
+async def _empty_implicit():
+    return ImplicitMemoryDraft()
 
 
 @pytest.mark.asyncio

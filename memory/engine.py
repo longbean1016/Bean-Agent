@@ -17,7 +17,7 @@ from memory.contracts import (
     MemoryMutationResult, MemoryQuery, MemoryQueryResult, MemoryRecord,
     MemoryToolProfile, MemoryToolSpec,
 )
-from memory.events import TurnIngested
+from memory.events import ConsolidationCommitted, TurnIngested
 from memory.implicit_extractor import ImplicitLongTermExtractor, ImplicitMemoryDraft
 from memory.md_store import MarkdownMemoryStore
 from memory.memorizer import Memorizer
@@ -191,6 +191,7 @@ class MemoryEngine:
             return
         self.unbind_events()
         event_bus.on(TurnCommitted, self.on_turn_committed)
+        event_bus.on(ConsolidationCommitted, self.on_consolidation_committed)
         self._event_bus = event_bus
 
     def unbind_events(self) -> None:
@@ -201,31 +202,58 @@ class MemoryEngine:
         from agent.event_bus import TurnCommitted
 
         self._event_bus.off(TurnCommitted, self.on_turn_committed)
+        self._event_bus.off(ConsolidationCommitted, self.on_consolidation_committed)
         self._event_bus = None
 
     async def _run_consolidation(self, event: TurnIngested) -> ConsolidationResult | None:
+        await self.replay_pending_consolidations()
         result = await self._consolidator.consolidate(event.session_key)
         if result is None:
             return None
-        for index, entry in enumerate(result.history_entries):
-            summary = str(entry.get("summary") or "").strip()
+        committed = ConsolidationCommitted(
+            history_entry_payloads=[
+                (str(entry.get("summary") or ""), int(entry.get("emotional_weight", 0) or 0))
+                for entry in result.history_entries if str(entry.get("summary") or "").strip()
+            ],
+            source_ref=result.source_ref,
+            scope_channel=event.channel,
+            scope_chat_id=event.chat_id,
+            conversation=result.conversation,
+        )
+        # outbox 必须先于事件派发持久化。cursor 已代表 Markdown 提交；若进程在派发前
+        # 崩溃，下次 Turn 仍能从 SQLite 重放向量同步，而不会重新归档旧窗口。
+        self._store.enqueue_consolidation(result.source_ref, _consolidation_payload(committed))
+        if self._event_bus is not None:
+            await self._event_bus.emit(committed)
+        else:
+            await self.on_consolidation_committed(committed)
+        return result
+
+    async def on_consolidation_committed(self, event: ConsolidationCommitted) -> None:
+        for index, (summary, emotional_weight) in enumerate(event.history_entry_payloads):
+            summary = str(summary or "").strip()
             if summary:
                 await self._memorizer.save_from_consolidation(
-                    summary, [], f"{result.source_ref}#{index}", event.channel, event.chat_id,
-                    emotional_weight=int(entry.get("emotional_weight", 0) or 0),
+                    summary, [], f"{event.source_ref}#{index}", event.scope_channel, event.scope_chat_id,
+                    emotional_weight=emotional_weight,
                 )
-        implicit = await self._implicit_extractor.extract(result.conversation, existing_profile="")
-        await self._save_implicit_long_term(implicit, result, event)
-        # cursor 是整个窗口的最终提交点。上面任一 LLM、Embedding 或 SQLite 写入失败，
-        # 都会跳过这里，使下一次维护仍能用相同 source_ref 幂等重试完整窗口。
-        self._consolidator.commit_cursor(result)
-        return result
+        implicit = await self._implicit_extractor.extract(event.conversation, existing_profile="")
+        await self._save_implicit_long_term(implicit, event)
+        self._store.complete_consolidation(event.source_ref)
+
+    async def replay_pending_consolidations(self) -> None:
+        """重放未完成的向量事务；单条失败保留 outbox 并继续其它窗口。"""
+
+        for payload in self._store.list_pending_consolidations():
+            try:
+                await self.on_consolidation_committed(_consolidation_from_payload(payload))
+            except Exception:
+                logger.exception("Consolidation 向量同步重放失败: source_ref=%s", payload.get("source_ref"))
 
     async def _save_implicit_long_term(
         self,
         draft: ImplicitMemoryDraft,
-        result: ConsolidationResult,
-        event: TurnIngested,
+        event: ConsolidationCommitted,
     ) -> None:
         for memory_type, items in (
             ("profile", draft.profile),
@@ -237,8 +265,8 @@ class MemoryEngine:
                 if not summary:
                     continue
                 extra: dict[str, object] = {
-                    "scope_channel": event.channel,
-                    "scope_chat_id": event.chat_id,
+                    "scope_channel": event.scope_channel,
+                    "scope_chat_id": event.scope_chat_id,
                 }
                 if memory_type == "profile":
                     extra["category"] = str(item.get("category") or "personal_fact")
@@ -252,7 +280,7 @@ class MemoryEngine:
                     summary,
                     memory_type,
                     extra,
-                    f"{result.source_ref}#{memory_type}:{index}",
+                    f"{event.source_ref}#{memory_type}:{index}",
                     happened_at=happened_at,
                     emotional_weight=_emotional_weight(item.get("emotional_weight")),
                     supersede_threshold=self._config.dedup.supersede_threshold,
@@ -421,6 +449,32 @@ def _emotional_weight(value: object) -> int:
         return max(0, min(int(value or 0), 10))
     except (TypeError, ValueError):
         return 0
+
+
+def _consolidation_payload(event: ConsolidationCommitted) -> dict[str, object]:
+    return {
+        "history_entry_payloads": [list(item) for item in event.history_entry_payloads],
+        "source_ref": event.source_ref,
+        "scope_channel": event.scope_channel,
+        "scope_chat_id": event.scope_chat_id,
+        "conversation": event.conversation,
+    }
+
+
+def _consolidation_from_payload(payload: dict[str, object]) -> ConsolidationCommitted:
+    raw_entries = payload.get("history_entry_payloads")
+    entries: list[tuple[str, int]] = []
+    if isinstance(raw_entries, list):
+        for item in raw_entries:
+            if isinstance(item, list) and len(item) == 2:
+                entries.append((str(item[0]), _emotional_weight(item[1])))
+    return ConsolidationCommitted(
+        history_entry_payloads=entries,
+        source_ref=str(payload.get("source_ref") or ""),
+        scope_channel=str(payload.get("scope_channel") or ""),
+        scope_chat_id=str(payload.get("scope_chat_id") or ""),
+        conversation=str(payload.get("conversation") or ""),
+    )
 
 
 def _injection_block(records: list[MemoryRecord]) -> str:
