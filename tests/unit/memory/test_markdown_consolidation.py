@@ -95,7 +95,12 @@ async def test_below_threshold_refreshes_recent_turns_without_llm(tmp_path: Path
     markdown = MarkdownMemoryStore(tmp_path)
     try:
         sessions.add_message(NewMessage(session_key="web:c", role="user", content="新问题"))
-        sessions.add_message(NewMessage(session_key="web:c", role="assistant", content="新回答"))
+        sessions.add_message(NewMessage(
+            session_key="web:c",
+            role="assistant",
+            content="新回答" + "长" * 80,
+        ))
+        sessions.add_message(NewMessage(session_key="web:c", role="tool", content="工具原文"))
         consolidator = Consolidator(sessions, markdown, ForbiddenExtractor(), keep_count=20, threshold=5)
 
         result = await consolidator.consolidate("web:c")
@@ -103,9 +108,13 @@ async def test_below_threshold_refreshes_recent_turns_without_llm(tmp_path: Path
         sessions.close()
 
     assert result is None
-    assert "## Recent Turns" in markdown.read_recent_context()
-    assert "[user] 新问题" in markdown.read_recent_context()
-    assert "[assistant] 新回答" in markdown.read_recent_context()
+    recent = markdown.read_recent_context()
+    assert "## Recent Turns" in recent
+    assert "[user] 新问题" in recent
+    assert "[a-preview] 新回答" in recent
+    assert "[assistant]" not in recent
+    assert "工具原文" not in recent
+    assert "长" * 61 not in recent
 
 
 class OptimizerLLM:

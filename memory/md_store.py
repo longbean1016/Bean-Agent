@@ -55,11 +55,17 @@ class MarkdownMemoryStore:
     def refresh_recent_turns(self, messages: Sequence[dict[str, object]]) -> None:
         """不调用 LLM，只用最新持久化消息替换 Recent Turns 区块。"""
 
-        lines = [
-            f"- [{str(item.get('role') or 'unknown')}] {str(item.get('content') or '').strip()}"
-            for item in messages
-            if str(item.get("content") or "").strip()
-        ]
+        lines: list[str] = []
+        for item in messages:
+            role = str(item.get("role") or "").strip().lower()
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "user":
+                lines.append(f"[user] {content}")
+            elif role == "assistant" and not item.get("proactive"):
+                # Recent Turns 只保存助手短预览，避免公共 Markdown 重复完整回复或工具输出。
+                lines.append(f"[a-preview] {content[:60]}")
         if not lines:
             return
         with self._lock:
