@@ -21,7 +21,9 @@ class Embedder:
 
 
 class Provider:
-    def __init__(self): self.chat_calls = 0; self.pipeline_messages = []
+    def __init__(self, *, chat_calls: int = 0):
+        self.chat_calls = chat_calls
+        self.pipeline_messages = []
     async def complete(self, messages, tools=None, **kwargs):
         prompt = messages[0]["content"]
         if "记忆检索决策器" in prompt:
@@ -56,26 +58,48 @@ def test_websocket_tool_turn_reconnects_with_history_and_memory(tmp_path: Path) 
     config.memory.embedding.dimensions = 2
     config.memory.optimizer.enabled = False
     config.agent.workdir = str(tmp_path / "workdir")
-    provider = Provider()
-    embedder = Embedder()
-    core = build_core_runtime(config, tmp_path / "workspace", provider=provider, embedder=embedder)
-    assert core.memory is not None
-    asyncio.run(core.memory.mutate(MemoryMutation(
+    workspace = tmp_path / "workspace"
+    first_provider = Provider()
+    first_embedder = Embedder()
+    first_core = build_core_runtime(
+        config,
+        workspace,
+        provider=first_provider,
+        embedder=first_embedder,
+    )
+    assert first_core.memory is not None
+    asyncio.run(first_core.memory.mutate(MemoryMutation(
         kind="remember", summary="用户偏好中文回答", memory_kind="preference",
         source_ref="web:c:seed", scope=MemoryScope(channel="web", chat_id="c"),
     )))
-    app = create_fastapi_app(core)
+    first_app = create_fastapi_app(first_core)
 
-    with TestClient(app) as client:
+    with TestClient(first_app) as client:
         with client.websocket_connect("/ws") as websocket:
             websocket.send_json({"type": "message.send", "request_id": "r1", "session_id": "web:c", "text": "列出目录"})
             first_frames = _receive_final(websocket)
+
+    assert first_provider.closed is True
+    assert first_embedder.closed is True
+
+    # 第一轮 runtime 已完全关闭；第二轮重新组装所有服务，证明 Session、工具链
+    # 和记忆来自 workspace 持久化，而不是进程内缓存或旧连接残留。
+    second_provider = Provider(chat_calls=2)
+    second_embedder = Embedder()
+    second_core = build_core_runtime(
+        config,
+        workspace,
+        provider=second_provider,
+        embedder=second_embedder,
+    )
+    second_app = create_fastapi_app(second_core)
+    with TestClient(second_app) as client:
         with client.websocket_connect("/ws") as websocket:
             websocket.send_json({"type": "message.send", "request_id": "r2", "session_id": "web:c", "text": "你记得我的回答偏好吗"})
             second_frames = _receive_final(websocket)
 
-        rows = core.sessions.store.fetch_session_messages("web:c")
-        second_prompt = provider.pipeline_messages[-1]
+        rows = second_core.sessions.store.fetch_session_messages("web:c")
+        second_prompt = second_provider.pipeline_messages[-1]
         assert any(frame["type"] == "react.tool.completed" for frame in first_frames)
         assert first_frames[-1]["request_id"] == "r1"
         assert second_frames[-1]["request_id"] == "r2"
@@ -84,5 +108,5 @@ def test_websocket_tool_turn_reconnects_with_history_and_memory(tmp_path: Path) 
         assert any(item.get("role") == "tool" for item in second_prompt)
         assert any("用户偏好中文回答" in str(item.get("content")) for item in second_prompt)
 
-    assert provider.closed is True
-    assert embedder.closed is True
+    assert second_provider.closed is True
+    assert second_embedder.closed is True
