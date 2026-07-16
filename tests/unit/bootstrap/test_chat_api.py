@@ -68,6 +68,7 @@ def test_upload_accepts_utf8_text_and_serves_only_workspace_media(
         payload = response.json()
         stored = Path(payload["upload_path"])
         assert stored.is_relative_to(runtime.workspace / "uploads")
+        assert stored.name == "notes.txt"
         assert stored.read_text(encoding="utf-8") == "测试文本"
         assert client.get(payload["upload_url"]).content == "测试文本".encode()
         assert client.get(

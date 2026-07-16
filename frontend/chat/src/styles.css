@@ -47,7 +47,7 @@ button { color: inherit; }
 .connection-state:not(.connected) { cursor: pointer; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.mobile-menu { display: none; }
+.icon-button.mobile-menu { display: none; }
 
 .error-banner { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 9px; margin: 10px 22px 0; padding: 9px 12px; border: 1px solid #e5b7b2; border-radius: 6px; background: #fff3f1; color: #8b2f28; font-size: 13px; }
 .icon-button { display: inline-grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 0; border-radius: 6px; background: transparent; cursor: pointer; }
@@ -126,7 +126,7 @@ button { color: inherit; }
   .app-shell { grid-template-columns: minmax(0, 1fr); }
   .desktop-sidebar { display: none; }
   .topbar { padding: 0 12px; }
-  .mobile-menu { display: inline-grid; }
+  .icon-button.mobile-menu { display: inline-grid; }
   .brand-compact { display: flex; flex: 1; margin-left: 8px; }
   .brand-compact .brand-mark { width: 30px; height: 30px; }
   .connection-state { min-width: 34px; width: 34px; padding: 0; justify-content: center; }

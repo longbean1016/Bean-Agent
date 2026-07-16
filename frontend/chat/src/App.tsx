@@ -244,7 +244,7 @@ function SessionSidebar(props: {
 function ConnectionControl({ status, onReconnect }: { status: ConnectionStatus; onReconnect: () => void }) {
   const label = { connecting: "连接中", connected: "已连接", reconnecting: "重连中", offline: "已断开" }[status];
   return (
-    <button className={`connection-state ${status}`} onClick={status === "connected" ? undefined : onReconnect} title={status === "connected" ? "WebSocket 已连接" : "点击立即重连"}>
+    <button className={`connection-state ${status}`} aria-label={label} onClick={status === "connected" ? undefined : onReconnect} title={status === "connected" ? "WebSocket 已连接" : "点击立即重连"}>
       {status === "connected" ? <PlugZap size={15} /> : <RefreshCw size={15} className={status === "reconnecting" ? "spin" : ""} />}
       <span>{label}</span>
     </button>
@@ -261,7 +261,7 @@ function MessageView({ message }: { message: ChatMessage }) {
         {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} /> : null}
         {message.tools.length ? <div className="tool-timeline">{message.tools.map((tool) => <ToolStep key={tool.callId} tool={tool} />)}</div> : null}
         {isUser ? <p className="user-text">{message.content}</p> : message.content ? (
-          <Streamdown plugins={markdownPlugins} isAnimating={Boolean(message.streaming)}>{message.content}</Streamdown>
+          <Streamdown key={`${message.id}-${message.streaming ? "stream" : "final"}`} plugins={markdownPlugins} isAnimating={Boolean(message.streaming)}>{message.content}</Streamdown>
         ) : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
         {message.status === "interrupted" ? <span className="interrupted-label">已停止</span> : null}
       </div>
@@ -335,9 +335,9 @@ function Composer(props: {
           </label>
           <span className="composer-hint">Enter 发送 · Shift+Enter 换行</span>
           {props.active ? (
-            <button className="send-button stop" onClick={props.onStop}><CircleStop size={18} /><span>停止</span></button>
+            <button className="send-button stop" aria-label="停止" onClick={props.onStop}><CircleStop size={18} /><span>停止</span></button>
           ) : (
-            <button className="send-button" onClick={props.onSend} disabled={props.sending || (!props.input.trim() && props.files.length === 0)}><SendHorizontal size={18} /><span>发送</span></button>
+            <button className="send-button" aria-label="发送" onClick={props.onSend} disabled={props.sending || (!props.input.trim() && props.files.length === 0)}><SendHorizontal size={18} /><span>发送</span></button>
           )}
         </div>
       </div>

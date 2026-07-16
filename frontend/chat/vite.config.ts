@@ -20,7 +20,7 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     setupFiles: resolve(here, "src/testSetup.ts"),
-    include: [resolve(here, "src/**/*.test.{ts,tsx}")],
+    include: ["src/**/*.test.{ts,tsx}"],
   },
   server: {
     proxy: {

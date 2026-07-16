@@ -353,12 +353,17 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
                 raise HTTPException(status_code=400, detail="文本文件必须使用 UTF-8") from error
             suffix = suffix if suffix in _TEXT_SUFFIXES else ".txt"
 
-        # 存储名完全由服务端生成，原始文件名不参与路径拼接，避免目录穿越和覆盖。
-        stored = (upload_dir / f"web_{uuid4().hex}{suffix}").resolve()
+        safe_name = f"{Path(clean_name).stem or 'upload'}{suffix}"
+        # 唯一目录负责防覆盖，末级保留清洗后的原文件名，保证前端和历史恢复
+        # 能展示用户认识的名称；两级路径都经过 resolve/relative_to 校验。
+        bucket = (upload_dir / uuid4().hex).resolve()
+        bucket.relative_to(upload_dir.resolve())
+        await asyncio.to_thread(bucket.mkdir, parents=True, exist_ok=False)
+        stored = (bucket / safe_name).resolve()
         stored.relative_to(upload_dir.resolve())
         await asyncio.to_thread(stored.write_bytes, data)
         return {
-            "filename": clean_name or f"upload{suffix}",
+            "filename": safe_name,
             "upload_path": str(stored),
             "upload_url": f"/api/chat/media?path={quote(str(stored), safe='')}",
             "media_type": content_type or (mimetypes.guess_type(stored.name)[0] or "application/octet-stream"),

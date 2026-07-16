@@ -1,0 +1,81 @@
+import { expect, test, type Page } from "@playwright/test";
+
+const browserErrors = new WeakMap<Page, string[]>();
+
+test.beforeEach(async ({ page }) => {
+  const errors: string[] = [];
+  browserErrors.set(page, errors);
+  page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "已连接" })).toBeVisible();
+});
+
+test.afterEach(async ({ page }) => {
+  expect(browserErrors.get(page) ?? []).toEqual([]);
+});
+
+test("聚合流式回复、工具状态并用 final 覆盖草稿", async ({ page }) => {
+  await page.getByPlaceholder("输入消息，或附加文本与图片").fill("执行完整前端测试");
+  await page.getByRole("button", { name: "发送" }).click();
+
+  await expect(page.getByText("list_dir")).toBeVisible();
+  await expect(page.getByText("完成", { exact: true })).toBeVisible();
+  await expect(page.getByText("最终内容", { exact: true })).toBeVisible();
+  await expect(page.getByText("流式草稿", { exact: true })).toHaveCount(0);
+  await expect(page.locator("pre code")).toContainText("print");
+  await expect(page.getByRole("img", { name: "Mermaid chart" })).toBeVisible();
+  if (page.viewportSize()?.width === 1440) {
+    await page.screenshot({ path: ".pytest_artifacts/frontend-desktop.png", fullPage: true });
+  }
+});
+
+test("展示结构化错误并停止活跃 Turn", async ({ page }) => {
+  const input = page.getByPlaceholder("输入消息，或附加文本与图片");
+  await input.fill("触发错误");
+  await page.getByRole("button", { name: "发送" }).click();
+  await expect(page.getByRole("alert")).toContainText("Fake 结构化错误");
+  await page.getByRole("button", { name: "关闭错误" }).click();
+
+  await input.fill("等待停止");
+  await page.getByRole("button", { name: "发送" }).click();
+  await page.getByRole("button", { name: "停止" }).click();
+  await expect(page.getByText("已停止")).toBeVisible();
+});
+
+test("上传文本附件并在断线后自动重连", async ({ page }) => {
+  const chooser = page.locator('input[type="file"]');
+  await chooser.setInputFiles([
+    { name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("attachment") },
+    { name: "photo.png", mimeType: "image/png", buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+X8dJAAAAAElFTkSuQmCC", "base64") },
+  ]);
+  await expect(page.getByText("notes.txt")).toBeVisible();
+  await expect(page.locator(".pending-file img")).toBeVisible();
+  await page.getByPlaceholder("输入消息，或附加文本与图片").fill("附件测试");
+  await page.getByRole("button", { name: "发送" }).click();
+  await expect(page.getByText("notes.txt")).toBeVisible();
+  await expect(page.getByAltText("photo.png")).toBeVisible();
+
+  await expect(page.getByRole("button", { name: "重连中" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "已连接" })).toBeVisible({ timeout: 5_000 });
+});
+
+test("移动端布局没有横向溢出", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile", "仅移动端项目执行布局断言");
+  const dimensions = await page.evaluate(() => ({
+    viewport: document.documentElement.clientWidth,
+    content: document.documentElement.scrollWidth,
+  }));
+  expect(dimensions.content).toBeLessThanOrEqual(dimensions.viewport);
+  await expect(page.getByRole("button", { name: "打开会话列表" })).toBeVisible();
+  await page.screenshot({ path: ".pytest_artifacts/frontend-mobile.png", fullPage: true });
+});
+
+test("加载历史会话并新建空会话", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "桌面侧栏覆盖即可");
+  await expect(page.getByRole("button", { name: "打开会话列表" })).toBeHidden();
+  await page.getByRole("button", { name: /历史问题/ }).click();
+  await expect(page.getByText("历史回答")).toBeVisible();
+  await page.getByRole("button", { name: "新建会话" }).click();
+  await expect(page.getByText("从一个具体问题开始")).toBeVisible();
+});

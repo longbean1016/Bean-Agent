@@ -1,0 +1,64 @@
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+
+import { App } from "./App";
+
+class FakeWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSED = 3;
+  static instances: FakeWebSocket[] = [];
+  readyState = FakeWebSocket.CONNECTING;
+  sent: Array<Record<string, unknown>> = [];
+  onopen: (() => void) | null = null;
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+
+  constructor(_url: string) {
+    FakeWebSocket.instances.push(this);
+    queueMicrotask(() => { this.readyState = FakeWebSocket.OPEN; this.onopen?.(); });
+  }
+
+  send(raw: string) {
+    const frame = JSON.parse(raw) as Record<string, unknown>;
+    this.sent.push(frame);
+    if (frame.type === "session.create") {
+      queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ type: "session.created", request_id: frame.request_id, session_id: "web:component" }) } as MessageEvent));
+    }
+  }
+
+  close() { this.readyState = FakeWebSocket.CLOSED; this.onclose?.(); }
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  FakeWebSocket.instances = [];
+  vi.stubGlobal("WebSocket", FakeWebSocket);
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    const payload = url.includes("/messages") ? { items: [], total: 0 } : { items: [], total: 0 };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+});
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+it("首次连接创建 Session 并发送用户消息", async () => {
+  render(<App />);
+
+  await screen.findByText("已连接");
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  const socket = FakeWebSocket.instances[0];
+  expect(socket.sent[0]).toMatchObject({ type: "session.create" });
+
+  const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
+  fireEvent.change(input, { target: { value: "组件测试消息" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+  await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send" && frame.text === "组件测试消息")).toBe(true));
+  expect(screen.getByText("组件测试消息")).toBeVisible();
+});
