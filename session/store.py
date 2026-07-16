@@ -223,6 +223,86 @@ class SessionStore:
             offset=offset,
         )
 
+    def list_chat_sessions(
+        self,
+        *,
+        channel: str = "web",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """按最近活动时间列出已有消息的聊天会话。"""
+
+        safe_limit = max(1, min(int(limit), 200))
+        safe_offset = max(0, int(offset))
+        prefix = f"{str(channel).strip()}:%"
+        with self._lock:
+            self._ensure_open()
+            count_row = self._conn.execute(
+                """
+                SELECT COUNT(1) AS count
+                FROM sessions s
+                WHERE s.key LIKE ?
+                  AND EXISTS (
+                      SELECT 1 FROM messages m WHERE m.session_key = s.key
+                  )
+                """,
+                (prefix,),
+            ).fetchone()
+            rows = self._conn.execute(
+                """
+                SELECT s.key, s.created_at, s.updated_at,
+                       COUNT(m.id) AS message_count,
+                       COALESCE((
+                           SELECT first.content
+                           FROM messages first
+                           WHERE first.session_key = s.key
+                             AND first.role = 'user'
+                           ORDER BY first.seq ASC
+                           LIMIT 1
+                       ), '') AS first_message_content
+                FROM sessions s
+                JOIN messages m ON m.session_key = s.key
+                WHERE s.key LIKE ?
+                GROUP BY s.key, s.created_at, s.updated_at
+                ORDER BY s.updated_at DESC, s.key DESC
+                LIMIT ? OFFSET ?
+                """,
+                (prefix, safe_limit, safe_offset),
+            ).fetchall()
+        total = int((count_row["count"] if count_row else 0) or 0)
+        return [dict(row) for row in rows], total
+
+    def list_chat_messages(
+        self,
+        session_key: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """为聊天前端读取原始消息，不展开模型专用的 tool 消息。"""
+
+        key = self._validate_session_key(session_key)
+        safe_limit = max(1, min(int(limit), 500))
+        safe_offset = max(0, int(offset))
+        with self._lock:
+            self._ensure_open()
+            count_row = self._conn.execute(
+                "SELECT COUNT(1) AS count FROM messages WHERE session_key = ?",
+                (key,),
+            ).fetchone()
+            rows = self._conn.execute(
+                f"""
+                SELECT {_MESSAGE_COLUMNS}
+                FROM messages
+                WHERE session_key = ?
+                ORDER BY seq ASC
+                LIMIT ? OFFSET ?
+                """,
+                (key, safe_limit, safe_offset),
+            ).fetchall()
+        total = int((count_row["count"] if count_row else 0) or 0)
+        return [self._row_to_message(row) for row in rows], total
+
     def set_cursor(self, session_key: str, value: int) -> None:
         """设置该会话已完成记忆归档的消息序号。"""
 

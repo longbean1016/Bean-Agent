@@ -294,6 +294,50 @@ async def test_cursor_defaults_to_zero_and_can_advance(store: SessionStore) -> N
     assert store.get_cursor("web:chat-1") == 12
 
 
+def test_list_chat_sessions_excludes_empty_and_orders_recent_first(
+    store: SessionStore,
+) -> None:
+    store.create_session("web:empty")
+    store.add_message(
+        NewMessage(session_key="web:older", role="user", content="较早的问题")
+    )
+    store.add_message(
+        NewMessage(session_key="web:newer", role="user", content="最近的问题")
+    )
+    store.add_message(
+        NewMessage(session_key="web:newer", role="assistant", content="最近的回答")
+    )
+
+    items, total = store.list_chat_sessions(channel="web", limit=20, offset=0)
+
+    assert total == 2
+    assert [item["key"] for item in items] == ["web:newer", "web:older"]
+    assert items[0]["message_count"] == 2
+    assert items[0]["first_message_content"] == "最近的问题"
+
+
+def test_list_chat_messages_returns_persisted_frontend_fields(
+    store: SessionStore,
+) -> None:
+    store.add_message(
+        NewMessage(
+            session_key="web:chat-1",
+            role="user",
+            content="查看图片",
+            turn_id="turn-1",
+            extra={"media": ["D:/workspace/uploads/image.png"]},
+        )
+    )
+
+    items, total = store.list_chat_messages(
+        "web:chat-1", limit=50, offset=0
+    )
+
+    assert total == 1
+    assert items[0]["turn_id"] == "turn-1"
+    assert items[0]["media"] == ["D:/workspace/uploads/image.png"]
+
+
 @pytest.mark.asyncio
 async def test_add_message_rejects_invalid_role(store: SessionStore) -> None:
     with pytest.raises(ValueError, match="role"):

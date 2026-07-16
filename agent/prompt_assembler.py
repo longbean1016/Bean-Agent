@@ -30,12 +30,24 @@ def build_context_frame_content(sections: list[PromptSectionRender]) -> str:
 
 
 class MessageEnvelopeBuilder:
-    def build(self, *, history: list[dict[str, object]], current_message: str, system_prompt: str, context_frame: str, message_timestamp: datetime | None = None) -> list[dict[str, object]]:
+    def build(self, *, history: list[dict[str, object]], current_message: object, system_prompt: str, context_frame: str, message_timestamp: datetime | None = None) -> list[dict[str, object]]:
         messages: list[dict[str, object]] = [{"role": "system", "content": system_prompt}, *history]
         if context_frame.strip():
             messages.append({"role": "user", "content": context_frame})
         timestamp = message_timestamp or datetime.now(timezone.utc)
-        stamped = f"[当前消息时间: {timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}]\n{current_message}"
+        stamp = f"[当前消息时间: {timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}]"
+        if isinstance(current_message, list):
+            # 多模态消息保持图片块原序，只在最后的文本块前写入动态时间戳。
+            stamped_blocks = [dict(item) for item in current_message if isinstance(item, dict)]
+            text_index = next((index for index in range(len(stamped_blocks) - 1, -1, -1) if stamped_blocks[index].get("type") == "text"), None)
+            if text_index is None:
+                stamped_blocks.append({"type": "text", "text": stamp})
+            else:
+                text = str(stamped_blocks[text_index].get("text") or "")
+                stamped_blocks[text_index] = {**stamped_blocks[text_index], "text": f"{stamp}\n{text}"}
+            stamped: object = stamped_blocks
+        else:
+            stamped = f"{stamp}\n{str(current_message)}"
         messages.append({"role": "user", "content": stamped})
         return messages
 
@@ -45,7 +57,7 @@ class PromptAssembler:
         self._builder = builder
         self._envelope_builder = envelope_builder
 
-    def assemble(self, *, turn_ctx: TurnContext, history: list[dict[str, object]], current_message: str, message_timestamp: datetime | None = None, disabled_sections: set[str] | None = None) -> PromptAssemblyResult:
+    def assemble(self, *, turn_ctx: TurnContext, history: list[dict[str, object]], current_message: object, message_timestamp: datetime | None = None, disabled_sections: set[str] | None = None) -> PromptAssemblyResult:
         built = self._builder.build(turn_ctx, disabled_sections=disabled_sections)
         stable = [item for item in built.sections if item.name not in _FRAME_SECTIONS]
         dynamic = [item for item in built.sections if item.name in _FRAME_SECTIONS]

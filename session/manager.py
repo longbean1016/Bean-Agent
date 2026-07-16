@@ -14,6 +14,11 @@ from typing import Any
 from session.store import NewMessage, SessionStore
 
 _TOOL_RESULT_CHAR_BUDGET = 10_000
+_TEXT_ATTACHMENT_CHAR_BUDGET = 100_000
+_TEXT_ATTACHMENT_SUFFIXES = {
+    ".txt", ".md", ".markdown", ".py", ".json", ".toml", ".yaml", ".yml",
+    ".csv", ".log", ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".xml",
+}
 
 
 def _truncate_tool_result(content: object) -> str:
@@ -58,6 +63,16 @@ def _rebuild_user_content(text: str, media_paths: list[str]) -> str | list[dict[
             except OSError:
                 # 附件属于历史增强信息，单个文件读取失败不能阻断整轮恢复。
                 file_refs.append(f"[图片（读取失败）: {file_path.name}]")
+        elif file_path.is_file() and file_path.suffix.lower() in _TEXT_ATTACHMENT_SUFFIXES:
+            try:
+                content = file_path.read_text(encoding="utf-8")
+                if len(content) > _TEXT_ATTACHMENT_CHAR_BUDGET:
+                    omitted = len(content) - _TEXT_ATTACHMENT_CHAR_BUDGET
+                    content = f"{content[:_TEXT_ATTACHMENT_CHAR_BUDGET]}\n...[省略 {omitted} 个字符]"
+                file_refs.append(f"[文本附件: {file_path.name}]\n```text\n{content}\n```")
+            except (OSError, UnicodeDecodeError):
+                # 历史恢复失败只降级为文件引用，不能破坏整个 Session 的加载。
+                file_refs.append(f"[文件（读取失败）: {file_path.name}]")
         elif file_path.is_file():
             file_refs.append(f"[文件: {path}]")
         else:

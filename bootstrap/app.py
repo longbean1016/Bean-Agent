@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 import logging
+from io import BytesIO
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
+from uuid import uuid4
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from PIL import Image, UnidentifiedImageError
 
 from agent.agent_loop import AgentLoop
 from agent.channel import WebChannel
@@ -26,6 +33,14 @@ from session.manager import SessionManager
 from tools import ToolRegistry, register_all
 
 logger = logging.getLogger(__name__)
+
+_TEXT_SUFFIXES = {
+    ".txt", ".md", ".markdown", ".py", ".json", ".toml", ".yaml", ".yml",
+    ".csv", ".log", ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".xml",
+}
+_IMAGE_FORMATS = {"PNG", "JPEG", "GIF", "WEBP", "BMP"}
+_MAX_TEXT_UPLOAD = 2 * 1024 * 1024
+_MAX_IMAGE_UPLOAD = 10 * 1024 * 1024
 
 
 class MemoryMaintenanceLoop:
@@ -79,7 +94,12 @@ class AppRuntime:
 
     def __init__(self, core: CoreRuntime) -> None:
         self.core = core
-        self.channel = WebChannel(core.message_bus, core.event_bus, core.agent_loop)
+        self.channel = WebChannel(
+            core.message_bus,
+            core.event_bus,
+            core.agent_loop,
+            media_root=core.workspace / "uploads",
+        )
         self.maintenance = (
             MemoryMaintenanceLoop(
                 core.memory,
@@ -255,6 +275,105 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
     app.state.core_runtime = application.core
     app.state.app_runtime = application
     app.state.web_channel = channel
+    project_root = Path(__file__).resolve().parent.parent
+    static_dir = project_root / "static" / "chat"
+    index_file = static_dir / "index.html"
+    upload_dir = application.core.workspace / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    app.mount(
+        "/assets",
+        StaticFiles(directory=static_dir, check_dir=False),
+        name="chat_assets",
+    )
+
+    @app.get("/", response_model=None)
+    def chat_index() -> FileResponse | dict[str, str]:
+        if index_file.is_file():
+            return FileResponse(index_file)
+        return {"status": "ok", "message": "聊天前端尚未构建，请运行 npm run build"}
+
+    @app.get("/api/chat/sessions")
+    def list_sessions(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+    ) -> dict[str, Any]:
+        items, total = application.core.sessions.store.list_chat_sessions(
+            channel=application.core.config.channels.chat.channel_name,
+            limit=page_size,
+            offset=(page - 1) * page_size,
+        )
+        return {"items": items, "total": total}
+
+    @app.get("/api/chat/sessions/{session_key:path}/messages")
+    def list_messages(
+        session_key: str,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        items, total = application.core.sessions.store.list_chat_messages(
+            session_key,
+            limit=page_size,
+            offset=(page - 1) * page_size,
+        )
+        return {"items": items, "total": total}
+
+    @app.post("/api/chat/uploads")
+    async def upload_file(
+        request: Request,
+        filename: str = Query(default="upload.txt"),
+    ) -> dict[str, str]:
+        data = await request.body()
+        if not data:
+            raise HTTPException(status_code=400, detail="上传内容不能为空")
+        clean_name = Path(filename).name
+        suffix = Path(clean_name).suffix.lower()
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+        is_image = content_type.startswith("image/")
+        is_text = content_type.startswith("text/") or suffix in _TEXT_SUFFIXES
+        if not is_image and not is_text:
+            raise HTTPException(status_code=415, detail="仅支持文本文件和图片")
+        if is_image:
+            if len(data) > _MAX_IMAGE_UPLOAD:
+                raise HTTPException(status_code=413, detail="图片不能超过 10 MiB")
+            try:
+                with Image.open(BytesIO(data)) as image:
+                    image.verify()
+                    image_format = str(image.format or "").upper()
+            except (UnidentifiedImageError, OSError, SyntaxError) as error:
+                raise HTTPException(status_code=400, detail="图片内容无效") from error
+            if image_format not in _IMAGE_FORMATS:
+                raise HTTPException(status_code=415, detail="不支持该图片格式")
+            suffix = mimetypes.guess_extension(content_type) or suffix or ".img"
+        else:
+            if len(data) > _MAX_TEXT_UPLOAD:
+                raise HTTPException(status_code=413, detail="文本文件不能超过 2 MiB")
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise HTTPException(status_code=400, detail="文本文件必须使用 UTF-8") from error
+            suffix = suffix if suffix in _TEXT_SUFFIXES else ".txt"
+
+        # 存储名完全由服务端生成，原始文件名不参与路径拼接，避免目录穿越和覆盖。
+        stored = (upload_dir / f"web_{uuid4().hex}{suffix}").resolve()
+        stored.relative_to(upload_dir.resolve())
+        await asyncio.to_thread(stored.write_bytes, data)
+        return {
+            "filename": clean_name or f"upload{suffix}",
+            "upload_path": str(stored),
+            "upload_url": f"/api/chat/media?path={quote(str(stored), safe='')}",
+            "media_type": content_type or (mimetypes.guess_type(stored.name)[0] or "application/octet-stream"),
+        }
+
+    @app.get("/api/chat/media")
+    def read_media(path: str = Query(...)) -> FileResponse:
+        requested = Path(path).expanduser().resolve()
+        try:
+            requested.relative_to(upload_dir.resolve())
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail="文件不存在") from error
+        if not requested.is_file():
+            raise HTTPException(status_code=404, detail="文件不存在")
+        return FileResponse(requested)
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

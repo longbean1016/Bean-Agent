@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -27,10 +28,11 @@ class InterruptController(Protocol):
 class WebChannel:
     name = "web"
 
-    def __init__(self, bus: MessageBus, event_bus: EventBus, interrupt_controller: InterruptController) -> None:
+    def __init__(self, bus: MessageBus, event_bus: EventBus, interrupt_controller: InterruptController, *, media_root: Path | None = None) -> None:
         self._bus = bus
         self._events = event_bus
         self._interrupt = interrupt_controller
+        self._media_root = media_root.resolve() if media_root is not None else None
         self._connections: dict[str, set[WebSocketApi]] = {}
         self._lock = asyncio.Lock()
         bus.subscribe_outbound(self.name, self._on_response)
@@ -68,12 +70,15 @@ class WebChannel:
                 session_key = f"web:{uuid4().hex}"
                 await websocket.send_json({"type": "session.created", "request_id": request_id, "session_id": session_key})
             text = str(frame.get("text") or "")
-            media = frame.get("media") if isinstance(frame.get("media"), list) else []
+            media = [str(item).strip() for item in frame.get("media", []) if isinstance(item, str) and str(item).strip()] if isinstance(frame.get("media"), list) else []
             if not text.strip() and not media:
                 await self._error(websocket, request_id, "empty_message", "消息不能为空")
                 return
             if len(text) > 32 * 1024 or len(media) > 8:
                 await self._error(websocket, request_id, "message_too_large", "消息或媒体数量超过限制")
+                return
+            if not self._media_is_allowed(media):
+                await self._error(websocket, request_id, "invalid_media", "附件路径无效或不属于当前 workspace")
                 return
             await self._register(session_key, websocket)
             chat_id = session_key.split(":", 1)[1]
@@ -84,6 +89,19 @@ class WebChannel:
             await websocket.send_json({"type": "turn.interrupted", "request_id": request_id, "session_id": session_key, "turn_id": result.turn_id, "status": result.status})
             return
         await self._error(websocket, request_id, "invalid_frame", f"不支持的帧类型: {frame_type or 'empty'}")
+
+    def _media_is_allowed(self, media: list[str]) -> bool:
+        if not media or self._media_root is None:
+            return True
+        for value in media:
+            try:
+                path = Path(value).expanduser().resolve()
+                path.relative_to(self._media_root)
+            except (OSError, ValueError):
+                return False
+            if not path.is_file():
+                return False
+        return True
 
     async def _on_response(self, message: OutboundMessage) -> None:
         session_key = f"{message.channel}:{message.chat_id}"

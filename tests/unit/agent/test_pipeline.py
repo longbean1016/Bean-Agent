@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from io import BytesIO
+from pathlib import Path
+
 import pytest
+from PIL import Image
 
 from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted
 from agent.message_bus import InboundMessage
@@ -69,3 +73,52 @@ async def test_pipeline_runs_tool_loop_and_emits_lifecycle_events() -> None:
 
 async def _history():
     return [{"role": "assistant", "content": "旧回答"}]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_includes_text_and_image_attachments_in_current_turn(
+    tmp_path: Path,
+) -> None:
+    class FinalProvider:
+        def __init__(self) -> None:
+            self.messages = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages = messages
+            return LLMResponse("已读取")
+
+    text_path = tmp_path / "notes.txt"
+    text_path.write_text("附件中的关键内容", encoding="utf-8")
+    image_path = tmp_path / "sample.png"
+    buffer = BytesIO()
+    Image.new("RGB", (3, 3), "#0f766e").save(buffer, format="PNG")
+    image_path.write_bytes(buffer.getvalue())
+    provider = FinalProvider()
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        EventBus(),
+        PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        ),
+        workspace=str(tmp_path),
+    )
+
+    await pipeline.process(
+        InboundMessage(
+            channel="web",
+            sender="u",
+            chat_id="c",
+            content="分析附件",
+            media=[str(text_path), str(image_path)],
+        ),
+        turn_id="t-attachment",
+    )
+
+    current = provider.messages[-1]["content"]
+    assert isinstance(current, list)
+    assert current[0]["type"] == "image_url"
+    assert current[0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert "附件中的关键内容" in current[-1]["text"]
+    assert "分析附件" in current[-1]["text"]

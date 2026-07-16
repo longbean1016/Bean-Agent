@@ -6,6 +6,7 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
+from agent.attachment_content import build_current_user_content
 from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted
 from agent.message_bus import InboundMessage, PipelineResult
 from agent.prompt_assembler import PromptAssembler
@@ -48,7 +49,8 @@ class Pipeline:
             if (tool := self._tools.get_tool(name)) is not None
         )
         context = TurnContext(self._workspace, message.channel, message.chat_id, self._memory, retrieved, summary, names)
-        assembled = self._assembler.assemble(turn_ctx=context, history=history, current_message=message.content)
+        current_content = await build_current_user_content(message.content, message.media)
+        assembled = self._assembler.assemble(turn_ctx=context, history=history, current_message=current_content)
         model_messages = list(assembled.messages)
         tool_chain: list[dict[str, Any]] = []
         tools_used: list[str] = []

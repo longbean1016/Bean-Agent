@@ -141,8 +141,8 @@ def test_get_history_rebuilds_image_and_file_attachments(tmp_path: Path) -> None
             "url": "data:image/png;base64," + base64.b64encode(b"png-bytes").decode()
         },
     }
-    assert "[文件:" in content[-1]["text"]
-    assert "notes.txt" in content[-1]["text"]
+    assert "[文本附件: notes.txt]" in content[-1]["text"]
+    assert "hello" in content[-1]["text"]
     assert "[文件（已失效）: missing.pdf]" in content[-1]["text"]
     assert content[-1]["text"].endswith("请查看附件")
 
