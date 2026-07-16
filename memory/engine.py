@@ -8,7 +8,7 @@ import json
 import logging
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent.config_models import MemoryConfig
 from memory.consolidator import ConsolidationDraft, ConsolidationExtractor, ConsolidationResult, Consolidator
@@ -27,6 +27,9 @@ from memory.query_rewriter import QueryRewriter
 from memory.retriever import Retriever
 from memory.store import MemoryStore2
 from session.store import SessionStore
+
+if TYPE_CHECKING:
+    from agent.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +77,7 @@ class MemoryEngine:
         self._lifecycle_lock = asyncio.Lock()
         self._accepting = True
         self._closed = False
+        self._event_bus: EventBus | None = None
 
     async def query(self, request: MemoryQuery) -> MemoryQueryResult:
         scope = request.scope
@@ -166,6 +170,9 @@ class MemoryEngine:
     async def on_turn_committed(self, event: Any) -> None:
         """将已持久化 Turn 快照投递给两条独立后台处理链。"""
 
+        status = event.get("status") if isinstance(event, dict) else getattr(event, "status", "ok")
+        if str(status or "ok") != "ok":
+            return
         if not self._accepting or self._closed:
             raise RuntimeError("MemoryEngine 已停止接收新的 Turn")
         snapshot = self._build_turn_snapshot(event)
@@ -174,6 +181,27 @@ class MemoryEngine:
         # 向量化或 Markdown IO，后台失败也不会回滚已经落库的对话。
         self._post_response_queue.put_nowait(snapshot)
         self._enqueue_maintenance(snapshot)
+
+    def bind_events(self, event_bus: EventBus) -> None:
+        """订阅正式 TurnCommitted；重复绑定同一总线保持幂等。"""
+
+        from agent.event_bus import TurnCommitted
+
+        if self._event_bus is event_bus:
+            return
+        self.unbind_events()
+        event_bus.on(TurnCommitted, self.on_turn_committed)
+        self._event_bus = event_bus
+
+    def unbind_events(self) -> None:
+        """关闭前解除订阅，避免已关闭的 Store 再收到提交事件。"""
+
+        if self._event_bus is None:
+            return
+        from agent.event_bus import TurnCommitted
+
+        self._event_bus.off(TurnCommitted, self.on_turn_committed)
+        self._event_bus = None
 
     async def _run_consolidation(self, event: TurnIngested) -> ConsolidationResult | None:
         result = await self._consolidator.consolidate(event.session_key)
@@ -321,10 +349,15 @@ class MemoryEngine:
         source_ref = str(value("source_ref") or "")
         if not source_ref:
             source_ref = ",".join(item for item in (user_id, assistant_id) if item)
+        channel = str(value("channel") or "")
+        chat_id = str(value("chat_id") or "")
+        if not channel and ":" in session_key:
+            channel, derived_chat_id = session_key.split(":", 1)
+            chat_id = chat_id or derived_chat_id
         return TurnIngested(
             session_key=session_key,
-            channel=str(value("channel") or ""),
-            chat_id=str(value("chat_id") or ""),
+            channel=channel,
+            chat_id=chat_id,
             user_message=user_message,
             assistant_response=assistant_response,
             tool_chain=safe_tool_chain,
@@ -338,6 +371,7 @@ class MemoryEngine:
         if self._closed:
             return
         self._accepting = False
+        self.unbind_events()
         # 先完成已接收任务，再取消等待新消息的常驻消费者；否则 SQLite/Markdown
         # 可能先关闭，造成尾部 Turn 丢失。取消仅发生在队列清空之后。
         await self.drain()
