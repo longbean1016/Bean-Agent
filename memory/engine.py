@@ -81,13 +81,16 @@ class MemoryEngine:
 
     async def query(self, request: MemoryQuery) -> MemoryQueryResult:
         scope = request.scope
+        # 每轮预检索对齐 Akashic 的 context 语义：scope 作为来源信息传入检索器，
+        # 但默认不作为过滤条件；显式查询 intent 的矩阵在独立边界中处理。
+        require_scope_match = bool(scope.channel and scope.chat_id) and request.intent != "context"
         items = await self._retriever.retrieve(
             request.text,
             memory_types=list(request.filters.kinds) or None,
             top_k=request.limit,
             scope_channel=scope.channel or None,
             scope_chat_id=scope.chat_id or None,
-            require_scope_match=bool(scope.channel and scope.chat_id),
+            require_scope_match=require_scope_match,
             time_start=request.filters.time_start,
             time_end=request.filters.time_end,
         )
@@ -166,7 +169,11 @@ class MemoryEngine:
             queries.append(decision.procedure_query)
         if not queries:
             return ""
-        result = await self.query(MemoryQuery(" ".join(queries), scope=_scope(channel, chat_id)))
+        result = await self.query(MemoryQuery(
+            " ".join(queries),
+            intent="context",
+            scope=_scope(channel, chat_id),
+        ))
         return _injection_block(result.records)
 
     async def ingest(self, request: MemoryIngestRequest) -> MemoryIngestResult:

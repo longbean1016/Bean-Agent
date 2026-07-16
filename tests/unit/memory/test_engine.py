@@ -83,6 +83,35 @@ async def test_explicit_remember_does_not_persist_session_scope(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_turn_context_retrieval_can_recall_event_from_another_session(
+    tmp_path: Path,
+) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    try:
+        engine._store.upsert_item(
+            "event",
+            "用户完成了 WebSocket 启动验证",
+            [1.0, 0.0],
+            "web:session-a@0-9",
+            extra={"scope_channel": "web", "scope_chat_id": "session-a"},
+        )
+
+        block = await engine.retrieve_for_turn(SimpleNamespace(
+            content="之前完成了什么验证",
+            channel="web",
+            chat_id="session-b",
+        ))
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert "用户完成了 WebSocket 启动验证" in block
+
+
+@pytest.mark.asyncio
 async def test_turn_committed_consolidates_and_syncs_vector_event(tmp_path: Path) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
     for index in range(6):
