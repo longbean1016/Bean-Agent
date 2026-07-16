@@ -39,8 +39,8 @@ button { color: inherit; }
 .session-row time { color: #7a8581; font-size: 10px; }
 .session-empty { margin: 10px; color: #78837f; font-size: 12px; line-height: 1.55; }
 
-.chat-workspace { display: grid; grid-template-rows: 58px auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; background: #fbfcfb; }
-.topbar { display: flex; align-items: center; justify-content: space-between; min-width: 0; padding: 0 22px; border-bottom: 1px solid #e0e5e3; background: rgba(251, 252, 251, .96); }
+.chat-workspace { display: grid; grid-template-areas: "topbar" "error" "conversation" "composer"; grid-template-rows: 58px auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; height: 100%; overflow: hidden; background: #fbfcfb; }
+.topbar { grid-area: topbar; display: flex; align-items: center; justify-content: space-between; min-width: 0; padding: 0 22px; border-bottom: 1px solid #e0e5e3; background: rgba(251, 252, 251, .96); }
 .brand-compact { display: none; }
 .connection-state { display: inline-flex; align-items: center; gap: 7px; min-width: 92px; min-height: 32px; padding: 0 10px; border: 1px solid #d4dcda; border-radius: 6px; background: #fff; color: #53605c; cursor: default; font-size: 12px; }
 .connection-state.connected svg { color: #0b766e; }
@@ -49,11 +49,11 @@ button { color: inherit; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .icon-button.mobile-menu { display: none; }
 
-.error-banner { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 9px; margin: 10px 22px 0; padding: 9px 12px; border: 1px solid #e5b7b2; border-radius: 6px; background: #fff3f1; color: #8b2f28; font-size: 13px; }
+.error-banner { grid-area: error; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 9px; margin: 10px 22px 0; padding: 9px 12px; border: 1px solid #e5b7b2; border-radius: 6px; background: #fff3f1; color: #8b2f28; font-size: 13px; }
 .icon-button { display: inline-grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 0; border-radius: 6px; background: transparent; cursor: pointer; }
 .icon-button:hover { background: #e8eeeb; }
 
-.conversation { min-height: 0; overflow-y: auto; padding: 28px max(24px, calc((100% - 880px) / 2)) 90px; scroll-behavior: smooth; }
+.conversation { grid-area: conversation; min-width: 0; min-height: 0; overflow-y: auto; overflow-wrap: anywhere; padding: 28px max(24px, calc((100% - 880px) / 2)) 90px; scroll-behavior: smooth; }
 .message { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 18px; width: 100%; margin-bottom: 30px; }
 .message-label { padding-top: 3px; color: #64716c; font-size: 12px; font-weight: 700; text-align: right; }
 .message-body { min-width: 0; max-width: 780px; color: #1f2825; font-size: 15px; line-height: 1.72; }
@@ -61,6 +61,7 @@ button { color: inherit; }
 .user-text { margin: 0; white-space: pre-wrap; }
 .assistant-message .message-body > div[data-streamdown] { width: 100%; }
 .message-body pre { max-width: 100%; overflow-x: auto; border-radius: 6px; }
+.message-body svg, .message-body img { max-width: 100%; }
 .message-body a { color: #076f68; text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .message-body table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
 .message-body th, .message-body td { padding: 7px 10px; border: 1px solid #d6dfdc; }
@@ -99,7 +100,7 @@ button { color: inherit; }
 .example-prompts button { min-height: 42px; padding: 9px 12px; border: 1px solid #d8dfdc; border-radius: 5px; background: transparent; cursor: pointer; text-align: left; }
 .example-prompts button:hover { border-color: #8eb6b0; background: #f1f6f4; }
 
-.composer-wrap { padding: 0 max(24px, calc((100% - 880px) / 2)) 18px; background: #fbfcfb; }
+.composer-wrap { grid-area: composer; position: relative; z-index: 2; padding: 0 max(24px, calc((100% - 880px) / 2)) 18px; background: #fbfcfb; }
 .composer { border: 1px solid #cdd7d3; border-radius: 8px; background: #fff; box-shadow: 0 8px 28px rgba(35, 54, 48, .09); }
 .composer textarea { display: block; width: 100%; min-height: 72px; max-height: 180px; resize: vertical; padding: 13px 15px 6px; border: 0; outline: 0; background: transparent; color: #19221f; line-height: 1.5; }
 .composer textarea::placeholder { color: #8a9591; }

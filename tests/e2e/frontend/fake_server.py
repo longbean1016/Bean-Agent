@@ -104,6 +104,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "turn.started", "request_id": request_id, "session_id": session_id, "turn_id": active_turn})
             if text == "等待停止":
                 continue
+            if text == "长回答布局测试":
+                paragraphs = "\n\n".join(
+                    f"### 资料 {index}\n这是用于验证长回答滚动边界的内容。"
+                    for index in range(1, 81)
+                )
+                content = (
+                    f"{paragraphs}\n\n"
+                    "https://example.com/this-is-an-intentionally-very-long-unbroken-reference-path-that-must-not-expand-the-layout\n\n"
+                    "```python\nprint('layout')\n```\n\n"
+                    "```mermaid\ngraph LR\n  A[WebSocket] --> B[Agent]\n```\n\n"
+                    "长回答结束"
+                )
+                await websocket.send_json({"type": "message.final", "request_id": request_id, "session_id": session_id, "turn_id": active_turn, "content": content, "thinking": "", "media": []})
+                active_turn = ""
+                continue
             await websocket.send_json({"type": "answer.delta", "session_id": session_id, "turn_id": active_turn, "delta": "流式草稿"})
             await websocket.send_json({"type": "react.tool.started", "session_id": session_id, "turn_id": active_turn, "call_id": "call-1", "tool_name": "list_dir", "arguments": {"path": "."}})
             await websocket.send_json({"type": "react.tool.completed", "session_id": session_id, "turn_id": active_turn, "call_id": "call-1", "tool_name": "list_dir", "status": "ok", "result_preview": "agent, tests"})

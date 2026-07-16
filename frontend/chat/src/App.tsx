@@ -261,7 +261,14 @@ function MessageView({ message }: { message: ChatMessage }) {
         {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} /> : null}
         {message.tools.length ? <div className="tool-timeline">{message.tools.map((tool) => <ToolStep key={tool.callId} tool={tool} />)}</div> : null}
         {isUser ? <p className="user-text">{message.content}</p> : message.content ? (
-          <Streamdown key={`${message.id}-${message.streaming ? "stream" : "final"}`} plugins={markdownPlugins} isAnimating={Boolean(message.streaming)}>{message.content}</Streamdown>
+          <Streamdown
+            key={`${message.id}-${message.streaming ? "stream" : "final"}`}
+            plugins={markdownPlugins}
+            controls={false}
+            isAnimating={Boolean(message.streaming)}
+          >
+            {message.content}
+          </Streamdown>
         ) : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
         {message.status === "interrupted" ? <span className="interrupted-label">已停止</span> : null}
       </div>

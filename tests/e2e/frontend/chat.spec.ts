@@ -79,3 +79,33 @@ test("加载历史会话并新建空会话", async ({ page }, testInfo) => {
   await page.getByRole("button", { name: "新建会话" }).click();
   await expect(page.getByText("从一个具体问题开始")).toBeVisible();
 });
+
+test("长回答只滚动消息区并始终保留输入框", async ({ page }) => {
+  await page.getByPlaceholder("输入消息，或附加文本与图片").fill("长回答布局测试");
+  await page.getByRole("button", { name: "发送" }).click();
+  await expect(page.getByText("长回答结束")).toBeVisible();
+
+  const layout = await page.evaluate(() => {
+    const conversation = document.querySelector<HTMLElement>(".conversation");
+    const composer = document.querySelector<HTMLElement>(".composer-wrap");
+    if (!conversation || !composer) throw new Error("聊天布局节点缺失");
+    const composerRect = composer.getBoundingClientRect();
+    return {
+      composerBottom: composerRect.bottom,
+      composerTop: composerRect.top,
+      conversationScrollable: conversation.scrollHeight > conversation.clientHeight,
+      viewportHeight: window.innerHeight,
+    };
+  });
+
+  expect(layout.conversationScrollable).toBe(true);
+  expect(layout.composerTop).toBeGreaterThan(0);
+  expect(layout.composerBottom).toBeLessThanOrEqual(layout.viewportHeight);
+  await page.locator(".conversation").evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  await expect(page.getByRole("img", { name: "Mermaid chart" })).toBeAttached();
+  await expect(
+    page.locator(".assistant-message button").filter({ hasNotText: "https://example.com" }),
+  ).toHaveCount(0);
+});
