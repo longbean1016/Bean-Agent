@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from agent.attachment_content import build_current_user_content
@@ -11,7 +13,7 @@ from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolC
 from agent.message_bus import InboundMessage, PipelineResult
 from agent.prompt_assembler import PromptAssembler
 from agent.prompt_block import TurnContext
-from agent.provider import LLMResponse
+from agent.provider import ContextLengthError, LLMResponse
 from tools.base import normalize_tool_result
 from tools.registry import ToolRegistry
 from tools.runtime import append_tool_result
@@ -22,6 +24,15 @@ class ProviderApi(Protocol):
 
 
 HistoryLoader = Callable[[str, int], Awaitable[list[dict[str, Any]]]]
+
+logger = logging.getLogger(__name__)
+
+_LOW_PRIORITY_SECTIONS = (
+    "active_tools",
+    "recent_context",
+    "session_context",
+    "self_model",
+)
 
 
 class Pipeline:
@@ -50,8 +61,9 @@ class Pipeline:
         )
         context = TurnContext(self._workspace, message.channel, message.chat_id, self._memory, retrieved, summary, names)
         current_content = await build_current_user_content(message.content, message.media)
-        assembled = self._assembler.assemble(turn_ctx=context, history=history, current_message=current_content)
-        model_messages = list(assembled.messages)
+        message_timestamp = datetime.now(timezone.utc)
+        disabled_sections: set[str] = set()
+        react_messages: list[dict[str, Any]] = []
         tool_chain: list[dict[str, Any]] = []
         tools_used: list[str] = []
 
@@ -63,13 +75,55 @@ class Pipeline:
                 thinking_delta=str(delta.get("thinking_delta") or ""),
             ))
 
+        async def chat_with_context_retry() -> LLMResponse:
+            nonlocal history
+            while True:
+                assembled = self._assembler.assemble(
+                    turn_ctx=context,
+                    history=history,
+                    current_message=current_content,
+                    message_timestamp=message_timestamp,
+                    disabled_sections=disabled_sections,
+                )
+                # ReAct 后缀可能包含已经执行过的工具结果。超限重试只重建基础
+                # Prompt，原样保留该后缀，避免重复执行有副作用的工具。
+                model_messages = [*assembled.messages, *react_messages]
+                try:
+                    return await self._provider.chat(
+                        model_messages,
+                        self._tools.get_schemas(),
+                        tool_choice="auto",
+                        on_content_delta=on_delta,
+                    )
+                except ContextLengthError:
+                    trimmed = _trim_oldest_complete_turn(history)
+                    if trimmed is not None:
+                        logger.info(
+                            "上下文超限，移除最旧完整 Turn: session=%s history=%d->%d",
+                            message.session_key,
+                            len(history),
+                            len(trimmed),
+                        )
+                        history = trimmed
+                        continue
+
+                    section = next(
+                        (name for name in _LOW_PRIORITY_SECTIONS if name not in disabled_sections),
+                        None,
+                    )
+                    if section is None:
+                        # system、最近完整 Turn、当前消息及关键记忆均不可再裁剪；
+                        # 此时保留 Provider 原始异常，交给 AgentLoop 结构化处理。
+                        raise
+                    disabled_sections.add(section)
+                    logger.info(
+                        "上下文超限，关闭低优先级 Prompt 区块: session=%s section=%s",
+                        message.session_key,
+                        section,
+                    )
+
         for iteration in range(1, self._max_iterations + 1):
-            response = await self._provider.chat(
-                model_messages,
-                self._tools.get_schemas(),
-                tool_choice="auto",
-                on_content_delta=on_delta,
-            )
+            response = await chat_with_context_retry()
             if not response.tool_calls:
                 return PipelineResult(
                     content=str(response.content or ""),
@@ -89,19 +143,38 @@ class Pipeline:
                 ],
                 **response.provider_fields,
             }
-            model_messages.append(assistant_message)
+            react_messages.append(assistant_message)
             group: dict[str, Any] = {"iteration": iteration, "text": response.content or "", "calls": [], "provider_fields": dict(response.provider_fields)}
             for call in response.tool_calls:
                 await self._events.emit(ToolCallStarted(message.session_key, turn_id, call.id, call.name, dict(call.arguments)))
                 raw_result = await self._tools.execute(call.name, call.arguments)
                 result = normalize_tool_result(raw_result)
                 status = "error" if result.text.startswith("工具执行出错:") or result.text.startswith("工具 '") else "ok"
-                append_tool_result(model_messages, tool_call_id=call.id, content=result, tool_name=call.name)
+                append_tool_result(react_messages, tool_call_id=call.id, content=result, tool_name=call.name)
                 await self._events.emit(ToolCallCompleted(message.session_key, turn_id, call.id, call.name, status, result.preview()[:500]))
                 group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "status": status})
                 tools_used.append(call.name)
             tool_chain.append(group)
         raise RuntimeError(f"ReAct 超过最大迭代次数: {self._max_iterations}")
+
+
+def _trim_oldest_complete_turn(
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    """删除最旧完整 Turn，并保证最近 Turn 不被拆散。
+
+    SessionLoader 正常会从 user 边界返回历史。这里仍防御异常输入：没有
+    user 的 assistant/tool 孤链整体丢弃，绝不把无法配对的工具消息发给模型。
+    """
+
+    user_indexes = [
+        index for index, item in enumerate(history) if item.get("role") == "user"
+    ]
+    if len(user_indexes) >= 2:
+        return history[user_indexes[1]:]
+    if not user_indexes and history:
+        return []
+    return None
 
 
 __all__ = ["Pipeline"]

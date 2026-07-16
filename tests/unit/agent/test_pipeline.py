@@ -13,7 +13,7 @@ from agent.message_bus import InboundMessage
 from agent.pipeline import Pipeline
 from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
-from agent.provider import LLMResponse, ToolCall
+from agent.provider import ContextLengthError, LLMResponse, ToolCall
 from tools.base import Tool
 from tools.registry import ToolRegistry
 
@@ -122,3 +122,203 @@ async def test_pipeline_includes_text_and_image_attachments_in_current_turn(
     assert current[0]["image_url"]["url"].startswith("data:image/png;base64,")
     assert "附件中的关键内容" in current[-1]["text"]
     assert "分析附件" in current[-1]["text"]
+
+
+def _assembler(tmp_path: Path) -> PromptAssembler:
+    return PromptAssembler(
+        SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+        MessageEnvelopeBuilder(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_trims_old_history_by_complete_turn_and_keeps_memory(
+    tmp_path: Path,
+) -> None:
+    class OverflowProvider:
+        def __init__(self) -> None:
+            self.messages: list[list[dict[str, object]]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages.append(messages)
+            if len(self.messages) < 3:
+                raise ContextLengthError("maximum context length exceeded")
+            return LLMResponse("裁剪成功")
+
+    class RichMemory(Memory):
+        def get_memory_context(self): return "必须保留的长期记忆"
+
+    async def history(_key: str, _limit: int) -> list[dict[str, object]]:
+        return [
+            {"role": "user", "content": "第一问"},
+            {"role": "assistant", "content": "第一答"},
+            {"role": "user", "content": "第二问"},
+            {"role": "assistant", "content": "第二答"},
+            {"role": "user", "content": "最近问题"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "history-call", "type": "function", "function": {"name": "echo", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "history-call", "content": "历史工具结果"},
+            {"role": "assistant", "content": "最近回答"},
+        ]
+
+    provider = OverflowProvider()
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        memory=RichMemory(),
+        history_loader=history,
+    )
+
+    result = await pipeline.process(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="当前问题"),
+        turn_id="trim-history",
+    )
+
+    assert result.content == "裁剪成功"
+    assert [item["role"] for item in provider.messages[2][1:5]] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert "历史工具结果" in str(provider.messages[2])
+    assert "最近问题" in str(provider.messages[2])
+    assert "当前问题" in str(provider.messages[2])
+    assert "必须保留的长期记忆" in str(provider.messages[2][0]["content"])
+    assert "用户偏好简洁" in str(provider.messages[2])
+
+
+@pytest.mark.asyncio
+async def test_pipeline_disables_low_priority_sections_after_latest_turn(
+    tmp_path: Path,
+) -> None:
+    class SectionProvider:
+        def __init__(self) -> None:
+            self.messages: list[list[dict[str, object]]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages.append(messages)
+            if len(self.messages) < 4:
+                raise ContextLengthError("too many tokens")
+            return LLMResponse("降级成功")
+
+    class SectionMemory(Memory):
+        def read_self(self): return "可裁剪的自我认知"
+        def get_memory_context(self): return "关键长期记忆"
+        def read_recent_context(self): return "可裁剪的近期上下文"
+
+    async def history(_key: str, _limit: int) -> list[dict[str, object]]:
+        return [
+            {"role": "user", "content": "最近问题"},
+            {"role": "assistant", "content": "最近回答"},
+        ]
+
+    provider = SectionProvider()
+    tools = ToolRegistry()
+    tools.register(EchoTool())
+    pipeline = Pipeline(
+        provider,
+        tools,
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        memory=SectionMemory(),
+        history_loader=history,
+    )
+
+    await pipeline.process(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="当前问题"),
+        turn_id="trim-sections",
+    )
+
+    final_payload = str(provider.messages[-1])
+    assert "最近问题" in final_payload
+    assert "最近回答" in final_payload
+    assert "当前问题" in final_payload
+    assert "关键长期记忆" in final_payload
+    assert "用户偏好简洁" in final_payload
+    assert "当前活跃工具" not in final_payload
+    assert "可裁剪的近期上下文" not in final_payload
+    assert "会话环境" not in final_payload
+    assert "可裁剪的自我认知" in final_payload
+
+
+@pytest.mark.asyncio
+async def test_pipeline_context_trimming_is_finite_and_reraises_original_error(
+    tmp_path: Path,
+) -> None:
+    class AlwaysOverflowProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.calls += 1
+            raise ContextLengthError("original overflow")
+
+    provider = AlwaysOverflowProvider()
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+    )
+
+    with pytest.raises(ContextLengthError, match="original overflow"):
+        await pipeline.process(
+            InboundMessage(channel="web", sender="u", chat_id="c", content="当前问题"),
+            turn_id="trim-bottom",
+        )
+
+    assert provider.calls == 5
+
+
+@pytest.mark.asyncio
+async def test_pipeline_context_retry_after_tool_does_not_execute_tool_twice(
+    tmp_path: Path,
+) -> None:
+    class ToolThenOverflowProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(None, [ToolCall("call-once", "echo", {"text": "once"})])
+            if self.calls == 2:
+                raise ContextLengthError("tool continuation overflow")
+            return LLMResponse("工具续轮成功")
+
+    class CountingEchoTool(EchoTool):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, text: str, **kwargs):
+            self.calls += 1
+            return await super().execute(text, **kwargs)
+
+    provider = ToolThenOverflowProvider()
+    tool = CountingEchoTool()
+    tools = ToolRegistry()
+    tools.register(tool)
+    pipeline = Pipeline(
+        provider,
+        tools,
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+    )
+
+    result = await pipeline.process(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="调用一次工具"),
+        turn_id="trim-tool",
+    )
+
+    assert result.content == "工具续轮成功"
+    assert tool.calls == 1
