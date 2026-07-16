@@ -138,6 +138,21 @@ class MemoryEngine:
     def tool_profile(self) -> MemoryToolProfile:
         return _tool_profile()
 
+    def read_self(self) -> str:
+        """供 PromptBlock 读取自我认知，不暴露 Markdown Store 所有权。"""
+
+        return self._markdown.read_self()
+
+    def get_memory_context(self) -> str:
+        """返回可直接注入稳定 Prompt 前缀的 Markdown 长期记忆。"""
+
+        return self._markdown.get_memory_context()
+
+    def read_recent_context(self) -> str:
+        """供动态 system-reminder 读取近期压缩上下文。"""
+
+        return self._markdown.read_recent_context()
+
     async def retrieve_for_turn(self, message: Any) -> str:
         text = str(getattr(message, "content", getattr(message, "text", "")) or "")
         channel = str(getattr(message, "channel", "") or "")
