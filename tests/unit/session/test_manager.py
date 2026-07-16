@@ -121,6 +121,21 @@ async def test_completed_turn_persists_user_and_assistant_in_one_batch(
     ]
 
 
+@pytest.mark.asyncio
+async def test_stale_cached_session_cannot_regress_consolidation_cursor(
+    manager: SessionManager,
+) -> None:
+    session = await manager.get_or_create("web:chat-1")
+
+    # Consolidation 在后台通过 Store 推进 cursor；前台缓存的 Session 仍可能保留旧值。
+    manager.store.set_cursor(session.key, 12)
+    message = session.add_message("user", "下一轮消息")
+    await manager.append_messages(session, [message])
+
+    assert session.last_consolidated == 0
+    assert manager.store.get_cursor(session.key) == 12
+
+
 def test_get_history_rebuilds_image_and_file_attachments(tmp_path: Path) -> None:
     image = tmp_path / "tiny.png"
     image.write_bytes(b"png-bytes")

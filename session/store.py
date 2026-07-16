@@ -555,6 +555,8 @@ class SessionStore:
         payload = json.dumps(metadata or {}, ensure_ascii=False)
         with self._lock:
             self._ensure_open()
+            # Consolidation 在后台直接推进 cursor，而 Session 缓存可能仍持有旧值；普通
+            # metadata upsert 只允许 cursor 单调前进，显式重置仍由 set_cursor() 负责。
             # next_seq 由 add_message 的事务独立维护；元数据刷新绝不能把它
             # 覆盖回旧值，否则后续消息可能获得重复 ID。
             self._conn.execute(
@@ -565,7 +567,10 @@ class SessionStore:
                 ) VALUES (?, ?, ?, ?, 0, ?)
                 ON CONFLICT(key) DO UPDATE SET
                     updated_at = excluded.updated_at,
-                    last_consolidated = excluded.last_consolidated,
+                    last_consolidated = MAX(
+                        sessions.last_consolidated,
+                        excluded.last_consolidated
+                    ),
                     metadata = excluded.metadata
                 """,
                 (

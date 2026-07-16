@@ -295,6 +295,10 @@ async def test_cursor_defaults_to_zero_and_can_advance(store: SessionStore) -> N
 
     assert store.get_cursor("web:chat-1") == 12
 
+    store.set_cursor("web:chat-1", 0)
+
+    assert store.get_cursor("web:chat-1") == 0
+
 
 def test_list_chat_sessions_excludes_empty_and_orders_recent_first(
     store: SessionStore,
