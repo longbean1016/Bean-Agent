@@ -18,6 +18,7 @@ from memory.contracts import (
     MemoryToolProfile, MemoryToolSpec,
 )
 from memory.events import TurnIngested
+from memory.implicit_extractor import ImplicitLongTermExtractor, ImplicitMemoryDraft
 from memory.md_store import MarkdownMemoryStore
 from memory.memorizer import Memorizer
 from memory.optimizer import MemoryOptimizer
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 class MemoryEngine:
     """组装记忆读写、归档和工具能力，不持有共享 LLMProvider 的所有权。"""
 
-    def __init__(self, workspace: Path, embedder: Any, provider: Any, sessions: SessionStore, *, config: MemoryConfig | None = None, consolidation_extractor: ConsolidationExtractor | None = None, keep_count: int = 20, consolidation_threshold: int | None = None) -> None:
+    def __init__(self, workspace: Path, embedder: Any, provider: Any, sessions: SessionStore, *, config: MemoryConfig | None = None, consolidation_extractor: ConsolidationExtractor | None = None, implicit_extractor: Any | None = None, keep_count: int = 20, consolidation_threshold: int | None = None) -> None:
         self._config = config or MemoryConfig()
         self._embedder = embedder
         self._provider = provider
@@ -55,6 +56,7 @@ class MemoryEngine:
             consolidation_extractor or _LLMConsolidationExtractor(provider),
             keep_count=keep_count, threshold=consolidation_threshold,
         )
+        self._implicit_extractor = implicit_extractor or ImplicitLongTermExtractor(provider)
         self._post_response = PostResponseMemoryWorker(
             self._memorizer,
             self._retriever,
@@ -184,7 +186,49 @@ class MemoryEngine:
                     summary, [], f"{result.source_ref}#{index}", event.channel, event.chat_id,
                     emotional_weight=int(entry.get("emotional_weight", 0) or 0),
                 )
+        implicit = await self._implicit_extractor.extract(result.conversation, existing_profile="")
+        await self._save_implicit_long_term(implicit, result, event)
+        # cursor 是整个窗口的最终提交点。上面任一 LLM、Embedding 或 SQLite 写入失败，
+        # 都会跳过这里，使下一次维护仍能用相同 source_ref 幂等重试完整窗口。
+        self._consolidator.commit_cursor(result)
         return result
+
+    async def _save_implicit_long_term(
+        self,
+        draft: ImplicitMemoryDraft,
+        result: ConsolidationResult,
+        event: TurnIngested,
+    ) -> None:
+        for memory_type, items in (
+            ("profile", draft.profile),
+            ("preference", draft.preference),
+            ("procedure", draft.procedure),
+        ):
+            for index, item in enumerate(items):
+                summary = str(item.get("summary") or "").strip()
+                if not summary:
+                    continue
+                extra: dict[str, object] = {
+                    "scope_channel": event.channel,
+                    "scope_chat_id": event.chat_id,
+                }
+                if memory_type == "profile":
+                    extra["category"] = str(item.get("category") or "personal_fact")
+                else:
+                    extra["tool_requirement"] = item.get("tool_requirement")
+                    extra["steps"] = item.get("steps") if isinstance(item.get("steps"), list) else []
+                    if memory_type == "procedure" and isinstance(item.get("rule_schema"), dict):
+                        extra["rule_schema"] = item["rule_schema"]
+                happened_at = item.get("happened_at") if isinstance(item.get("happened_at"), str) else None
+                await self._memorizer.save_item_with_supersede(
+                    summary,
+                    memory_type,
+                    extra,
+                    f"{result.source_ref}#{memory_type}:{index}",
+                    happened_at=happened_at,
+                    emotional_weight=_emotional_weight(item.get("emotional_weight")),
+                    supersede_threshold=self._config.dedup.supersede_threshold,
+                )
 
     async def drain(self) -> None:
         """等待当前已接收的两类后台任务全部完成，主要用于关闭和确定性测试。"""
@@ -334,6 +378,15 @@ class _LLMConsolidationExtractor:
 def _scope(channel: str, chat_id: str):
     from memory.contracts import MemoryScope
     return MemoryScope(session_key=f"{channel}:{chat_id}" if channel and chat_id else "", channel=channel, chat_id=chat_id)
+
+
+def _emotional_weight(value: object) -> int:
+    """容忍 LLM 的字符串或越界输出，避免一处非关键字段阻塞整个归档窗口。"""
+
+    try:
+        return max(0, min(int(value or 0), 10))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _injection_block(records: list[MemoryRecord]) -> str:

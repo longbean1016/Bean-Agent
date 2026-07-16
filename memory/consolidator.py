@@ -22,6 +22,7 @@ class ConsolidationResult:
     source_ref: str
     cursor: int
     history_entries: list[dict[str, object]]
+    conversation: str
 
 
 class ConsolidationExtractor(Protocol):
@@ -54,13 +55,22 @@ class Consolidator:
             f"- [{str(item.get('tag') or 'key_info')}] {str(item.get('content') or '').strip()}"
             for item in draft.pending_items if str(item.get("content") or "").strip()
         ]
-        # cursor 更新是提交点：只有两个 Markdown 目标均成功后才推进，失败则完整重试窗口。
+        # Markdown 先用稳定 source_ref 幂等落盘，但此处不推进 cursor。Engine 还需要完成
+        # event 和隐式长期记忆写入，全部成功后才调用 commit_cursor() 提交整个窗口。
         if pending_lines:
             self._markdown.append_pending_once("\n".join(pending_lines), source_ref=source_ref)
         if draft.recent_context.strip():
             self._markdown.write_recent_context(draft.recent_context)
-        self._sessions.set_cursor(session_key, end)
-        return ConsolidationResult(session_key, source_ref, end, draft.history_entries)
+        conversation = "\n".join(
+            f"[{str(item.get('role') or 'unknown')}] {str(item.get('content') or '')}"
+            for item in window
+        )
+        return ConsolidationResult(session_key, source_ref, end, draft.history_entries, conversation)
+
+    def commit_cursor(self, result: ConsolidationResult) -> None:
+        """在所有派生记忆成功后提交窗口游标。"""
+
+        self._sessions.set_cursor(result.session_key, result.cursor)
 
 
 __all__ = ["ConsolidationDraft", "ConsolidationResult", "Consolidator"]

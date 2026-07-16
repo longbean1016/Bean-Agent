@@ -11,6 +11,7 @@ from agent.config_models import MemoryConfig
 from memory.consolidator import ConsolidationDraft
 from memory.contracts import MemoryIngestRequest, MemoryMutation, MemoryQuery, MemoryScope
 from memory.engine import MemoryEngine
+from memory.implicit_extractor import ImplicitMemoryDraft
 from session.store import NewMessage, SessionStore
 
 
@@ -22,6 +23,8 @@ class Embedder:
 
 class Provider:
     async def complete(self, messages, tools=None):
+        if "长期记忆提取专家" in messages[0]["content"]:
+            return type("Response", (), {"content": "{}"})()
         return type("Response", (), {"content": "<decision>RETRIEVE</decision><history_query>回答风格</history_query>"})()
 
 
@@ -316,3 +319,66 @@ async def test_consolidation_maintenance_serializes_same_session(tmp_path: Path)
         sessions.close()
 
     assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_implicit_memory_failure_keeps_consolidation_cursor(tmp_path: Path) -> None:
+    class FailingImplicitExtractor:
+        async def extract(self, conversation, existing_profile=""):
+            raise RuntimeError("隐式提取失败")
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(4):
+        sessions.add_message(NewMessage(session_key="web:c", role="user", content=f"消息 {index}"))
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path, Embedder(), Provider(), sessions, config=config,
+        consolidation_extractor=Extractor(), implicit_extractor=FailingImplicitExtractor(),
+        keep_count=1, consolidation_threshold=3,
+    )
+    try:
+        await engine.on_turn_committed({"session_key": "web:c", "channel": "web", "chat_id": "c"})
+        await engine.drain()
+        cursor = sessions.get_cursor("web:c")
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert cursor == 0
+
+
+@pytest.mark.asyncio
+async def test_consolidation_saves_all_implicit_memory_types(tmp_path: Path) -> None:
+    class ImplicitExtractor:
+        async def extract(self, conversation, existing_profile=""):
+            return ImplicitMemoryDraft(
+                profile=[{"summary": "用户是后端开发者", "category": "personal_fact"}],
+                preference=[{"summary": "用户偏好中文回答"}],
+                procedure=[{"summary": "修改后运行测试", "tool_requirement": "shell", "steps": ["运行测试"]}],
+            )
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(4):
+        sessions.add_message(NewMessage(session_key="web:c", role="user", content=f"消息 {index}"))
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path, Embedder(), Provider(), sessions, config=config,
+        consolidation_extractor=Extractor(), implicit_extractor=ImplicitExtractor(),
+        keep_count=1, consolidation_threshold=3,
+    )
+    try:
+        await engine.on_turn_committed({"session_key": "web:c", "channel": "web", "chat_id": "c"})
+        await engine.drain()
+        items = engine._store.get_items_by_ids([str(row["id"]) for row in engine._store._active_rows(None)])
+        cursor = sessions.get_cursor("web:c")
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert {item["memory_type"] for item in items} == {"event", "profile", "preference", "procedure"}
+    procedure = next(item for item in items if item["memory_type"] == "procedure")
+    assert procedure["extra_json"]["tool_requirement"] == "shell"
+    assert procedure["extra_json"]["steps"] == ["运行测试"]
+    assert cursor == 3
