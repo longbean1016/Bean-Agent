@@ -81,9 +81,7 @@ class MemoryEngine:
 
     async def query(self, request: MemoryQuery) -> MemoryQueryResult:
         scope = request.scope
-        # 每轮预检索对齐 Akashic 的 context 语义：scope 作为来源信息传入检索器，
-        # 但默认不作为过滤条件；显式查询 intent 的矩阵在独立边界中处理。
-        require_scope_match = bool(scope.channel and scope.chat_id) and request.intent != "context"
+        require_scope_match = _should_require_scope_match(request)
         items = await self._retriever.retrieve(
             request.text,
             memory_types=list(request.filters.kinds) or None,
@@ -598,6 +596,18 @@ def _injection_block(records: list[MemoryRecord]) -> str:
     history = [*groups["event"], *groups["profile"]]
     if history: sections.append("## 【相关历史】与当前用户的过往信息\n" + "\n".join(history))
     return "\n\n".join(sections)
+
+
+def _should_require_scope_match(request: MemoryQuery) -> bool:
+    """按 Akashic 的 query intent 决定来源 scope 是否升级为严格过滤条件。"""
+
+    scope = request.scope
+    has_scope = bool(scope.channel and scope.chat_id)
+    if request.intent in {"answer", "interest"}:
+        return has_scope
+    if request.intent in {"context", "procedure"}:
+        return has_scope and bool(request.context.get("require_scope_match", False))
+    return False
 
 
 def _tool_profile() -> MemoryToolProfile:

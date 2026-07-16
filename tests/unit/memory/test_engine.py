@@ -112,6 +112,78 @@ async def test_turn_context_retrieval_can_recall_event_from_another_session(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        ("answer", {"会话 B 的发布记录"}),
+        ("interest", {"会话 B 的发布记录"}),
+        ("context", {"会话 A 的发布记录", "会话 B 的发布记录"}),
+        ("procedure", {"会话 A 的发布记录", "会话 B 的发布记录"}),
+        ("timeline", {"会话 A 的发布记录", "会话 B 的发布记录"}),
+    ],
+)
+async def test_query_intent_controls_session_scope(
+    tmp_path: Path,
+    intent: str,
+    expected: set[str],
+) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    try:
+        for chat_id, summary in (
+            ("session-a", "会话 A 的发布记录"),
+            ("session-b", "会话 B 的发布记录"),
+        ):
+            engine._store.upsert_item(
+                "event",
+                summary,
+                [1.0, 0.0],
+                f"web:{chat_id}@0-1",
+                extra={"scope_channel": "web", "scope_chat_id": chat_id},
+            )
+        result = await engine.query(MemoryQuery(
+            "发布记录",
+            intent=intent,
+            scope=MemoryScope(channel="web", chat_id="session-b"),
+        ))
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert {record.summary for record in result.records} == expected
+
+
+@pytest.mark.asyncio
+async def test_context_query_can_explicitly_require_session_scope(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    try:
+        for chat_id in ("session-a", "session-b"):
+            engine._store.upsert_item(
+                "event",
+                f"{chat_id} 的记录",
+                [1.0, 0.0],
+                f"web:{chat_id}@0-1",
+                extra={"scope_channel": "web", "scope_chat_id": chat_id},
+            )
+        result = await engine.query(MemoryQuery(
+            "记录",
+            intent="context",
+            scope=MemoryScope(channel="web", chat_id="session-b"),
+            context={"require_scope_match": True},
+        ))
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert [record.summary for record in result.records] == ["session-b 的记录"]
+
+
+@pytest.mark.asyncio
 async def test_turn_committed_consolidates_and_syncs_vector_event(tmp_path: Path) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
     for index in range(6):
