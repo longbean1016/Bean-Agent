@@ -126,3 +126,39 @@ it("代码复制保留原始格式并将按钮图标切换为勾选", async () =
     "function demo() {\n  const ready = true;\n\n  return ready;\n}\n",
   );
 });
+
+it("Mermaid fenced block 作为普通代码显示且不生成图表", async () => {
+  localStorage.setItem("beanagent.session_id", "web:mermaid-source");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const payload = String(input).includes("/messages") ? {
+      items: [{
+        id: "web:mermaid-source:0",
+        role: "assistant",
+        content: "```mermaid\nflowchart TD\n  A[开始] --> B[完成]\n```",
+        turn_id: "turn-mermaid",
+        tool_chain: [],
+        timestamp: "2026-07-18T10:00:00+08:00",
+      }],
+      total: 1,
+    } : { items: [], total: 0 };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  const { container } = render(<App />);
+
+  await screen.findByText(/flowchart TD/);
+  const codeBlock = container.querySelector('[data-streamdown="code-block"]');
+  expect(codeBlock).not.toBeNull();
+  expect(codeBlock).toHaveTextContent("A[开始] --> B[完成]");
+  expect(codeBlock).toHaveTextContent("mermaid");
+  const diagramSvg = [...container.querySelectorAll(".message-body svg")]
+    .find((svg) => !svg.closest('[data-streamdown="code-block-actions"]'));
+  expect(diagramSvg).toBeUndefined();
+});
+
+it("空会话不再提供 Mermaid 流程图示例", async () => {
+  render(<App />);
+
+  await screen.findByText("从一个具体问题开始");
+  expect(screen.queryByText("画一张 Mermaid 流程图说明当前链路")).not.toBeInTheDocument();
+});

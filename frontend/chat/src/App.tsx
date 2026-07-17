@@ -1,7 +1,6 @@
 import * as Collapsible from "@radix-ui/react-collapsible";
 import * as Dialog from "@radix-ui/react-dialog";
 import { code } from "@streamdown/code";
-import { mermaid } from "@streamdown/mermaid";
 import {
   AlertCircle,
   Brain,
@@ -28,10 +27,11 @@ import type { ChatFrame, ChatMessage, ConnectionStatus, SessionSummary, ToolActi
 import { BeanWebSocketClient } from "./websocketClient";
 
 const SESSION_STORAGE_KEY = "beanagent.session_id";
-const markdownPlugins = { code, mermaid };
+// Mermaid 暂时只按普通 fenced code 展示。交互式 SVG 会在复杂图中撑大消息区域，
+// 并劫持图表区域内的缩放手势；恢复预览前必须先提供固定视口和显式打开入口。
+const markdownPlugins = { code };
 const markdownControls = {
   code: { copy: true, download: false },
-  mermaid: false,
   table: false,
 };
 const markdownTranslations = {
@@ -420,7 +420,7 @@ function EmptyConversation({ onExample }: { onExample: (text: string) => void })
     <div className="empty-conversation">
       <span className="empty-mark">B</span><h1>从一个具体问题开始</h1><p>BeanAgent 可以读取工作区、调用工具并记住重要信息。</p>
       <div className="example-prompts">
-        {["列出当前工作目录并概括项目结构", "记住我的项目偏好", "画一张 Mermaid 流程图说明当前链路"].map((text) => <button key={text} onClick={() => onExample(text)}>{text}</button>)}
+        {["列出当前工作目录并概括项目结构", "记住我的项目偏好", "解释一段代码并指出潜在风险"].map((text) => <button key={text} onClick={() => onExample(text)}>{text}</button>)}
       </div>
     </div>
   );
