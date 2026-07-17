@@ -50,8 +50,10 @@ def register_filesystem_tools(
     registry.register(EditFileTool(allowed_dir))
     registry.register(ListDirTool(allowed_dir))
     if vl_available:
-        # 只有工具确实已注册时，ReadFileTool 才会提示模型调用它。
-        registry.register(ReadImageVisionTool(vl_provider, vl_model, allowed_dir))
+        # 对齐 Akashic：Channel 上传可能落在 workspace/uploads 或系统临时目录，
+        # 它们不一定属于 agent.workdir。视觉工具因此不继承普通文件工具的路径根
+        # 限制；Read/Write/Edit/List 仍严格限制在 allowed_dir 内。
+        registry.register(ReadImageVisionTool(vl_provider, vl_model, None))
     return registry
 
 
