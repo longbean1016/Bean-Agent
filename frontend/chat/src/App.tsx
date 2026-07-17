@@ -3,6 +3,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { code } from "@streamdown/code";
 import {
   AlertCircle,
+  ArrowDown,
   Brain,
   Check,
   ChevronDown,
@@ -79,8 +80,10 @@ export function App() {
   const [files, setFiles] = useState<File[]>([]);
   const [sending, setSending] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [followingLatest, setFollowingLatest] = useState(true);
   const clientRef = useRef<BeanWebSocketClient | null>(null);
   const conversationRef = useRef<HTMLElement | null>(null);
+  const followingLatestRef = useRef(true);
   const chatRef = useRef(chat);
   chatRef.current = chat;
 
@@ -125,19 +128,38 @@ export function App() {
 
   useEffect(() => {
     const conversation = conversationRef.current;
-    if (!conversation || chat.messages.length === 0) return;
-    // 对齐 Akashic 的 stick-to-bottom：流式 delta、thinking 和工具状态改变 DOM
-    // 后再滚动，保证新内容始终出现在编辑器上方的可视区域。
+    if (!conversation || chat.messages.length === 0 || !followingLatestRef.current) return;
+    // 流式更新只在用户仍停留于底部时跟随。用户向上阅读后不能由下一段 delta
+    // 抢回视口；这是 Akashic stick-to-bottom 的 escaped lock 边界。
     const frame = requestAnimationFrame(() => {
-      conversation.scrollTo({ top: conversation.scrollHeight, behavior: "smooth" });
+      conversation.scrollTo({ top: conversation.scrollHeight, behavior: "auto" });
     });
     return () => cancelAnimationFrame(frame);
   }, [chat.messages]);
+
+  const setLatestFollowing = (value: boolean) => {
+    followingLatestRef.current = value;
+    setFollowingLatest(value);
+  };
+
+  const handleConversationScroll = () => {
+    const conversation = conversationRef.current;
+    if (!conversation) return;
+    const distanceFromBottom = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight;
+    setLatestFollowing(distanceFromBottom <= 48);
+  };
+
+  const scrollToLatest = (behavior: ScrollBehavior = "smooth") => {
+    setLatestFollowing(true);
+    const conversation = conversationRef.current;
+    if (conversation) conversation.scrollTo({ top: conversation.scrollHeight, behavior });
+  };
 
   const loadSession = async (sessionId: string, closeSidebar = true) => {
     try {
       const messages = rowsToMessages(await fetchMessages(sessionId));
       localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+      setLatestFollowing(true);
       dispatch({ type: "ui.session.select", sessionId, messages });
       if (closeSidebar) setSidebarOpen(false);
     } catch (error) {
@@ -148,6 +170,7 @@ export function App() {
   const createSession = () => {
     if (connection !== "connected") return;
     localStorage.removeItem(SESSION_STORAGE_KEY);
+    setLatestFollowing(true);
     dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
     clientRef.current?.send({ type: "session.create", request_id: crypto.randomUUID() });
     setSidebarOpen(false);
@@ -161,6 +184,7 @@ export function App() {
       return;
     }
     setSending(true);
+    scrollToLatest();
     dispatch({ type: "ui.error.clear" });
     try {
       const uploaded = await Promise.all(files.map(uploadAttachment));
@@ -243,11 +267,16 @@ export function App() {
           </div>
         ) : null}
 
-        <section className="conversation" aria-live="polite" ref={conversationRef}>
+        <section className="conversation" aria-live="polite" ref={conversationRef} onScroll={handleConversationScroll}>
           {chat.messages.length === 0 ? <EmptyConversation onExample={setInput} /> : chat.messages.map((message) => (
             <MessageView key={message.id} message={message} />
           ))}
         </section>
+        {!followingLatest ? (
+          <button className="scroll-latest" aria-label="回到最新消息" title="回到最新消息" onClick={() => scrollToLatest()}>
+            <ArrowDown size={18} />
+          </button>
+        ) : null}
 
         <Composer
           active={Boolean(chat.activeTurnId)}

@@ -72,6 +72,54 @@ it("首次连接创建 Session 并发送用户消息", async () => {
   expect(screen.getByText("组件测试消息")).toBeVisible();
 });
 
+it("用户向上滚动后流式增量不抢回视口并可主动回到底部", async () => {
+  localStorage.setItem("beanagent.session_id", "web:scroll-lock");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const payload = String(input).includes("/messages") ? {
+      items: [{
+        id: "web:scroll-lock:0",
+        role: "assistant",
+        content: "已有的长回答",
+        turn_id: "old-turn",
+        tool_chain: [],
+        timestamp: "2026-07-18T10:00:00+08:00",
+      }],
+      total: 1,
+    } : { items: [], total: 0 };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  const { container } = render(<App />);
+  await screen.findByText("已有的长回答");
+  const conversation = container.querySelector<HTMLElement>(".conversation");
+  expect(conversation).not.toBeNull();
+  Object.defineProperties(conversation!, {
+    scrollHeight: { configurable: true, value: 1200 },
+    clientHeight: { configurable: true, value: 400 },
+    scrollTop: { configurable: true, writable: true, value: 300 },
+  });
+  const scrollTo = vi.mocked(conversation!.scrollTo);
+  await waitFor(() => expect(scrollTo).toHaveBeenCalled());
+  scrollTo.mockClear();
+
+  fireEvent.scroll(conversation!);
+  const latestButton = await screen.findByRole("button", { name: "回到最新消息" });
+  const socket = FakeWebSocket.instances[0];
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.started", request_id: "r-scroll", session_id: "web:scroll-lock",
+    turn_id: "turn-scroll", content: "继续",
+  }) } as MessageEvent);
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "answer.delta", session_id: "web:scroll-lock", turn_id: "turn-scroll", delta: "新内容",
+  }) } as MessageEvent);
+
+  await screen.findByText("新内容");
+  expect(scrollTo).not.toHaveBeenCalled();
+  fireEvent.click(latestButton);
+  expect(scrollTo).toHaveBeenCalledWith({ top: 1200, behavior: "smooth" });
+  expect(screen.queryByRole("button", { name: "回到最新消息" })).not.toBeInTheDocument();
+});
+
 it("粗体包裹的裸链接不显示星号并可直接跳转", async () => {
   localStorage.setItem("beanagent.session_id", "web:links");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
