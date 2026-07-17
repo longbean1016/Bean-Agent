@@ -3,6 +3,9 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 
+let systemDark = false;
+let colorSchemeListener: ((event: MediaQueryListEvent) => void) | null = null;
+
 class FakeWebSocket {
   static CONNECTING = 0;
   static OPEN = 1;
@@ -33,6 +36,9 @@ class FakeWebSocket {
 
 beforeEach(() => {
   localStorage.clear();
+  document.documentElement.removeAttribute("data-theme");
+  systemDark = false;
+  colorSchemeListener = null;
   FakeWebSocket.instances = [];
   vi.stubGlobal("WebSocket", FakeWebSocket);
   Object.defineProperty(HTMLElement.prototype, "scrollTo", {
@@ -44,6 +50,18 @@ beforeEach(() => {
     value: { writeText: vi.fn().mockResolvedValue(undefined) },
   });
   vi.spyOn(window, "open").mockImplementation(() => null);
+  vi.stubGlobal("matchMedia", vi.fn(() => ({
+    matches: systemDark,
+    media: "(prefers-color-scheme: dark)",
+    onchange: null,
+    addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => { colorSchemeListener = listener; },
+    removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
+      if (colorSchemeListener === listener) colorSchemeListener = null;
+    },
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  })));
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     const payload = url.includes("/messages") ? { items: [], total: 0 } : { items: [], total: 0 };
@@ -118,6 +136,32 @@ it("用户向上滚动后流式增量不抢回视口并可主动回到底部", a
   fireEvent.click(latestButton);
   expect(scrollTo).toHaveBeenCalledWith({ top: 1200, behavior: "smooth" });
   expect(screen.queryByRole("button", { name: "回到最新消息" })).not.toBeInTheDocument();
+});
+
+it("主题支持浅色、跟随系统和深色并持久化选择", async () => {
+  render(<App />);
+  await screen.findByText("已连接");
+
+  const system = screen.getByRole("button", { name: "跟随系统" });
+  const dark = screen.getByRole("button", { name: "深色" });
+  const light = screen.getByRole("button", { name: "浅色" });
+  expect(system).toHaveAttribute("aria-pressed", "true");
+  expect(document.documentElement).toHaveAttribute("data-theme", "light");
+
+  fireEvent.click(dark);
+  expect(document.documentElement).toHaveAttribute("data-theme", "dark");
+  expect(localStorage.getItem("beanagent.theme")).toBe("dark");
+  expect(dark).toHaveAttribute("aria-pressed", "true");
+
+  fireEvent.click(light);
+  expect(document.documentElement).toHaveAttribute("data-theme", "light");
+  expect(localStorage.getItem("beanagent.theme")).toBe("light");
+
+  fireEvent.click(system);
+  systemDark = true;
+  colorSchemeListener?.({ matches: true } as MediaQueryListEvent);
+  await waitFor(() => expect(document.documentElement).toHaveAttribute("data-theme", "dark"));
+  expect(localStorage.getItem("beanagent.theme")).toBe("system");
 });
 
 it("粗体包裹的裸链接不显示星号并可直接跳转", async () => {

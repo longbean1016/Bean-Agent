@@ -11,6 +11,18 @@
   --sd-border: #dbe2df;
   --sd-primary: #0b766e;
   --sd-primary-foreground: #ffffff;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --sd-background: #171c1a;
+  --sd-foreground: #e2e9e6;
+  --sd-muted: #252c29;
+  --sd-muted-foreground: #9ba8a3;
+  --sd-border: #35413d;
+  --sd-primary: #62b8aa;
+  --sd-primary-foreground: #0d1714;
 }
 
 * { box-sizing: border-box; }
@@ -41,10 +53,15 @@ button { color: inherit; }
 
 .chat-workspace { position: relative; display: grid; grid-template-areas: "topbar" "error" "conversation" "composer"; grid-template-rows: 58px auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; height: 100%; overflow: hidden; background: #fbfcfb; }
 .topbar { grid-area: topbar; display: flex; align-items: center; justify-content: space-between; min-width: 0; padding: 0 22px; border-bottom: 1px solid #e0e5e3; background: rgba(251, 252, 251, .96); }
+.topbar-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .brand-compact { display: none; }
 .connection-state { display: inline-flex; align-items: center; gap: 7px; min-width: 92px; min-height: 32px; padding: 0 10px; border: 1px solid #d4dcda; border-radius: 6px; background: #fff; color: #53605c; cursor: default; font-size: 12px; }
 .connection-state.connected svg { color: #0b766e; }
 .connection-state:not(.connected) { cursor: pointer; }
+.theme-control { display: inline-grid; grid-template-columns: repeat(3, auto); height: 32px; padding: 2px; border: 1px solid #d4dcda; border-radius: 6px; background: #edf2f0; }
+.theme-control button { display: inline-flex; min-width: 64px; height: 26px; align-items: center; justify-content: center; gap: 5px; padding: 0 7px; border: 0; border-radius: 4px; color: #687570; background: transparent; cursor: pointer; font-size: 11px; }
+.theme-control button:hover { color: #164f49; }
+.theme-control button.active { color: #075f58; background: #fff; box-shadow: 0 1px 3px rgba(26, 48, 42, .12); font-weight: 650; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .icon-button.mobile-menu { display: none; }
@@ -145,6 +162,57 @@ button { color: inherit; }
 .sidebar-close { position: absolute; z-index: 2; top: 12px; right: 10px; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 
+/* 深色模式保持工作界面的低干扰层次，覆盖现有组件中的浅色实体表面。 */
+:root[data-theme="dark"] { color: #e2e9e6; background: #141816; }
+:root[data-theme="dark"] body,
+:root[data-theme="dark"] .app-shell { background: #141816; }
+:root[data-theme="dark"] .desktop-sidebar,
+:root[data-theme="dark"] .mobile-sidebar { border-color: #34403c; background: #202624; }
+:root[data-theme="dark"] .chat-workspace,
+:root[data-theme="dark"] .composer-wrap { background: #171c1a; }
+:root[data-theme="dark"] .topbar { border-color: #303a37; background: rgba(23, 28, 26, .97); }
+:root[data-theme="dark"] .brand-lockup span:last-child,
+:root[data-theme="dark"] .brand-compact span:last-child,
+:root[data-theme="dark"] .message-label,
+:root[data-theme="dark"] .composer-hint,
+:root[data-theme="dark"] .session-heading,
+:root[data-theme="dark"] .session-empty { color: #93a19c; }
+:root[data-theme="dark"] .new-chat-button,
+:root[data-theme="dark"] .connection-state,
+:root[data-theme="dark"] .scroll-latest,
+:root[data-theme="dark"] .composer,
+:root[data-theme="dark"] .theme-control button.active { border-color: #3b4944; color: #dfe8e4; background: #252c29; }
+:root[data-theme="dark"] .theme-control { border-color: #3b4944; background: #121715; }
+:root[data-theme="dark"] .theme-control button { color: #93a19c; }
+:root[data-theme="dark"] .theme-control button:hover,
+:root[data-theme="dark"] .theme-control button.active { color: #75c9bb; }
+:root[data-theme="dark"] .session-row:hover { background: #29312e; }
+:root[data-theme="dark"] .session-row.active { border-left-color: #62b8aa; background: #171c1a; }
+:root[data-theme="dark"] .message-body,
+:root[data-theme="dark"] .tool-trigger strong,
+:root[data-theme="dark"] .composer textarea { color: #e2e9e6; }
+:root[data-theme="dark"] .user-message .message-body { border-color: #3a4944; background: #252d2a; }
+:root[data-theme="dark"] .thinking { border-color: #52625c; }
+:root[data-theme="dark"] .thinking-trigger,
+:root[data-theme="dark"] .tool-trigger,
+:root[data-theme="dark"] .thinking-content,
+:root[data-theme="dark"] .tool-detail { color: #aab6b1; }
+:root[data-theme="dark"] .tool-timeline { border-color: #3d4a45; }
+:root[data-theme="dark"] .tool-step { border-color: #37433f; background: #202624; }
+:root[data-theme="dark"] .tool-step::before { border-color: #171c1a; }
+:root[data-theme="dark"] .tool-detail pre,
+:root[data-theme="dark"] [data-streamdown="code-block-header"] { border-color: #3a4642; background: #252c29; }
+:root[data-theme="dark"] [data-streamdown="code-block"],
+:root[data-theme="dark"] [data-streamdown="code-block-body"] { border-color: #3a4642; background: #121715; }
+:root[data-theme="dark"] [data-streamdown="code-block-copy-button"] { color: #aab6b1; }
+:root[data-theme="dark"] [data-streamdown="code-block-copy-button"]:hover { color: #78c7ba; background: #29332f; }
+:root[data-theme="dark"] .file-attachment,
+:root[data-theme="dark"] .pending-file { border-color: #394641; background: #222a27; }
+:root[data-theme="dark"] .example-prompts button { border-color: #36423e; color: #dce5e1; }
+:root[data-theme="dark"] .example-prompts button:hover { border-color: #57998e; background: #202b27; }
+:root[data-theme="dark"] .error-banner { border-color: #784841; color: #f0aaa0; background: #321f1c; }
+:root[data-theme="dark"] .dialog-overlay { background: rgba(5, 8, 7, .62); }
+
 @media (max-width: 760px) {
   .app-shell { grid-template-columns: minmax(0, 1fr); }
   .desktop-sidebar { display: none; }
@@ -154,6 +222,9 @@ button { color: inherit; }
   .brand-compact .brand-mark { width: 30px; height: 30px; }
   .connection-state { min-width: 34px; width: 34px; padding: 0; justify-content: center; }
   .connection-state span { display: none; }
+  .topbar-actions { gap: 6px; }
+  .theme-control button { min-width: 30px; width: 30px; padding: 0; }
+  .theme-control button span { display: none; }
   .conversation { padding: 20px 14px 80px; }
   .scroll-latest { right: 14px; bottom: 106px; }
   .message { grid-template-columns: 1fr; gap: 6px; margin-bottom: 24px; }

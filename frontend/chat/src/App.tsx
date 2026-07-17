@@ -12,10 +12,13 @@ import {
   Image as ImageIcon,
   Menu,
   MessageSquarePlus,
+  Monitor,
+  Moon,
   Paperclip,
   PlugZap,
   RefreshCw,
   SendHorizontal,
+  Sun,
   Wrench,
   X,
 } from "lucide-react";
@@ -28,6 +31,8 @@ import type { ChatFrame, ChatMessage, ConnectionStatus, SessionSummary, ToolActi
 import { BeanWebSocketClient } from "./websocketClient";
 
 const SESSION_STORAGE_KEY = "beanagent.session_id";
+const THEME_STORAGE_KEY = "beanagent.theme";
+type ThemePreference = "light" | "system" | "dark";
 // Mermaid 暂时只按普通 fenced code 展示。交互式 SVG 会在复杂图中撑大消息区域，
 // 并劫持图表区域内的缩放手势；恢复预览前必须先提供固定视口和显式打开入口。
 const markdownPlugins = { code };
@@ -81,11 +86,28 @@ export function App() {
   const [sending, setSending] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [followingLatest, setFollowingLatest] = useState(true);
+  const [theme, setTheme] = useState<ThemePreference>(() => readThemePreference());
+  const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
   const clientRef = useRef<BeanWebSocketClient | null>(null);
   const conversationRef = useRef<HTMLElement | null>(null);
   const followingLatestRef = useRef(true);
   const chatRef = useRef(chat);
   chatRef.current = chat;
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const handleChange = (event: MediaQueryListEvent) => setSystemDark(event.matches);
+    setSystemDark(media.matches);
+    media.addEventListener("change", handleChange);
+    return () => media.removeEventListener("change", handleChange);
+  }, []);
+
+  useEffect(() => {
+    // preference 与实际主题分离：system 保留用户意图，系统变化只更新最终配色。
+    const resolved = theme === "system" ? (systemDark ? "dark" : "light") : theme;
+    document.documentElement.dataset.theme = resolved;
+    localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [systemDark, theme]);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -257,7 +279,10 @@ export function App() {
             <span className="brand-mark">B</span>
             <div><strong>BeanAgent</strong><span>{shortSession(chat.sessionId)}</span></div>
           </div>
-          <ConnectionControl status={connection} onReconnect={() => clientRef.current?.reconnectNow()} />
+          <div className="topbar-actions">
+            <ConnectionControl status={connection} onReconnect={() => clientRef.current?.reconnectNow()} />
+            <ThemeControl value={theme} onChange={setTheme} />
+          </div>
         </header>
 
         {chat.error ? (
@@ -328,6 +353,33 @@ function ConnectionControl({ status, onReconnect }: { status: ConnectionStatus; 
       {status === "connected" ? <PlugZap size={15} /> : <RefreshCw size={15} className={status === "reconnecting" ? "spin" : ""} />}
       <span>{label}</span>
     </button>
+  );
+}
+
+function ThemeControl({ value, onChange }: { value: ThemePreference; onChange: (value: ThemePreference) => void }) {
+  const options = [
+    { value: "light" as const, label: "浅色", icon: Sun },
+    { value: "system" as const, label: "跟随系统", icon: Monitor },
+    { value: "dark" as const, label: "深色", icon: Moon },
+  ];
+  return (
+    <div className="theme-control" role="group" aria-label="主题模式">
+      {options.map((option) => {
+        const Icon = option.icon;
+        return (
+          <button
+            key={option.value}
+            className={value === option.value ? "active" : ""}
+            aria-label={option.label}
+            aria-pressed={value === option.value}
+            title={option.label}
+            onClick={() => onChange(option.value)}
+          >
+            <Icon size={14} /><span>{option.label}</span>
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -457,6 +509,11 @@ function EmptyConversation({ onExample }: { onExample: (text: string) => void })
 
 function errorFrame(error: unknown): ChatFrame {
   return { type: "error", request_id: "", code: "client_error", message: error instanceof Error ? error.message : "发生未知错误" };
+}
+
+function readThemePreference(): ThemePreference {
+  const stored = localStorage.getItem(THEME_STORAGE_KEY);
+  return stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
 }
 
 function shortSession(sessionId: string): string { return sessionId ? `会话 ${sessionId.slice(-8)}` : "正在创建会话"; }
