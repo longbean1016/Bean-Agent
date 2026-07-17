@@ -219,7 +219,7 @@ it("代码复制保留原始格式并将按钮图标切换为勾选", async () =
   );
 });
 
-it("Mermaid fenced block 作为普通代码显示且不生成图表", async () => {
+it("Mermaid fenced block 强制改写为 text 代码且不生成图表", async () => {
   localStorage.setItem("beanagent.session_id", "web:mermaid-source");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages") ? {
@@ -242,7 +242,8 @@ it("Mermaid fenced block 作为普通代码显示且不生成图表", async () =
   const codeBlock = container.querySelector('[data-streamdown="code-block"]');
   expect(codeBlock).not.toBeNull();
   expect(codeBlock).toHaveTextContent("A[开始] --> B[完成]");
-  expect(codeBlock).toHaveTextContent("mermaid");
+  expect(codeBlock).toHaveTextContent("text");
+  expect(codeBlock).not.toHaveTextContent("mermaid");
   const diagramSvg = [...container.querySelectorAll(".message-body svg")]
     .find((svg) => !svg.closest('[data-streamdown="code-block-actions"]'));
   expect(diagramSvg).toBeUndefined();

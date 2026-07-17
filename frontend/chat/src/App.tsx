@@ -57,8 +57,15 @@ function prepareMessageMarkdown(markdown: string): string {
   let fenced = false;
   return markdown.split(/(\n)/).map((line) => {
     if (line === "\n") return line;
-    if (/^\s*(```|~~~)/.test(line)) {
+    const fence = line.match(/^(\s*)(```|~~~)(.*)$/);
+    if (fence) {
+      const opening = !fenced;
       fenced = !fenced;
+      // 即使旧 bundle 或未来依赖再次注册 Mermaid 插件，输入边界也不会把流程图
+      // 交给交互式 SVG 渲染器；只改语言标识，图表源码仍可查看和复制。
+      if (opening && /^\s*mermaid\s*$/i.test(fence[3])) {
+        return `${fence[1]}${fence[2]}text`;
+      }
       return line;
     }
     if (fenced) return line;
