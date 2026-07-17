@@ -236,6 +236,10 @@ def build_core_runtime(
         history_loader=sessions.load_history,
         history_limit=config.session.history_window,
         max_iterations=config.llm.max_iterations or 10,
+        # 主模型和独立视觉模型是两条互斥的图片消费路径：前者直接接收图片块，
+        # 后者只通过 read_image_vision 工具读取本地上传路径。
+        multimodal=config.llm.multimodal,
+        vl_available=vision_provider is not None,
     )
     agent_loop = AgentLoop(messages, events, pipeline, sessions)
     return CoreRuntime(

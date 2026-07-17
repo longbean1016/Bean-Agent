@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from agent.attachment_content import build_current_user_content
 from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted
 from agent.message_bus import InboundMessage
 from agent.pipeline import Pipeline
@@ -122,6 +123,85 @@ async def test_pipeline_includes_text_and_image_attachments_in_current_turn(
     assert current[0]["image_url"]["url"].startswith("data:image/png;base64,")
     assert "附件中的关键内容" in current[-1]["text"]
     assert "分析附件" in current[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_attachment_content_routes_local_image_to_independent_vl(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "sample.png"
+    Image.new("RGB", (3, 3), "#0f766e").save(image_path)
+
+    content = await build_current_user_content(
+        "这是什么？",
+        [str(image_path)],
+        multimodal=False,
+        vl_available=True,
+    )
+
+    assert isinstance(content, str)
+    assert str(image_path) in content
+    assert "read_image_vision" in content
+    assert "当前主模型不能直接接收图片内容" in content
+    assert "image_url" not in content
+
+
+@pytest.mark.asyncio
+async def test_attachment_content_reports_missing_image_capability(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "sample.png"
+    Image.new("RGB", (3, 3), "#0f766e").save(image_path)
+
+    content = await build_current_user_content(
+        "这是什么？",
+        [str(image_path)],
+        multimodal=False,
+        vl_available=False,
+    )
+
+    assert isinstance(content, str)
+    assert str(image_path) in content
+    assert "未配置 VL 视觉模型" in content
+    assert "read_image_vision" not in content
+    assert "image_url" not in content
+
+
+@pytest.mark.asyncio
+async def test_pipeline_routes_image_to_independent_vl_tool_hint(
+    tmp_path: Path,
+) -> None:
+    class FinalProvider:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages = messages
+            return LLMResponse("已识别")
+
+    image_path = tmp_path / "sample.png"
+    Image.new("RGB", (3, 3), "#0f766e").save(image_path)
+    provider = FinalProvider()
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        multimodal=False,
+        vl_available=True,
+    )
+
+    await pipeline.process(
+        InboundMessage("web", "u", "c", "这是什么？", [str(image_path)]),
+        turn_id="t-vl",
+    )
+
+    current = provider.messages[-1]["content"]
+    assert isinstance(current, str)
+    assert str(image_path) in current
+    assert "read_image_vision" in current
+    assert "image_url" not in current
 
 
 def _assembler(tmp_path: Path) -> PromptAssembler:

@@ -40,7 +40,21 @@ _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 class Pipeline:
     """执行单个 Turn 的纯推理部分，不负责 Session 持久化或最终出站。"""
 
-    def __init__(self, provider: ProviderApi, tools: ToolRegistry, event_bus: EventBus, assembler: PromptAssembler, *, workspace: str, memory: Any | None = None, history_loader: HistoryLoader | None = None, history_limit: int = 40, max_iterations: int = 10) -> None:
+    def __init__(
+        self,
+        provider: ProviderApi,
+        tools: ToolRegistry,
+        event_bus: EventBus,
+        assembler: PromptAssembler,
+        *,
+        workspace: str,
+        memory: Any | None = None,
+        history_loader: HistoryLoader | None = None,
+        history_limit: int = 40,
+        max_iterations: int = 10,
+        multimodal: bool = True,
+        vl_available: bool = False,
+    ) -> None:
         self._provider = provider
         self._tools = tools
         self._events = event_bus
@@ -50,6 +64,10 @@ class Pipeline:
         self._history_loader = history_loader
         self._history_limit = max(0, int(history_limit))
         self._max_iterations = max(1, int(max_iterations))
+        # 图片能力在应用组装时确定，Turn 内只读取这份稳定快照。纯文本主模型不能
+        # 接收 image_url；独立 VL 可用时则由现有 ReAct 工具链负责真正读图。
+        self._multimodal = bool(multimodal)
+        self._vl_available = bool(vl_available)
 
     async def process(self, message: InboundMessage, *, turn_id: str) -> PipelineResult:
         self._tools.set_context(channel=message.channel, chat_id=message.chat_id, session_key=message.session_key)
@@ -62,7 +80,12 @@ class Pipeline:
             if (tool := self._tools.get_tool(name)) is not None
         )
         context = TurnContext(self._workspace, message.channel, message.chat_id, self._memory, retrieved, summary, names)
-        current_content = await build_current_user_content(message.content, message.media)
+        current_content = await build_current_user_content(
+            message.content,
+            message.media,
+            multimodal=self._multimodal,
+            vl_available=self._vl_available,
+        )
         message_timestamp = datetime.now(_LOCAL_TZ)
         disabled_sections: set[str] = set()
         react_messages: list[dict[str, Any]] = []

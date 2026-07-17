@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import mimetypes
 from pathlib import Path
 from typing import Any
@@ -14,18 +15,33 @@ _MAX_TEXT_CHARS = 100_000
 async def build_current_user_content(
     text: str,
     media_paths: list[str],
+    *,
+    multimodal: bool = True,
+    vl_available: bool = False,
 ) -> str | list[dict[str, Any]]:
-    """异步读取附件，避免在 AgentLoop 事件循环中执行同步文件 IO。"""
+    """按模型能力构造附件内容，并避免在事件循环中执行同步文件 IO。"""
 
     if not media_paths:
         return text
-    return await asyncio.to_thread(_build_current_user_content_sync, text, media_paths)
+    return await asyncio.to_thread(
+        _build_current_user_content_sync,
+        text,
+        media_paths,
+        multimodal=multimodal,
+        vl_available=vl_available,
+    )
 
 
 def _build_current_user_content_sync(
     text: str,
     media_paths: list[str],
+    *,
+    multimodal: bool,
+    vl_available: bool,
 ) -> str | list[dict[str, Any]]:
+    if not multimodal:
+        return _build_text_with_media_refs(text, media_paths, vl_available=vl_available)
+
     images: list[dict[str, Any]] = []
     text_parts: list[str] = []
     for raw_path in media_paths:
@@ -48,6 +64,54 @@ def _build_current_user_content_sync(
     if not images:
         return combined
     return [*images, {"type": "text", "text": combined}]
+
+
+def _build_text_with_media_refs(
+    text: str,
+    media_paths: list[str],
+    *,
+    vl_available: bool,
+) -> str:
+    """为纯文本主模型保留附件引用，图片只能经独立 VL 工具读取。"""
+
+    refs: list[str] = []
+    local_images: list[str] = []
+    for raw_path in media_paths:
+        value = str(raw_path)
+        if value.startswith(("http://", "https://")):
+            refs.append(f"- 图片URL: {value}")
+            continue
+
+        path = Path(value)
+        mime, _ = mimetypes.guess_type(path.name)
+        if not path.is_file():
+            continue
+        if mime and mime.startswith("image/"):
+            refs.append(f"- 图片路径: {value}")
+            local_images.append(value)
+        else:
+            refs.append(f"- 文件路径: {value}")
+
+    if not refs:
+        return text
+
+    lines = [text, "", "[附加媒体]", *refs]
+    if vl_available and local_images:
+        # 主模型只看到路径和明确的 ReAct 指令，不能收到它不支持的 image_url；
+        # 真正的图片字节由 read_image_vision 交给独立 VL Provider。
+        lines.append(
+            "当前主模型不能直接接收图片内容；需要识别图片时，调用 read_image_vision 工具。"
+        )
+        for path in local_images:
+            quoted_path = json.dumps(path, ensure_ascii=False)
+            lines.append(
+                f'- read_image_vision(path={quoted_path}, prompt="描述这张图片的内容")'
+            )
+    elif vl_available:
+        lines.append("当前主模型不能直接接收图片内容；远程图片需先取得本地路径后再读图。")
+    else:
+        lines.append("当前主模型不能直接接收图片内容，且未配置 VL 视觉模型。")
+    return "\n".join(lines)
 
 
 __all__ = ["build_current_user_content"]
