@@ -25,6 +25,8 @@ def test_config_defaults_and_nested_instances_are_independent() -> None:
     assert first.llm.model == "deepseek-v4-flash"
     assert first.llm.max_tokens == 8192
     assert first.memory.embedding.dimensions == 1024
+    assert first.memory.retrieval.procedure_threshold == 0.66
+    assert first.memory.retrieval.max_event_profile == 4
     assert first.session.history_window == 40
     assert first.channels.chat.port == 6322
     assert first.channels.chat.channel_name == "web"
@@ -82,6 +84,12 @@ hotness_alpha = 0.3
 half_life_days = 10.0
 rrf_k = 50
 keyword_rrf_weight = 0.4
+procedure_threshold = 0.7
+preference_threshold = 0.6
+event_threshold = 0.55
+profile_threshold = 0.52
+max_procedure_preference = 3
+max_event_profile = 2
 
 [memory.dedup]
 supersede_threshold = 0.8
@@ -121,6 +129,9 @@ port = 8000
     assert config.memory.embedding.dimensions == 768
     assert config.memory.optimizer.enabled is False
     assert config.memory.retrieval.rrf_k == 50
+    assert config.memory.retrieval.procedure_threshold == 0.7
+    assert config.memory.retrieval.max_procedure_preference == 3
+    assert config.memory.retrieval.max_event_profile == 2
     assert config.memory.dedup.event_dedup_window_days == 5
     assert config.session.history_window == 25
     assert config.agent.workdir == "runtime"

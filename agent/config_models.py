@@ -69,6 +69,12 @@ class RetrievalConfig:
     half_life_days: float = 14.0  # 记忆热度随时间衰减的半衰期天数
     rrf_k: int = 60  # 双路检索进行 RRF 融合时的平滑常数
     keyword_rrf_weight: float = 0.5  # 关键词检索在 RRF 融合中的权重
+    procedure_threshold: float = 0.66  # 流程记忆自动注入的最低原始相关分
+    preference_threshold: float = 0.5  # 偏好记忆自动注入的最低原始相关分
+    event_threshold: float = 0.5  # 事件记忆自动注入的最低原始相关分
+    profile_threshold: float = 0.5  # 用户画像记忆自动注入的最低原始相关分
+    max_procedure_preference: int = 4  # 单次注入的流程和偏好总数上限
+    max_event_profile: int = 4  # 单次注入的事件和画像总数上限
 
 
 @dataclass

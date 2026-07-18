@@ -210,6 +210,14 @@ def _load_memory_config(data: dict[str, Any]) -> MemoryConfig:
             keyword_rrf_weight=float(
                 retrieval_raw.get("keyword_rrf_weight", 0.5)
             ),
+            procedure_threshold=float(retrieval_raw.get("procedure_threshold", 0.66)),
+            preference_threshold=float(retrieval_raw.get("preference_threshold", 0.5)),
+            event_threshold=float(retrieval_raw.get("event_threshold", 0.5)),
+            profile_threshold=float(retrieval_raw.get("profile_threshold", 0.5)),
+            max_procedure_preference=int(
+                retrieval_raw.get("max_procedure_preference", 4)
+            ),
+            max_event_profile=int(retrieval_raw.get("max_event_profile", 4)),
         ),
         # 去重阈值集中配置，避免记忆写入流程中出现散落的魔法数字。
         dedup=DedupConfig(

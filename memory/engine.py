@@ -19,6 +19,7 @@ from memory.contracts import (
 )
 from memory.events import ConsolidationCommitted, TurnIngested
 from memory.hyde_enhancer import HyDEEnhancer
+from memory.injection_planner import InjectionPlanner
 from memory.implicit_extractor import ImplicitLongTermExtractor, ImplicitMemoryDraft
 from memory.md_store import MarkdownMemoryStore
 from memory.memorizer import Memorizer
@@ -57,6 +58,17 @@ class MemoryEngine:
         self._memorizer = Memorizer(self._store, embedder)
         self._rewriter = QueryRewriter(provider)
         self._hyde = HyDEEnhancer(provider)
+        retrieval_config = self._config.retrieval
+        self._injection_planner = InjectionPlanner(
+            thresholds={
+                "procedure": retrieval_config.procedure_threshold,
+                "preference": retrieval_config.preference_threshold,
+                "event": retrieval_config.event_threshold,
+                "profile": retrieval_config.profile_threshold,
+            },
+            max_procedure_preference=retrieval_config.max_procedure_preference,
+            max_event_profile=retrieval_config.max_event_profile,
+        )
         self._optimizer = MemoryOptimizer(self._markdown, provider)
         self._consolidator = Consolidator(
             sessions, self._markdown,
@@ -123,6 +135,8 @@ class MemoryEngine:
             hyde_used = augmented.used_hyde
             hypothesis = augmented.hypothesis
 
+        injection_plan = self._injection_planner.plan(items)
+        items = injection_plan.items
         records: list[MemoryRecord] = []
         for item in items:
             source_ref = str(item.get("source_ref") or "")
@@ -148,6 +162,8 @@ class MemoryEngine:
             "vector_keyword_fusion": True,
             "hyde_used": hyde_used,
             "hyde_hypothesis": hypothesis,
+            "injected_ids": [str(item.get("id") or "") for item in items],
+            "rejected": injection_plan.rejected,
         })
 
     async def mutate(self, mutation: MemoryMutation) -> MemoryMutationResult:
