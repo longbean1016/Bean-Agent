@@ -128,3 +128,23 @@ def test_append_tool_result_preserves_text_and_content_blocks() -> None:
             ],
         },
     ]
+
+
+def test_append_tool_result_truncates_long_text_but_preserves_content_blocks() -> None:
+    messages: list[dict[str, object]] = []
+    full_text = "x" * 10_500
+
+    append_tool_result(
+        messages,
+        tool_call_id="call-long",
+        tool_name="read_file",
+        content=ToolResult(
+            text=full_text,
+            content_blocks=[{"type": "image_url", "image_url": {"url": "data:test"}}],
+        ),
+    )
+
+    tool_text = str(messages[0]["content"])
+    assert len(tool_text) <= 10_000
+    assert "已截断工具结果，省略" in tool_text
+    assert messages[1]["content"][1]["image_url"]["url"] == "data:test"

@@ -6,6 +6,28 @@ from typing import Any
 
 from tools.base import ToolResult, normalize_tool_result
 
+_TOOL_RESULT_CHAR_BUDGET = 10_000
+
+
+def _truncate_tool_text(text: str) -> str:
+    """将发给模型的工具文本限制在固定预算内，并明确标注省略量。
+
+    截断只发生在 LLM 消息边界；调用方仍持有原始 ToolResult，可用于 Session
+    持久化和前端展示。标记本身计入预算，避免看似截断后仍超过上下文上限。
+    """
+
+    if len(text) <= _TOOL_RESULT_CHAR_BUDGET:
+        return text
+    omitted = len(text) - _TOOL_RESULT_CHAR_BUDGET
+    while True:
+        marker = f"\n[已截断工具结果，省略 {omitted} 个字符]"
+        keep = max(0, _TOOL_RESULT_CHAR_BUDGET - len(marker))
+        actual_omitted = len(text) - keep
+        if actual_omitted == omitted:
+            break
+        omitted = actual_omitted
+    return f"{text[:keep]}{marker}"
+
 
 def append_tool_result(
     messages: list[dict[str, Any]],
@@ -17,11 +39,12 @@ def append_tool_result(
     """追加标准 tool 消息，并把图片块作为后续 user 多模态消息传入。"""
 
     result = normalize_tool_result(content)
+    model_text = _truncate_tool_text(result.text)
     messages.append(
         {
             "role": "tool",
             "tool_call_id": tool_call_id,
-            "content": result.text or "工具执行完成。",
+            "content": model_text or "工具执行完成。",
         }
     )
     if result.content_blocks:

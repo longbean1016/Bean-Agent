@@ -117,6 +117,53 @@ async def test_pipeline_runs_tool_loop_and_emits_lifecycle_events() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pipeline_keeps_full_tool_chain_while_model_receives_budgeted_result() -> None:
+    full_result = "r" * 10_500
+
+    class LongTool(Tool):
+        name = "long_result"
+        description = "返回长结果"
+        parameters = {"type": "object", "properties": {}}
+
+        async def execute(self, **kwargs):
+            return full_result
+
+    class LongProvider:
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, object]]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return LLMResponse(None, [ToolCall("long-1", "long_result", {})])
+            return LLMResponse("完成")
+
+    tools = ToolRegistry()
+    tools.register(LongTool())
+    provider = LongProvider()
+    pipeline = Pipeline(
+        provider,
+        tools,
+        EventBus(),
+        PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        ),
+        workspace="D:/workspace",
+    )
+
+    result = await pipeline.process(
+        InboundMessage("web", "u", "c", "读取长结果"),
+        turn_id="long-result",
+    )
+
+    assert result.tool_chain[0]["calls"][0]["result"] == full_result
+    model_tool_result = str(provider.calls[1][-1]["content"])
+    assert len(model_tool_result) <= 10_000
+    assert "已截断工具结果，省略" in model_tool_result
+
+
+@pytest.mark.asyncio
 async def test_interrupt_snapshot_keeps_completed_calls_in_current_tool_group() -> None:
     class TwoCallProvider:
         async def chat(self, messages, tools=None, **kwargs):
