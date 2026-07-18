@@ -17,6 +17,7 @@ from agent.pipeline import Pipeline
 from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
 from agent.provider import LLMResponse, ToolCall
+from agent.skills import SkillsLoader
 from memory.contracts import MemoryMutation, MemoryScope
 from memory.engine import MemoryEngine
 from session.manager import SessionManager
@@ -65,6 +66,74 @@ class Provider:
 class WebSocket:
     def __init__(self): self.frames = []
     async def send_json(self, frame): self.frames.append(frame)
+
+
+@pytest.mark.asyncio
+async def test_web_message_explicit_builtin_skill_uses_dynamic_context(
+    tmp_path: Path,
+) -> None:
+    """Web 消息显式命中 Skill 时，正文只进入本轮动态上下文。"""
+
+    class SkillProvider:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] = []
+
+        async def chat(self, messages, tools=None, on_content_delta=None, **kwargs):
+            self.messages = list(messages)
+            return LLMResponse("天气查询已准备")
+
+    bus = MessageBus()
+    events = EventBus()
+    sessions = SessionManager(tmp_path)
+    provider = SkillProvider()
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        events,
+        PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        ),
+        workspace=str(tmp_path),
+        skills=SkillsLoader(tmp_path),
+        history_loader=sessions.load_history,
+    )
+    loop = AgentLoop(bus, events, pipeline, sessions)
+    channel = WebChannel(bus, events, loop)
+    websocket = WebSocket()
+
+    try:
+        await channel.handle_frame(
+            websocket,
+            {
+                "type": "message.send",
+                "request_id": "skill-r1",
+                "session_id": "web:skills",
+                "text": "$weather 查询上海天气",
+            },
+        )
+        await loop.run_once()
+
+        system_prompt = str(provider.messages[0]["content"])
+        dynamic_frame = str(provider.messages[-2]["content"])
+        assert '<skill name="weather"' in system_prompt
+        assert "Get current weather and short-term forecasts" in system_prompt
+        assert "wttr.in（首选）" not in system_prompt
+        assert dynamic_frame.startswith(
+            '<system-reminder data-system-context-frame="true">'
+        )
+        assert "### Skill: weather" in dynamic_frame
+        assert "wttr.in（首选）" in dynamic_frame
+        assert provider.messages[-1]["role"] == "user"
+        assert str(provider.messages[-1]["content"]).endswith("$weather 查询上海天气")
+        assert any(
+            frame["type"] == "message.final"
+            and frame["request_id"] == "skill-r1"
+            for frame in websocket.frames
+        )
+    finally:
+        await channel.close()
+        await sessions.close()
 
 
 @pytest.mark.asyncio
