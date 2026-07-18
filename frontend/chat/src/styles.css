@@ -80,7 +80,8 @@ button { color: inherit; }
 .message-body { position: relative; min-width: 0; max-width: 780px; color: #1f2825; font-size: 15px; line-height: 1.72; }
 .user-message .message-body { width: fit-content; max-width: min(680px, 100%); padding: 11px 14px; border: 1px solid #d8e1dd; border-radius: 7px; background: #eef3f1; }
 .user-text { margin: 0; white-space: pre-wrap; }
-.assistant-message .message-body > div[data-streamdown] { width: 100%; }
+.assistant-message .beanagent-markdown,
+.assistant-message .beanagent-markdown > div[data-streamdown] { width: 100%; min-width: 0; }
 .message-body pre { max-width: 100%; overflow-x: auto; border-radius: 6px; }
 .message-body svg, .message-body img { max-width: 100%; }
 .message-body a { color: #076f68; text-decoration-thickness: 1px; text-underline-offset: 3px; }
@@ -99,6 +100,17 @@ button { color: inherit; }
 [data-streamdown="code-block-body"] pre { width: max-content; min-width: 100%; margin: 0; overflow: visible; background: transparent; }
 [data-streamdown="code-block-body"] code { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 13px; line-height: 1.65; white-space: pre; }
 [data-streamdown="code-block-body"] code > span { display: block; min-height: 1.65em; }
+
+/* Akashic 直接注册 Mermaid；BeanAgent 在相同渲染能力外增加非交互边界。
+   Streamdown 即使隐藏 pan/zoom 按钮仍会注册 wheel 和 pointer 事件，因此让
+   application 画布不参与命中，并锁定 transform，滚轮自然交给会话滚动层。 */
+.beanagent-markdown [data-streamdown="mermaid-block"] { width: 100%; min-width: 0; margin: 16px 0; overflow: hidden; border-radius: 6px; }
+.beanagent-markdown [data-streamdown="mermaid"] { width: 100%; min-width: 0; max-width: 100%; overflow-x: auto; overflow-y: hidden; }
+.beanagent-markdown [data-streamdown="mermaid"] [role="application"] { min-width: 100%; width: max-content; pointer-events: none; touch-action: pan-y !important; cursor: default !important; transform: none !important; transition: none !important; will-change: auto !important; }
+.beanagent-markdown [data-streamdown="mermaid"] [role="img"] { min-width: 100%; width: max-content; justify-content: flex-start; }
+.beanagent-markdown [data-streamdown="mermaid"] svg { display: block; width: auto; min-width: 100%; max-width: none; height: auto; max-height: min(70vh, 720px); }
+.beanagent-markdown [data-streamdown="mermaid-block-actions"] button { display: inline-grid; width: 26px; height: 26px; flex: 0 0 26px; padding: 0; place-items: center; }
+.beanagent-markdown [data-streamdown="mermaid-block-actions"] svg { width: 14px; min-width: 14px; height: 14px; max-height: 14px; }
 .stream-caret { display: inline-block; width: 7px; height: 18px; background: #0b766e; animation: blink .85s steps(1) infinite; vertical-align: text-bottom; }
 @keyframes blink { 50% { opacity: 0; } }
 .interrupted-label { display: inline-block; margin-top: 10px; color: #8c4f24; font-size: 12px; }

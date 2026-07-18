@@ -46,6 +46,18 @@ beforeEach(() => {
     unobserve() {}
     disconnect() {}
   });
+  vi.stubGlobal("IntersectionObserver", class {
+    constructor(private readonly callback: IntersectionObserverCallback) {}
+    observe(target: Element) {
+      this.callback([{ isIntersecting: true, target } as IntersectionObserverEntry], this as unknown as IntersectionObserver);
+    }
+    unobserve() {}
+    disconnect() {}
+    takeRecords() { return []; }
+    root = null;
+    rootMargin = "0px";
+    thresholds = [0];
+  });
   Object.defineProperty(HTMLElement.prototype, "scrollTo", {
     configurable: true,
     value: vi.fn(),
@@ -262,7 +274,7 @@ it("代码复制保留原始格式并将按钮图标切换为勾选", async () =
   );
 });
 
-it("Mermaid fenced block 强制改写为 text 代码且不生成图表", async () => {
+it("Mermaid fenced block 生成受限图表而不是普通代码块", async () => {
   localStorage.setItem("beanagent.session_id", "web:mermaid-source");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages") ? {
@@ -281,15 +293,12 @@ it("Mermaid fenced block 强制改写为 text 代码且不生成图表", async (
 
   const { container } = render(<App />);
 
-  await screen.findByText(/flowchart TD/);
-  const codeBlock = container.querySelector('[data-streamdown="code-block"]');
-  expect(codeBlock).not.toBeNull();
-  expect(codeBlock).toHaveTextContent("A[开始] --> B[完成]");
-  expect(codeBlock).toHaveTextContent("text");
-  expect(codeBlock).not.toHaveTextContent("mermaid");
-  const diagramSvg = [...container.querySelectorAll(".message-body svg")]
-    .find((svg) => !svg.closest('[data-streamdown="code-block-actions"]'));
-  expect(diagramSvg).toBeUndefined();
+  await waitFor(() => expect(container.querySelector('[data-streamdown="mermaid"]')).not.toBeNull());
+  expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull();
+  expect(container.querySelector('[data-streamdown="mermaid"]')?.closest(".beanagent-markdown")).not.toBeNull();
+  expect(container.querySelector('[data-streamdown="mermaid"] [role="application"]')).not.toBeNull();
+  expect(screen.queryByTitle("Zoom in")).not.toBeInTheDocument();
+  expect(screen.queryByTitle("Zoom out")).not.toBeInTheDocument();
 });
 
 it("空会话不再提供 Mermaid 流程图示例", async () => {

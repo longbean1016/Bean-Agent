@@ -1,6 +1,7 @@
 import * as Collapsible from "@radix-ui/react-collapsible";
 import * as Dialog from "@radix-ui/react-dialog";
 import { code } from "@streamdown/code";
+import { mermaid } from "@streamdown/mermaid";
 import {
   AlertCircle,
   ArrowDown,
@@ -34,11 +35,12 @@ import { BeanWebSocketClient } from "./websocketClient";
 const SESSION_STORAGE_KEY = "beanagent.session_id";
 const THEME_STORAGE_KEY = "beanagent.theme";
 type ThemePreference = "light" | "system" | "dark";
-// Mermaid 暂时只按普通 fenced code 展示。交互式 SVG 会在复杂图中撑大消息区域，
-// 并劫持图表区域内的缩放手势；恢复预览前必须先提供固定视口和显式打开入口。
-const markdownPlugins = { code };
+const markdownPlugins = { code, mermaid };
 const markdownControls = {
   code: { copy: true, download: false },
+  // Streamdown 的 panZoom 开关只负责控制按钮；CSS 兼容层还会阻断画布事件，
+  // 保证鼠标位于图表上时滚轮仍属于外层会话。
+  mermaid: { copy: true, download: false, fullscreen: false, panZoom: false },
   table: false,
 };
 const markdownTranslations = {
@@ -60,13 +62,7 @@ function prepareMessageMarkdown(markdown: string): string {
     if (line === "\n") return line;
     const fence = line.match(/^(\s*)(```|~~~)(.*)$/);
     if (fence) {
-      const opening = !fenced;
       fenced = !fenced;
-      // 即使旧 bundle 或未来依赖再次注册 Mermaid 插件，输入边界也不会把流程图
-      // 交给交互式 SVG 渲染器；只改语言标识，图表源码仍可查看和复制。
-      if (opening && /^\s*mermaid\s*$/i.test(fence[3])) {
-        return `${fence[1]}${fence[2]}text`;
-      }
       return line;
     }
     if (fenced) return line;
@@ -415,17 +411,19 @@ function MessageView({ message }: { message: ChatMessage }) {
         {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} /> : null}
         {message.tools.length ? <div className="tool-timeline">{message.tools.map((tool) => <ToolStep key={tool.callId} tool={tool} />)}</div> : null}
         {isUser ? <p className="user-text">{message.content}</p> : message.content ? (
-          <Streamdown
-            key={`${message.id}-${message.streaming ? "stream" : "final"}`}
-            plugins={markdownPlugins}
-            controls={markdownControls}
-            isAnimating={Boolean(message.streaming)}
-            lineNumbers={false}
-            linkSafety={markdownLinkSafety}
-            translations={markdownTranslations}
-          >
-            {prepareMessageMarkdown(message.content)}
-          </Streamdown>
+          <div className="beanagent-markdown">
+            <Streamdown
+              key={`${message.id}-${message.streaming ? "stream" : "final"}`}
+              plugins={markdownPlugins}
+              controls={markdownControls}
+              isAnimating={Boolean(message.streaming)}
+              lineNumbers={false}
+              linkSafety={markdownLinkSafety}
+              translations={markdownTranslations}
+            >
+              {prepareMessageMarkdown(message.content)}
+            </Streamdown>
+          </div>
         ) : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
         {message.status === "interrupted" ? <span className="interrupted-label">已停止</span> : null}
       </div>
@@ -441,8 +439,8 @@ function Thinking({ content, streaming }: { content: string; streaming: boolean 
         <span>{streaming ? "正在思考…" : "思考完成"}</span>
         <ChevronDown size={14} />
       </Collapsible.Trigger>
-      <Collapsible.Content className="thinking-content">
-        <Streamdown controls={false} lineNumbers={false} linkSafety={markdownLinkSafety} translations={markdownTranslations}>
+      <Collapsible.Content className="thinking-content beanagent-markdown">
+        <Streamdown plugins={markdownPlugins} controls={markdownControls} lineNumbers={false} linkSafety={markdownLinkSafety} translations={markdownTranslations}>
           {prepareMessageMarkdown(content)}
         </Streamdown>
       </Collapsible.Content>
