@@ -384,6 +384,32 @@ it("拖拽文件和粘贴图片进入统一附件队列并显示文件大小", a
   expect(screen.getByText("3 B")).toBeVisible();
 });
 
+it("剪贴板只通过 DataTransferItem 暴露图片时仍可粘贴", async () => {
+  const { container } = render(<App />);
+  await screen.findByText("已连接");
+  const composer = container.querySelector<HTMLElement>(".composer");
+  const image = new File(["image"], "clipboard.png", { type: "image/png" });
+
+  fireEvent.paste(composer!, {
+    clipboardData: {
+      files: [],
+      items: [{ kind: "file", getAsFile: () => image }],
+    },
+  });
+
+  expect(screen.getByText("clipboard.png")).toBeVisible();
+});
+
+it("文件拖到聊天页面而非精确落在输入框时仍可加入附件", async () => {
+  render(<App />);
+  await screen.findByText("已连接");
+  const source = new File(["class Main {}"], "Main.java", { type: "text/plain" });
+
+  fireEvent.drop(document, { dataTransfer: { types: ["Files"], files: [source] } });
+
+  expect(screen.getByText("Main.java")).toBeVisible();
+});
+
 it("附件数量、格式和大小不符合要求时显示错误且不静默截断", async () => {
   const { container } = render(<App />);
   await screen.findByText("已连接");

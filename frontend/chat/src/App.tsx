@@ -522,7 +522,7 @@ function Composer(props: {
   const previews = useMemo(() => props.files.map((file) => ({ file, url: file.type.startsWith("image/") ? URL.createObjectURL(file) : "" })), [props.files]);
   useEffect(() => () => previews.forEach((item) => item.url && URL.revokeObjectURL(item.url)), [previews]);
 
-  const addFiles = (incoming: File[]) => {
+  const addFiles = useCallback((incoming: File[]) => {
     // 选择、拖拽和粘贴共用同一入口；这里只负责即时反馈，服务端仍执行最终内容校验。
     setAttachmentError("");
     if (props.files.length + incoming.length > MAX_ATTACHMENTS) {
@@ -544,24 +544,48 @@ function Composer(props: {
       }
     }
     props.onFiles([...props.files, ...incoming]);
-  };
+  }, [props.files, props.onFiles]);
+
+  useEffect(() => {
+    // 与 Akashic 一致使用原生页面级监听，文件落在会话区或输入框外围时也不会被浏览器打开。
+    const hasFiles = (event: DragEvent) => {
+      const transfer = event.dataTransfer;
+      return !!transfer && (transfer.types?.includes("Files") || transfer.files.length > 0);
+    };
+    const handleDragOver = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      setDragging(true);
+    };
+    const handleDrop = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      setDragging(false);
+      const dropped = Array.from(event.dataTransfer?.files ?? []);
+      if (dropped.length) addFiles(dropped);
+    };
+    const handleDragEnd = () => setDragging(false);
+    document.addEventListener("dragover", handleDragOver);
+    document.addEventListener("drop", handleDrop);
+    document.addEventListener("dragleave", handleDragEnd);
+    return () => {
+      document.removeEventListener("dragover", handleDragOver);
+      document.removeEventListener("drop", handleDrop);
+      document.removeEventListener("dragleave", handleDragEnd);
+    };
+  }, [addFiles]);
 
   return (
     <footer className="composer-wrap">
       <div
         className={`composer${dragging ? " dragging" : ""}`}
-        onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
-        onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
-        onDragLeave={(event) => {
-          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
-        }}
-        onDrop={(event) => {
-          event.preventDefault();
-          setDragging(false);
-          addFiles(Array.from(event.dataTransfer.files));
-        }}
         onPaste={(event) => {
-          const pasted = Array.from(event.clipboardData.files);
+          // 浏览器复制截图时经常只填充 items 而不填充 files，必须兼容两种数据来源。
+          const direct = Array.from(event.clipboardData.files);
+          const pasted = direct.length ? direct : Array.from(event.clipboardData.items)
+            .filter((item) => item.kind === "file")
+            .map((item) => item.getAsFile())
+            .filter((file): file is File => file !== null);
           if (!pasted.length) return;
           event.preventDefault();
           addFiles(pasted);
