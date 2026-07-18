@@ -1,6 +1,9 @@
 # LLM 与嵌入客户端
 openai>=2.0.0
 
+# SKILL.md YAML frontmatter 安全解析
+PyYAML>=6.0.2
+
 # Web 服务
 fastapi>=0.134.0
 uvicorn>=0.41.0

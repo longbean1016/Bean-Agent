@@ -20,6 +20,7 @@ from tools.web_search import AsyncHttpClient as SearchHttpClient, WebSearchTool
 
 if TYPE_CHECKING:
     from agent.provider import LLMProvider
+    from agent.skills import SkillsLoader
 
 
 class MemoryToolsApi(MemoryRetrievalApi, MemoryWriteApi, Protocol):
@@ -70,6 +71,7 @@ def register_all(
     fetch_client: FetchHttpClient | None = None,
     session_store: SessionStore | None = None,
     memory_engine: MemoryToolsApi | None = None,
+    skills: SkillsLoader | None = None,
 ) -> ToolRegistry:
     """注册当前依赖实际支持的全部内置工具。"""
 
@@ -89,6 +91,12 @@ def register_all(
     )
     registry.register(WebSearchTool(client=search_client))
     registry.register(WebFetchTool(client=fetch_client))
+
+    if skills is not None:
+        # Skill 目录由 Prompt 和加载工具共享同一读取边界，避免两套路径规则产生差异。
+        from tools.load_skill import LoadSkillTool
+
+        registry.register(LoadSkillTool(skills))
 
     if session_store is not None:
         # 历史工具直接依赖可用 Store；不注册“暂不可用”的占位 Schema。
