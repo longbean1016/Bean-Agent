@@ -34,6 +34,23 @@ import { BeanWebSocketClient } from "./websocketClient";
 
 const SESSION_STORAGE_KEY = "beanagent.session_id";
 const THEME_STORAGE_KEY = "beanagent.theme";
+const MAX_ATTACHMENTS = 8;
+const MAX_TEXT_ATTACHMENT_SIZE = 2 * 1024 * 1024;
+const MAX_IMAGE_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+const IMAGE_SUFFIXES = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
+const TEXT_SUFFIXES = new Set([
+  ".txt", ".md", ".markdown", ".py", ".json", ".toml", ".yaml", ".yml",
+  ".csv", ".log", ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".xml",
+  ".rst", ".adoc", ".tex", ".java", ".c", ".h", ".cpp", ".hpp", ".cs",
+  ".go", ".rs", ".php", ".rb", ".swift", ".kt", ".kts", ".scala", ".lua",
+  ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd", ".sql", ".r", ".vue",
+  ".svelte", ".ini", ".conf", ".cfg", ".properties", ".ndjson", ".jsonl",
+  ".tsv", ".graphql", ".gql", ".dockerfile",
+]);
+const ATTACHMENT_ACCEPT = [
+  "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp",
+  ...TEXT_SUFFIXES,
+].join(",");
 type ThemePreference = "light" | "system" | "dark";
 const markdownPlugins = { code, renderers: [{ language: "mermaid", component: MermaidBlock }] };
 const markdownControls = {
@@ -500,18 +517,64 @@ function Composer(props: {
   input: string; files: File[]; active: boolean; connected: boolean; sending: boolean;
   onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void;
 }) {
+  const [attachmentError, setAttachmentError] = useState("");
+  const [dragging, setDragging] = useState(false);
   const previews = useMemo(() => props.files.map((file) => ({ file, url: file.type.startsWith("image/") ? URL.createObjectURL(file) : "" })), [props.files]);
   useEffect(() => () => previews.forEach((item) => item.url && URL.revokeObjectURL(item.url)), [previews]);
+
+  const addFiles = (incoming: File[]) => {
+    // 选择、拖拽和粘贴共用同一入口；这里只负责即时反馈，服务端仍执行最终内容校验。
+    setAttachmentError("");
+    if (props.files.length + incoming.length > MAX_ATTACHMENTS) {
+      setAttachmentError(`最多添加 ${MAX_ATTACHMENTS} 个附件`);
+      return;
+    }
+    for (const file of incoming) {
+      const suffix = fileSuffix(file.name);
+      const image = IMAGE_SUFFIXES.has(suffix) && file.type.startsWith("image/");
+      const text = TEXT_SUFFIXES.has(suffix);
+      if (!image && !text) {
+        setAttachmentError(`不支持的附件格式：${file.name}`);
+        return;
+      }
+      const limit = image ? MAX_IMAGE_ATTACHMENT_SIZE : MAX_TEXT_ATTACHMENT_SIZE;
+      if (file.size > limit) {
+        setAttachmentError(`${file.name} 不能超过 ${image ? 10 : 2} MB`);
+        return;
+      }
+    }
+    props.onFiles([...props.files, ...incoming]);
+  };
+
   return (
     <footer className="composer-wrap">
-      <div className="composer">
+      <div
+        className={`composer${dragging ? " dragging" : ""}`}
+        onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
+        onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
+        }}
+        onDrop={(event) => {
+          event.preventDefault();
+          setDragging(false);
+          addFiles(Array.from(event.dataTransfer.files));
+        }}
+        onPaste={(event) => {
+          const pasted = Array.from(event.clipboardData.files);
+          if (!pasted.length) return;
+          event.preventDefault();
+          addFiles(pasted);
+        }}
+      >
         {previews.length ? <div className="pending-files">{previews.map(({ file, url }) => (
           <div className="pending-file" key={`${file.name}-${file.lastModified}`}>
             {url ? <img src={url} alt="" /> : <FileText size={17} />}
-            <span>{file.name}</span>
+            <span className="pending-file-info"><span>{file.name}</span><small>{formatFileSize(file.size)}</small></span>
             <button className="icon-button" onClick={() => props.onFiles(props.files.filter((item) => item !== file))} aria-label={`移除 ${file.name}`}><X size={14} /></button>
           </div>
         ))}</div> : null}
+        {attachmentError ? <div className="attachment-error" role="alert">{attachmentError}</div> : null}
         <textarea
           value={props.input}
           onChange={(event) => props.onInput(event.target.value)}
@@ -525,7 +588,7 @@ function Composer(props: {
         <div className="composer-actions">
           <label className="icon-button attach-button" title="添加文本或图片">
             <Paperclip size={18} /><span className="sr-only">添加附件</span>
-            <input type="file" multiple accept="image/png,image/jpeg,image/gif,image/webp,image/bmp,text/*,.md,.json,.toml,.yaml,.yml,.py,.js,.ts,.tsx,.csv" onChange={(event) => props.onFiles([...props.files, ...Array.from(event.target.files ?? [])].slice(0, 8))} />
+            <input type="file" multiple accept={ATTACHMENT_ACCEPT} onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />
           </label>
           <span className="composer-hint">Enter 发送 · Shift+Enter 换行</span>
           {props.active ? (
@@ -561,4 +624,10 @@ function readThemePreference(): ThemePreference {
 
 function shortSession(sessionId: string): string { return sessionId ? `会话 ${sessionId.slice(-8)}` : "正在创建会话"; }
 function fileName(path: string): string { return path.replaceAll("\\", "/").split("/").pop() || "附件"; }
+function fileSuffix(name: string): string { const index = name.lastIndexOf("."); return index >= 0 ? name.slice(index).toLowerCase() : ""; }
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Number((bytes / 1024).toFixed(1))} KB`;
+  return `${Number((bytes / 1024 / 1024).toFixed(1))} MB`;
+}
 function formatTime(value: string): string { const date = new Date(value); return Number.isNaN(date.getTime()) ? "" : new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric" }).format(date); }

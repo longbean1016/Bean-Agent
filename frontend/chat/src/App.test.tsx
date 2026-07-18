@@ -88,6 +88,14 @@ beforeEach(() => {
     const payload = url.includes("/messages") ? { items: [], total: 0 } : { items: [], total: 0 };
     return { ok: true, json: async () => payload } as Response;
   }));
+  Object.defineProperty(URL, "createObjectURL", {
+    configurable: true,
+    value: vi.fn(() => "blob:preview"),
+  });
+  Object.defineProperty(URL, "revokeObjectURL", {
+    configurable: true,
+    value: vi.fn(),
+  });
 });
 
 afterEach(() => {
@@ -345,4 +353,51 @@ it("空会话不再提供 Mermaid 流程图示例", async () => {
 
   await screen.findByText("从一个具体问题开始");
   expect(screen.queryByText("画一张 Mermaid 流程图说明当前链路")).not.toBeInTheDocument();
+});
+
+it("附件选择器包含新增的代码、文档和配置格式", async () => {
+  const { container } = render(<App />);
+  await screen.findByText("已连接");
+
+  const input = container.querySelector<HTMLInputElement>('input[type="file"]');
+  expect(input?.accept).toContain(".java");
+  expect(input?.accept).toContain(".cpp");
+  expect(input?.accept).toContain(".vue");
+  expect(input?.accept).toContain(".rst");
+  expect(input?.accept).toContain(".graphql");
+  expect(input?.accept).not.toContain(".env");
+});
+
+it("拖拽文件和粘贴图片进入统一附件队列并显示文件大小", async () => {
+  const { container } = render(<App />);
+  await screen.findByText("已连接");
+  const composer = container.querySelector<HTMLElement>(".composer");
+  const source = new File(["x".repeat(1536)], "Main.java", { type: "text/plain" });
+  const image = new File(["png"], "paste.png", { type: "image/png" });
+
+  fireEvent.drop(composer!, { dataTransfer: { files: [source] } });
+  expect(screen.getByText("Main.java")).toBeVisible();
+  expect(screen.getByText("1.5 KB")).toBeVisible();
+
+  fireEvent.paste(composer!, { clipboardData: { files: [image] } });
+  expect(screen.getByText("paste.png")).toBeVisible();
+  expect(screen.getByText("3 B")).toBeVisible();
+});
+
+it("附件数量、格式和大小不符合要求时显示错误且不静默截断", async () => {
+  const { container } = render(<App />);
+  await screen.findByText("已连接");
+  const composer = container.querySelector<HTMLElement>(".composer");
+  const unsupported = new File(["PK"], "archive.zip", { type: "application/zip" });
+  fireEvent.drop(composer!, { dataTransfer: { files: [unsupported] } });
+  expect(screen.getByRole("alert")).toHaveTextContent("不支持的附件格式");
+
+  const tooLarge = new File([new Uint8Array(2 * 1024 * 1024 + 1)], "large.java", { type: "text/plain" });
+  fireEvent.drop(composer!, { dataTransfer: { files: [tooLarge] } });
+  expect(screen.getByRole("alert")).toHaveTextContent("不能超过 2 MB");
+
+  const files = Array.from({ length: 9 }, (_, index) => new File(["x"], `${index}.txt`, { type: "text/plain" }));
+  fireEvent.drop(composer!, { dataTransfer: { files } });
+  expect(screen.getByRole("alert")).toHaveTextContent("最多添加 8 个附件");
+  expect(screen.queryByText("8.txt")).not.toBeInTheDocument();
 });
