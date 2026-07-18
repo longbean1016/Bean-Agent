@@ -39,15 +39,16 @@ def _build_current_user_content_sync(
     multimodal: bool,
     vl_available: bool,
 ) -> str | list[dict[str, Any]]:
-    if not multimodal:
-        return _build_text_with_media_refs(text, media_paths, vl_available=vl_available)
-
     images: list[dict[str, Any]] = []
+    deferred_images: list[str] = []
     text_parts: list[str] = []
     for raw_path in media_paths:
         path = Path(raw_path)
         mime, _ = mimetypes.guess_type(path.name)
         if mime and mime.startswith("image/"):
+            if not multimodal:
+                deferred_images.append(raw_path)
+                continue
             encoded = base64.b64encode(path.read_bytes()).decode("ascii")
             images.append({
                 "type": "image_url",
@@ -61,6 +62,14 @@ def _build_current_user_content_sync(
         text_parts.append(f"[文本附件: {path.name}]\n```text\n{content}\n```")
 
     combined = "\n\n".join([part for part in [text.strip(), *text_parts] if part]).strip()
+    # 多模态开关只决定图片如何消费；UTF-8 文本附件始终直接进入当前消息，
+    # 避免模型根据工作目录自行猜测上传路径是否可访问。
+    if not multimodal:
+        return _build_text_with_media_refs(
+            combined,
+            deferred_images,
+            vl_available=vl_available,
+        )
     if not images:
         return combined
     return [*images, {"type": "text", "text": combined}]

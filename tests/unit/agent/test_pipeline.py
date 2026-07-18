@@ -147,6 +147,26 @@ async def test_attachment_content_routes_local_image_to_independent_vl(
 
 
 @pytest.mark.asyncio
+async def test_attachment_content_embeds_html_for_text_only_main_model(
+    tmp_path: Path,
+) -> None:
+    html_path = tmp_path / "page.html"
+    html_path.write_text("<main>附件正文</main>", encoding="utf-8")
+
+    content = await build_current_user_content(
+        "请分析这个页面",
+        [str(html_path)],
+        multimodal=False,
+        vl_available=False,
+    )
+
+    assert isinstance(content, str)
+    assert "[文本附件: page.html]" in content
+    assert "<main>附件正文</main>" in content
+    assert "文件路径" not in content
+
+
+@pytest.mark.asyncio
 async def test_attachment_content_reports_missing_image_capability(
     tmp_path: Path,
 ) -> None:
