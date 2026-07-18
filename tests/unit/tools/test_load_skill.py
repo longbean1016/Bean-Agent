@@ -30,6 +30,7 @@ async def test_load_skill_returns_body_and_base_directory(tmp_path: Path) -> Non
     result = await tool.execute(skill="memory")
 
     assert "# Skill: memory" in result
+    assert "Source: workspace" in result
     assert f"Base directory: {skill_dir.resolve()}" in result
     assert "先读取记忆，再回答。" in result
     assert "description:" not in result

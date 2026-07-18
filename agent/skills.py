@@ -19,6 +19,7 @@ from typing import Any
 import yaml
 
 logger = logging.getLogger(__name__)
+BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
 
 def collect_skill_mentions(content: str, available_names: list[str]) -> list[str]:
@@ -39,6 +40,8 @@ class SkillRecord:
     """一份 SKILL.md 的只读索引记录。"""
 
     name: str
+    source: str
+    source_id: str
     root_dir: Path
     skill_file: Path
     content: str
@@ -56,9 +59,18 @@ class SkillsLoader:
     目录块使用摘要本身作为缓存签名，内容未变化时仍能复用本地渲染和供应商前缀。
     """
 
-    def __init__(self, workspace: str | Path) -> None:
+    def __init__(
+        self,
+        workspace: str | Path,
+        builtin_skills_dir: str | Path | None = BUILTIN_SKILLS_DIR,
+    ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.skills_dir = self.workspace / "skills"
+        self.builtin_skills_dir = (
+            Path(builtin_skills_dir).expanduser().resolve()
+            if builtin_skills_dir is not None
+            else None
+        )
 
     def list_skill_records(
         self,
@@ -122,7 +134,8 @@ class SkillsLoader:
         for record in records:
             lines.append(
                 f'  <skill name="{self._escape_xml(record.name)}" '
-                f'available="{str(record.available).lower()}">'
+                f'available="{str(record.available).lower()}" '
+                f'source="{self._escape_xml(record.source)}">'
             )
             lines.append(
                 f"    <description>{self._escape_xml(record.description)}</description>"
@@ -142,15 +155,45 @@ class SkillsLoader:
         return "\n".join(lines)
 
     def _build_index(self) -> list[SkillRecord]:
-        if not self.skills_dir.is_dir():
+        # workspace 先写入索引，builtin 只补充缺失名称；这是用户自定义覆盖内置
+        # Skill 的唯一优先级规则，不能依赖文件系统遍历顺序。
+        records: dict[str, SkillRecord] = {}
+        for record in self._scan_skills_dir(
+            self.skills_dir,
+            source="workspace",
+            source_id="workspace",
+            reject_symlinks=True,
+        ):
+            records[record.name] = record
+        if self.builtin_skills_dir is not None:
+            for record in self._scan_skills_dir(
+                self.builtin_skills_dir,
+                source="builtin",
+                source_id="builtin",
+                reject_symlinks=False,
+            ):
+                records.setdefault(record.name, record)
+        return sorted(records.values(), key=lambda record: record.name)
+
+    def _scan_skills_dir(
+        self,
+        skills_dir: Path,
+        *,
+        source: str,
+        source_id: str,
+        reject_symlinks: bool,
+    ) -> list[SkillRecord]:
+        """扫描一个 Skill 根目录；workspace 额外拒绝符号链接越界。"""
+
+        if not skills_dir.is_dir():
             return []
         records: list[SkillRecord] = []
-        for skill_dir in sorted(self.skills_dir.iterdir(), key=lambda item: item.name):
+        for skill_dir in sorted(skills_dir.iterdir(), key=lambda item: item.name):
             # 符号链接即使当前目标仍在 workspace 内也不读取，避免目标后来被替换后越界。
-            if skill_dir.is_symlink() or not skill_dir.is_dir():
+            if (reject_symlinks and skill_dir.is_symlink()) or not skill_dir.is_dir():
                 continue
             skill_file = skill_dir / "SKILL.md"
-            if not skill_file.is_file() or skill_file.is_symlink():
+            if not skill_file.is_file() or (reject_symlinks and skill_file.is_symlink()):
                 continue
             try:
                 content = skill_file.read_text(encoding="utf-8")
@@ -167,6 +210,8 @@ class SkillsLoader:
             records.append(
                 SkillRecord(
                     name=name,
+                    source=source,
+                    source_id=source_id,
                     root_dir=skill_dir,
                     skill_file=skill_file,
                     content=content,
@@ -178,7 +223,7 @@ class SkillsLoader:
                     missing=missing,
                 )
             )
-        return sorted(records, key=lambda record: record.name)
+        return records
 
     @staticmethod
     def _parse_frontmatter(content: str) -> dict[str, Any]:

@@ -49,6 +49,7 @@ class LoadSkillTool(Tool):
             return f"错误：Skill 正文为空：{name}。"
         return (
             f"# Skill: {record.name}\n\n"
+            f"Source: {record.source}\n"
             f"Base directory: {record.root_dir.resolve()}\n\n"
             "相对路径必须以 Base directory 为基准解析。\n\n"
             "---\n\n"

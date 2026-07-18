@@ -60,6 +60,40 @@ def test_loader_builds_stably_sorted_catalog_and_strips_frontmatter(
     assert "SKILL.md" not in summary
 
 
+def test_loader_merges_builtin_and_workspace_with_workspace_precedence(
+    tmp_path: Path,
+) -> None:
+    builtin = tmp_path / "builtin"
+    workspace = tmp_path / "workspace"
+    _write_skill(builtin, "weather", description="内置天气", body="builtin body")
+    _write_skill(builtin, "summarize", description="内置总结")
+    _write_skill(
+        workspace / "skills",
+        "weather",
+        description="用户天气",
+        body="workspace body",
+    )
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    records = loader.list_skill_records(filter_unavailable=False)
+
+    assert [(record.name, record.source) for record in records] == [
+        ("summarize", "builtin"),
+        ("weather", "workspace"),
+    ]
+    assert loader.load_skill_body("weather") == "workspace body"
+    assert 'source="workspace"' in loader.build_skills_summary()
+
+
+def test_loader_discovers_new_workspace_skill_on_next_query(tmp_path: Path) -> None:
+    loader = SkillsLoader(tmp_path, builtin_skills_dir=None)
+    assert loader.list_skill_records(filter_unavailable=False) == []
+
+    _write_skill(tmp_path / "skills", "weather")
+
+    assert [record.name for record in loader.list_skill_records()] == ["weather"]
+
+
 def test_loader_marks_missing_dependencies_unavailable(
     tmp_path: Path,
     monkeypatch,
