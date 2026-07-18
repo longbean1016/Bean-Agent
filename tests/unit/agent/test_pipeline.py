@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from io import BytesIO
 from pathlib import Path
 
@@ -90,6 +91,51 @@ async def test_pipeline_injects_explicit_skill_mention_into_dynamic_frame(
     assert "审查代码" in str(provider.messages[0]["content"])
     assert "检查行为回归" not in str(provider.messages[0]["content"])
     assert "检查行为回归" in str(provider.messages[-2]["content"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt_tokens", "hit_tokens", "expected"),
+    [
+        (120, 90, "prompt_cache: session=web:c iteration=1 hit=90/120 rate=75.00%"),
+        (None, None, ""),
+    ],
+)
+async def test_pipeline_logs_cache_usage_only_when_provider_reports_it(
+    caplog: pytest.LogCaptureFixture,
+    prompt_tokens: int | None,
+    hit_tokens: int | None,
+    expected: str,
+) -> None:
+    class CacheProvider:
+        async def chat(self, messages, tools=None, **kwargs):
+            return LLMResponse(
+                "完成",
+                cache_prompt_tokens=prompt_tokens,
+                cache_hit_tokens=hit_tokens,
+            )
+
+    pipeline = Pipeline(
+        CacheProvider(),
+        ToolRegistry(),
+        EventBus(),
+        PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        ),
+        workspace="D:/workspace",
+    )
+
+    with caplog.at_level(logging.INFO, logger="agent.pipeline"):
+        await pipeline.process(
+            InboundMessage("web", "u", "c", "测试缓存"),
+            turn_id="cache-usage",
+        )
+
+    if expected:
+        assert expected in caplog.text
+    else:
+        assert "prompt_cache:" not in caplog.text
 
 
 @pytest.mark.asyncio

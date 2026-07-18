@@ -180,6 +180,12 @@ class Pipeline:
 
         for iteration in range(1, self._max_iterations + 1):
             response = await chat_with_context_retry()
+            _log_prompt_cache_usage(
+                session_key=message.session_key,
+                iteration=iteration,
+                prompt_tokens=response.cache_prompt_tokens,
+                hit_tokens=response.cache_hit_tokens,
+            )
             if not response.tool_calls:
                 return PipelineResult(
                     content=str(response.content or ""),
@@ -245,6 +251,28 @@ def _trim_oldest_complete_turn(
     if not user_indexes and history:
         return []
     return None
+
+
+def _log_prompt_cache_usage(
+    *,
+    session_key: str,
+    iteration: int,
+    prompt_tokens: int | None,
+    hit_tokens: int | None,
+) -> None:
+    """记录供应商返回的 Prompt Cache 指标，不用缺失值伪造命中率。"""
+
+    if prompt_tokens is None or hit_tokens is None:
+        return
+    rate = (hit_tokens / prompt_tokens * 100.0) if prompt_tokens > 0 else 0.0
+    logger.info(
+        "prompt_cache: session=%s iteration=%d hit=%d/%d rate=%.2f%%",
+        session_key,
+        iteration,
+        hit_tokens,
+        prompt_tokens,
+        rate,
+    )
 
 
 __all__ = ["Pipeline"]
