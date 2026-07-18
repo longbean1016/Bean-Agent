@@ -5,6 +5,7 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -74,6 +75,36 @@ def test_upload_accepts_utf8_text_and_serves_only_workspace_media(
         assert client.get(
             "/api/chat/media", params={"path": str(tmp_path / "outside.txt")}
         ).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "README.rst", "guide.adoc", "paper.tex",
+        "Main.java", "main.c", "types.hpp", "Program.cs", "main.go", "lib.rs",
+        "index.php", "task.rb", "App.swift", "build.kt", "build.kts", "Main.scala",
+        "init.lua", "deploy.sh", "profile.bash", "env.zsh", "setup.ps1", "run.bat",
+        "run.cmd", "query.sql", "analysis.r", "App.vue", "Page.svelte",
+        "app.ini", "server.conf", "tool.cfg", "messages.properties",
+        "events.ndjson", "records.jsonl", "data.tsv", "schema.graphql", "query.gql",
+        "image.dockerfile",
+    ],
+)
+def test_upload_preserves_supported_utf8_source_and_config_suffixes(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    client, _runtime = _client(tmp_path)
+
+    with client:
+        response = client.post(
+            f"/api/chat/uploads?filename={filename}",
+            content=b"example content\n",
+            headers={"content-type": "application/octet-stream"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["filename"] == filename
 
 
 def test_upload_validates_image_content_and_rejects_binary(tmp_path: Path) -> None:

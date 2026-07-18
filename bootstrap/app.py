@@ -37,6 +37,12 @@ logger = logging.getLogger(__name__)
 _TEXT_SUFFIXES = {
     ".txt", ".md", ".markdown", ".py", ".json", ".toml", ".yaml", ".yml",
     ".csv", ".log", ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".xml",
+    # 这些格式均按 UTF-8 纯文本读取；脚本和构建文件只作为内容提供给模型，绝不执行。
+    ".rst", ".adoc", ".tex", ".java", ".c", ".h", ".cpp", ".hpp", ".cs",
+    ".go", ".rs", ".php", ".rb", ".swift", ".kt", ".kts", ".scala", ".lua",
+    ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd", ".sql", ".r", ".vue",
+    ".svelte", ".ini", ".conf", ".cfg", ".properties", ".ndjson", ".jsonl",
+    ".tsv", ".graphql", ".gql", ".dockerfile",
 }
 _IMAGE_FORMATS = {"PNG", "JPEG", "GIF", "WEBP", "BMP"}
 _MAX_TEXT_UPLOAD = 2 * 1024 * 1024
