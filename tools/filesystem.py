@@ -48,27 +48,6 @@ def _resolve_path(path: str, allowed_dir: Path | None = None) -> Path:
     return resolved
 
 
-def _resolve_read_path(
-    path: str,
-    allowed_dir: Path | None,
-    additional_allowed_dirs: tuple[Path, ...],
-) -> Path:
-    """读取工具可额外访问受控附件根；相对路径仍固定基于主工作目录解析。"""
-
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute() and allowed_dir is not None:
-        resolved = (allowed_dir / candidate).resolve()
-    else:
-        resolved = candidate.resolve()
-    if allowed_dir is None:
-        return resolved
-    roots = (allowed_dir, *additional_allowed_dirs)
-    if not any(_is_inside(resolved, root.expanduser().resolve()) for root in roots):
-        allowed = ", ".join(str(root) for root in roots)
-        raise PermissionError(f"路径 {path} 超出允许目录：{allowed}")
-    return resolved
-
-
 def _get_file_mutation_key(file_path: Path) -> str:
     """为现有和待创建文件生成稳定锁键。"""
 
@@ -293,10 +272,8 @@ class ReadFileTool(Tool):
         allowed_dir: Path | None = None,
         multimodal: bool = True,
         vl_available: bool = False,
-        additional_allowed_dirs: tuple[Path, ...] = (),
     ) -> None:
         self._allowed_dir = allowed_dir
-        self._additional_allowed_dirs = additional_allowed_dirs
         self._multimodal = multimodal
         self._vl_available = vl_available
 
@@ -345,11 +322,7 @@ class ReadFileTool(Tool):
         raw_limit = kwargs.get("limit")
         limit = int(raw_limit) if raw_limit is not None else None
         try:
-            file_path = _resolve_read_path(
-                path,
-                self._allowed_dir,
-                self._additional_allowed_dirs,
-            )
+            file_path = _resolve_path(path, self._allowed_dir)
             if not file_path.exists():
                 return f"错误：文件不存在：{path}"
             if not file_path.is_file():

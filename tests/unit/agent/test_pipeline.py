@@ -121,7 +121,8 @@ async def test_pipeline_includes_text_and_image_attachments_in_current_turn(
     assert isinstance(current, list)
     assert current[0]["type"] == "image_url"
     assert current[0]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert "附件中的关键内容" in current[-1]["text"]
+    assert str(text_path) in current[-1]["text"]
+    assert "附件中的关键内容" not in current[-1]["text"]
     assert "分析附件" in current[-1]["text"]
 
 
@@ -147,7 +148,7 @@ async def test_attachment_content_routes_local_image_to_independent_vl(
 
 
 @pytest.mark.asyncio
-async def test_attachment_content_embeds_html_for_text_only_main_model(
+async def test_attachment_content_references_html_for_text_only_main_model(
     tmp_path: Path,
 ) -> None:
     html_path = tmp_path / "page.html"
@@ -161,9 +162,9 @@ async def test_attachment_content_embeds_html_for_text_only_main_model(
     )
 
     assert isinstance(content, str)
-    assert "[文本附件: page.html]" in content
-    assert "<main>附件正文</main>" in content
-    assert "文件路径" not in content
+    assert "文件路径" in content
+    assert str(html_path) in content
+    assert "<main>附件正文</main>" not in content
 
 
 @pytest.mark.asyncio

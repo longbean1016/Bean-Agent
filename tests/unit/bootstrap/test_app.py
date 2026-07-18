@@ -68,26 +68,27 @@ def test_build_core_runtime_injects_image_capabilities_into_pipeline(
 
 
 @pytest.mark.asyncio
-async def test_build_core_runtime_allows_reading_uploaded_text_outside_workdir(
+async def test_build_core_runtime_allows_unrestricted_reads_but_keeps_writes_scoped(
     tmp_path: Path,
 ) -> None:
     config = Config()
     config.memory.enabled = False
     config.agent.workdir = str(tmp_path / "source")
     workspace = tmp_path / "runtime"
-    uploaded = workspace / "uploads" / "request" / "Main.java"
-    uploaded.parent.mkdir(parents=True)
-    uploaded.write_text("class Main {}", encoding="utf-8")
+    outside = tmp_path / "outside" / "Main.java"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("class Main {}", encoding="utf-8")
 
     runtime = build_core_runtime(config, workspace, provider=Provider())
-    result = await runtime.tools.execute("read_file", {"path": str(uploaded)})
-    outside = tmp_path / "private.txt"
-    outside.write_text("secret", encoding="utf-8")
-    rejected = await runtime.tools.execute("read_file", {"path": str(outside)})
+    result = await runtime.tools.execute("read_file", {"path": str(outside)})
+    rejected_write = await runtime.tools.execute(
+        "write_file",
+        {"path": str(tmp_path / "outside" / "created.txt"), "content": "blocked"},
+    )
 
     assert "class Main {}" in str(result)
-    assert "超出允许目录" in str(rejected)
-    assert "secret" not in str(rejected)
+    assert "超出允许目录" in str(rejected_write)
+    assert not (tmp_path / "outside" / "created.txt").exists()
 
 
 def test_fastapi_exposes_real_websocket_route(tmp_path: Path) -> None:
