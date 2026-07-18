@@ -393,7 +393,7 @@ function SessionSidebar(props: {
             onClick={() => props.onSelect(session.key)}
           >
             <span>{session.first_message_content || "未命名会话"}</span>
-            <time>{formatTime(session.updated_at)}</time>
+            <time>{formatTime(session.created_at)}</time>
           </button>
         ))}
       </nav>

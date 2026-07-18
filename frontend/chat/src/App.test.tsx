@@ -119,6 +119,29 @@ it("首次连接创建 Session 并发送用户消息", async () => {
   expect(screen.getByText("组件测试消息")).toBeVisible();
 });
 
+it("会话列表展示第一次提问时间而不是最近更新时间", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const payload = String(input).includes("/messages")
+      ? { items: [], total: 0 }
+      : {
+          items: [{
+            key: "web:first-time",
+            first_message_content: "固定创建时间",
+            created_at: "2026-01-02T10:00:00+08:00",
+            updated_at: "2026-12-31T10:00:00+08:00",
+          }],
+          total: 1,
+        };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  render(<App />);
+
+  await screen.findByText("固定创建时间");
+  expect(screen.getByText("1/2")).toBeVisible();
+  expect(screen.queryByText("12/31")).not.toBeInTheDocument();
+});
+
 it("用户向上滚动后流式增量不抢回视口并可主动回到底部", async () => {
   localStorage.setItem("beanagent.session_id", "web:scroll-lock");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {

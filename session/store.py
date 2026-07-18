@@ -232,7 +232,7 @@ class SessionStore:
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
-        """按最近活动时间列出已有消息的聊天会话。"""
+        """按第一次用户提问时间列出已有消息的聊天会话。"""
 
         safe_limit = max(1, min(int(limit), 200))
         safe_offset = max(0, int(offset))
@@ -252,7 +252,16 @@ class SessionStore:
             ).fetchone()
             rows = self._conn.execute(
                 """
-                SELECT s.key, s.created_at, s.updated_at,
+                SELECT s.key,
+                       COALESCE((
+                           SELECT first.ts
+                           FROM messages first
+                           WHERE first.session_key = s.key
+                             AND first.role = 'user'
+                           ORDER BY first.seq ASC
+                           LIMIT 1
+                       ), s.created_at) AS created_at,
+                       s.updated_at,
                        COUNT(m.id) AS message_count,
                        COALESCE((
                            SELECT first.content
@@ -266,7 +275,8 @@ class SessionStore:
                 JOIN messages m ON m.session_key = s.key
                 WHERE s.key LIKE ?
                 GROUP BY s.key, s.created_at, s.updated_at
-                ORDER BY s.updated_at DESC, s.key DESC
+                -- 列表时间和排序使用同一份首次提问时间；后续消息不能改变会话位置。
+                ORDER BY created_at DESC, s.key DESC
                 LIMIT ? OFFSET ?
                 """,
                 (prefix, safe_limit, safe_offset),

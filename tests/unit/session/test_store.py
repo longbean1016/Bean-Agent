@@ -300,26 +300,43 @@ async def test_cursor_defaults_to_zero_and_can_advance(store: SessionStore) -> N
     assert store.get_cursor("web:chat-1") == 0
 
 
-def test_list_chat_sessions_excludes_empty_and_orders_recent_first(
+def test_list_chat_sessions_uses_first_user_time_for_display_and_order(
     store: SessionStore,
 ) -> None:
     store.create_session("web:empty")
     store.add_message(
-        NewMessage(session_key="web:older", role="user", content="较早的问题")
+        NewMessage(
+            session_key="web:older",
+            role="user",
+            content="较早的问题",
+            timestamp="2026-07-18T10:00:00+08:00",
+        )
     )
     store.add_message(
-        NewMessage(session_key="web:newer", role="user", content="最近的问题")
+        NewMessage(
+            session_key="web:newer",
+            role="user",
+            content="较晚创建的问题",
+            timestamp="2026-07-18T11:00:00+08:00",
+        )
     )
     store.add_message(
-        NewMessage(session_key="web:newer", role="assistant", content="最近的回答")
+        NewMessage(
+            session_key="web:older",
+            role="assistant",
+            content="后来才追加的回答",
+            timestamp="2026-07-18T12:00:00+08:00",
+        )
     )
 
     items, total = store.list_chat_sessions(channel="web", limit=20, offset=0)
 
     assert total == 2
     assert [item["key"] for item in items] == ["web:newer", "web:older"]
-    assert items[0]["message_count"] == 2
-    assert items[0]["first_message_content"] == "最近的问题"
+    assert items[0]["created_at"] == "2026-07-18T11:00:00+08:00"
+    assert items[1]["created_at"] == "2026-07-18T10:00:00+08:00"
+    assert items[1]["message_count"] == 2
+    assert items[0]["first_message_content"] == "较晚创建的问题"
 
 
 def test_list_chat_messages_returns_persisted_frontend_fields(
