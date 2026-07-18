@@ -35,6 +35,7 @@ def register_filesystem_tools(
     multimodal: bool,
     vl_provider: LLMProvider | None = None,
     vl_model: str = "",
+    read_allowed_dirs: tuple[Path, ...] = (),
 ) -> ToolRegistry:
     """注册文件工具，并按主模型能力决定是否增加独立视觉工具。"""
 
@@ -44,6 +45,7 @@ def register_filesystem_tools(
             allowed_dir=allowed_dir,
             multimodal=multimodal,
             vl_available=vl_available,
+            additional_allowed_dirs=read_allowed_dirs,
         )
     )
     registry.register(WriteFileTool(allowed_dir))
@@ -69,6 +71,7 @@ def register_all(
     fetch_client: FetchHttpClient | None = None,
     session_store: SessionStore | None = None,
     memory_engine: MemoryToolsApi | None = None,
+    read_allowed_dirs: tuple[Path, ...] = (),
 ) -> ToolRegistry:
     """注册当前依赖实际支持的全部内置工具。"""
 
@@ -85,6 +88,7 @@ def register_all(
         multimodal=multimodal,
         vl_provider=vl_provider,
         vl_model=vl_model,
+        read_allowed_dirs=read_allowed_dirs,
     )
     registry.register(WebSearchTool(client=search_client))
     registry.register(WebFetchTool(client=fetch_client))

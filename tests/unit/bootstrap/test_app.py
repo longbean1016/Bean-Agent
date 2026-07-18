@@ -67,6 +67,29 @@ def test_build_core_runtime_injects_image_capabilities_into_pipeline(
         asyncio.run(runtime.vision_provider.close())
 
 
+@pytest.mark.asyncio
+async def test_build_core_runtime_allows_reading_uploaded_text_outside_workdir(
+    tmp_path: Path,
+) -> None:
+    config = Config()
+    config.memory.enabled = False
+    config.agent.workdir = str(tmp_path / "source")
+    workspace = tmp_path / "runtime"
+    uploaded = workspace / "uploads" / "request" / "Main.java"
+    uploaded.parent.mkdir(parents=True)
+    uploaded.write_text("class Main {}", encoding="utf-8")
+
+    runtime = build_core_runtime(config, workspace, provider=Provider())
+    result = await runtime.tools.execute("read_file", {"path": str(uploaded)})
+    outside = tmp_path / "private.txt"
+    outside.write_text("secret", encoding="utf-8")
+    rejected = await runtime.tools.execute("read_file", {"path": str(outside)})
+
+    assert "class Main {}" in str(result)
+    assert "超出允许目录" in str(rejected)
+    assert "secret" not in str(rejected)
+
+
 def test_fastapi_exposes_real_websocket_route(tmp_path: Path) -> None:
     config = Config()
     config.memory.enabled = False

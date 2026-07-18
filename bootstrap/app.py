@@ -227,6 +227,9 @@ def build_core_runtime(
         vl_model=config.llm.vl.model if config.llm.vl else "",
         session_store=sessions.store,
         memory_engine=memory,
+        # Akashic 的 uploads 位于工具 workspace 内；BeanAgent 支持独立 workdir，
+        # 因此显式把运行 workspace 的附件目录加入只读根，写入类工具不继承该权限。
+        read_allowed_dirs=(root / "uploads",),
     )
     assembler = PromptAssembler(
         SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
