@@ -44,7 +44,7 @@ def test_loader_builds_stably_sorted_catalog_and_strips_frontmatter(
         extra_frontmatter="when_to_use: 用户明确要求第一个技能\nalways: true",
     )
 
-    loader = SkillsLoader(tmp_path)
+    loader = SkillsLoader(tmp_path, builtin_skills_dir=None)
 
     assert [record.name for record in loader.list_skill_records()] == [
         "a-first",
@@ -110,7 +110,7 @@ def test_loader_marks_missing_dependencies_unavailable(
         ),
     )
 
-    loader = SkillsLoader(tmp_path)
+    loader = SkillsLoader(tmp_path, builtin_skills_dir=None)
     record = loader.load_skill_record("needs-env")
 
     assert record is not None
@@ -131,6 +131,6 @@ def test_loader_ignores_symlinked_skill_directory(tmp_path: Path) -> None:
         # Windows 未启用开发者模式时不能创建符号链接，边界由生产代码测试覆盖。
         return
 
-    loader = SkillsLoader(tmp_path / "workspace")
+    loader = SkillsLoader(tmp_path / "workspace", builtin_skills_dir=None)
 
     assert loader.list_skill_records(filter_unavailable=False) == []

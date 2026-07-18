@@ -25,7 +25,7 @@ def _write_skill(root: Path, name: str, body: str = "执行正文") -> Path:
 @pytest.mark.asyncio
 async def test_load_skill_returns_body_and_base_directory(tmp_path: Path) -> None:
     skill_dir = _write_skill(tmp_path, "memory", "先读取记忆，再回答。")
-    tool = LoadSkillTool(SkillsLoader(tmp_path))
+    tool = LoadSkillTool(SkillsLoader(tmp_path, builtin_skills_dir=None))
 
     result = await tool.execute(skill="memory")
 
@@ -39,7 +39,7 @@ async def test_load_skill_returns_body_and_base_directory(tmp_path: Path) -> Non
 @pytest.mark.asyncio
 async def test_load_skill_returns_stable_unknown_error(tmp_path: Path) -> None:
     _write_skill(tmp_path, "memory")
-    tool = LoadSkillTool(SkillsLoader(tmp_path))
+    tool = LoadSkillTool(SkillsLoader(tmp_path, builtin_skills_dir=None))
 
     result = await tool.execute(skill="missing")
 
