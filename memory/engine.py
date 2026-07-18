@@ -23,6 +23,7 @@ from memory.md_store import MarkdownMemoryStore
 from memory.memorizer import Memorizer
 from memory.optimizer import MemoryOptimizer
 from memory.post_response_worker import PostResponseMemoryWorker
+from memory.query_builder import build_memory_queries
 from memory.query_rewriter import QueryRewriter
 from memory.retriever import Retriever
 from memory.store import MemoryStore2
@@ -91,6 +92,7 @@ class MemoryEngine:
             require_scope_match=require_scope_match,
             time_start=request.filters.time_start,
             time_end=request.filters.time_end,
+            aux_queries=_string_list(request.context.get("aux_queries")),
         )
         records: list[MemoryRecord] = []
         for item in items:
@@ -161,16 +163,24 @@ class MemoryEngine:
         text = str(getattr(message, "content", getattr(message, "text", "")) or "")
         channel = str(getattr(message, "channel", "") or "")
         chat_id = str(getattr(message, "chat_id", "") or "")
-        decision = await self._rewriter.decide(text, "")
-        queries = [decision.episodic_query] if decision.needs_episodic else []
-        if decision.procedure_query:
-            queries.append(decision.procedure_query)
+        session_key = str(getattr(message, "session_key", "") or "")
+        if not session_key and channel and chat_id:
+            session_key = f"{channel}:{chat_id}"
+        # SessionStore 是同步 SQLite 接口，放入线程执行，避免记忆 Gate 阻塞事件循环。
+        history = await asyncio.to_thread(self._sessions.load_history, session_key, 12) if session_key else []
+        decision = await self._rewriter.decide(text, _format_recent_history(history))
+        queries = build_memory_queries(
+            text,
+            decision.episodic_query if decision.needs_episodic else "",
+            decision.procedure_query,
+        )
         if not queries:
             return ""
         result = await self.query(MemoryQuery(
-            " ".join(queries),
+            queries[0],
             intent="context",
             scope=_scope(channel, chat_id),
+            context={"aux_queries": queries[1:]},
         ))
         return _injection_block(result.records)
 
@@ -547,6 +557,25 @@ def _render_recent_context(data: dict[str, object]) -> str:
 def _scope(channel: str, chat_id: str):
     from memory.contracts import MemoryScope
     return MemoryScope(session_key=f"{channel}:{chat_id}" if channel and chat_id else "", channel=channel, chat_id=chat_id)
+
+
+def _format_recent_history(messages: list[dict[str, Any]], *, max_chars: int = 4000) -> str:
+    """将近期消息压缩为 query rewrite 可读文本，并从尾部限制字符预算。"""
+
+    lines = [
+        f"{str(item.get('role') or '').upper()}: {str(item.get('content') or '').strip()}"
+        for item in messages
+        if str(item.get("content") or "").strip()
+    ]
+    return "\n".join(lines)[-max(1, int(max_chars)):]
+
+
+def _string_list(value: object) -> list[str]:
+    """只接受显式字符串列表，防止工具上下文把任意对象传入检索器。"""
+
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _emotional_weight(value: object) -> int:

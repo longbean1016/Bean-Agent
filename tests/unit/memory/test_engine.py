@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.config_models import MemoryConfig
+from agent.message_bus import InboundMessage
 from memory.consolidator import ConsolidationDraft
 from memory.contracts import MemoryIngestRequest, MemoryMutation, MemoryQuery, MemoryScope
 from memory.engine import MemoryEngine
@@ -109,6 +110,61 @@ async def test_turn_context_retrieval_can_recall_event_from_another_session(
         sessions.close()
 
     assert "用户完成了 WebSocket 启动验证" in block
+
+
+@pytest.mark.asyncio
+async def test_turn_retrieval_uses_recent_history_and_distinct_queries(
+    tmp_path: Path,
+) -> None:
+    """当前消息、历史改写和流程改写必须作为独立 query 进入检索。"""
+
+    class CapturingRewriter:
+        recent_history = ""
+
+        async def decide(self, user_msg: str, recent_history: str):
+            self.recent_history = recent_history
+            return SimpleNamespace(
+                needs_episodic=True,
+                episodic_query="用户的手环型号",
+                procedure_query="回答设备记忆问题时查找历史依据",
+            )
+
+    class CapturingRetriever:
+        calls: list[tuple[str, list[str]]] = []
+
+        async def retrieve(self, query: str, **kwargs):
+            self.calls.append((query, list(kwargs.get("aux_queries") or [])))
+            return []
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    sessions.add_message(NewMessage(
+        session_key="web:c",
+        role="user",
+        content="我用的是 Fitbit Charge 6",
+    ))
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    rewriter = CapturingRewriter()
+    retriever = CapturingRetriever()
+    engine._rewriter = rewriter
+    engine._retriever = retriever
+    try:
+        await engine.retrieve_for_turn(InboundMessage(
+            channel="web",
+            sender="web",
+            chat_id="c",
+            content="你还记得我的设备吗",
+        ))
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert "Fitbit Charge 6" in rewriter.recent_history
+    assert retriever.calls == [(
+        "你还记得我的设备吗",
+        ["用户的手环型号", "回答设备记忆问题时查找历史依据"],
+    )]
 
 
 @pytest.mark.asyncio
