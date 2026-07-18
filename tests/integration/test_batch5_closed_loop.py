@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -111,3 +112,77 @@ async def test_two_turn_closed_loop_restores_history_and_memory(tmp_path: Path) 
         await sessions.close()
 
     assert embedder.closed is True
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_is_expanded_into_next_provider_messages(
+    tmp_path: Path,
+) -> None:
+    class InterruptProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.waiting = asyncio.Event()
+            self.messages: list[list[dict[str, object]]] = []
+
+        async def chat(self, messages, tools=None, on_content_delta=None, **kwargs):
+            self.calls += 1
+            self.messages.append(list(messages))
+            if self.calls == 1:
+                return LLMResponse(
+                    None,
+                    [ToolCall("interrupted-call", "echo", {"text": "已读取内容"})],
+                )
+            if self.calls == 2:
+                self.waiting.set()
+                await asyncio.Event().wait()
+            return LLMResponse("继续后的完整回答")
+
+    bus = MessageBus()
+    events = EventBus()
+    sessions = SessionManager(tmp_path)
+    provider = InterruptProvider()
+    tools = ToolRegistry()
+    tools.register(EchoTool())
+    pipeline = Pipeline(
+        provider,
+        tools,
+        events,
+        PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        ),
+        workspace=str(tmp_path),
+        history_loader=sessions.load_history,
+    )
+    loop = AgentLoop(bus, events, pipeline, sessions)
+
+    try:
+        await bus.publish_inbound(
+            InboundMessage("web", "u", "c", "读取文件并分析")
+        )
+        interrupted_turn = asyncio.create_task(loop.run_once())
+        await provider.waiting.wait()
+        assert loop.request_interrupt("web:c").status == "interrupted"
+        await interrupted_turn
+
+        # 中断发生时不落库；同一会话的下一条消息负责补写中断标记。
+        assert sessions.store.fetch_session_messages("web:c") == []
+        await bus.publish_inbound(InboundMessage("web", "u", "c", "继续"))
+        await loop.run_once()
+
+        model_messages = provider.messages[-1]
+        history = [item for item in model_messages if item.get("role") != "system"]
+        assert history[0] == {"role": "user", "content": "读取文件并分析"}
+        assert history[1]["role"] == "assistant"
+        assert history[1]["tool_calls"][0]["function"]["name"] == "echo"
+        assert history[2] == {
+            "role": "tool",
+            "tool_call_id": "interrupted-call",
+            "content": "echo:已读取内容",
+        }
+        assert history[3]["role"] == "assistant"
+        assert history[3]["content"] == "[interrupted]"
+        assert history[-1]["role"] == "user"
+        assert str(history[-1]["content"]).endswith("\n继续")
+    finally:
+        await sessions.close()
