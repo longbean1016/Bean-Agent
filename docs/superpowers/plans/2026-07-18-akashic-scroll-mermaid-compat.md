@@ -39,3 +39,17 @@
 - [ ] 为 Mermaid 容器和 SVG 增加宽高、overflow、pointer、touch 与固定图标尺寸约束。
 - [ ] 验证普通回答与思考内容采用相同插件策略，渲染失败不破坏消息列表。
 - [ ] 运行完整前端单测、类型检查、生产构建和 `git diff --check`，提交 `feature: 恢复受限的 Mermaid 流程图`。
+
+### Task 3: 固定预览与大图查看
+
+**Files:**
+- Modify: `frontend/chat/src/App.tsx`
+- Modify: `frontend/chat/src/styles.css`
+- Test: `frontend/chat/src/App.test.tsx`
+
+- [ ] 新增失败测试：内嵌 Mermaid 提供“查看大图”，不显示缩放按钮。
+- [ ] 新增失败测试：点击后出现接近全屏查看器及缩放、复位按钮，关闭后返回消息。
+- [ ] 配置 Streamdown fullscreen control，使用作用域 CSS 只禁用内嵌画布交互，不影响 Portal 内全屏画布。
+- [ ] 将内嵌预览固定在 380px 高度，增加边框、背景、标题栏和稳定图标尺寸。
+- [ ] 为延迟渲染增加“正在生成流程图”骨架；通过 Mermaid error component 提供中文错误、重试、查看与复制源码。
+- [ ] 运行完整前端单测、类型检查、生产构建和 `git diff --check`，提交 `feature: 增加 Mermaid 大图查看器`。
