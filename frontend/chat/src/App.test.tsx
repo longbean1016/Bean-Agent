@@ -307,6 +307,24 @@ it("Mermaid fenced block 生成受限图表而不是普通代码块", async () =
   expect(screen.queryByTitle("关闭大图")).not.toBeInTheDocument();
 });
 
+it("流式消息中的 Mermaid fence 闭合后允许立即查看大图", async () => {
+  localStorage.setItem("beanagent.session_id", "web:stream-mermaid");
+  const { container } = render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.started", request_id: "r-mermaid", session_id: "web:stream-mermaid",
+    turn_id: "turn-stream-mermaid", content: "生成流程图",
+  }) } as MessageEvent);
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "answer.delta", session_id: "web:stream-mermaid", turn_id: "turn-stream-mermaid",
+    delta: "```mermaid\nflowchart TD\n  A --> B\n```",
+  }) } as MessageEvent);
+
+  await waitFor(() => expect(container.querySelector('[data-streamdown="mermaid"]')).not.toBeNull());
+  expect(screen.getByTitle("查看大图")).not.toBeDisabled();
+});
+
 it("空会话不再提供 Mermaid 流程图示例", async () => {
   render(<App />);
 

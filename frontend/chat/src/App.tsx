@@ -86,6 +86,28 @@ function prepareMessageMarkdown(markdown: string): string {
   }).join("");
 }
 
+function containsClosedMermaidFence(markdown: string): boolean {
+  let opening: { marker: "`" | "~"; length: number; mermaid: boolean } | null = null;
+  for (const line of markdown.split("\n")) {
+    if (!opening) {
+      const fence = line.match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+      if (!fence) continue;
+      opening = {
+        marker: fence[1][0] as "`" | "~",
+        length: fence[1].length,
+        mermaid: /^\s*mermaid(?:\s|$)/i.test(fence[2]),
+      };
+      continue;
+    }
+    const closing = line.trim();
+    if (closing.length >= opening.length && [...closing].every((char) => char === opening!.marker)) {
+      if (opening.mermaid) return true;
+      opening = null;
+    }
+  }
+  return false;
+}
+
 export function App() {
   const [chat, dispatch] = useReducer(reduceChatFrame, {
     ...initialChatState,
@@ -410,6 +432,9 @@ function ThemeControl({ value, onChange }: { value: ThemePreference; onChange: (
 
 function MessageView({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
+  // Streamdown 在 isAnimating 期间会禁用复制和全屏按钮。Mermaid fence 一旦
+  // 闭合就已经具备稳定源码，应立即放开查看大图，而不必等待 final 帧。
+  const markdownAnimating = Boolean(message.streaming && !containsClosedMermaidFence(message.content));
 
   return (
     <article className={`message ${isUser ? "user-message" : "assistant-message"}`}>
@@ -424,7 +449,7 @@ function MessageView({ message }: { message: ChatMessage }) {
               key={`${message.id}-${message.streaming ? "stream" : "final"}`}
               plugins={markdownPlugins}
               controls={markdownControls}
-              isAnimating={Boolean(message.streaming)}
+              isAnimating={markdownAnimating}
               lineNumbers={false}
               linkSafety={markdownLinkSafety}
               mermaid={markdownMermaidOptions}
