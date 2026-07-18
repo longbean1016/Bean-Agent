@@ -12,6 +12,14 @@ class MemoryPromptApi(Protocol):
     def read_recent_context(self) -> str: ...
 
 
+class SkillsPromptApi(Protocol):
+    """Prompt 组装只依赖 Skill 目录与正文读取，不感知磁盘扫描实现。"""
+
+    def build_skills_summary(self) -> str: ...
+    def get_always_skills(self) -> list[str]: ...
+    def load_skills_for_context(self, names: list[str]) -> str: ...
+
+
 @dataclass(slots=True)
 class TurnContext:
     workspace: str
@@ -21,6 +29,8 @@ class TurnContext:
     retrieved_memory_block: str = ""
     tools_summary: str = ""
     active_tool_names: list[str] = field(default_factory=list)
+    skills: SkillsPromptApi | None = None
+    active_skill_names: list[str] = field(default_factory=list)
 
 
 class PromptBlock(Protocol):
@@ -100,6 +110,17 @@ class ToolsCatalogPromptBlock(_Block):
     def cache_signature(self, ctx: TurnContext) -> str | None: return ctx.tools_summary or None
 
 
+class SkillsCatalogPromptBlock(_Block):
+    priority, label, is_static = 25, "skills_catalog", True
+    def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
+        summary = cached_signature if cached_signature is not None else (
+            ctx.skills.build_skills_summary() if ctx.skills else ""
+        )
+        return f"## Skill 目录\n{summary}" if summary.strip() else None
+    def cache_signature(self, ctx: TurnContext) -> str | None:
+        return ctx.skills.build_skills_summary() or None if ctx.skills else None
+
+
 class SelfModelPromptBlock(_Block):
     priority, label = 30, "self_model"
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
@@ -137,6 +158,20 @@ class ActiveToolsPromptBlock(_Block):
         return f"当前活跃工具: {', '.join(ctx.active_tool_names)}" if ctx.active_tool_names else None
 
 
+class ActiveSkillsPromptBlock(_Block):
+    priority, label = 52, "active_skills"
+    def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
+        if not ctx.skills:
+            return None
+        # always Skill 先于本轮显式命中，既保证基础约束稳定，也保持用户提及顺序。
+        names = list(dict.fromkeys([
+            *ctx.skills.get_always_skills(),
+            *ctx.active_skill_names,
+        ]))
+        content = ctx.skills.load_skills_for_context(names)
+        return f"# Active Skills\n\n{content}" if content else None
+
+
 class RetrievedMemoryPromptBlock(_Block):
     priority, label = 55, "retrieved_memory"
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
@@ -171,7 +206,7 @@ class SystemPromptBuilder:
 
 
 def default_prompt_blocks() -> list[PromptBlock]:
-    return [IdentityPromptBlock(), BehaviorRulesPromptBlock(), ToolsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), RecentContextPromptBlock(), ActiveToolsPromptBlock(), RetrievedMemoryPromptBlock()]
+    return [IdentityPromptBlock(), BehaviorRulesPromptBlock(), ToolsCatalogPromptBlock(), SkillsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), RecentContextPromptBlock(), ActiveToolsPromptBlock(), ActiveSkillsPromptBlock(), RetrievedMemoryPromptBlock()]
 
 
 __all__ = ["PromptSectionMeta", "PromptSectionRender", "SectionCache", "SystemPromptBuilder", "TurnContext", "default_prompt_blocks"]

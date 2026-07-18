@@ -15,6 +15,18 @@ class Memory:
         return "## Compression\n- 项目开发\n\n## Recent Turns\n- [user] 重复消息"
 
 
+class Skills:
+    def build_skills_summary(self) -> str:
+        return '<skills><skill name="review"><description>代码审查</description></skill></skills>'
+
+    def get_always_skills(self) -> list[str]:
+        return ["base"]
+
+    def load_skills_for_context(self, names: list[str]) -> str:
+        bodies = {"base": "始终遵循基础流程", "review": "检查行为回归"}
+        return "\n".join(bodies[name] for name in names if name in bodies)
+
+
 def test_static_prefix_cache_and_dynamic_context_frame_are_separated() -> None:
     builder = SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache())
     assembler = PromptAssembler(builder, MessageEnvelopeBuilder())
@@ -70,3 +82,42 @@ def test_stable_behavior_rules_request_chinese_answer_and_reasoning() -> None:
 
     system_prompt = str(result.messages[0]["content"])
     assert "最终回复与思考过程使用简体中文" in system_prompt
+
+
+def test_skill_catalog_is_stable_while_active_skill_body_stays_in_frame() -> None:
+    assembler = PromptAssembler(
+        SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
+        MessageEnvelopeBuilder(),
+    )
+    base = TurnContext(
+        workspace="D:/workspace",
+        channel="web",
+        chat_id="c",
+        skills=Skills(),
+        active_skill_names=[],
+    )
+    active = TurnContext(
+        workspace="D:/workspace",
+        channel="web",
+        chat_id="c",
+        skills=Skills(),
+        active_skill_names=["review"],
+    )
+
+    first = assembler.assemble(
+        turn_ctx=base,
+        history=[],
+        current_message="普通问题",
+    )
+    second = assembler.assemble(
+        turn_ctx=active,
+        history=[],
+        current_message="$review 检查代码",
+    )
+
+    assert first.messages[0]["content"] == second.messages[0]["content"]
+    assert "代码审查" in str(first.messages[0]["content"])
+    assert "始终遵循基础流程" not in str(first.messages[0]["content"])
+    assert "始终遵循基础流程" in str(first.messages[-2]["content"])
+    assert "检查行为回归" not in str(first.messages[-2]["content"])
+    assert "检查行为回归" in str(second.messages[-2]["content"])

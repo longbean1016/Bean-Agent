@@ -16,6 +16,7 @@ from agent.pipeline import Pipeline
 from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
 from agent.provider import ContextLengthError, LLMResponse, ToolCall
+from agent.skills import SkillsLoader
 from tools.base import Tool
 from tools.registry import ToolRegistry
 
@@ -47,6 +48,48 @@ class Memory:
     def read_self(self): return ""
     def get_memory_context(self): return ""
     def read_recent_context(self): return ""
+
+
+@pytest.mark.asyncio
+async def test_pipeline_injects_explicit_skill_mention_into_dynamic_frame(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / "review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: review\ndescription: 审查代码\n---\n检查行为回归。\n",
+        encoding="utf-8",
+    )
+
+    class FinalProvider:
+        def __init__(self) -> None:
+            self.messages = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages = messages
+            return LLMResponse("完成")
+
+    provider = FinalProvider()
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        EventBus(),
+        PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        ),
+        workspace=str(tmp_path),
+        skills=SkillsLoader(tmp_path),
+    )
+
+    await pipeline.process(
+        InboundMessage("web", "u", "c", "$review 请检查"),
+        turn_id="skill-turn",
+    )
+
+    assert "审查代码" in str(provider.messages[0]["content"])
+    assert "检查行为回归" not in str(provider.messages[0]["content"])
+    assert "检查行为回归" in str(provider.messages[-2]["content"])
 
 
 @pytest.mark.asyncio

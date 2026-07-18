@@ -16,6 +16,7 @@ from agent.message_bus import InboundMessage, PipelineResult
 from agent.prompt_assembler import PromptAssembler
 from agent.prompt_block import TurnContext
 from agent.provider import ContextLengthError, LLMResponse
+from agent.skills import SkillsLoader, collect_skill_mentions
 from tools.base import normalize_tool_result
 from tools.registry import ToolRegistry
 from tools.runtime import append_tool_result
@@ -50,6 +51,7 @@ class Pipeline:
         *,
         workspace: str,
         memory: Any | None = None,
+        skills: SkillsLoader | None = None,
         history_loader: HistoryLoader | None = None,
         history_limit: int = 40,
         max_iterations: int = 10,
@@ -62,6 +64,7 @@ class Pipeline:
         self._assembler = assembler
         self._workspace = workspace
         self._memory = memory
+        self._skills = skills
         self._history_loader = history_loader
         self._history_limit = max(0, int(history_limit))
         self._max_iterations = max(1, int(max_iterations))
@@ -88,7 +91,23 @@ class Pipeline:
             for name in names
             if (tool := self._tools.get_tool(name)) is not None
         )
-        context = TurnContext(self._workspace, message.channel, message.chat_id, self._memory, retrieved, summary, names)
+        available_skills = (
+            [record.name for record in self._skills.list_skill_records()]
+            if self._skills
+            else []
+        )
+        active_skills = collect_skill_mentions(message.content, available_skills)
+        context = TurnContext(
+            workspace=self._workspace,
+            channel=message.channel,
+            chat_id=message.chat_id,
+            memory=self._memory,
+            retrieved_memory_block=retrieved,
+            tools_summary=summary,
+            active_tool_names=names,
+            skills=self._skills,
+            active_skill_names=active_skills,
+        )
         current_content = await build_current_user_content(
             message.content,
             message.media,

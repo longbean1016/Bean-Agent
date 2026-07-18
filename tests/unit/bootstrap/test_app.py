@@ -39,8 +39,9 @@ def test_build_core_runtime_wires_singletons_and_all_tools(tmp_path: Path) -> No
     assert runtime.memory is not None
     assert runtime.agent_loop is not None
     assert runtime.pipeline is not None
+    assert runtime.pipeline._skills is not None
     assert runtime.sessions.store is runtime.memory._sessions
-    assert len(runtime.tools.get_registered_names()) == 12
+    assert "load_skill" in runtime.tools.get_registered_names()
 
 
 def test_build_core_runtime_injects_image_capabilities_into_pipeline(

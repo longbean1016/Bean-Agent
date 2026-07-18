@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,19 @@ from typing import Any
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+def collect_skill_mentions(content: str, available_names: list[str]) -> list[str]:
+    """按出现顺序收集合法 ``$skill-name``，未知名称不会进入 Prompt。"""
+
+    available = set(available_names)
+    seen: set[str] = set()
+    result: list[str] = []
+    for name in re.findall(r"\$([a-zA-Z0-9_:-]+)", content):
+        if name in available and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,4 +247,4 @@ class SkillsLoader:
         )
 
 
-__all__ = ["SkillRecord", "SkillsLoader"]
+__all__ = ["SkillRecord", "SkillsLoader", "collect_skill_mentions"]

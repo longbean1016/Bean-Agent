@@ -27,6 +27,7 @@ from agent.pipeline import Pipeline
 from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
 from agent.provider import LLMProvider, create_vision_provider
+from agent.skills import SkillsLoader
 from memory.embedder import Embedder
 from memory.engine import MemoryEngine
 from session.manager import SessionManager
@@ -218,6 +219,7 @@ def build_core_runtime(
         memory.bind_events(events)
 
     vision_provider = create_vision_provider(config.llm.vl)
+    skills = SkillsLoader(root)
     tools = ToolRegistry()
     register_all(
         tools,
@@ -227,6 +229,7 @@ def build_core_runtime(
         vl_model=config.llm.vl.model if config.llm.vl else "",
         session_store=sessions.store,
         memory_engine=memory,
+        skills=skills,
     )
     assembler = PromptAssembler(
         SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
@@ -239,6 +242,7 @@ def build_core_runtime(
         assembler,
         workspace=str(root),
         memory=memory,
+        skills=skills,
         history_loader=sessions.load_history,
         history_limit=config.session.history_window,
         max_iterations=config.llm.max_iterations or 10,

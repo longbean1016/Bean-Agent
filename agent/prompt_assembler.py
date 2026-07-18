@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from agent.prompt_block import PromptSectionMeta, PromptSectionRender, SystemPromptBuilder, TurnContext
 
-_FRAME_SECTIONS = {"recent_context", "active_tools", "retrieved_memory"}
+_FRAME_SECTIONS = {"recent_context", "active_tools", "active_skills", "retrieved_memory"}
 _FRAME_START = '<system-reminder data-system-context-frame="true">'
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
