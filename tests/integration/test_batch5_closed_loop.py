@@ -104,6 +104,21 @@ async def test_two_turn_closed_loop_restores_history_and_memory(tmp_path: Path) 
         assert rows[1]["tool_chain"][0]["calls"][0]["name"] == "echo"
         assert any(item.get("role") == "tool" and "echo:第一轮" in item.get("content", "") for item in second_prompt)
         assert any("用户偏好中文回答" in str(item.get("content")) for item in second_prompt)
+        frame_index = next(
+            index
+            for index, item in enumerate(second_prompt)
+            if str(item.get("content", "")).startswith(
+                '<system-reminder data-system-context-frame="true">'
+            )
+        )
+        tool_index = next(
+            index for index, item in enumerate(second_prompt)
+            if item.get("role") == "tool"
+        )
+        assert second_prompt[0]["role"] == "system"
+        assert tool_index < frame_index == len(second_prompt) - 2
+        assert second_prompt[-1]["role"] == "user"
+        assert str(second_prompt[-1]["content"]).endswith("\n你记得我的回答偏好吗")
         assert any(frame["type"] == "react.tool.completed" for frame in websocket.frames)
         assert [frame["request_id"] for frame in websocket.frames if frame["type"] == "message.final"] == ["r1", "r2"]
     finally:

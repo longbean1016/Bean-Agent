@@ -121,3 +121,43 @@ def test_skill_catalog_is_stable_while_active_skill_body_stays_in_frame() -> Non
     assert "始终遵循基础流程" in str(first.messages[-2]["content"])
     assert "检查行为回归" not in str(first.messages[-2]["content"])
     assert "检查行为回归" in str(second.messages[-2]["content"])
+
+
+def test_system_prefix_is_byte_identical_when_all_turn_dynamic_inputs_change() -> None:
+    assembler = PromptAssembler(
+        SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
+        MessageEnvelopeBuilder(),
+    )
+    first = assembler.assemble(
+        turn_ctx=TurnContext(
+            workspace="D:/workspace",
+            channel="web",
+            chat_id="c",
+            memory=Memory(),
+            retrieved_memory_block="第一条语义记忆",
+            skills=Skills(),
+            active_skill_names=[],
+        ),
+        history=[{"role": "assistant", "content": "第一段历史"}],
+        current_message="第一条问题",
+        message_timestamp=datetime(2026, 7, 18, 1, 0, tzinfo=timezone.utc),
+    )
+    second = assembler.assemble(
+        turn_ctx=TurnContext(
+            workspace="D:/workspace",
+            channel="web",
+            chat_id="c",
+            memory=Memory(),
+            retrieved_memory_block="完全不同的语义记忆",
+            skills=Skills(),
+            active_skill_names=["review"],
+        ),
+        history=[{"role": "assistant", "content": "另一段历史"}],
+        current_message="$review 第二条问题",
+        message_timestamp=datetime(2026, 7, 18, 2, 0, tzinfo=timezone.utc),
+    )
+
+    first_prefix = str(first.messages[0]["content"]).encode("utf-8")
+    second_prefix = str(second.messages[0]["content"]).encode("utf-8")
+    assert first_prefix == second_prefix
+    assert first.messages[1:] != second.messages[1:]
