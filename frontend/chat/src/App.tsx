@@ -1,7 +1,6 @@
 import * as Collapsible from "@radix-ui/react-collapsible";
 import * as Dialog from "@radix-ui/react-dialog";
 import { code } from "@streamdown/code";
-import { mermaid } from "@streamdown/mermaid";
 import {
   AlertCircle,
   ArrowDown,
@@ -9,8 +8,6 @@ import {
   Check,
   ChevronDown,
   CircleStop,
-  Code2,
-  Copy,
   FileText,
   Image as ImageIcon,
   Menu,
@@ -20,7 +17,6 @@ import {
   Paperclip,
   PlugZap,
   RefreshCw,
-  RotateCcw,
   SendHorizontal,
   Sun,
   Wrench,
@@ -28,23 +24,22 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { Streamdown } from "streamdown";
-import type { MermaidErrorComponentProps } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
 import { fetchMessages, fetchSessions, mediaUrl, uploadAttachment } from "./api";
 import { initialChatState, reduceChatFrame, rowsToMessages } from "./chatReducer";
+import { MermaidBlock } from "./MermaidBlock";
 import type { ChatFrame, ChatMessage, ConnectionStatus, SessionSummary, ToolActivity } from "./types";
 import { BeanWebSocketClient } from "./websocketClient";
 
 const SESSION_STORAGE_KEY = "beanagent.session_id";
 const THEME_STORAGE_KEY = "beanagent.theme";
 type ThemePreference = "light" | "system" | "dark";
-const markdownPlugins = { code, mermaid };
+const markdownPlugins = { code, renderers: [{ language: "mermaid", component: MermaidBlock }] };
 const markdownControls = {
   code: { copy: true, download: false },
   // Streamdown 的 panZoom 开关只负责控制按钮；CSS 兼容层还会阻断画布事件，
   // 保证鼠标位于图表上时滚轮仍属于外层会话。
-  mermaid: { copy: true, download: false, fullscreen: true, panZoom: true },
   table: false,
 };
 const markdownTranslations = {
@@ -54,11 +49,7 @@ const markdownTranslations = {
   externalLinkWarning: "即将访问外部网站",
   openExternalLink: "打开外部链接",
   openLink: "打开链接",
-  viewFullscreen: "查看大图",
-  exitFullscreen: "关闭大图",
 };
-
-const markdownMermaidOptions = { errorComponent: MermaidErrorFallback };
 
 const markdownLinkSafety = {
   enabled: false,
@@ -452,7 +443,6 @@ function MessageView({ message }: { message: ChatMessage }) {
               isAnimating={markdownAnimating}
               lineNumbers={false}
               linkSafety={markdownLinkSafety}
-              mermaid={markdownMermaidOptions}
               translations={markdownTranslations}
             >
               {prepareMessageMarkdown(message.content)}
@@ -474,35 +464,11 @@ function Thinking({ content, streaming }: { content: string; streaming: boolean 
         <ChevronDown size={14} />
       </Collapsible.Trigger>
       <Collapsible.Content className="thinking-content beanagent-markdown">
-        <Streamdown plugins={markdownPlugins} controls={markdownControls} lineNumbers={false} linkSafety={markdownLinkSafety} mermaid={markdownMermaidOptions} translations={markdownTranslations}>
+        <Streamdown plugins={markdownPlugins} controls={markdownControls} lineNumbers={false} linkSafety={markdownLinkSafety} translations={markdownTranslations}>
           {prepareMessageMarkdown(content)}
         </Streamdown>
       </Collapsible.Content>
     </Collapsible.Root>
-  );
-}
-
-function MermaidErrorFallback({ chart, error, retry }: MermaidErrorComponentProps) {
-  const [sourceOpen, setSourceOpen] = useState(false);
-  const [copied, setCopied] = useState(false);
-
-  const copySource = async () => {
-    await navigator.clipboard.writeText(chart);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1600);
-  };
-
-  return (
-    <div className="mermaid-error" role="alert">
-      <strong>流程图生成失败</strong>
-      <p>{error}</p>
-      <div className="mermaid-error-actions">
-        <button type="button" onClick={retry}><RotateCcw size={14} /><span>重试</span></button>
-        <button type="button" onClick={() => setSourceOpen((open) => !open)}><Code2 size={14} /><span>查看源码</span></button>
-        <button type="button" onClick={() => void copySource()}><Copy size={14} /><span>{copied ? "已复制" : "复制源码"}</span></button>
-      </div>
-      {sourceOpen ? <pre><code>{chart}</code></pre> : null}
-    </div>
   );
 }
 

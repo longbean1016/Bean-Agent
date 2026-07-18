@@ -101,33 +101,38 @@ button { color: inherit; }
 [data-streamdown="code-block-body"] code { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 13px; line-height: 1.65; white-space: pre; }
 [data-streamdown="code-block-body"] code > span { display: block; min-height: 1.65em; }
 
-/* Akashic 直接注册 Mermaid；BeanAgent 在相同渲染能力外增加非交互边界。
-   Streamdown 即使隐藏 pan/zoom 按钮仍会注册 wheel 和 pointer 事件，因此让
-   application 画布不参与命中，并锁定 transform，滚轮自然交给会话滚动层。 */
-.beanagent-markdown [data-streamdown="mermaid-block"] { width: 100%; min-width: 0; margin: 18px 0; overflow: hidden; border: 1px solid #c8d4d0; border-radius: 6px; background: #f2f6f4; box-shadow: 0 1px 2px rgba(28, 48, 41, .06); }
-.beanagent-markdown [data-streamdown="mermaid-block"] > div:first-child { border-bottom: 1px solid #d3ddda; background: #e8efec; }
-.beanagent-markdown [data-streamdown="mermaid"] { width: 100%; min-width: 0; max-width: 100%; height: 380px; overflow: hidden; padding: 16px; background: #fbfcfb; }
-.beanagent-markdown [data-streamdown="mermaid"] [role="application"] { min-width: 100%; width: max-content; pointer-events: none; touch-action: pan-y !important; cursor: default !important; transform: none !important; transition: none !important; will-change: auto !important; }
-.beanagent-markdown [data-streamdown="mermaid"] [role="img"] { min-width: 100%; width: max-content; justify-content: flex-start; }
-.beanagent-markdown [data-streamdown="mermaid"] svg { display: block; width: auto; min-width: 100%; max-width: none; height: auto; max-height: 348px; }
-/* 全屏按钮会把查看器 Portal 到 body；这里只隐藏内嵌预览自己的缩放组。 */
-.beanagent-markdown [data-streamdown="mermaid"] button { display: none; }
-.beanagent-markdown [data-streamdown="mermaid-block-actions"] button { display: inline-grid; width: 26px; height: 26px; flex: 0 0 26px; padding: 0; place-items: center; }
-.beanagent-markdown [data-streamdown="mermaid-block-actions"] svg { width: 14px; min-width: 14px; height: 14px; max-height: 14px; }
-.beanagent-markdown [data-streamdown="mermaid-block"] > div:last-child:not([data-streamdown="mermaid"]):empty { position: relative; min-height: 380px; margin: 0; background: linear-gradient(90deg, #f3f6f5 25%, #e9efed 50%, #f3f6f5 75%); background-size: 200% 100%; animation: mermaid-loading 1.4s ease-in-out infinite; }
-.beanagent-markdown [data-streamdown="mermaid-block"] > div:last-child:not([data-streamdown="mermaid"]):empty::after { position: absolute; inset: 0; display: grid; place-items: center; color: #63706c; content: "正在生成流程图"; font-size: 13px; }
-.beanagent-markdown [data-streamdown="mermaid-block"] > div:last-child:not([data-streamdown="mermaid"]) span { font-size: 0; }
-.beanagent-markdown [data-streamdown="mermaid-block"] > div:last-child:not([data-streamdown="mermaid"]) span::after { content: "正在生成流程图"; font-size: 13px; }
-@keyframes mermaid-loading { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-.mermaid-error { min-height: 240px; padding: 22px; border-top: 1px solid #e4bbb6; background: #fff6f4; color: #7b302a; }
-.mermaid-error > strong { font-size: 14px; }
+.mermaid-viewer { width: 100%; min-width: 0; margin: 18px 0; overflow: hidden; border: 1px solid #c8d4d0; border-radius: 6px; background: #fbfcfb; box-shadow: 0 1px 2px rgba(28, 48, 41, .06); }
+.mermaid-toolbar { display: flex; min-height: 48px; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 10px; border-bottom: 1px solid #d3ddda; background: #edf2f0; }
+.mermaid-tabs, .mermaid-actions { display: flex; align-items: center; gap: 4px; }
+.mermaid-tabs { padding: 3px; border-radius: 6px; background: #e3e9e7; }
+.mermaid-tabs button, .mermaid-actions button { display: inline-flex; height: 32px; align-items: center; justify-content: center; gap: 6px; padding: 0 10px; border: 0; border-radius: 4px; background: transparent; color: #596661; cursor: pointer; font-size: 12px; }
+.mermaid-tabs button[aria-pressed="true"] { background: #fff; color: #17221f; box-shadow: 0 1px 3px rgba(27, 45, 39, .14); font-weight: 700; }
+.mermaid-actions button:hover:not(:disabled), .mermaid-tabs button:hover { color: #075f58; background: rgba(255, 255, 255, .72); }
+.mermaid-actions button:disabled { cursor: not-allowed; opacity: .38; }
+.mermaid-tabs svg, .mermaid-actions svg { width: 16px; min-width: 16px; height: 16px; }
+.mermaid-preview { position: relative; width: 100%; height: 380px; overflow: hidden; padding: 16px; background: #fbfcfb; }
+.mermaid-loading { display: grid; width: 100%; height: 100%; place-items: center; color: #65716d; background: #f3f6f5; font-size: 13px; }
+.mermaid-canvas { position: relative; width: 100%; height: 100%; overflow: hidden; }
+.mermaid-canvas.static { pointer-events: none; }
+.mermaid-svg { display: flex; width: 100%; height: 100%; align-items: center; justify-content: center; transform-origin: center; }
+.mermaid-svg svg { display: block; width: 100%; max-width: 100%; height: 100%; max-height: 100%; }
+.mermaid-source { width: 100%; height: 380px; margin: 0; overflow: auto; padding: 18px; background: #f8faf9; color: #25312d; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; line-height: 1.65; white-space: pre; }
+.mermaid-error { min-height: 100%; padding: 22px; background: #fff6f4; color: #7b302a; }
 .mermaid-error > p { margin: 6px 0 14px; font-size: 12px; }
-.mermaid-error-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.mermaid-error-actions button { display: inline-flex; height: 30px; align-items: center; gap: 5px; padding: 0 9px; border: 1px solid #d7aaa5; border-radius: 4px; background: #fff; color: #78352f; cursor: pointer; font-size: 12px; }
-.mermaid-error pre { max-height: 240px; margin: 14px 0 0; overflow: auto; padding: 12px; border: 1px solid #e0c7c3; background: #fff; color: #382724; font-size: 12px; }
-:root[data-theme="dark"] .beanagent-markdown [data-streamdown="mermaid-block"] { border-color: #45534e; background: #1c2421; }
-:root[data-theme="dark"] .beanagent-markdown [data-streamdown="mermaid-block"] > div:first-child { border-color: #45534e; background: #252f2b; }
-:root[data-theme="dark"] .beanagent-markdown [data-streamdown="mermaid"] { background: #121715; }
+.mermaid-error button { display: inline-flex; height: 30px; align-items: center; gap: 5px; padding: 0 9px; border: 1px solid #d7aaa5; border-radius: 4px; background: #fff; color: #78352f; cursor: pointer; }
+.mermaid-fullscreen { position: fixed; z-index: 1000; inset: 0; padding: 18px; background: rgba(250, 252, 251, .98); }
+.mermaid-fullscreen-close { position: absolute; z-index: 3; top: 20px; right: 20px; display: inline-grid; width: 38px; height: 38px; padding: 0; place-items: center; border: 1px solid #c9d3d0; border-radius: 6px; background: #fff; color: #33413c; cursor: pointer; }
+.mermaid-fullscreen .mermaid-canvas { border: 1px solid #cbd6d2; border-radius: 6px; background: #fff; }
+.mermaid-fullscreen .mermaid-svg { cursor: grab; touch-action: none; }
+.mermaid-fullscreen .mermaid-svg:active { cursor: grabbing; }
+.mermaid-zoom-controls { position: absolute; z-index: 2; bottom: 18px; left: 18px; display: flex; gap: 5px; padding: 5px; border: 1px solid #cad5d1; border-radius: 6px; background: rgba(255, 255, 255, .94); }
+.mermaid-zoom-controls button { display: inline-grid; width: 34px; height: 34px; padding: 0; place-items: center; border: 0; border-radius: 4px; background: transparent; color: #40504a; cursor: pointer; }
+.mermaid-zoom-controls button:hover { background: #e8efec; color: #07675f; }
+:root[data-theme="dark"] .mermaid-viewer { border-color: #45534e; background: #121715; }
+:root[data-theme="dark"] .mermaid-toolbar { border-color: #45534e; background: #252f2b; }
+:root[data-theme="dark"] .mermaid-tabs { background: #17201d; }
+:root[data-theme="dark"] .mermaid-tabs button[aria-pressed="true"] { background: #3a4642; color: #eef4f1; }
+:root[data-theme="dark"] .mermaid-preview, :root[data-theme="dark"] .mermaid-source { background: #121715; color: #dce5e1; }
 .stream-caret { display: inline-block; width: 7px; height: 18px; background: #0b766e; animation: blink .85s steps(1) infinite; vertical-align: text-bottom; }
 @keyframes blink { 50% { opacity: 0; } }
 .interrupted-label { display: inline-block; margin-top: 10px; color: #8c4f24; font-size: 12px; }
@@ -257,8 +262,10 @@ button { color: inherit; }
   .theme-control button { min-width: 30px; width: 30px; padding: 0; }
   .theme-control button span { display: none; }
   .conversation-content { padding: 20px 14px 80px; }
-  .beanagent-markdown [data-streamdown="mermaid"] { height: 340px; padding: 10px; }
-  .beanagent-markdown [data-streamdown="mermaid"] svg { max-height: 320px; }
+  .mermaid-toolbar { align-items: flex-start; flex-direction: column; }
+  .mermaid-actions { width: 100%; justify-content: flex-end; }
+  .mermaid-actions button span { display: none; }
+  .mermaid-preview, .mermaid-source { height: 340px; }
   .scroll-latest { right: 14px; bottom: 106px; }
   .message { grid-template-columns: 1fr; gap: 6px; margin-bottom: 24px; }
   .message-label { text-align: left; }

@@ -58,6 +58,10 @@ beforeEach(() => {
     rootMargin = "0px";
     thresholds = [0];
   });
+  Object.defineProperty(SVGElement.prototype, "getBBox", {
+    configurable: true,
+    value: () => ({ x: 0, y: 0, width: 120, height: 24 }),
+  });
   Object.defineProperty(HTMLElement.prototype, "scrollTo", {
     configurable: true,
     value: vi.fn(),
@@ -295,12 +299,23 @@ it("Mermaid fenced block 生成受限图表而不是普通代码块", async () =
 
   await waitFor(() => expect(container.querySelector('[data-streamdown="mermaid"]')).not.toBeNull());
   expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull();
-  expect(container.querySelector('[data-streamdown="mermaid"]')?.closest(".beanagent-markdown")).not.toBeNull();
-  expect(container.querySelector('[data-streamdown="mermaid"] [role="application"]')).not.toBeNull();
-  const inlineZoom = screen.getByTitle("Zoom in");
-  expect(inlineZoom.closest('[data-streamdown="mermaid"]')).not.toBeNull();
+  const diagramTab = screen.getByRole("button", { name: "图表" });
+  const codeTab = screen.getByRole("button", { name: "代码" });
+  const fullscreen = screen.getByTitle("全屏查看") as HTMLButtonElement;
+  expect(diagramTab).toHaveAttribute("aria-pressed", "true");
+  await waitFor(() => expect(!fullscreen.disabled || screen.queryByRole("alert") !== null).toBe(true));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  await waitFor(() => expect(fullscreen).not.toBeDisabled());
 
-  fireEvent.click(screen.getByTitle("查看大图"));
+  fireEvent.click(codeTab);
+  expect(codeTab).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByText(/flowchart TD/)).toBeVisible();
+  expect(fullscreen).toBeDisabled();
+  fireEvent.click(screen.getByTitle("复制 Mermaid 源码"));
+  expect(navigator.clipboard.writeText).toHaveBeenCalledWith("flowchart TD\n  A[开始] --> B[完成]\n");
+
+  fireEvent.click(diagramTab);
+  fireEvent.click(fullscreen);
   expect(screen.getByTitle("关闭大图")).toBeVisible();
   expect(document.body.style.overflow).toBe("hidden");
   fireEvent.click(screen.getByTitle("关闭大图"));
@@ -322,7 +337,7 @@ it("流式消息中的 Mermaid fence 闭合后允许立即查看大图", async (
   }) } as MessageEvent);
 
   await waitFor(() => expect(container.querySelector('[data-streamdown="mermaid"]')).not.toBeNull());
-  expect(screen.getByTitle("查看大图")).not.toBeDisabled();
+  await waitFor(() => expect(screen.getByTitle("全屏查看")).not.toBeDisabled());
 });
 
 it("空会话不再提供 Mermaid 流程图示例", async () => {
