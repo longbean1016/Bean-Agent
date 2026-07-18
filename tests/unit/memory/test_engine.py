@@ -161,10 +161,56 @@ async def test_turn_retrieval_uses_recent_history_and_distinct_queries(
         sessions.close()
 
     assert "Fitbit Charge 6" in rewriter.recent_history
-    assert retriever.calls == [(
+    assert retriever.calls[0] == (
         "你还记得我的设备吗",
         ["用户的手环型号", "回答设备记忆问题时查找历史依据"],
-    )]
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_retrieval_uses_hyde_only_after_empty_raw_results(
+    tmp_path: Path,
+) -> None:
+    class HyDEProvider(Provider):
+        async def complete(self, messages, tools=None):
+            prompt = messages[0]["content"]
+            if "假想条目" in prompt:
+                return type("Response", (), {"content": "用户使用 Fitbit Charge 6"})()
+            return await super().complete(messages, tools)
+
+    class Retriever:
+        queries: list[str] = []
+
+        async def retrieve(self, query: str, **kwargs):
+            self.queries.append(query)
+            if query == "用户使用 Fitbit Charge 6":
+                return [{
+                    "id": "device",
+                    "memory_type": "profile",
+                    "summary": "用户使用 Fitbit Charge 6",
+                    "score": 0.9,
+                }]
+            return []
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), HyDEProvider(), sessions, config=config)
+    retriever = Retriever()
+    engine._retriever = retriever
+    try:
+        block = await engine.retrieve_for_turn(InboundMessage(
+            channel="web",
+            sender="web",
+            chat_id="c",
+            content="我的设备是什么",
+        ))
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert retriever.queries[-1] == "用户使用 Fitbit Charge 6"
+    assert "Fitbit Charge 6" in block
 
 
 @pytest.mark.asyncio

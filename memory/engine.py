@@ -18,6 +18,7 @@ from memory.contracts import (
     MemoryToolProfile, MemoryToolSpec,
 )
 from memory.events import ConsolidationCommitted, TurnIngested
+from memory.hyde_enhancer import HyDEEnhancer
 from memory.implicit_extractor import ImplicitLongTermExtractor, ImplicitMemoryDraft
 from memory.md_store import MarkdownMemoryStore
 from memory.memorizer import Memorizer
@@ -27,6 +28,7 @@ from memory.query_builder import build_memory_queries
 from memory.query_rewriter import QueryRewriter
 from memory.retriever import Retriever
 from memory.store import MemoryStore2
+from memory.sufficiency_checker import should_enhance_retrieval
 from session.store import SessionStore
 
 if TYPE_CHECKING:
@@ -54,6 +56,7 @@ class MemoryEngine:
         )
         self._memorizer = Memorizer(self._store, embedder)
         self._rewriter = QueryRewriter(provider)
+        self._hyde = HyDEEnhancer(provider)
         self._optimizer = MemoryOptimizer(self._markdown, provider)
         self._consolidator = Consolidator(
             sessions, self._markdown,
@@ -94,6 +97,32 @@ class MemoryEngine:
             time_end=request.filters.time_end,
             aux_queries=_string_list(request.context.get("aux_queries")),
         )
+        hyde_used = False
+        hypothesis: str | None = None
+        if bool(request.context.get("enable_hyde")) and should_enhance_retrieval(items):
+            # HyDE 只增强 Turn 上下文的空召回；显式 recall 工具保持一次确定性检索。
+            async def retrieve_hypothesis(query: str) -> list[dict[str, object]]:
+                return await self._retriever.retrieve(
+                    query,
+                    memory_types=list(request.filters.kinds) or None,
+                    top_k=request.limit,
+                    scope_channel=scope.channel or None,
+                    scope_chat_id=scope.chat_id or None,
+                    require_scope_match=require_scope_match,
+                    time_start=request.filters.time_start,
+                    time_end=request.filters.time_end,
+                )
+
+            augmented = await self._hyde.augment(
+                query=request.text,
+                context=str(request.context.get("hyde_context") or ""),
+                raw_items=items,
+                retrieve_fn=retrieve_hypothesis,
+            )
+            items = augmented.items
+            hyde_used = augmented.used_hyde
+            hypothesis = augmented.hypothesis
+
         records: list[MemoryRecord] = []
         for item in items:
             source_ref = str(item.get("source_ref") or "")
@@ -113,7 +142,13 @@ class MemoryEngine:
                 evidence=evidence,
                 signals=extra if isinstance(extra, dict) else {},
             ))
-        return MemoryQueryResult(records=records, trace={"engine": "default", "intent": request.intent, "vector_keyword_fusion": True})
+        return MemoryQueryResult(records=records, trace={
+            "engine": "default",
+            "intent": request.intent,
+            "vector_keyword_fusion": True,
+            "hyde_used": hyde_used,
+            "hyde_hypothesis": hypothesis,
+        })
 
     async def mutate(self, mutation: MemoryMutation) -> MemoryMutationResult:
         if mutation.kind == "forget":
@@ -180,7 +215,11 @@ class MemoryEngine:
             queries[0],
             intent="context",
             scope=_scope(channel, chat_id),
-            context={"aux_queries": queries[1:]},
+            context={
+                "aux_queries": queries[1:],
+                "enable_hyde": True,
+                "hyde_context": _format_recent_history(history),
+            },
         ))
         return _injection_block(result.records)
 
