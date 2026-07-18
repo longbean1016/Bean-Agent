@@ -15,6 +15,7 @@ from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolC
 from agent.message_bus import InboundMessage, PipelineResult
 from agent.prompt_assembler import PromptAssembler
 from agent.prompt_block import TurnContext
+from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import ContextLengthError, LLMResponse
 from agent.skills import SkillsLoader, collect_skill_mentions
 from tools.base import normalize_tool_result
@@ -52,6 +53,7 @@ class Pipeline:
         workspace: str,
         memory: Any | None = None,
         skills: SkillsLoader | None = None,
+        prompt_cache_log: PromptCacheLogWriter | None = None,
         history_loader: HistoryLoader | None = None,
         history_limit: int = 40,
         max_iterations: int = 10,
@@ -65,6 +67,7 @@ class Pipeline:
         self._workspace = workspace
         self._memory = memory
         self._skills = skills
+        self._prompt_cache_log = prompt_cache_log
         self._history_loader = history_loader
         self._history_limit = max(0, int(history_limit))
         self._max_iterations = max(1, int(max_iterations))
@@ -186,6 +189,22 @@ class Pipeline:
                 prompt_tokens=response.cache_prompt_tokens,
                 hit_tokens=response.cache_hit_tokens,
             )
+            if self._prompt_cache_log is not None:
+                try:
+                    self._prompt_cache_log.write(
+                        session_key=message.session_key,
+                        turn_id=turn_id,
+                        iteration=iteration,
+                        prompt_tokens=response.cache_prompt_tokens,
+                        hit_tokens=response.cache_hit_tokens,
+                    )
+                except OSError as error:
+                    # 缓存观测是辅助能力，磁盘只读或空间不足不能中断用户对话。
+                    logger.warning(
+                        "Prompt Cache 日志写入失败: session=%s error=%s",
+                        message.session_key,
+                        error,
+                    )
             if not response.tool_calls:
                 return PipelineResult(
                     content=str(response.content or ""),

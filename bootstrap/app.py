@@ -26,6 +26,7 @@ from agent.message_bus import MessageBus
 from agent.pipeline import Pipeline
 from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
+from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import LLMProvider, create_vision_provider
 from agent.skills import SkillsLoader
 from memory.embedder import Embedder
@@ -220,6 +221,7 @@ def build_core_runtime(
 
     vision_provider = create_vision_provider(config.llm.vl)
     skills = SkillsLoader(root)
+    prompt_cache_log = PromptCacheLogWriter(root)
     tools = ToolRegistry()
     register_all(
         tools,
@@ -243,6 +245,7 @@ def build_core_runtime(
         workspace=str(root),
         memory=memory,
         skills=skills,
+        prompt_cache_log=prompt_cache_log,
         history_loader=sessions.load_history,
         history_limit=config.session.history_window,
         max_iterations=config.llm.max_iterations or 10,

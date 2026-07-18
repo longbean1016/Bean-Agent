@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from io import BytesIO
 from pathlib import Path
@@ -14,6 +15,7 @@ from agent.attachment_content import build_current_user_content
 from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted
 from agent.message_bus import InboundMessage
 from agent.pipeline import Pipeline
+from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
 from agent.provider import ContextLengthError, LLMResponse, ToolCall
@@ -136,6 +138,57 @@ async def test_pipeline_logs_cache_usage_only_when_provider_reports_it(
         assert expected in caplog.text
     else:
         assert "prompt_cache:" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_pipeline_persists_each_provider_cache_result_for_session(
+    tmp_path: Path,
+) -> None:
+    class CacheProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(
+                    None,
+                    [ToolCall("cache-call", "echo", {"text": "x"})],
+                    cache_prompt_tokens=100,
+                    cache_hit_tokens=40,
+                )
+            return LLMResponse(
+                "完成",
+                cache_prompt_tokens=120,
+                cache_hit_tokens=80,
+            )
+
+    tools = ToolRegistry()
+    tools.register(EchoTool())
+    pipeline = Pipeline(
+        CacheProvider(),
+        tools,
+        EventBus(),
+        PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        ),
+        workspace=str(tmp_path),
+        prompt_cache_log=PromptCacheLogWriter(tmp_path),
+    )
+
+    await pipeline.process(
+        InboundMessage("web", "u", "c", "测试缓存日志"),
+        turn_id="cache-log-turn",
+    )
+
+    files = list((tmp_path / "logs" / "prompt-cache").glob("*.log"))
+    assert len(files) == 1
+    rows = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+    assert [(row["iteration"], row["hit_tokens"]) for row in rows] == [
+        (1, 40),
+        (2, 80),
+    ]
 
 
 @pytest.mark.asyncio
