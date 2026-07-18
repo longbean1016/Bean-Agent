@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { Streamdown } from "streamdown";
+import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
 import { fetchMessages, fetchSessions, mediaUrl, uploadAttachment } from "./api";
 import { initialChatState, reduceChatFrame, rowsToMessages } from "./chatReducer";
@@ -92,12 +93,9 @@ export function App() {
   const [files, setFiles] = useState<File[]>([]);
   const [sending, setSending] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [followingLatest, setFollowingLatest] = useState(true);
   const [theme, setTheme] = useState<ThemePreference>(() => readThemePreference());
   const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
   const clientRef = useRef<BeanWebSocketClient | null>(null);
-  const conversationRef = useRef<HTMLElement | null>(null);
-  const followingLatestRef = useRef(true);
   const chatRef = useRef(chat);
   chatRef.current = chat;
 
@@ -155,40 +153,10 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat.sessionId]);
 
-  useEffect(() => {
-    const conversation = conversationRef.current;
-    if (!conversation || chat.messages.length === 0 || !followingLatestRef.current) return;
-    // 流式更新只在用户仍停留于底部时跟随。用户向上阅读后不能由下一段 delta
-    // 抢回视口；这是 Akashic stick-to-bottom 的 escaped lock 边界。
-    const frame = requestAnimationFrame(() => {
-      conversation.scrollTo({ top: conversation.scrollHeight, behavior: "auto" });
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [chat.messages]);
-
-  const setLatestFollowing = (value: boolean) => {
-    followingLatestRef.current = value;
-    setFollowingLatest(value);
-  };
-
-  const handleConversationScroll = () => {
-    const conversation = conversationRef.current;
-    if (!conversation) return;
-    const distanceFromBottom = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight;
-    setLatestFollowing(distanceFromBottom <= 48);
-  };
-
-  const scrollToLatest = (behavior: ScrollBehavior = "smooth") => {
-    setLatestFollowing(true);
-    const conversation = conversationRef.current;
-    if (conversation) conversation.scrollTo({ top: conversation.scrollHeight, behavior });
-  };
-
   const loadSession = async (sessionId: string, closeSidebar = true) => {
     try {
       const messages = rowsToMessages(await fetchMessages(sessionId));
       localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
-      setLatestFollowing(true);
       dispatch({ type: "ui.session.select", sessionId, messages });
       if (closeSidebar) setSidebarOpen(false);
     } catch (error) {
@@ -199,7 +167,6 @@ export function App() {
   const createSession = () => {
     if (connection !== "connected") return;
     localStorage.removeItem(SESSION_STORAGE_KEY);
-    setLatestFollowing(true);
     dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
     clientRef.current?.send({ type: "session.create", request_id: crypto.randomUUID() });
     setSidebarOpen(false);
@@ -213,7 +180,6 @@ export function App() {
       return;
     }
     setSending(true);
-    scrollToLatest();
     dispatch({ type: "ui.error.clear" });
     try {
       const uploaded = await Promise.all(files.map(uploadAttachment));
@@ -299,16 +265,15 @@ export function App() {
           </div>
         ) : null}
 
-        <section className="conversation" aria-live="polite" ref={conversationRef} onScroll={handleConversationScroll}>
-          {chat.messages.length === 0 ? <EmptyConversation onExample={setInput} /> : chat.messages.map((message) => (
-            <MessageView key={message.id} message={message} />
-          ))}
-        </section>
-        {!followingLatest ? (
-          <button className="scroll-latest" aria-label="回到最新消息" title="回到最新消息" onClick={() => scrollToLatest()}>
-            <ArrowDown size={18} />
-          </button>
-        ) : null}
+        <StickToBottom className="conversation" initial="instant" resize="smooth" role="log">
+          <StickToBottom.Content className="conversation-content" scrollClassName="conversation-scroll">
+            {chat.messages.length === 0 ? <EmptyConversation onExample={setInput} /> : chat.messages.map((message) => (
+              <MessageView key={message.id} message={message} />
+            ))}
+          </StickToBottom.Content>
+          <ConversationAutoScroll sessionId={chat.sessionId} messages={chat.messages} active={Boolean(chat.activeTurnId)} />
+          <ConversationScrollButton />
+        </StickToBottom>
 
         <Composer
           active={Boolean(chat.activeTurnId)}
@@ -323,6 +288,55 @@ export function App() {
         />
       </main>
     </div>
+  );
+}
+
+function ConversationAutoScroll({ sessionId, messages, active }: {
+  sessionId: string;
+  messages: ChatMessage[];
+  active: boolean;
+}) {
+  const { escapedFromLock, isAtBottom, scrollToBottom } = useStickToBottomContext();
+  const previousSessionRef = useRef("");
+  const previousCountRef = useRef(0);
+
+  useEffect(() => {
+    // 会话切换必须在目标消息已经进入 DOM 后再定位，且不能继承上一会话的
+    // escaped lock；相同消息数量的两个会话也必须触发该边界。
+    if (sessionId && messages.length > 0 && previousSessionRef.current !== sessionId) {
+      previousSessionRef.current = sessionId;
+      previousCountRef.current = messages.length;
+      void scrollToBottom({ animation: "instant", ignoreEscapes: true });
+      return;
+    }
+
+    const lastMessage = messages.at(-1);
+    const hasNewUserMessage = messages.length > previousCountRef.current && lastMessage?.role === "user";
+    previousCountRef.current = messages.length;
+    if (hasNewUserMessage) {
+      void scrollToBottom({ animation: "smooth", ignoreEscapes: true });
+      return;
+    }
+    if (active && isAtBottom && !escapedFromLock) {
+      void scrollToBottom({ animation: "smooth", ignoreEscapes: false });
+    }
+  }, [active, escapedFromLock, isAtBottom, messages, sessionId, scrollToBottom]);
+
+  return null;
+}
+
+function ConversationScrollButton() {
+  const { isAtBottom, scrollToBottom } = useStickToBottomContext();
+  if (isAtBottom) return null;
+  return (
+    <button
+      className="scroll-latest"
+      aria-label="回到最新消息"
+      title="回到最新消息"
+      onClick={() => void scrollToBottom({ animation: "smooth", ignoreEscapes: true })}
+    >
+      <ArrowDown size={18} />
+    </button>
   );
 }
 

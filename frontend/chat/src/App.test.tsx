@@ -41,6 +41,11 @@ beforeEach(() => {
   colorSchemeListener = null;
   FakeWebSocket.instances = [];
   vi.stubGlobal("WebSocket", FakeWebSocket);
+  vi.stubGlobal("ResizeObserver", class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  });
   Object.defineProperty(HTMLElement.prototype, "scrollTo", {
     configurable: true,
     value: vi.fn(),
@@ -109,18 +114,15 @@ it("用户向上滚动后流式增量不抢回视口并可主动回到底部", a
 
   const { container } = render(<App />);
   await screen.findByText("已有的长回答");
-  const conversation = container.querySelector<HTMLElement>(".conversation");
+  const conversation = container.querySelector<HTMLElement>(".conversation-scroll");
   expect(conversation).not.toBeNull();
   Object.defineProperties(conversation!, {
     scrollHeight: { configurable: true, value: 1200 },
     clientHeight: { configurable: true, value: 400 },
     scrollTop: { configurable: true, writable: true, value: 300 },
   });
-  const scrollTo = vi.mocked(conversation!.scrollTo);
-  await waitFor(() => expect(scrollTo).toHaveBeenCalled());
-  scrollTo.mockClear();
-
-  fireEvent.scroll(conversation!);
+  conversation!.style.overflow = "auto";
+  fireEvent.wheel(conversation!, { deltaY: -120 });
   const latestButton = await screen.findByRole("button", { name: "回到最新消息" });
   const socket = FakeWebSocket.instances[0];
   socket.onmessage?.({ data: JSON.stringify({
@@ -132,10 +134,51 @@ it("用户向上滚动后流式增量不抢回视口并可主动回到底部", a
   }) } as MessageEvent);
 
   await screen.findByText("新内容");
-  expect(scrollTo).not.toHaveBeenCalled();
+  expect(conversation!.scrollTop).toBe(300);
   fireEvent.click(latestButton);
-  expect(scrollTo).toHaveBeenCalledWith({ top: 1200, behavior: "smooth" });
+  await waitFor(() => expect(conversation!.scrollTop).toBeGreaterThan(798.5));
   expect(screen.queryByRole("button", { name: "回到最新消息" })).not.toBeInTheDocument();
+});
+
+it("点击历史会话后在目标消息渲染完成时强制回到底部", async () => {
+  localStorage.setItem("beanagent.session_id", "web:first");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    const payload = url.includes("/messages") ? {
+      items: [{
+        id: url.includes("web%3Asecond") ? "web:second:0" : "web:first:0",
+        role: "assistant",
+        content: url.includes("web%3Asecond") ? "第二个会话的末尾" : "第一个会话的末尾",
+        turn_id: url.includes("web%3Asecond") ? "turn-second" : "turn-first",
+        tool_chain: [],
+        timestamp: "2026-07-18T10:00:00+08:00",
+      }],
+      total: 1,
+    } : {
+      items: [
+        { key: "web:first", first_message_content: "第一个会话", updated_at: "2026-07-18T10:00:00+08:00" },
+        { key: "web:second", first_message_content: "第二个会话", updated_at: "2026-07-18T11:00:00+08:00" },
+      ],
+      total: 2,
+    };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  const { container } = render(<App />);
+  await screen.findByText("第一个会话的末尾");
+  expect(screen.getByRole("log")).toHaveClass("conversation");
+  const conversation = container.querySelector<HTMLElement>(".conversation-scroll");
+  expect(conversation).not.toBeNull();
+  Object.defineProperties(conversation, {
+    scrollHeight: { configurable: true, value: 1600 },
+    clientHeight: { configurable: true, value: 400 },
+    scrollTop: { configurable: true, writable: true, value: 250 },
+  });
+  fireEvent.click(screen.getByRole("button", { name: /第二个会话/ }));
+
+  await screen.findByText("第二个会话的末尾");
+  await waitFor(() => expect(conversation!.scrollTop).toBe(1199));
+  expect(container.querySelector(".conversation-content")).not.toBeNull();
 });
 
 it("主题支持浅色、跟随系统和深色并持久化选择", async () => {
