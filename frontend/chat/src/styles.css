@@ -104,13 +104,30 @@ button { color: inherit; }
 /* Akashic 直接注册 Mermaid；BeanAgent 在相同渲染能力外增加非交互边界。
    Streamdown 即使隐藏 pan/zoom 按钮仍会注册 wheel 和 pointer 事件，因此让
    application 画布不参与命中，并锁定 transform，滚轮自然交给会话滚动层。 */
-.beanagent-markdown [data-streamdown="mermaid-block"] { width: 100%; min-width: 0; margin: 16px 0; overflow: hidden; border-radius: 6px; }
-.beanagent-markdown [data-streamdown="mermaid"] { width: 100%; min-width: 0; max-width: 100%; overflow-x: auto; overflow-y: hidden; }
+.beanagent-markdown [data-streamdown="mermaid-block"] { width: 100%; min-width: 0; margin: 18px 0; overflow: hidden; border: 1px solid #c8d4d0; border-radius: 6px; background: #f2f6f4; box-shadow: 0 1px 2px rgba(28, 48, 41, .06); }
+.beanagent-markdown [data-streamdown="mermaid-block"] > div:first-child { border-bottom: 1px solid #d3ddda; background: #e8efec; }
+.beanagent-markdown [data-streamdown="mermaid"] { width: 100%; min-width: 0; max-width: 100%; height: 380px; overflow: hidden; padding: 16px; background: #fbfcfb; }
 .beanagent-markdown [data-streamdown="mermaid"] [role="application"] { min-width: 100%; width: max-content; pointer-events: none; touch-action: pan-y !important; cursor: default !important; transform: none !important; transition: none !important; will-change: auto !important; }
 .beanagent-markdown [data-streamdown="mermaid"] [role="img"] { min-width: 100%; width: max-content; justify-content: flex-start; }
-.beanagent-markdown [data-streamdown="mermaid"] svg { display: block; width: auto; min-width: 100%; max-width: none; height: auto; max-height: min(70vh, 720px); }
+.beanagent-markdown [data-streamdown="mermaid"] svg { display: block; width: auto; min-width: 100%; max-width: none; height: auto; max-height: 348px; }
+/* 全屏按钮会把查看器 Portal 到 body；这里只隐藏内嵌预览自己的缩放组。 */
+.beanagent-markdown [data-streamdown="mermaid"] button { display: none; }
 .beanagent-markdown [data-streamdown="mermaid-block-actions"] button { display: inline-grid; width: 26px; height: 26px; flex: 0 0 26px; padding: 0; place-items: center; }
 .beanagent-markdown [data-streamdown="mermaid-block-actions"] svg { width: 14px; min-width: 14px; height: 14px; max-height: 14px; }
+.beanagent-markdown [data-streamdown="mermaid-block"] > div:last-child:not([data-streamdown="mermaid"]):empty { position: relative; min-height: 380px; margin: 0; background: linear-gradient(90deg, #f3f6f5 25%, #e9efed 50%, #f3f6f5 75%); background-size: 200% 100%; animation: mermaid-loading 1.4s ease-in-out infinite; }
+.beanagent-markdown [data-streamdown="mermaid-block"] > div:last-child:not([data-streamdown="mermaid"]):empty::after { position: absolute; inset: 0; display: grid; place-items: center; color: #63706c; content: "正在生成流程图"; font-size: 13px; }
+.beanagent-markdown [data-streamdown="mermaid-block"] > div:last-child:not([data-streamdown="mermaid"]) span { font-size: 0; }
+.beanagent-markdown [data-streamdown="mermaid-block"] > div:last-child:not([data-streamdown="mermaid"]) span::after { content: "正在生成流程图"; font-size: 13px; }
+@keyframes mermaid-loading { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+.mermaid-error { min-height: 240px; padding: 22px; border-top: 1px solid #e4bbb6; background: #fff6f4; color: #7b302a; }
+.mermaid-error > strong { font-size: 14px; }
+.mermaid-error > p { margin: 6px 0 14px; font-size: 12px; }
+.mermaid-error-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.mermaid-error-actions button { display: inline-flex; height: 30px; align-items: center; gap: 5px; padding: 0 9px; border: 1px solid #d7aaa5; border-radius: 4px; background: #fff; color: #78352f; cursor: pointer; font-size: 12px; }
+.mermaid-error pre { max-height: 240px; margin: 14px 0 0; overflow: auto; padding: 12px; border: 1px solid #e0c7c3; background: #fff; color: #382724; font-size: 12px; }
+:root[data-theme="dark"] .beanagent-markdown [data-streamdown="mermaid-block"] { border-color: #45534e; background: #1c2421; }
+:root[data-theme="dark"] .beanagent-markdown [data-streamdown="mermaid-block"] > div:first-child { border-color: #45534e; background: #252f2b; }
+:root[data-theme="dark"] .beanagent-markdown [data-streamdown="mermaid"] { background: #121715; }
 .stream-caret { display: inline-block; width: 7px; height: 18px; background: #0b766e; animation: blink .85s steps(1) infinite; vertical-align: text-bottom; }
 @keyframes blink { 50% { opacity: 0; } }
 .interrupted-label { display: inline-block; margin-top: 10px; color: #8c4f24; font-size: 12px; }
@@ -240,6 +257,8 @@ button { color: inherit; }
   .theme-control button { min-width: 30px; width: 30px; padding: 0; }
   .theme-control button span { display: none; }
   .conversation-content { padding: 20px 14px 80px; }
+  .beanagent-markdown [data-streamdown="mermaid"] { height: 340px; padding: 10px; }
+  .beanagent-markdown [data-streamdown="mermaid"] svg { max-height: 320px; }
   .scroll-latest { right: 14px; bottom: 106px; }
   .message { grid-template-columns: 1fr; gap: 6px; margin-bottom: 24px; }
   .message-label { text-align: left; }

@@ -297,8 +297,14 @@ it("Mermaid fenced block 生成受限图表而不是普通代码块", async () =
   expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull();
   expect(container.querySelector('[data-streamdown="mermaid"]')?.closest(".beanagent-markdown")).not.toBeNull();
   expect(container.querySelector('[data-streamdown="mermaid"] [role="application"]')).not.toBeNull();
-  expect(screen.queryByTitle("Zoom in")).not.toBeInTheDocument();
-  expect(screen.queryByTitle("Zoom out")).not.toBeInTheDocument();
+  const inlineZoom = screen.getByTitle("Zoom in");
+  expect(inlineZoom.closest('[data-streamdown="mermaid"]')).not.toBeNull();
+
+  fireEvent.click(screen.getByTitle("查看大图"));
+  expect(screen.getByTitle("关闭大图")).toBeVisible();
+  expect(document.body.style.overflow).toBe("hidden");
+  fireEvent.click(screen.getByTitle("关闭大图"));
+  expect(screen.queryByTitle("关闭大图")).not.toBeInTheDocument();
 });
 
 it("空会话不再提供 Mermaid 流程图示例", async () => {
