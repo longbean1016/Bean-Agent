@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from io import BytesIO
 from pathlib import Path
 
@@ -70,6 +71,55 @@ async def test_pipeline_runs_tool_loop_and_emits_lifecycle_events() -> None:
     assert any(isinstance(event, ToolCallCompleted) for event in seen)
     assert any(isinstance(event, StreamDeltaReady) for event in seen)
     assert provider.messages[1][-1]["role"] == "tool"
+
+
+@pytest.mark.asyncio
+async def test_interrupt_snapshot_keeps_completed_calls_in_current_tool_group() -> None:
+    class TwoCallProvider:
+        async def chat(self, messages, tools=None, **kwargs):
+            return LLMResponse(
+                None,
+                [
+                    ToolCall("call-1", "echo", {"text": "first"}),
+                    ToolCall("call-2", "echo", {"text": "block"}),
+                ],
+            )
+
+    class BlockingSecondTool(EchoTool):
+        def __init__(self) -> None:
+            self.blocked = asyncio.Event()
+
+        async def execute(self, text: str, **kwargs):
+            if text == "block":
+                self.blocked.set()
+                await asyncio.Event().wait()
+            return await super().execute(text, **kwargs)
+
+    tool = BlockingSecondTool()
+    tools = ToolRegistry()
+    tools.register(tool)
+    pipeline = Pipeline(
+        TwoCallProvider(),
+        tools,
+        EventBus(),
+        PromptAssembler(SystemPromptBuilder(default_prompt_blocks(), SectionCache()), MessageEnvelopeBuilder()),
+        workspace="D:/workspace",
+    )
+    running = asyncio.create_task(
+        pipeline.process(
+            InboundMessage(channel="web", sender="u", chat_id="c", content="执行"),
+            turn_id="interrupt-tools",
+        )
+    )
+    await tool.blocked.wait()
+
+    snapshot = pipeline.snapshot_interrupt_state("interrupt-tools")
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    assert snapshot["tools_used"] == ["echo"]
+    assert snapshot["tool_chain_partial"][0]["calls"][0]["call_id"] == "call-1"
 
 
 async def _history():

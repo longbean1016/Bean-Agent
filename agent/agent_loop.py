@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
-from typing import Protocol
+import time
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 from uuid import uuid4
 
 from agent.event_bus import EventBus, TurnCommitted, TurnStarted
@@ -26,6 +27,25 @@ class InterruptResult:
     turn_id: str = ""
 
 
+@dataclass(slots=True)
+class TurnInterruptState:
+    """被中断 Turn 的纯内存快照；30 分钟内由同一会话的下一条消息消费。"""
+
+    session_key: str
+    original_user_message: str
+    original_metadata: dict[str, Any] = field(default_factory=dict)
+    partial_reply: str = ""
+    partial_thinking: str | None = None
+    tools_used: list[str] = field(default_factory=list)
+    tool_chain_partial: list[dict[str, Any]] = field(default_factory=list)
+    interrupted_at: float = field(default_factory=time.monotonic)
+    ttl_seconds: int = 1800
+
+    @property
+    def expired(self) -> bool:
+        return (time.monotonic() - self.interrupted_at) > self.ttl_seconds
+
+
 class AgentLoop:
     """唯一 Turn 编排者：推理、批量持久化、提交事件和最终出站。"""
 
@@ -36,6 +56,8 @@ class AgentLoop:
         self._sessions = sessions
         self._active_tasks: dict[str, asyncio.Task[None]] = {}
         self._active_turn_ids: dict[str, str] = {}
+        self._active_turn_states: dict[str, TurnInterruptState] = {}
+        self.interrupt_states: dict[str, TurnInterruptState] = {}
         self._running = False
 
     async def run(self) -> None:
@@ -46,6 +68,11 @@ class AgentLoop:
     async def run_once(self) -> None:
         message = await self._bus.consume_inbound()
         turn_id = uuid4().hex
+        self._active_turn_states[message.session_key] = TurnInterruptState(
+            session_key=message.session_key,
+            original_user_message=message.content,
+            original_metadata=dict(message.metadata),
+        )
         task = asyncio.create_task(self._process_message(message, turn_id), name=f"agent-turn:{message.session_key}")
         self._active_tasks[message.session_key] = task
         self._active_turn_ids[message.session_key] = turn_id
@@ -55,21 +82,22 @@ class AgentLoop:
             if self._active_tasks.get(message.session_key) is task:
                 self._active_tasks.pop(message.session_key, None)
                 self._active_turn_ids.pop(message.session_key, None)
+                self._active_turn_states.pop(message.session_key, None)
+            discard = getattr(self._pipeline, "discard_interrupt_snapshot", None)
+            if callable(discard):
+                discard(turn_id)
             self._bus.complete_inbound()
 
     async def _process_message(self, message: InboundMessage, turn_id: str) -> None:
         request_id = str(message.metadata.get("request_id") or "")
+        resumed = await self._persist_pending_interrupt(message.session_key)
         await self._events.emit(TurnStarted(message.session_key, turn_id, request_id, message.content))
         try:
             # 正常被动 Turn 对齐参考实现：Pipeline 推理期间不提前把 user 放进 Session；
             # 推理完成后才把 user 与 assistant 作为一个提交批次写入 SQLite。
             result = await self._pipeline.process(message, turn_id=turn_id)
         except asyncio.CancelledError:
-            await self._persist_terminal_turn(message, turn_id, "interrupted", "对话已中断")
-            await self._bus.publish_outbound(OutboundMessage(
-                message.channel, message.chat_id, "对话已中断",
-                metadata={"turn_id": turn_id, "request_id": request_id, "status": "interrupted"},
-            ))
+            # Channel 已同步返回 turn.interrupted；这里不写 Session 或发送 final，避免覆盖前端半截回复。
             return
         except Exception as error:
             logger.exception("Agent 推理异常: session_key=%s", message.session_key)
@@ -97,6 +125,32 @@ class AgentLoop:
             message.channel, message.chat_id, result.content, result.thinking, result.media,
             {"turn_id": turn_id, "request_id": request_id, "status": "ok"},
         ))
+        if resumed:
+            self.interrupt_states.pop(message.session_key, None)
+
+    async def _persist_pending_interrupt(self, session_key: str) -> bool:
+        state = self.interrupt_states.get(session_key)
+        if state is None:
+            return False
+        if state.expired:
+            # TTL 在下一条消息到达时惰性检查，避免为少量内存状态启动额外清理任务。
+            self.interrupt_states.pop(session_key, None)
+            return False
+        if not state.original_user_message.strip():
+            return True
+
+        session = await self._sessions.get_or_create(session_key)
+        user = session.add_message("user", state.original_user_message)
+        assistant = session.add_message(
+            "assistant",
+            "[interrupted]",
+            status="interrupted",
+            tools_used=list(state.tools_used),
+            tool_chain=list(state.tool_chain_partial),
+        )
+        # 中断标记必须成对批量落库；不发 TurnCommitted，避免未完成 Turn 进入长期记忆。
+        await self._sessions.append_messages(session, [user, assistant])
+        return True
 
     async def _persist_terminal_turn(self, message: InboundMessage, turn_id: str, status: str, assistant_content: str) -> None:
         session = await self._sessions.get_or_create(message.session_key)
@@ -110,11 +164,25 @@ class AgentLoop:
         task = self._active_tasks.get(session_key)
         if task is None or task.done():
             return InterruptResult("idle", session_key)
+        turn_id = self._active_turn_ids.get(session_key, "")
+        state = self._active_turn_states.get(session_key)
+        if state is not None:
+            snapshotter = getattr(self._pipeline, "snapshot_interrupt_state", None)
+            snapshot = snapshotter(turn_id) if callable(snapshotter) else {}
+            self.interrupt_states[session_key] = TurnInterruptState(
+                session_key=session_key,
+                original_user_message=state.original_user_message,
+                original_metadata=dict(state.original_metadata),
+                partial_reply=str(snapshot.get("partial_reply") or ""),
+                partial_thinking=str(snapshot.get("partial_thinking") or "") or None,
+                tools_used=list(snapshot.get("tools_used") or []),
+                tool_chain_partial=list(snapshot.get("tool_chain_partial") or []),
+            )
         task.cancel()
-        return InterruptResult("interrupted", session_key, self._active_turn_ids.get(session_key, ""))
+        return InterruptResult("interrupted", session_key, turn_id)
 
     def stop(self) -> None:
         self._running = False
 
 
-__all__ = ["AgentLoop", "InterruptResult"]
+__all__ = ["AgentLoop", "InterruptResult", "TurnInterruptState"]

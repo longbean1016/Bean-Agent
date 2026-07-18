@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from pathlib import Path
 
 import pytest
 
-from agent.agent_loop import AgentLoop
+from agent.agent_loop import AgentLoop, TurnInterruptState
 from agent.event_bus import EventBus, TurnCommitted
 from agent.message_bus import InboundMessage, MessageBus, PipelineResult
 from agent.config_models import MemoryConfig
@@ -63,6 +65,98 @@ async def test_pipeline_failure_persists_error_turn_without_committed(tmp_path: 
     assert rows[1]["status"] == "error"
     assert committed == []
     assert "模型失败" in outbound.content
+    await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_defers_persistence_until_next_message_and_preserves_tools(tmp_path: Path) -> None:
+    class BlockingPipeline:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def process(self, message, *, turn_id):
+            self.started.set()
+            await asyncio.Event().wait()
+
+        def snapshot_interrupt_state(self, turn_id: str):
+            return {
+                "partial_reply": "未完成回答",
+                "partial_thinking": "未完成思考",
+                "tools_used": ["read_file"],
+                "tool_chain_partial": [
+                    {
+                        "iteration": 1,
+                        "calls": [
+                            {
+                                "call_id": "call-1",
+                                "name": "read_file",
+                                "arguments": {"path": "a.txt"},
+                                "result": "文件内容",
+                                "status": "ok",
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        def discard_interrupt_snapshot(self, turn_id: str) -> None:
+            pass
+
+    bus = MessageBus()
+    events = EventBus()
+    sessions = SessionManager(tmp_path)
+    pipeline = BlockingPipeline()
+    loop = AgentLoop(bus, events, pipeline, sessions)
+    first = InboundMessage(channel="web", sender="u", chat_id="c", content="读取文件")
+    await bus.publish_inbound(first)
+    running = asyncio.create_task(loop.run_once())
+    await pipeline.started.wait()
+
+    result = loop.request_interrupt("web:c")
+    await running
+
+    assert result.status == "interrupted"
+    assert sessions.store.fetch_session_messages("web:c") == []
+    state = loop.interrupt_states["web:c"]
+    assert state.original_user_message == "读取文件"
+    assert state.partial_reply == "未完成回答"
+    assert state.partial_thinking == "未完成思考"
+    assert state.tools_used == ["read_file"]
+
+    loop._pipeline = Pipeline()
+    await bus.publish_inbound(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="继续")
+    )
+    await loop.run_once()
+
+    rows = sessions.store.fetch_session_messages("web:c")
+    assert [row["content"] for row in rows] == ["读取文件", "[interrupted]", "继续", "回答"]
+    assert rows[1]["status"] == "interrupted"
+    assert rows[1]["tools_used"] == ["read_file"]
+    assert rows[1]["tool_chain"][0]["calls"][0]["result"] == "文件内容"
+    assert "web:c" not in loop.interrupt_states
+    await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_interrupt_state_is_discarded_without_marker(tmp_path: Path) -> None:
+    bus = MessageBus()
+    sessions = SessionManager(tmp_path)
+    loop = AgentLoop(bus, EventBus(), Pipeline(), sessions)
+    loop.interrupt_states["web:c"] = TurnInterruptState(
+        session_key="web:c",
+        original_user_message="旧问题",
+        interrupted_at=time.monotonic() - 1801,
+    )
+    await bus.publish_inbound(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="新问题")
+    )
+
+    await loop.run_once()
+
+    rows = sessions.store.fetch_session_messages("web:c")
+    assert [row["content"] for row in rows] == ["新问题", "回答"]
+    assert "web:c" not in loop.interrupt_states
     await sessions.close()
 
 

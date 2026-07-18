@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from copy import deepcopy
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any, Protocol
@@ -68,8 +69,16 @@ class Pipeline:
         # 接收 image_url；独立 VL 可用时则由现有 ReAct 工具链负责真正读图。
         self._multimodal = bool(multimodal)
         self._vl_available = bool(vl_available)
+        # 中断快照只服务于当前进程内的停止/续跑语义，不进入 Session 或长期记忆。
+        self._interrupt_snapshots: dict[str, dict[str, Any]] = {}
 
     async def process(self, message: InboundMessage, *, turn_id: str) -> PipelineResult:
+        self._interrupt_snapshots[turn_id] = {
+            "partial_reply": "",
+            "partial_thinking": "",
+            "tools_used": [],
+            "tool_chain_partial": [],
+        }
         self._tools.set_context(channel=message.channel, chat_id=message.chat_id, session_key=message.session_key)
         history = await self._history_loader(message.session_key, self._history_limit) if self._history_loader else []
         retrieved = await self._memory.retrieve_for_turn(message) if self._memory else ""
@@ -93,6 +102,9 @@ class Pipeline:
         tools_used: list[str] = []
 
         async def on_delta(delta: dict[str, str]) -> None:
+            snapshot = self._interrupt_snapshots[turn_id]
+            snapshot["partial_reply"] += str(delta.get("content_delta") or "")
+            snapshot["partial_thinking"] += str(delta.get("thinking_delta") or "")
             await self._events.emit(StreamDeltaReady(
                 session_key=message.session_key,
                 turn_id=turn_id,
@@ -179,8 +191,22 @@ class Pipeline:
                 await self._events.emit(ToolCallCompleted(message.session_key, turn_id, call.id, call.name, status, result.preview()[:500]))
                 group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "status": status})
                 tools_used.append(call.name)
+                # 一组内后续工具也可能阻塞或被取消；每完成一个调用就刷新快照，避免丢失已完成结果。
+                snapshot = self._interrupt_snapshots[turn_id]
+                snapshot["tools_used"] = list(dict.fromkeys(tools_used))
+                snapshot["tool_chain_partial"] = deepcopy([*tool_chain, group])
             tool_chain.append(group)
         raise RuntimeError(f"ReAct 超过最大迭代次数: {self._max_iterations}")
+
+    def snapshot_interrupt_state(self, turn_id: str) -> dict[str, Any]:
+        """返回当前 Turn 的隔离副本，避免取消后的清理影响中断状态。"""
+
+        return deepcopy(self._interrupt_snapshots.get(turn_id, {}))
+
+    def discard_interrupt_snapshot(self, turn_id: str) -> None:
+        """Turn 结束后幂等释放纯内存快照。"""
+
+        self._interrupt_snapshots.pop(turn_id, None)
 
 
 def _trim_oldest_complete_turn(
