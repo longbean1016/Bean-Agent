@@ -44,6 +44,7 @@ async def test_explicit_procedure_merges_same_tool_requirement(tmp_path: Path) -
     assert merged.startswith("merged:")
     assert item["summary"] == "提交前跑测试；测试后检查差异"
     assert item["extra_json"]["steps"] == ["跑测试", "检查差异"]
+    assert item["extra_json"]["rule_schema"]["required_tools"] == ["pytest"]
 
 
 @pytest.mark.asyncio

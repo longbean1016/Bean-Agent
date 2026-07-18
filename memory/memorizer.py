@@ -7,6 +7,7 @@ import re
 from typing import Protocol
 
 from memory.store import MemoryStore2
+from memory.rule_schema import build_procedure_rule_schema
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,12 @@ class Memorizer:
             new_extra["tool_requirement"] = patch["tool_requirement"]
         steps = [*(new_extra.get("steps") or []), *(patch.get("steps") or [])]
         new_extra["steps"] = list(dict.fromkeys(str(step).strip() for step in steps if str(step).strip()))
+        new_extra["rule_schema"] = build_procedure_rule_schema(
+            merged_summary,
+            tool_requirement=str(new_extra.get("tool_requirement") or "") or None,
+            steps=[str(step) for step in new_extra["steps"]],
+            rule_schema=patch.get("rule_schema") if isinstance(patch.get("rule_schema"), dict) else None,
+        )
         # 旧 trigger_tags 可能不再描述合并后的规则，保留会造成错误触发。
         new_extra.pop("trigger_tags", None)
         embedding = await self._embedder.embed(merged_summary)
