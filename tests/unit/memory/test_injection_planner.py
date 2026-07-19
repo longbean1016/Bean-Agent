@@ -28,3 +28,32 @@ def test_planner_applies_type_thresholds_and_group_quotas_in_order() -> None:
         "p2": "procedure_preference_quota",
         "profile": "event_profile_quota",
     }
+
+
+def test_planner_forces_tool_required_procedures_with_separate_quota() -> None:
+    planner = InjectionPlanner(
+        thresholds={"procedure": 0.66, "preference": 0.5},
+        max_forced_procedures=1,
+        max_procedure_preference=1,
+    )
+    items = [
+        {
+            "id": "forced",
+            "memory_type": "procedure",
+            "score": 0.1,
+            "extra_json": {"tool_requirement": "pytest"},
+        },
+        {
+            "id": "forced-overflow",
+            "memory_type": "procedure",
+            "score": 0.9,
+            "extra_json": {"tool_requirement": "shell"},
+        },
+        {"id": "preference", "memory_type": "preference", "score": 0.8},
+    ]
+
+    result = planner.plan(items)
+
+    assert [item["id"] for item in result.items] == ["forced", "preference"]
+    assert result.items[0]["forced"] is True
+    assert result.rejected == {"forced-overflow": "forced_procedure_quota"}

@@ -26,6 +26,7 @@ def test_config_defaults_and_nested_instances_are_independent() -> None:
     assert first.llm.max_tokens == 8192
     assert first.memory.embedding.dimensions == 1024
     assert first.memory.retrieval.procedure_threshold == 0.66
+    assert first.memory.retrieval.max_forced_procedures == 3
     assert first.memory.retrieval.max_event_profile == 4
     assert first.session.history_window == 40
     assert first.channels.chat.port == 6322
@@ -89,6 +90,7 @@ preference_threshold = 0.6
 event_threshold = 0.55
 profile_threshold = 0.52
 max_procedure_preference = 3
+max_forced_procedures = 2
 max_event_profile = 2
 
 [memory.dedup]
@@ -131,6 +133,7 @@ port = 8000
     assert config.memory.retrieval.rrf_k == 50
     assert config.memory.retrieval.procedure_threshold == 0.7
     assert config.memory.retrieval.max_procedure_preference == 3
+    assert config.memory.retrieval.max_forced_procedures == 2
     assert config.memory.retrieval.max_event_profile == 2
     assert config.memory.dedup.event_dedup_window_days == 5
     assert config.session.history_window == 25

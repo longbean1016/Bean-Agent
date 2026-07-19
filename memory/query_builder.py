@@ -25,4 +25,13 @@ def build_memory_queries(
     return queries
 
 
-__all__ = ["build_memory_queries"]
+def build_procedure_queries(
+    user_message: str,
+    rewritten_query: str = "",
+) -> list[str]:
+    """保留原始行动描述，并追加一个可选的流程检索改写。"""
+
+    return build_memory_queries(user_message, rewritten_query)
+
+
+__all__ = ["build_memory_queries", "build_procedure_queries"]

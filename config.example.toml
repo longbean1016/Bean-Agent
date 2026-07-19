@@ -44,6 +44,7 @@ hotness_alpha = 0.20 # 最终排序中的热度权重
 half_life_days = 14.0 # 记忆热度的半衰期天数
 rrf_k = 60 # RRF 融合的平滑常数
 keyword_rrf_weight = 0.5 # 关键词检索的融合权重
+max_forced_procedures = 3 # 带工具要求的强制流程单次注入上限
 
 [memory.dedup]
 supersede_threshold = 0.90 # 新事实替代旧事实的相似度阈值

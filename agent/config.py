@@ -214,6 +214,9 @@ def _load_memory_config(data: dict[str, Any]) -> MemoryConfig:
             preference_threshold=float(retrieval_raw.get("preference_threshold", 0.5)),
             event_threshold=float(retrieval_raw.get("event_threshold", 0.5)),
             profile_threshold=float(retrieval_raw.get("profile_threshold", 0.5)),
+            max_forced_procedures=int(
+                retrieval_raw.get("max_forced_procedures", 3)
+            ),
             max_procedure_preference=int(
                 retrieval_raw.get("max_procedure_preference", 4)
             ),

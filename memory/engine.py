@@ -25,7 +25,7 @@ from memory.md_store import MarkdownMemoryStore
 from memory.memorizer import Memorizer
 from memory.optimizer import MemoryOptimizer
 from memory.post_response_worker import PostResponseMemoryWorker
-from memory.query_builder import build_memory_queries
+from memory.query_builder import build_memory_queries, build_procedure_queries
 from memory.query_rewriter import QueryRewriter
 from memory.retriever import Retriever
 from memory.rule_schema import build_procedure_rule_schema
@@ -67,6 +67,7 @@ class MemoryEngine:
                 "event": retrieval_config.event_threshold,
                 "profile": retrieval_config.profile_threshold,
             },
+            max_forced_procedures=retrieval_config.max_forced_procedures,
             max_procedure_preference=retrieval_config.max_procedure_preference,
             max_event_profile=retrieval_config.max_event_profile,
         )
@@ -103,6 +104,17 @@ class MemoryEngine:
         require_scope_match = _should_require_scope_match(request)
         recent_history = ""
         aux_queries = _string_list(request.context.get("aux_queries"))
+        memory_types = list(request.filters.kinds) or None
+        if request.intent == "procedure":
+            # 专用流程查询只查看规则和服务偏好，不触发任何 LLM 改写；调用方
+            # 可提供一个已生成的辅助 query，原始行动描述始终保留为主 query。
+            memory_types = ["procedure", "preference"]
+            rewritten = aux_queries[0] if aux_queries else ""
+            procedure_queries = build_procedure_queries(request.text, rewritten)
+            aux_queries = list(dict.fromkeys([
+                *procedure_queries[1:],
+                *aux_queries[1:],
+            ]))
         if request.intent == "answer":
             # 深度回忆允许使用近期对话消解指代；普通 Turn 不经过这条 LLM 路径，避免增加首字等待。
             session_key = scope.session_key or (
@@ -129,7 +141,7 @@ class MemoryEngine:
                 logger.warning("深度记忆查询改写失败，使用原始问题检索: %s", error)
         items = await self._retriever.retrieve(
             request.text,
-            memory_types=list(request.filters.kinds) or None,
+            memory_types=memory_types,
             top_k=request.limit,
             scope_channel=scope.channel or None,
             scope_chat_id=scope.chat_id or None,
@@ -717,7 +729,10 @@ def _injection_block(records: list[MemoryRecord]) -> str:
         return ""
     groups = {"procedure": [], "preference": [], "event": [], "profile": []}
     for record in records:
-        groups.setdefault(record.kind, []).append(f"- [{record.id}] {record.summary}")
+        line = f"- [{record.id}] {record.summary}"
+        if record.kind == "procedure" and record.signals.get("tool_requirement"):
+            line += f"（必须调用工具：{record.signals['tool_requirement']}）"
+        groups.setdefault(record.kind, []).append(line)
     sections = []
     if groups["procedure"]: sections.append("## 【强制约束】记忆规则（必须执行）\n" + "\n".join(groups["procedure"]))
     if groups["preference"]: sections.append("## 【流程规范】用户偏好与规则\n" + "\n".join(groups["preference"]))

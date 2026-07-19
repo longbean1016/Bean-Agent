@@ -73,6 +73,7 @@ class RetrievalConfig:
     preference_threshold: float = 0.5  # 偏好记忆自动注入的最低原始相关分
     event_threshold: float = 0.5  # 事件记忆自动注入的最低原始相关分
     profile_threshold: float = 0.5  # 用户画像记忆自动注入的最低原始相关分
+    max_forced_procedures: int = 3  # 带工具要求的强制流程单次注入上限
     max_procedure_preference: int = 4  # 单次注入的流程和偏好总数上限
     max_event_profile: int = 4  # 单次注入的事件和画像总数上限
 

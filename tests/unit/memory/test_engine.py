@@ -117,6 +117,37 @@ async def test_turn_context_retrieval_can_recall_event_from_another_session(
 
 
 @pytest.mark.asyncio
+async def test_turn_context_automatically_injects_tool_required_procedure(
+    tmp_path: Path,
+) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    try:
+        engine._store.upsert_item(
+            "procedure",
+            "发布前运行完整测试",
+            [1.0, 0.0],
+            "web:source:0",
+            extra={"tool_requirement": "pytest"},
+        )
+
+        block = await engine.retrieve_for_turn(SimpleNamespace(
+            content="帮我发布这个项目",
+            channel="web",
+            chat_id="new-chat",
+        ))
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert "【强制约束】" in block
+    assert "发布前运行完整测试" in block
+    assert "必须调用工具：pytest" in block
+
+
+@pytest.mark.asyncio
 async def test_turn_retrieval_uses_only_current_message_without_llm_enhancement(
     tmp_path: Path,
 ) -> None:
@@ -275,13 +306,56 @@ async def test_timeline_query_reads_structured_events_without_retriever(
 
 
 @pytest.mark.asyncio
+async def test_procedure_query_limits_types_without_llm_enhancement(
+    tmp_path: Path,
+) -> None:
+    class ForbiddenRewriter:
+        async def decide(self, user_msg: str, recent_history: str):
+            raise AssertionError("procedure 不应调用查询改写器")
+
+    class CapturingRetriever:
+        kwargs: dict[str, object] = {}
+
+        async def retrieve(self, query: str, **kwargs):
+            self.kwargs = kwargs
+            return [{
+                "id": "procedure-1",
+                "memory_type": "procedure",
+                "summary": "发布前运行测试",
+                "score": 0.9,
+                "extra_json": {"tool_requirement": "pytest"},
+            }]
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    retriever = CapturingRetriever()
+    engine._rewriter = ForbiddenRewriter()
+    engine._retriever = retriever
+    try:
+        result = await engine.query(MemoryQuery(
+            "发布项目",
+            intent="procedure",
+            context={"aux_queries": ["项目发布流程", "项目发布流程"]},
+        ))
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert retriever.kwargs["memory_types"] == ["procedure", "preference"]
+    assert retriever.kwargs["aux_queries"] == ["项目发布流程"]
+    assert result.records[0].kind == "procedure"
+    assert result.records[0].signals["tool_requirement"] == "pytest"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "intent",
     [
         "answer",
         "interest",
         "context",
-        "procedure",
     ],
 )
 async def test_default_query_intents_share_workspace_memories_across_sessions(
