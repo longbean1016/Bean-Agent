@@ -119,7 +119,7 @@ it("首次连接创建 Session 并发送用户消息", async () => {
   expect(screen.getByText("组件测试消息")).toBeVisible();
 });
 
-it("会话列表使用第一次提问时间分组而不是最近更新时间", async () => {
+it("会话列表使用最近更新时间分组", async () => {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages")
       ? { items: [], total: 0 }
@@ -128,7 +128,7 @@ it("会话列表使用第一次提问时间分组而不是最近更新时间", a
             key: "web:first-time",
             first_message_content: "固定创建时间",
             created_at: "2026-01-02T10:00:00+08:00",
-            updated_at: "2026-12-31T10:00:00+08:00",
+            updated_at: "2026-06-10T10:00:00+08:00",
           }],
           total: 1,
         };
@@ -138,8 +138,8 @@ it("会话列表使用第一次提问时间分组而不是最近更新时间", a
   const { container } = render(<App />);
 
   await screen.findByText("固定创建时间");
-  expect(screen.getByText("2026-01", { selector: ".session-group-title" })).toBeVisible();
-  expect(screen.queryByText("2026-12", { selector: ".session-group-title" })).not.toBeInTheDocument();
+  expect(screen.getByText("2026-06", { selector: ".session-group-title" })).toBeVisible();
+  expect(screen.queryByText("2026-01", { selector: ".session-group-title" })).not.toBeInTheDocument();
   expect(container.querySelector(".session-row time")).toBeNull();
 });
 
@@ -166,13 +166,15 @@ it("会话列表显示时间分组标题", async () => {
 
 it("通过会话菜单重命名且不触发会话切换", async () => {
   localStorage.setItem("beanagent.session_id", "web:rename");
+  let renamed = false;
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (init?.method === "PATCH") {
+      renamed = true;
       return { ok: true, json: async () => ({ key: "web:rename", title: "新标题" }) } as Response;
     }
     const payload = url.includes("/messages") ? { items: [], total: 0 } : {
-      items: [{ key: "web:rename", first_message_content: "原始标题", title: "", created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
+      items: [{ key: "web:rename", first_message_content: "原始标题", title: renamed ? "新标题" : "", created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
       total: 1,
     };
     return { ok: true, json: async () => payload } as Response;
@@ -210,10 +212,14 @@ it("点击会话菜单外部会关闭菜单", async () => {
 });
 
 it("重命名失焦后保存并收起输入框", async () => {
+  let renamed = false;
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    if (init?.method === "PATCH") return { ok: true, json: async () => ({ key: "web:blur", title: "失焦标题" }) } as Response;
+    if (init?.method === "PATCH") {
+      renamed = true;
+      return { ok: true, json: async () => ({ key: "web:blur", title: "失焦标题" }) } as Response;
+    }
     const payload = String(input).includes("/messages") ? { items: [] } : {
-      items: [{ key: "web:blur", first_message_content: "原始会话", created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
+      items: [{ key: "web:blur", first_message_content: "原始会话", title: renamed ? "失焦标题" : "", created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
     };
     return { ok: true, json: async () => payload } as Response;
   }));

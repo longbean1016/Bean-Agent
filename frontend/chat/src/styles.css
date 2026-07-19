@@ -42,7 +42,14 @@ button { color: inherit; }
 .brand-mark, .empty-mark { display: grid; flex: 0 0 auto; place-items: center; width: 34px; height: 34px; border-radius: 7px; background: #116f68; color: white; font-family: Georgia, serif; font-weight: 700; }
 .new-chat-button { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; border: 1px solid #b9c6c2; border-radius: 6px; background: #f9fbfa; cursor: pointer; font-weight: 650; }
 .new-chat-button:hover { border-color: #0b766e; color: #075b55; }
-.session-list { flex: 1 1 0; min-height: 0; margin-top: 14px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.session-list { flex: 1 1 0; min-height: 0; margin-top: 14px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-color: transparent transparent; scrollbar-gutter: stable; scrollbar-width: thin; }
+.session-list.scrollbar-visible { scrollbar-color: rgba(116, 126, 122, .36) transparent; }
+.session-list::-webkit-scrollbar { width: 8px; }
+.session-list::-webkit-scrollbar-track { background: transparent; }
+.session-list::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 999px; background-color: transparent; background-clip: padding-box; transition: background-color .25s ease; }
+.session-list.scrollbar-visible::-webkit-scrollbar-thumb { background-color: rgba(116, 126, 122, .36); }
+.session-list.scrollbar-visible::-webkit-scrollbar-thumb:hover { background-color: rgba(116, 126, 122, .52); }
+.session-list::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
 .session-group + .session-group { margin-top: 16px; }
 .session-group-title { margin: 0 10px 5px; color: #7a8581; font-size: 12px; font-weight: 650; letter-spacing: 0; }
 .session-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 28px; width: 100%; min-height: 42px; border-left: 3px solid transparent; border-radius: 4px; background: transparent; }

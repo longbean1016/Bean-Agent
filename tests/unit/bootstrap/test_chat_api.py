@@ -72,6 +72,7 @@ def test_chat_api_renames_session_and_validates_title(tmp_path: Path) -> None:
 
     assert renamed.status_code == 200
     assert renamed.json()["title"] == "新标题"
+    assert renamed.json()["updated_at"]
     assert empty.status_code == 400
     assert too_long.status_code == 400
     assert missing.status_code == 404

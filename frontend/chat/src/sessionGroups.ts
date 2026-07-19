@@ -15,14 +15,14 @@ function monthLabel(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
 }
 
-export function groupSessionsByCreatedAt(sessions: SessionSummary[], now = new Date()): SessionGroup[] {
-  const sorted = [...sessions].sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at));
+export function groupSessionsByUpdatedAt(sessions: SessionSummary[], now = new Date()): SessionGroup[] {
+  const sorted = [...sessions].sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at));
   const buckets = new Map<string, SessionSummary[]>();
   const today = calendarDay(now);
 
   for (const session of sorted) {
-    const created = new Date(session.created_at);
-    const age = Number.isNaN(created.getTime()) ? 30 : Math.max(0, today - calendarDay(created));
+    const updated = new Date(session.updated_at);
+    const age = Number.isNaN(updated.getTime()) ? 30 : Math.max(0, today - calendarDay(updated));
     const label = age === 0
       ? "今天"
       : age === 1
@@ -31,7 +31,7 @@ export function groupSessionsByCreatedAt(sessions: SessionSummary[], now = new D
           ? "7天内"
           : age < 30
             ? "30天内"
-            : Number.isNaN(created.getTime()) ? "更早" : monthLabel(created);
+            : Number.isNaN(updated.getTime()) ? "更早" : monthLabel(updated);
     const bucket = buckets.get(label) ?? [];
     bucket.push(session);
     buckets.set(label, bucket);

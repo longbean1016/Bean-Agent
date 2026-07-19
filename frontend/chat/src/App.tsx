@@ -36,7 +36,7 @@ import { initialChatState, reduceChatFrame, rowsToMessages } from "./chatReducer
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
-import { groupSessionsByCreatedAt } from "./sessionGroups";
+import { groupSessionsByUpdatedAt } from "./sessionGroups";
 import type { ChatFrame, ChatMessage, ConnectionStatus, SessionSummary, ToolActivity } from "./types";
 import { BeanWebSocketClient } from "./websocketClient";
 
@@ -177,6 +177,15 @@ export function App() {
     if (frame.type === "session.created") {
       localStorage.setItem(SESSION_STORAGE_KEY, frame.session_id);
     }
+    if (frame.type === "turn.started") {
+      // 收到后端接收确认后立即提升已有会话；最终提交后再通过列表接口校准持久化时间。
+      const acknowledgedAt = new Date().toISOString();
+      setSessions((current) => current.map((session) => (
+        session.key === frame.session_id
+          ? { ...session, updated_at: acknowledgedAt }
+          : session
+      )));
+    }
     if (frame.type === "message.final") void refreshSessions();
   }, [refreshSessions]);
 
@@ -224,10 +233,9 @@ export function App() {
 
   const handleRenameSession = async (sessionId: string, title: string) => {
     try {
-      const updated = await renameSession(sessionId, title);
-      setSessions((current) => current.map((session) => (
-        session.key === sessionId ? { ...session, ...updated, title } : session
-      )));
+      await renameSession(sessionId, title);
+      // PATCH 成功后重新读取服务端目录，确保分组和顺序使用数据库中的最终 updated_at。
+      await refreshSessions();
     } catch (error) {
       dispatch(errorFrame(error));
       throw error;
@@ -424,12 +432,35 @@ function SessionSidebar(props: {
   onRename: (id: string, title: string) => Promise<void>;
   onSelect: (id: string) => void;
 }) {
-  const groups = useMemo(() => groupSessionsByCreatedAt(props.sessions), [props.sessions]);
+  const groups = useMemo(() => groupSessionsByUpdatedAt(props.sessions), [props.sessions]);
   const [menuSessionId, setMenuSessionId] = useState("");
   const [editingSessionId, setEditingSessionId] = useState("");
   const [titleDraft, setTitleDraft] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [scrollbarVisible, setScrollbarVisible] = useState(false);
+  const scrollbarHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (scrollbarHideTimerRef.current !== null) clearTimeout(scrollbarHideTimerRef.current);
+  }, []);
+
+  const showSessionScrollbar = () => {
+    if (scrollbarHideTimerRef.current !== null) {
+      clearTimeout(scrollbarHideTimerRef.current);
+      scrollbarHideTimerRef.current = null;
+    }
+    setScrollbarVisible(true);
+  };
+
+  const scheduleSessionScrollbarHide = () => {
+    if (scrollbarHideTimerRef.current !== null) clearTimeout(scrollbarHideTimerRef.current);
+    // 移出后保留短暂视觉提示，避免用户刚离开列表时滚动位置突然失去参照。
+    scrollbarHideTimerRef.current = setTimeout(() => {
+      setScrollbarVisible(false);
+      scrollbarHideTimerRef.current = null;
+    }, 3_000);
+  };
 
   useEffect(() => {
     if (!menuSessionId) return;
@@ -461,7 +492,12 @@ function SessionSidebar(props: {
     <div className="session-panel">
       <div className="brand-lockup"><span className="brand-mark">B</span><div><strong>BeanAgent</strong><span>Local workspace</span></div></div>
       <button className="new-chat-button" onClick={props.onCreate}><MessageSquarePlus size={17} />新建会话</button>
-      <nav className="session-list" aria-label="会话列表">
+      <nav
+        className={`session-list ${scrollbarVisible ? "scrollbar-visible" : ""}`}
+        aria-label="会话列表"
+        onPointerEnter={showSessionScrollbar}
+        onPointerLeave={scheduleSessionScrollbarHide}
+      >
         {props.sessions.length === 0 ? <p className="session-empty">完成第一轮对话后，会话会出现在这里。</p> : groups.map((group) => (
           <section className="session-group" key={group.label}>
             <h2 className="session-group-title">{group.label}</h2>

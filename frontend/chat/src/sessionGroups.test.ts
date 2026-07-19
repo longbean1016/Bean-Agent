@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 
-import { groupSessionsByCreatedAt } from "./sessionGroups";
+import { groupSessionsByUpdatedAt } from "./sessionGroups";
 import type { SessionSummary } from "./types";
 
 function session(key: string, createdAt: string): SessionSummary {
@@ -8,7 +8,7 @@ function session(key: string, createdAt: string): SessionSummary {
 }
 
 it("按本地自然日将会话分入互斥时间区间", () => {
-  const groups = groupSessionsByCreatedAt([
+  const groups = groupSessionsByUpdatedAt([
     session("month", "2026-05-10T12:00:00+08:00"),
     session("thirty", "2026-06-25T12:00:00+08:00"),
     session("week", "2026-07-15T12:00:00+08:00"),
@@ -25,8 +25,8 @@ it("按本地自然日将会话分入互斥时间区间", () => {
   ]);
 });
 
-it("隐藏空分组并在组内按创建时间倒序", () => {
-  const groups = groupSessionsByCreatedAt([
+it("隐藏空分组并在组内按更新时间倒序", () => {
+  const groups = groupSessionsByUpdatedAt([
     session("early", "2026-07-19T08:00:00+08:00"),
     session("late", "2026-07-19T12:00:00+08:00"),
   ], new Date("2026-07-19T18:00:00+08:00"));

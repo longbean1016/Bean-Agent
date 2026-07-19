@@ -384,7 +384,12 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
         updated = await application.core.sessions.update_title(session_key, clean_title)
         if updated is None:
             raise HTTPException(status_code=404, detail="会话不存在")
-        return {"key": session_key, "title": clean_title}
+        # 前端按最近活动时间分组，重命名也属于一次活动，必须把持久化后的时间一并返回。
+        return {
+            "key": session_key,
+            "title": clean_title,
+            "updated_at": str(updated["updated_at"]),
+        }
 
     @app.delete("/api/chat/sessions/{session_key:path}", status_code=204)
     async def delete_session(session_key: str) -> Response:
