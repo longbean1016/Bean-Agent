@@ -33,6 +33,7 @@ import { initialChatState, reduceChatFrame, rowsToMessages } from "./chatReducer
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
+import { groupSessionsByCreatedAt } from "./sessionGroups";
 import type { ChatFrame, ChatMessage, ConnectionStatus, SessionSummary, ToolActivity } from "./types";
 import { BeanWebSocketClient } from "./websocketClient";
 
@@ -392,21 +393,26 @@ function SessionSidebar(props: {
   onCreate: () => void;
   onSelect: (id: string) => void;
 }) {
+  const groups = useMemo(() => groupSessionsByCreatedAt(props.sessions), [props.sessions]);
   return (
     <div className="session-panel">
       <div className="brand-lockup"><span className="brand-mark">B</span><div><strong>BeanAgent</strong><span>Local workspace</span></div></div>
       <button className="new-chat-button" onClick={props.onCreate}><MessageSquarePlus size={17} />新建会话</button>
-      <div className="session-heading">最近会话</div>
       <nav className="session-list" aria-label="会话列表">
-        {props.sessions.length === 0 ? <p className="session-empty">完成第一轮对话后，会话会出现在这里。</p> : props.sessions.map((session) => (
-          <button
-            key={session.key}
-            className={`session-row ${session.key === props.activeSessionId ? "active" : ""}`}
-            onClick={() => props.onSelect(session.key)}
-          >
-            <span>{session.first_message_content || "未命名会话"}</span>
-            <time>{formatTime(session.created_at)}</time>
-          </button>
+        {props.sessions.length === 0 ? <p className="session-empty">完成第一轮对话后，会话会出现在这里。</p> : groups.map((group) => (
+          <section className="session-group" key={group.label}>
+            <h2 className="session-group-title">{group.label}</h2>
+            {group.sessions.map((session) => (
+              <button
+                key={session.key}
+                className={`session-row ${session.key === props.activeSessionId ? "active" : ""}`}
+                onClick={() => props.onSelect(session.key)}
+              >
+                <span>{session.first_message_content || "未命名会话"}</span>
+                <time>{formatTime(session.created_at)}</time>
+              </button>
+            ))}
+          </section>
         ))}
       </nav>
     </div>

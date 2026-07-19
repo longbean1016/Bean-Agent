@@ -142,6 +142,27 @@ it("会话列表展示第一次提问时间而不是最近更新时间", async (
   expect(screen.queryByText("12/31")).not.toBeInTheDocument();
 });
 
+it("会话列表显示时间分组标题", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-07-19T18:00:00+08:00"));
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const payload = String(input).includes("/messages") ? { items: [], total: 0 } : {
+      items: [
+        { key: "web:today", first_message_content: "今天会话", created_at: "2026-07-19T10:00:00+08:00", updated_at: "2026-07-19T10:00:00+08:00" },
+        { key: "web:yesterday", first_message_content: "昨天会话", created_at: "2026-07-18T10:00:00+08:00", updated_at: "2026-07-18T10:00:00+08:00" },
+      ],
+      total: 2,
+    };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  render(<App />);
+
+  expect(await screen.findByText("今天", { selector: ".session-group-title" })).toBeVisible();
+  expect(screen.getByText("昨天", { selector: ".session-group-title" })).toBeVisible();
+  vi.useRealTimers();
+});
+
 it("用户向上滚动后流式增量不抢回视口并可主动回到底部", async () => {
   localStorage.setItem("beanagent.session_id", "web:scroll-lock");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {

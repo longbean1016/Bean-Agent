@@ -42,8 +42,9 @@ button { color: inherit; }
 .brand-mark, .empty-mark { display: grid; flex: 0 0 auto; place-items: center; width: 34px; height: 34px; border-radius: 7px; background: #116f68; color: white; font-family: Georgia, serif; font-weight: 700; }
 .new-chat-button { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; border: 1px solid #b9c6c2; border-radius: 6px; background: #f9fbfa; cursor: pointer; font-weight: 650; }
 .new-chat-button:hover { border-color: #0b766e; color: #075b55; }
-.session-heading { margin: 22px 8px 8px; color: #687570; font-size: 11px; font-weight: 700; text-transform: uppercase; }
-.session-list { min-height: 0; overflow-y: auto; }
+.session-list { min-height: 0; margin-top: 14px; overflow-y: auto; }
+.session-group + .session-group { margin-top: 16px; }
+.session-group-title { margin: 0 10px 5px; color: #7a8581; font-size: 12px; font-weight: 650; letter-spacing: 0; }
 .session-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; width: 100%; min-height: 42px; padding: 9px 10px; border: 0; border-left: 3px solid transparent; border-radius: 4px; background: transparent; cursor: pointer; text-align: left; }
 .session-row:hover { background: #f1f5f3; }
 .session-row.active { border-left-color: #0b766e; background: #ffffff; }
@@ -228,7 +229,7 @@ button { color: inherit; }
 :root[data-theme="dark"] .brand-compact span:last-child,
 :root[data-theme="dark"] .message-label,
 :root[data-theme="dark"] .composer-hint,
-:root[data-theme="dark"] .session-heading,
+:root[data-theme="dark"] .session-group-title,
 :root[data-theme="dark"] .session-empty { color: #93a19c; }
 :root[data-theme="dark"] .new-chat-button,
 :root[data-theme="dark"] .connection-state,
