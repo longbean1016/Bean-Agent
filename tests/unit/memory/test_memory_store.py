@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -56,3 +57,36 @@ def test_consolidation_source_ref_is_idempotent(store: MemoryStore2) -> None:
     assert first.startswith("saved:")
     assert second == "skipped:web:c:turn-1"
     assert store.has_consolidation_source_ref("web:c:turn-1") is True
+
+
+def test_list_events_by_time_range_uses_happened_at_and_orders_ascending(
+    store: MemoryStore2,
+) -> None:
+    older = store.upsert_item(
+        "event", "完成需求分析", [1.0, 0.0, 0.0], "web:a:0",
+        happened_at="2026-07-18T09:00:00+00:00",
+    ).split(":", 1)[1]
+    newer = store.upsert_item(
+        "event", "完成代码实现", [1.0, 0.0, 0.0], "web:b:0",
+        happened_at="2026-07-19T10:00:00+00:00",
+    ).split(":", 1)[1]
+    superseded = store.upsert_item(
+        "event", "已经过期的计划", [1.0, 0.0, 0.0], "web:c:0",
+        happened_at="2026-07-19T12:00:00+00:00",
+    ).split(":", 1)[1]
+    store.mark_superseded_batch([superseded])
+    store.upsert_item(
+        "preference", "偏好简洁回答", [1.0, 0.0, 0.0], "web:d:0",
+        happened_at="2026-07-19T11:00:00+00:00",
+    )
+    store.upsert_item(
+        "event", "没有事件时间", [1.0, 0.0, 0.0], "web:e:0",
+    )
+
+    items = store.list_events_by_time_range(
+        datetime(2026, 7, 18, tzinfo=timezone.utc),
+        datetime(2026, 7, 20, tzinfo=timezone.utc),
+    )
+
+    assert [item["id"] for item in items] == [older, newer]
+    assert [item["score"] for item in items] == [1.0, 1.0]

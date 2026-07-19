@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +11,10 @@ import pytest
 from agent.config_models import MemoryConfig
 from agent.message_bus import InboundMessage
 from memory.consolidator import ConsolidationDraft
-from memory.contracts import MemoryIngestRequest, MemoryMutation, MemoryQuery, MemoryScope
+from memory.contracts import (
+    MemoryIngestRequest, MemoryMutation, MemoryQuery, MemoryQueryFilters,
+    MemoryScope,
+)
 from memory.engine import MemoryEngine
 from memory.implicit_extractor import ImplicitMemoryDraft
 from session.store import NewMessage, SessionStore
@@ -233,6 +237,44 @@ async def test_answer_query_uses_recent_six_messages_and_hyde_after_empty_result
 
 
 @pytest.mark.asyncio
+async def test_timeline_query_reads_structured_events_without_retriever(
+    tmp_path: Path,
+) -> None:
+    class ForbiddenRetriever:
+        async def retrieve(self, query: str, **kwargs):
+            raise AssertionError("timeline 不应调用向量或关键词 Retriever")
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    engine._retriever = ForbiddenRetriever()
+    try:
+        engine._store.upsert_item(
+            "event",
+            "完成时间线实现",
+            [1.0, 0.0],
+            "web:a:0",
+            happened_at="2026-07-19T09:00:00+00:00",
+        )
+        result = await engine.query(MemoryQuery(
+            "最近完成了什么",
+            intent="timeline",
+            filters=MemoryQueryFilters(
+                time_start=datetime(2026, 7, 19, tzinfo=timezone.utc),
+                time_end=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            ),
+        ))
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert [record.summary for record in result.records] == ["完成时间线实现"]
+    assert result.trace["intent"] == "timeline"
+    assert result.trace["hit_count"] == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "intent",
     [
@@ -240,7 +282,6 @@ async def test_answer_query_uses_recent_six_messages_and_hyde_after_empty_result
         "interest",
         "context",
         "procedure",
-        "timeline",
     ],
 )
 async def test_default_query_intents_share_workspace_memories_across_sessions(

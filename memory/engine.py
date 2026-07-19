@@ -97,6 +97,8 @@ class MemoryEngine:
         self._event_bus: EventBus | None = None
 
     async def query(self, request: MemoryQuery) -> MemoryQueryResult:
+        if request.intent == "timeline":
+            return self._query_timeline(request)
         scope = request.scope
         require_scope_match = _should_require_scope_match(request)
         recent_history = ""
@@ -191,6 +193,29 @@ class MemoryEngine:
             "hyde_hypothesis": hypothesis,
             "injected_ids": [str(item.get("id") or "") for item in items],
             "rejected": injection_plan.rejected,
+        })
+
+    def _query_timeline(self, request: MemoryQuery) -> MemoryQueryResult:
+        """直接读取结构化事件时间线，避免为确定的时间范围调用远端 Embedding。"""
+
+        time_start = request.filters.time_start
+        time_end = request.filters.time_end
+        if time_start is None or time_end is None:
+            return MemoryQueryResult(trace={
+                "engine": "default",
+                "intent": "timeline_missing_time",
+                "hit_count": 0,
+            })
+        items = self._store.list_events_by_time_range(
+            time_start,
+            time_end,
+            limit=request.limit,
+        )
+        records = [_record_from_item(item) for item in items]
+        return MemoryQueryResult(records=records, trace={
+            "engine": "default",
+            "intent": "timeline",
+            "hit_count": len(records),
         })
 
     async def mutate(self, mutation: MemoryMutation) -> MemoryMutationResult:
@@ -699,6 +724,28 @@ def _injection_block(records: list[MemoryRecord]) -> str:
     history = [*groups["event"], *groups["profile"]]
     if history: sections.append("## 【相关历史】与当前用户的过往信息\n" + "\n".join(history))
     return "\n\n".join(sections)
+
+
+def _record_from_item(item: dict[str, object]) -> MemoryRecord:
+    """把存储层条目转换为稳定的记忆记录，并保留原始消息证据。"""
+
+    source_ref = str(item.get("source_ref") or "")
+    evidence = [
+        EvidenceRef(
+            kind="message",
+            refs=[source_ref],
+            source_ref=source_ref,
+        )
+    ] if source_ref else []
+    extra = item.get("extra_json")
+    return MemoryRecord(
+        id=str(item["id"]),
+        kind=str(item.get("memory_type") or "event"),
+        summary=str(item.get("summary") or ""),
+        score=float(item.get("score") or 0),
+        evidence=evidence,
+        signals=extra if isinstance(extra, dict) else {},
+    )
 
 
 def _should_require_scope_match(request: MemoryQuery) -> bool:

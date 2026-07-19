@@ -220,6 +220,40 @@ class MemoryStore2:
         hits.sort(key=lambda value: (-float(value["keyword_score"]), -int(value["reinforcement"]), str(value["id"])))
         return hits[: max(1, int(limit))]
 
+    def list_events_by_time_range(
+        self,
+        time_start: datetime,
+        time_end: datetime,
+        limit: int = 200,
+    ) -> list[dict[str, object]]:
+        """按事件实际发生时间返回结构化时间线，不使用创建时间补齐缺失值。"""
+
+        start = _aware_datetime(time_start)
+        end = _aware_datetime(time_end)
+        if end <= start:
+            return []
+        hits: list[tuple[datetime, dict[str, object]]] = []
+        for row in self._active_rows(["event"]):
+            item = self._row_to_item(row)
+            happened_at = str(item.get("happened_at") or "").strip()
+            if not happened_at:
+                continue
+            try:
+                event_time = _aware_datetime(datetime.fromisoformat(happened_at))
+            except ValueError:
+                continue
+            if event_time < start or event_time >= end:
+                continue
+            item.pop("embedding", None)
+            item["score"] = 1.0
+            hits.append((event_time, item))
+
+        # 先保留时间上最近的 limit 条，再按正序交给调用方展示时间线。
+        max_items = max(1, min(int(limit), 200))
+        selected = sorted(hits, key=lambda value: value[0], reverse=True)[:max_items]
+        selected.sort(key=lambda value: value[0])
+        return [item for _, item in selected]
+
     def keyword_match_procedures(self, action_tokens: list[str]) -> list[dict[str, object]]:
         action = " ".join(action_tokens).lower()
         result: list[dict[str, object]] = []
@@ -408,6 +442,12 @@ def _time_matches(item: dict[str, object], start: datetime | None, end: datetime
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return (start is None or value >= start) and (end is None or value < end)
+
+
+def _aware_datetime(value: datetime) -> datetime:
+    """统一时间比较基准，兼容旧数据中的无时区 ISO 时间。"""
+
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
