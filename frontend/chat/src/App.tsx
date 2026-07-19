@@ -24,6 +24,7 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import type { ComponentPropsWithoutRef } from "react";
 import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
@@ -56,6 +57,7 @@ const ATTACHMENT_ACCEPT = [
 ].join(",");
 type ThemePreference = "light" | "system" | "dark";
 const markdownPlugins = { code, renderers: [{ language: "mermaid", component: MermaidBlock }] };
+const markdownComponents = { inlineCode: MemoryInlineCode };
 const markdownControls = {
   code: { copy: true, download: false },
   // Streamdown 的 panZoom 开关只负责控制按钮；CSS 兼容层还会阻断画布事件，
@@ -95,6 +97,13 @@ function prepareMessageMarkdown(markdown: string): string {
       },
     );
   }).join("");
+}
+
+function MemoryInlineCode({ children, node: _node, ...props }: ComponentPropsWithoutRef<"code"> & { node?: unknown }) {
+  const value = String(children ?? "");
+  const citation = value.match(/^§memory-citation:(\d+)§$/u);
+  if (citation) return <span className="memory-citation-inline">[{citation[1]}]</span>;
+  return <code {...props}>{children}</code>;
 }
 
 function containsClosedMermaidFence(markdown: string): boolean {
@@ -460,6 +469,7 @@ function MessageView({ message }: { message: ChatMessage }) {
             <Streamdown
               key={`${message.id}-${message.streaming ? "stream" : "final"}`}
               plugins={markdownPlugins}
+              components={markdownComponents}
               controls={markdownControls}
               isAnimating={markdownAnimating}
               lineNumbers={false}

@@ -86,6 +86,7 @@ button { color: inherit; }
 .message-body svg, .message-body img { max-width: 100%; }
 .message-body a { color: #076f68; text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .message-body [data-streamdown="link"] { display: inline; padding: 0; border: 0; color: #076f68; background: transparent; font: inherit; font-weight: 600; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; overflow-wrap: anywhere; cursor: pointer; }
+.memory-citation-inline { display: inline-flex; min-width: 20px; height: 20px; align-items: center; justify-content: center; margin: 0 2px; padding: 0 4px; border: 1px solid #9fc4bd; border-radius: 4px; background: #e8f5f1; color: #076b62; font-size: 11px; font-weight: 750; line-height: 1; vertical-align: text-top; }
 .memory-citations { display: flex; position: relative; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; padding-top: 9px; border-top: 1px solid #e0e6e3; color: #697570; font-size: 11px; }
 .memory-citations-label { margin-right: 2px; font-weight: 650; }
 .memory-citation-chips { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -244,6 +245,7 @@ button { color: inherit; }
 :root[data-theme="dark"] .tool-trigger strong,
 :root[data-theme="dark"] .composer textarea { color: #e2e9e6; }
 :root[data-theme="dark"] .memory-citation-chip { border-color: #46615a; background: #21332e; color: #7cc8bb; }
+:root[data-theme="dark"] .memory-citation-inline { border-color: #4b7068; background: #1e3832; color: #83d4c6; }
 :root[data-theme="dark"] .memory-citations { border-color: #34413d; color: #93a19c; }
 :root[data-theme="dark"] .memory-citation-detail { border-color: #3a4944; background: #1d2421; color: #b5c0bc; }
 :root[data-theme="dark"] .memory-citation-id code { color: #d3ddd9; }

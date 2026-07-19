@@ -8,7 +8,7 @@ it("将完整记忆引用替换为稳定编号并合并重复引用", () => {
   );
 
   expect(result.markdown).toBe(
-    "第一条。**[1]** 第二条。**[1]** 组合。**[2]**",
+    "第一条。`§memory-citation:1§` 第二条。`§memory-citation:1§` 组合。`§memory-citation:2§`",
   );
   expect(result.citations).toEqual([
     { number: 1, ids: ["mem_1"] },

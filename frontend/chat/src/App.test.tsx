@@ -135,7 +135,7 @@ it("会话列表展示第一次提问时间而不是最近更新时间", async (
     return { ok: true, json: async () => payload } as Response;
   }));
 
-  render(<App />);
+  const { container } = render(<App />);
 
   await screen.findByText("固定创建时间");
   expect(screen.getByText("1/2")).toBeVisible();
@@ -298,11 +298,12 @@ it("将记忆引用渲染为编号并支持展开和复制ID", async () => {
     return { ok: true, json: async () => payload } as Response;
   }));
 
-  render(<App />);
+  const { container } = render(<App />);
 
   await screen.findByText("记得你的电脑型号。", { exact: false });
   expect(screen.queryByRole("link", { name: "[1]" })).not.toBeInTheDocument();
   expect(screen.getAllByText("[1]").length).toBeGreaterThan(0);
+  expect(container.querySelector(".memory-citation-inline")).toHaveTextContent("[1]");
   expect(screen.queryByText(/§cited/)).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "查看引用 1" }));
   expect(screen.getAllByText("记忆 ID：")).toHaveLength(2);

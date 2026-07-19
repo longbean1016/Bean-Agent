@@ -25,7 +25,7 @@ export function parseMemoryCitations(source: string): ParsedMemoryCitations {
       numbers.set(key, number);
       citations.push({ number, ids: uniqueIds });
     }
-    return `**[${number}]**`;
+    return `\`§memory-citation:${number}§\``;
   });
 
   return { markdown, citations };
