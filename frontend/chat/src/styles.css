@@ -31,9 +31,9 @@ body { overflow: hidden; }
 button, textarea, input { font: inherit; letter-spacing: 0; }
 button { color: inherit; }
 
-.app-shell { display: grid; grid-template-columns: 272px minmax(0, 1fr); height: 100%; background: #f4f6f5; }
-.desktop-sidebar { min-width: 0; border-right: 1px solid #d9dfdc; background: #e9eeec; }
-.session-panel { display: flex; flex-direction: column; height: 100%; padding: 18px 14px; }
+.app-shell { display: grid; grid-template-columns: 272px minmax(0, 1fr); min-height: 0; height: 100%; overflow: hidden; background: #f4f6f5; }
+.desktop-sidebar { min-width: 0; min-height: 0; height: 100%; overflow: hidden; border-right: 1px solid #d9dfdc; background: #e9eeec; }
+.session-panel { display: flex; min-height: 0; height: 100%; flex-direction: column; overflow: hidden; padding: 18px 14px; }
 .brand-lockup, .brand-compact { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .brand-lockup { padding: 0 6px 18px; }
 .brand-lockup div, .brand-compact div { display: flex; flex-direction: column; min-width: 0; }
@@ -42,7 +42,7 @@ button { color: inherit; }
 .brand-mark, .empty-mark { display: grid; flex: 0 0 auto; place-items: center; width: 34px; height: 34px; border-radius: 7px; background: #116f68; color: white; font-family: Georgia, serif; font-weight: 700; }
 .new-chat-button { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; border: 1px solid #b9c6c2; border-radius: 6px; background: #f9fbfa; cursor: pointer; font-weight: 650; }
 .new-chat-button:hover { border-color: #0b766e; color: #075b55; }
-.session-list { min-height: 0; margin-top: 14px; overflow-y: auto; }
+.session-list { flex: 1 1 0; min-height: 0; margin-top: 14px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .session-group + .session-group { margin-top: 16px; }
 .session-group-title { margin: 0 10px 5px; color: #7a8581; font-size: 12px; font-weight: 650; letter-spacing: 0; }
 .session-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 28px; width: 100%; min-height: 42px; border-left: 3px solid transparent; border-radius: 4px; background: transparent; }
@@ -67,7 +67,7 @@ button { color: inherit; }
 .delete-dialog-actions button:disabled { cursor: wait; opacity: .65; }
 .session-empty { margin: 10px; color: #78837f; font-size: 12px; line-height: 1.55; }
 
-.chat-workspace { position: relative; display: grid; grid-template-areas: "topbar" "error" "conversation" "composer"; grid-template-rows: 58px auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; height: 100%; overflow: hidden; background: #fbfcfb; }
+.chat-workspace { position: relative; display: grid; grid-template-areas: "topbar" "error" "conversation" "composer"; grid-template-rows: 58px auto minmax(0, 1fr) max-content; min-width: 0; min-height: 0; height: 100%; overflow: hidden; background: #fbfcfb; }
 .topbar { grid-area: topbar; display: flex; align-items: center; justify-content: space-between; min-width: 0; padding: 0 22px; border-bottom: 1px solid #e0e5e3; background: rgba(251, 252, 251, .96); }
 .topbar-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .brand-compact { display: none; }
@@ -204,7 +204,7 @@ button { color: inherit; }
 .example-prompts button { min-height: 42px; padding: 9px 12px; border: 1px solid #d8dfdc; border-radius: 5px; background: transparent; cursor: pointer; text-align: left; }
 .example-prompts button:hover { border-color: #8eb6b0; background: #f1f6f4; }
 
-.composer-wrap { grid-area: composer; position: relative; z-index: 2; padding: 0 max(24px, calc((100% - 880px) / 2)) 18px; background: #fbfcfb; }
+.composer-wrap { grid-area: composer; position: relative; z-index: 2; align-self: end; min-width: 0; width: 100%; padding: 0 max(24px, calc((100% - 880px) / 2)) 18px; background: #fbfcfb; }
 .composer { border: 1px solid #cdd7d3; border-radius: 8px; background: #fff; box-shadow: 0 8px 28px rgba(35, 54, 48, .09); }
 .composer.dragging { border-color: #16877e; background: #f2f8f6; box-shadow: 0 0 0 3px rgba(11, 118, 110, .12), 0 8px 28px rgba(35, 54, 48, .09); }
 .composer textarea { display: block; width: 100%; min-height: 72px; max-height: 180px; resize: vertical; padding: 13px 15px 6px; border: 0; outline: 0; background: transparent; color: #19221f; line-height: 1.5; }
