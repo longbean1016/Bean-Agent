@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 import logging
+from datetime import datetime
 from io import BytesIO
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -56,10 +57,11 @@ _MAX_IMAGE_UPLOAD = 10 * 1024 * 1024
 class MemoryMaintenanceLoop:
     """启动恢复与周期 Optimizer；不包含主动任务或插件调度。"""
 
-    def __init__(self, memory: Any, *, enabled: bool, interval_seconds: float) -> None:
+    def __init__(self, memory: Any, *, enabled: bool, interval_seconds: float, now_fn: Callable[[], datetime] | None = None) -> None:
         self._memory = memory
         self._enabled = bool(enabled)
-        self._interval = max(0.001, float(interval_seconds))
+        self._interval = max(60.0, float(interval_seconds))
+        self._now_fn = now_fn or datetime.now
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._started = False
@@ -77,9 +79,15 @@ class MemoryMaintenanceLoop:
             self._task = asyncio.create_task(self._run(), name="memory-optimizer")
 
     async def _run(self) -> None:
+        logger.info(
+            "记忆 Optimizer 周期已启动: interval_seconds=%.0f",
+            self._interval,
+        )
         while not self._stop_event.is_set():
+            seconds = self._seconds_until_next_tick()
+            logger.info("距离下次记忆优化 %.0f 秒", seconds)
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=self._interval)
+                await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
                 return
             except TimeoutError:
                 pass
@@ -89,6 +97,14 @@ class MemoryMaintenanceLoop:
                 # 周期整理失败不能终止对话服务；PENDING snapshot 自身负责回滚，
                 # 下一周期会重新尝试。
                 logger.exception("记忆 Optimizer 周期执行失败")
+
+    def _seconds_until_next_tick(self) -> float:
+        """按绝对时间轴寻找下一周期边界，避免服务重启后重新等待完整周期。"""
+
+        now = self._now_fn()
+        current = now.replace(second=0, microsecond=0).timestamp()
+        next_tick = (current // self._interval + 1) * self._interval
+        return max(1.0, next_tick - now.timestamp())
 
     async def close(self) -> None:
         if self._closed:

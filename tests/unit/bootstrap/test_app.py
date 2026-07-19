@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -123,7 +124,8 @@ async def test_memory_maintenance_replays_outbox_and_runs_optimizer() -> None:
         async def optimize(self): self.optimized += 1; return {}
 
     memory = Memory()
-    loop = MemoryMaintenanceLoop(memory, enabled=True, interval_seconds=0.01)
+    loop = MemoryMaintenanceLoop(memory, enabled=True, interval_seconds=60)
+    loop._seconds_until_next_tick = lambda: 0.01
 
     await loop.start()
     await asyncio.sleep(0.03)
@@ -131,6 +133,18 @@ async def test_memory_maintenance_replays_outbox_and_runs_optimizer() -> None:
 
     assert memory.replayed == 1
     assert memory.optimized >= 1
+
+
+def test_memory_maintenance_aligns_next_run_to_absolute_time_boundary() -> None:
+    now = datetime.fromtimestamp(100, tz=timezone.utc)
+    loop = MemoryMaintenanceLoop(
+        object(),
+        enabled=True,
+        interval_seconds=60,
+        now_fn=lambda: now,
+    )
+
+    assert loop._seconds_until_next_tick() == 20
 
 
 @pytest.mark.asyncio

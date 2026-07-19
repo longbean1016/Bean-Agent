@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Protocol
 
 from memory.md_store import DEFAULT_SELF_MD, MarkdownMemoryStore
@@ -11,12 +12,29 @@ class LLMApi(Protocol):
     async def complete(self, messages: list[dict[str, str]], tools: list[dict[str, Any]] | None = None) -> Any: ...
 
 
+class MemoryOptimizerBusy(RuntimeError):
+    """同一 Workspace 的 Markdown 记忆正在整理。"""
+
+
 class MemoryOptimizer:
     def __init__(self, store: MarkdownMemoryStore, provider: LLMApi) -> None:
         self._store = store
         self._provider = provider
+        self._lock = asyncio.Lock()
+
+    @property
+    def is_running(self) -> bool:
+        return self._lock.locked()
 
     async def optimize(self) -> dict[str, int]:
+        if self._lock.locked():
+            raise MemoryOptimizerBusy("memory optimizer 正在运行")
+        # 锁必须覆盖 snapshot、两次 LLM 调用和文件提交；否则并发任务会把处理中
+        # 的临时空 PENDING 误判为没有工作，并破坏快照事务的单写者约束。
+        async with self._lock:
+            return await self._optimize()
+
+    async def _optimize(self) -> dict[str, int]:
         pending = self._store.snapshot_pending()
         if not pending.strip():
             return {"pending_chars": 0, "memory_chars": len(self._store.read_long_term()), "self_chars": len(self._store.read_self())}
@@ -50,4 +68,4 @@ class MemoryOptimizer:
         return content
 
 
-__all__ = ["MemoryOptimizer"]
+__all__ = ["MemoryOptimizer", "MemoryOptimizerBusy"]

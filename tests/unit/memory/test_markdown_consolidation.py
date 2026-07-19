@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from memory.consolidator import ConsolidationDraft, Consolidator
 from memory.md_store import MarkdownMemoryStore
-from memory.optimizer import MemoryOptimizer
+from memory.optimizer import MemoryOptimizer, MemoryOptimizerBusy
 from session.store import NewMessage, SessionStore
 
 
@@ -149,6 +150,35 @@ class OptimizerLLM:
             raise RuntimeError("self update failed")
         content = "# 用户长期记忆\n- 用户是开发者" if self.calls == 1 else "# BeanAgent\n## 人格与形象\n- 直接"
         return type("Response", (), {"content": content})()
+
+
+class BlockingOptimizerLLM:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def complete(self, messages, tools=None):
+        self.started.set()
+        await self.release.wait()
+        return type("Response", (), {"content": "# 用户长期记忆\n- 已整理"})()
+
+
+@pytest.mark.asyncio
+async def test_optimizer_rejects_concurrent_runs(tmp_path: Path) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    store.append_pending("- [identity] 用户是开发者")
+    provider = BlockingOptimizerLLM()
+    optimizer = MemoryOptimizer(store, provider)
+    first = asyncio.create_task(optimizer.optimize())
+    await provider.started.wait()
+
+    try:
+        with pytest.raises(MemoryOptimizerBusy, match="正在运行"):
+            await optimizer.optimize()
+    finally:
+        provider.release.set()
+        await first
+        store.close()
 
 
 @pytest.mark.asyncio
