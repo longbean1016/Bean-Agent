@@ -13,6 +13,7 @@ from tools.memorize import MemorizeTool
 from tools.message_lookup import FetchMessagesTool, SearchMessagesTool
 from tools.recall_memory import RecallMemoryTool
 from tools.registry import ToolRegistry
+from tools.tool_search import ToolSearchTool
 from tools.shell import ShellTool
 from tools.vision import ReadImageVisionTool
 from tools.web_fetch import AsyncHttpClient as FetchHttpClient, WebFetchTool
@@ -42,7 +43,7 @@ def register_filesystem_tools(
     vl_available = not multimodal and vl_provider is not None and bool(vl_model)
     registry.register(
         ReadFileTool(
-            # 对齐 Akashic 主 Agent：读取不设路径根，写入、编辑和目录枚举仍受 workdir 约束。
+            # 读取允许使用上传文件的绝对路径；写入、编辑和目录枚举仍受 workdir 约束。
             allowed_dir=None,
             multimodal=multimodal,
             vl_available=vl_available,
@@ -52,7 +53,7 @@ def register_filesystem_tools(
     registry.register(EditFileTool(allowed_dir))
     registry.register(ListDirTool(allowed_dir))
     if vl_available:
-        # 对齐 Akashic：Channel 上传可能落在 workspace/uploads 或系统临时目录，
+        # Channel 上传可能落在 workspace/uploads 或系统临时目录，
         # 它们不一定属于 agent.workdir。视觉工具因此不继承普通文件工具的路径根
         # 限制；Read/Write/Edit/List 仍严格限制在 allowed_dir 内。
         registry.register(ReadImageVisionTool(vl_provider, vl_model, None))
@@ -75,6 +76,7 @@ def register_all(
 ) -> ToolRegistry:
     """注册当前依赖实际支持的全部内置工具。"""
 
+    registry.register(ToolSearchTool(registry), always_on=True)
     registry.register(
         ShellTool(
             allow_network=allow_shell_network,

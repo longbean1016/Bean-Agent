@@ -90,11 +90,11 @@ class Pipeline:
             channel=message.channel,
             chat_id=message.chat_id,
             session_key=message.session_key,
-            visible_names=self._tools.get_registered_names(),
+            visible_names=self._tools.get_always_on_names(),
         )
         history = await self._history_loader(message.session_key, self._history_limit) if self._history_loader else []
         retrieved = await self._memory.retrieve_for_turn(message) if self._memory else ""
-        names = sorted(self._tools.get_registered_names())
+        names = list(tool_view.visible_order)
         summary = "\n".join(
             f"- {name}: {tool.description}"
             for name in names
@@ -156,7 +156,10 @@ class Pipeline:
                 try:
                     return await self._provider.chat(
                         model_messages,
-                        self._tools.get_schemas(),
+                        self._tools.get_schemas(
+                            visible_names=tool_view.visible_names,
+                            visible_order=tool_view.visible_order,
+                        ),
                         tool_choice="auto",
                         on_content_delta=on_delta,
                     )
@@ -234,12 +237,28 @@ class Pipeline:
             group: dict[str, Any] = {"iteration": iteration, "text": response.content or "", "calls": [], "provider_fields": dict(response.provider_fields)}
             for call in response.tool_calls:
                 await self._events.emit(ToolCallStarted(message.session_key, turn_id, call.id, call.name, dict(call.arguments)))
+                execution_context: dict[str, Any] = tool_view.context
+                if call.name == "tool_search":
+                    # 搜索工具需要知道哪些 Schema 已在当前 Turn 可见，但不能
+                    # 持有 View 本身，否则状态会重新泄漏到全局工具实例。
+                    execution_context["excluded_names"] = set(tool_view.visible_names)
                 raw_result = await self._tools.execute(
                     call.name,
                     call.arguments,
-                    context=tool_view.context,
+                    context=execution_context,
                 )
                 result = normalize_tool_result(raw_result)
+                if call.name == "tool_search":
+                    try:
+                        payload = json.loads(result.text)
+                        unlocked = payload.get("unlocked", [])
+                        if isinstance(unlocked, list):
+                            tool_view.unlock(
+                                name for name in unlocked if isinstance(name, str)
+                            )
+                    except (json.JSONDecodeError, AttributeError):
+                        # 搜索结果异常只表示本次没有解锁，原工具结果仍完整交给模型。
+                        logger.warning("tool_search 返回了无法解析的结果")
                 status = "error" if result.text.startswith("工具执行出错:") or result.text.startswith("工具 '") else "ok"
                 append_tool_result(react_messages, tool_call_id=call.id, content=result, tool_name=call.name)
                 await self._events.emit(ToolCallCompleted(message.session_key, turn_id, call.id, call.name, status, result.preview()[:500]))

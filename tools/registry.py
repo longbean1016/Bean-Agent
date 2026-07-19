@@ -205,7 +205,7 @@ class ToolRegistry:
         name: str,
         arguments: dict[str, Any],
         *,
-        context: dict[str, str] | None = None,
+        context: dict[str, Any] | None = None,
         raise_errors: bool = False,
     ) -> str | ToolResult:
         """执行工具；默认把未知工具和运行异常降级为稳定文本结果。"""

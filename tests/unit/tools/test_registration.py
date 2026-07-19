@@ -36,7 +36,7 @@ def test_register_all_without_optional_services_exposes_base_tools(
     )
 
     assert registry.get_registered_names() == {
-        "shell", "read_file", "write_file", "edit_file", "list_dir",
+        "tool_search", "shell", "read_file", "write_file", "edit_file", "list_dir",
         "web_search", "web_fetch",
     }
 

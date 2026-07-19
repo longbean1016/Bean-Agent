@@ -22,6 +22,7 @@ from agent.provider import ContextLengthError, LLMResponse, ToolCall
 from agent.skills import SkillsLoader
 from tools.base import Tool
 from tools.registry import ToolRegistry
+from tools.tool_search import ToolSearchTool
 
 
 class EchoTool(Tool):
@@ -51,6 +52,95 @@ class Memory:
     def read_self(self): return ""
     def get_memory_context(self): return ""
     def read_recent_context(self): return ""
+
+
+@pytest.mark.asyncio
+async def test_tool_search_unlocks_only_the_current_turn_schema() -> None:
+    class HiddenTool(Tool):
+        name = "mcp_demo__lookup"
+        description = "查询演示记录"
+        parameters = {"type": "object", "properties": {}}
+
+        async def execute(self, **kwargs):
+            return "record"
+
+    class SearchProvider:
+        def __init__(self) -> None:
+            self.schema_names: list[list[str]] = []
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.schema_names.append(
+                [item["function"]["name"] for item in tools or []]
+            )
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(
+                    None,
+                    [ToolCall("search", "tool_search", {"query": "演示"})],
+                )
+            if self.calls == 2:
+                return LLMResponse(
+                    None,
+                    [ToolCall("lookup", "mcp_demo__lookup", {})],
+                )
+            return LLMResponse("完成")
+
+    class FinalProvider:
+        def __init__(self) -> None:
+            self.schema_names: list[str] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.schema_names = [item["function"]["name"] for item in tools or []]
+            return LLMResponse("完成")
+
+    registry = ToolRegistry()
+    registry.register(ToolSearchTool(registry), always_on=True)
+    registry.register(
+        HiddenTool(),
+        always_on=False,
+        risk="external-side-effect",
+        source_type="mcp",
+        source_name="demo",
+    )
+    assembler = PromptAssembler(
+        SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+        MessageEnvelopeBuilder(),
+    )
+    first_provider = SearchProvider()
+    first = Pipeline(
+        first_provider,
+        registry,
+        EventBus(),
+        assembler,
+        workspace="D:/workspace",
+    )
+
+    result = await first.process(
+        InboundMessage("web", "u", "a", "查询演示记录"),
+        turn_id="turn-a",
+    )
+
+    assert result.content == "完成"
+    assert first_provider.schema_names == [
+        ["tool_search"],
+        ["tool_search", "mcp_demo__lookup"],
+        ["tool_search", "mcp_demo__lookup"],
+    ]
+
+    second_provider = FinalProvider()
+    second = Pipeline(
+        second_provider,
+        registry,
+        EventBus(),
+        assembler,
+        workspace="D:/workspace",
+    )
+    await second.process(
+        InboundMessage("web", "u", "b", "新会话"),
+        turn_id="turn-b",
+    )
+    assert second_provider.schema_names == ["tool_search"]
 
 
 @pytest.mark.asyncio
