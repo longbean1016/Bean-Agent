@@ -64,6 +64,56 @@ def test_register_overwrites_same_name_and_preserves_schema_order() -> None:
     assert registry.has_tool("second") is False
 
 
+def test_registry_tracks_metadata_source_and_visible_schema_order() -> None:
+    registry = ToolRegistry()
+    registry.register(_RecordingTool(), risk="write", search_hint="保存记录")
+    registry.register(
+        _SecondTool(),
+        always_on=False,
+        risk="external-side-effect",
+        source_type="mcp",
+        source_name="demo",
+    )
+
+    assert registry.get_always_on_names() == {"record"}
+    assert registry.get_tool_names_by_source("mcp", "demo") == ["second"]
+    assert registry.get_metadata("second").risk == "external-side-effect"
+    assert [
+        item["function"]["name"]
+        for item in registry.get_schemas(
+            visible_names={"record", "second"},
+            visible_order=["second", "record"],
+        )
+    ] == ["second", "record"]
+
+    registry.unregister("second")
+    assert registry.get_metadata("second") is None
+    assert registry.search("第二个") == []
+
+
+def test_registry_search_is_ranked_stable_and_filters_risk() -> None:
+    registry = ToolRegistry()
+    registry.register(_RecordingTool(), risk="write", search_hint="保存记录")
+    registry.register(
+        _SecondTool(),
+        always_on=False,
+        risk="read-only",
+        search_hint="记录查询",
+        source_type="mcp",
+        source_name="demo",
+    )
+
+    assert [item["name"] for item in registry.search("second")] == ["second"]
+    assert [item["name"] for item in registry.search("记录")] == [
+        "record",
+        "second",
+    ]
+    assert [
+        item["name"]
+        for item in registry.search("记录", allowed_risk={"read-only"})
+    ] == ["second"]
+
+
 @pytest.mark.asyncio
 async def test_execute_merges_context_as_low_priority_defaults() -> None:
     registry = ToolRegistry()
