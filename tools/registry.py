@@ -15,9 +15,6 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
-        # 当前架构只有一个 AgentLoop 串行处理 Turn，因此与参考实现一样使用
-        # Registry 级上下文。若未来允许并行 Turn，必须改成 Turn 局部状态。
-        self._context: dict[str, str] = {}
 
     def register(self, tool: Tool) -> None:
         """注册工具；同名工具覆盖旧实例且保留原注册位置。"""
@@ -47,21 +44,12 @@ class ToolRegistry:
 
         return [tool.to_schema() for tool in self._tools.values()]
 
-    def set_context(self, **kwargs: str) -> None:
-        """更新当前 Turn 的隐藏上下文，不把这些字段暴露给 LLM Schema。"""
-
-        self._context.update(kwargs)
-
-    def get_context(self) -> dict[str, str]:
-        """返回当前上下文字典，与参考实现保持同一对象语义。"""
-
-        return self._context
-
     async def execute(
         self,
         name: str,
         arguments: dict[str, Any],
         *,
+        context: dict[str, str] | None = None,
         raise_errors: bool = False,
     ) -> str | ToolResult:
         """执行工具；默认把未知工具和运行异常降级为稳定文本结果。"""
@@ -73,9 +61,9 @@ class ToolRegistry:
             return f"工具 '{name}' 不存在"
 
         try:
-            # context 是系统提供的低优先级默认值；LLM arguments 放在后面，
-            # 与参考实现一致，显式参数可以覆盖同名上下文字段。
-            merged: dict[str, Any] = {**self._context, **arguments}
+            # 系统身份只属于当前 Turn，通过调用参数显式传入；模型参数放在
+            # 后面，继续允许显式值覆盖同名默认值。
+            merged: dict[str, Any] = {**(context or {}), **arguments}
             return await tool.execute(**merged)
         except Exception as error:
             logger.error("工具 %s 执行出错: %s", name, error, exc_info=True)

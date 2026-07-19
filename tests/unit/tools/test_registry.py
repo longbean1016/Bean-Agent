@@ -69,11 +69,11 @@ async def test_execute_merges_context_as_low_priority_defaults() -> None:
     registry = ToolRegistry()
     tool = _RecordingTool()
     registry.register(tool)
-    registry.set_context(channel="web", chat_id="context-chat")
 
     result = await registry.execute(
         "record",
         {"query": "BeanAgent", "chat_id": "argument-chat"},
+        context={"channel": "web", "chat_id": "context-chat"},
     )
 
     assert result == "first"
@@ -84,7 +84,8 @@ async def test_execute_merges_context_as_low_priority_defaults() -> None:
             "query": "BeanAgent",
         }
     ]
-    assert registry.get_context() == {"channel": "web", "chat_id": "context-chat"}
+    assert not hasattr(registry, "set_context")
+    assert not hasattr(registry, "get_context")
 
 
 @pytest.mark.asyncio

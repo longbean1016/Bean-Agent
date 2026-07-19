@@ -18,6 +18,7 @@ from agent.prompt_block import TurnContext
 from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import ContextLengthError, LLMResponse
 from agent.skills import SkillsLoader, collect_skill_mentions
+from agent.tool_runtime import ToolRuntimeView
 from tools.base import normalize_tool_result
 from tools.registry import ToolRegistry
 from tools.runtime import append_tool_result
@@ -85,7 +86,12 @@ class Pipeline:
             "tools_used": [],
             "tool_chain_partial": [],
         }
-        self._tools.set_context(channel=message.channel, chat_id=message.chat_id, session_key=message.session_key)
+        tool_view = ToolRuntimeView.create(
+            channel=message.channel,
+            chat_id=message.chat_id,
+            session_key=message.session_key,
+            visible_names=self._tools.get_registered_names(),
+        )
         history = await self._history_loader(message.session_key, self._history_limit) if self._history_loader else []
         retrieved = await self._memory.retrieve_for_turn(message) if self._memory else ""
         names = sorted(self._tools.get_registered_names())
@@ -228,7 +234,11 @@ class Pipeline:
             group: dict[str, Any] = {"iteration": iteration, "text": response.content or "", "calls": [], "provider_fields": dict(response.provider_fields)}
             for call in response.tool_calls:
                 await self._events.emit(ToolCallStarted(message.session_key, turn_id, call.id, call.name, dict(call.arguments)))
-                raw_result = await self._tools.execute(call.name, call.arguments)
+                raw_result = await self._tools.execute(
+                    call.name,
+                    call.arguments,
+                    context=tool_view.context,
+                )
                 result = normalize_tool_result(raw_result)
                 status = "error" if result.text.startswith("工具执行出错:") or result.text.startswith("工具 '") else "ok"
                 append_tool_result(react_messages, tool_call_id=call.id, content=result, tool_name=call.name)
