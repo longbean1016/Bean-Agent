@@ -431,6 +431,19 @@ function SessionSidebar(props: {
   const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
   const [deleting, setDeleting] = useState(false);
 
+  useEffect(() => {
+    if (!menuSessionId) return;
+    const closeMenuOutside = (event: PointerEvent) => {
+      const owner = event.target instanceof Element
+        ? event.target.closest<HTMLElement>("[data-session-menu-owner]")
+        : null;
+      if (owner?.dataset.sessionMenuOwner !== menuSessionId) setMenuSessionId("");
+    };
+    // 使用捕获阶段，保证点击会话切换等控件时先收起菜单，再执行目标控件自己的动作。
+    document.addEventListener("pointerdown", closeMenuOutside, true);
+    return () => document.removeEventListener("pointerdown", closeMenuOutside, true);
+  }, [menuSessionId]);
+
   const beginRename = (session: SessionSummary) => {
     setMenuSessionId("");
     setEditingSessionId(session.key);
@@ -456,7 +469,11 @@ function SessionSidebar(props: {
               const title = session.title || session.first_message_content || "未命名会话";
               const active = session.key === props.activeSessionId;
               return (
-                <div key={session.key} className={`session-row ${active ? "active" : ""}`}>
+                <div
+                  key={session.key}
+                  className={`session-row ${active ? "active" : ""}`}
+                  data-session-menu-owner={session.key}
+                >
                   {editingSessionId === session.key ? (
                     <input
                       className="session-title-input"
@@ -474,7 +491,6 @@ function SessionSidebar(props: {
                   ) : (
                     <button className="session-row-select" onClick={() => props.onSelect(session.key)}>
                       <span>{title}</span>
-                      <time>{formatTime(session.created_at)}</time>
                     </button>
                   )}
                   <button
@@ -499,7 +515,7 @@ function SessionSidebar(props: {
       </nav>
       <Dialog.Root open={deleteTarget !== null} onOpenChange={(open) => { if (!open && !deleting) setDeleteTarget(null); }}>
         <Dialog.Portal>
-          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Overlay className="dialog-overlay" onClick={() => { if (!deleting) setDeleteTarget(null); }} />
           <Dialog.Content className="delete-session-dialog">
             <Dialog.Title>删除“{deleteTarget ? (deleteTarget.title || deleteTarget.first_message_content || "未命名会话") : ""}”？</Dialog.Title>
             <Dialog.Description>
@@ -837,4 +853,3 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${Number((bytes / 1024).toFixed(1))} KB`;
   return `${Number((bytes / 1024 / 1024).toFixed(1))} MB`;
 }
-function formatTime(value: string): string { const date = new Date(value); return Number.isNaN(date.getTime()) ? "" : new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric" }).format(date); }

@@ -119,7 +119,7 @@ it("首次连接创建 Session 并发送用户消息", async () => {
   expect(screen.getByText("组件测试消息")).toBeVisible();
 });
 
-it("会话列表展示第一次提问时间而不是最近更新时间", async () => {
+it("会话列表使用第一次提问时间分组而不是最近更新时间", async () => {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages")
       ? { items: [], total: 0 }
@@ -138,8 +138,9 @@ it("会话列表展示第一次提问时间而不是最近更新时间", async (
   const { container } = render(<App />);
 
   await screen.findByText("固定创建时间");
-  expect(screen.getByText("1/2")).toBeVisible();
-  expect(screen.queryByText("12/31")).not.toBeInTheDocument();
+  expect(screen.getByText("2026-01", { selector: ".session-group-title" })).toBeVisible();
+  expect(screen.queryByText("2026-12", { selector: ".session-group-title" })).not.toBeInTheDocument();
+  expect(container.querySelector(".session-row time")).toBeNull();
 });
 
 it("会话列表显示时间分组标题", async () => {
@@ -190,6 +191,77 @@ it("通过会话菜单重命名且不触发会话切换", async () => {
     "/api/chat/sessions/web%3Arename",
     expect.objectContaining({ method: "PATCH" }),
   );
+});
+
+it("点击会话菜单外部会关闭菜单", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => ({
+    ok: true,
+    json: async () => ({
+      items: [{ key: "web:menu", first_message_content: "菜单会话", created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
+    }),
+  }) as Response));
+
+  render(<App />);
+  await screen.findByText("菜单会话");
+  fireEvent.click(screen.getByRole("button", { name: "打开会话“菜单会话”的菜单" }));
+  expect(screen.getByRole("menu")).toBeVisible();
+  fireEvent.pointerDown(screen.getByRole("main"));
+  expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+});
+
+it("重命名失焦后保存并收起输入框", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === "PATCH") return { ok: true, json: async () => ({ key: "web:blur", title: "失焦标题" }) } as Response;
+    const payload = String(input).includes("/messages") ? { items: [] } : {
+      items: [{ key: "web:blur", first_message_content: "原始会话", created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
+    };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  render(<App />);
+  await screen.findByText("原始会话");
+  fireEvent.click(screen.getByRole("button", { name: "打开会话“原始会话”的菜单" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "重命名" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "会话标题" }), { target: { value: "失焦标题" } });
+  fireEvent.blur(screen.getByRole("textbox", { name: "会话标题" }));
+
+  expect(await screen.findByText("失焦标题")).toBeVisible();
+  expect(screen.queryByRole("textbox", { name: "会话标题" })).not.toBeInTheDocument();
+});
+
+it("会话列表不重复展示日期且聊天输入框始终存在", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => ({
+    ok: true,
+    json: async () => ({
+      items: [{ key: "web:no-date", first_message_content: "无日期会话", created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
+    }),
+  }) as Response));
+
+  const { container } = render(<App />);
+  await screen.findByText("无日期会话");
+  expect(container.querySelector(".session-row time")).toBeNull();
+  expect(screen.getByPlaceholderText("输入消息，或附加文本与图片")).toBeVisible();
+});
+
+it("点击删除确认框外部会关闭确认框", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => ({
+    ok: true,
+    json: async () => ({
+      items: [{ key: "web:dialog", first_message_content: "删除弹窗", created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
+    }),
+  }) as Response));
+
+  const { container } = render(<App />);
+  await screen.findByText("删除弹窗");
+  fireEvent.click(screen.getByRole("button", { name: "打开会话“删除弹窗”的菜单" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "删除" }));
+  expect(screen.getByRole("dialog")).toBeVisible();
+  const overlay = document.querySelector<HTMLElement>(".dialog-overlay");
+  expect(overlay).not.toBeNull();
+  fireEvent.pointerDown(overlay!);
+  fireEvent.click(overlay!);
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(container.querySelector(".composer textarea")).toBeVisible();
 });
 
 it("删除当前会话后复用新建流程并回到空白会话", async () => {

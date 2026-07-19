@@ -48,9 +48,8 @@ button { color: inherit; }
 .session-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 28px; width: 100%; min-height: 42px; border-left: 3px solid transparent; border-radius: 4px; background: transparent; }
 .session-row:hover { background: #f1f5f3; }
 .session-row.active { border-left-color: #0b766e; background: #ffffff; }
-.session-row-select { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; min-width: 0; min-height: 42px; padding: 9px 5px 9px 7px; border: 0; background: transparent; cursor: pointer; text-align: left; }
-.session-row-select > span { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
-.session-row time { color: #7a8581; font-size: 10px; }
+.session-row-select { display: block; min-width: 0; min-height: 42px; padding: 9px 5px 9px 7px; overflow: hidden; border: 0; background: transparent; cursor: pointer; text-align: left; }
+.session-row-select > span { display: block; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .session-menu-trigger { display: grid; align-self: center; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 4px; background: transparent; cursor: pointer; opacity: 0; }
 .session-row:hover .session-menu-trigger, .session-row.active .session-menu-trigger, .session-menu-trigger:focus-visible, .session-menu-trigger[aria-expanded="true"] { opacity: 1; }
 .session-menu-trigger:hover { background: #dfe7e3; }

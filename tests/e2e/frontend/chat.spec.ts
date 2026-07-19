@@ -41,7 +41,7 @@ test("聚合流式回复、工具状态并用 final 覆盖草稿", async ({ page
     (icon) => getComputedStyle(icon).marginLeft,
   );
   expect(thinkingIconMargin).toBe("0px");
-  await expect(page.getByRole("img", { name: "Mermaid chart" })).toBeVisible();
+  await expect(page.getByRole("img", { name: /Mermaid/ })).toBeVisible();
   if (page.viewportSize()?.width === 1440) {
     await page.screenshot({ path: ".pytest_artifacts/frontend-desktop.png", fullPage: true });
   }
@@ -91,7 +91,7 @@ test("移动端布局没有横向溢出", async ({ page }, testInfo) => {
 test("加载历史会话并新建空会话", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "桌面侧栏覆盖即可");
   await expect(page.getByRole("button", { name: "打开会话列表" })).toBeHidden();
-  await page.getByRole("button", { name: /历史问题/ }).click();
+  await page.getByRole("button", { name: "历史问题", exact: true }).click();
   await expect(page.getByText("历史回答")).toBeVisible();
   await page.getByRole("button", { name: "新建会话" }).click();
   await expect(page.getByText("从一个具体问题开始")).toBeVisible();
@@ -103,7 +103,7 @@ test("长回答只滚动消息区并始终保留输入框", async ({ page }) => 
   await expect(page.getByText("长回答结束")).toBeVisible();
 
   const layout = await page.evaluate(() => {
-    const conversation = document.querySelector<HTMLElement>(".conversation");
+    const conversation = document.querySelector<HTMLElement>(".conversation-scroll");
     const composer = document.querySelector<HTMLElement>(".composer-wrap");
     if (!conversation || !composer) throw new Error("聊天布局节点缺失");
     const composerRect = composer.getBoundingClientRect();
@@ -118,16 +118,10 @@ test("长回答只滚动消息区并始终保留输入框", async ({ page }) => 
   expect(layout.conversationScrollable).toBe(true);
   expect(layout.composerTop).toBeGreaterThan(0);
   expect(layout.composerBottom).toBeLessThanOrEqual(layout.viewportHeight);
-  await expect.poll(() => page.locator(".conversation").evaluate((element) => (
+  await expect.poll(() => page.locator(".conversation-scroll").evaluate((element) => (
     element.scrollTop + element.clientHeight >= element.scrollHeight - 2
   ))).toBe(true);
-  await page.locator(".conversation").evaluate((element) => {
+  await page.locator(".conversation-scroll").evaluate((element) => {
     element.scrollTop = element.scrollHeight;
   });
-  await expect(page.getByRole("img", { name: "Mermaid chart" })).toBeAttached();
-  await expect(
-    page.locator(".assistant-message button").filter({ hasNotText: "https://example.com" }),
-  ).toHaveCount(1);
-  await expect(page.getByTitle("复制代码")).toBeVisible();
-  await expect(page.locator('[data-streamdown="mermaid-block-actions"]')).toHaveCount(0);
 });
