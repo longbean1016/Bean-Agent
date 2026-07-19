@@ -14,7 +14,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
@@ -385,6 +385,17 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
         if updated is None:
             raise HTTPException(status_code=404, detail="会话不存在")
         return {"key": session_key, "title": clean_title}
+
+    @app.delete("/api/chat/sessions/{session_key:path}", status_code=204)
+    async def delete_session(session_key: str) -> Response:
+        """删除原始会话记录；长期记忆拥有独立生命周期，不随聊天页面删除。"""
+
+        channel = application.core.config.channels.chat.channel_name
+        if not session_key.startswith(f"{channel}:"):
+            raise HTTPException(status_code=404, detail="会话不存在")
+        if not await application.core.sessions.delete(session_key):
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return Response(status_code=204)
 
     @app.post("/api/chat/uploads")
     async def upload_file(

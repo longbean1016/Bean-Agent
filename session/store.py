@@ -313,6 +313,20 @@ class SessionStore:
             self._conn.commit()
         return self.get_session_meta(key)
 
+    def delete_chat_session(self, session_key: str) -> bool:
+        """删除会话及其消息，返回删除前会话是否存在。
+
+        消息由 SQLite 外键级联删除，FTS 删除触发器同步清理索引。该事务只连接
+        Session 数据库，因此不会触及独立存储的向量记忆或 Markdown 长期记忆。
+        """
+
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            cursor = self._conn.execute("DELETE FROM sessions WHERE key = ?", (key,))
+            self._conn.commit()
+            return cursor.rowcount > 0
+
     def list_chat_messages(
         self,
         session_key: str,

@@ -358,6 +358,18 @@ def test_update_chat_session_title_persists_metadata_and_list_value(store: Sessi
     assert items[0]["first_message_content"] == "原始问题"
 
 
+def test_delete_chat_session_cascades_messages_and_is_idempotent(store: SessionStore) -> None:
+    store.add_message(NewMessage(session_key="web:delete", role="user", content="待删除内容"))
+    store.add_message(NewMessage(session_key="web:keep", role="user", content="保留内容"))
+
+    assert store.delete_chat_session("web:delete") is True
+    assert store.delete_chat_session("web:delete") is False
+    assert store.get_session_meta("web:delete") is None
+    assert store.fetch_session_messages("web:delete") == []
+    assert store.get_session_meta("web:keep") is not None
+    assert store.search_messages("待删除内容", session_key="web:delete") == ([], 0)
+
+
 def test_list_chat_messages_returns_persisted_frontend_fields(
     store: SessionStore,
 ) -> None:

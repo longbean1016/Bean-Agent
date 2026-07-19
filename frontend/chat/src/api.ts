@@ -27,6 +27,16 @@ export async function renameSession(sessionId: string, title: string): Promise<S
   return response.json() as Promise<SessionSummary>;
 }
 
+export async function deleteSession(sessionId: string): Promise<void> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { detail?: string };
+    throw new Error(payload.detail || "无法删除会话");
+  }
+}
+
 export async function uploadAttachment(file: File): Promise<UploadedFile> {
   const response = await fetch(`/api/chat/uploads?filename=${encodeURIComponent(file.name)}`, {
     method: "POST",

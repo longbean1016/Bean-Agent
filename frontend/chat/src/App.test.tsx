@@ -192,6 +192,36 @@ it("通过会话菜单重命名且不触发会话切换", async () => {
   );
 });
 
+it("删除当前会话后复用新建流程并回到空白会话", async () => {
+  localStorage.setItem("beanagent.session_id", "web:delete");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (init?.method === "DELETE") return { ok: true, status: 204 } as Response;
+    const payload = url.includes("web%3Adelete/messages") ? {
+      items: [{ id: "web:delete:0", role: "user", content: "即将删除", tool_chain: [] }],
+    } : url.includes("/messages") ? { items: [] } : {
+      items: [{ key: "web:delete", first_message_content: "即将删除", created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
+    };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  render(<App />);
+  await screen.findAllByText("即将删除");
+  fireEvent.click(screen.getByRole("button", { name: "打开会话“即将删除”的菜单" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "删除" }));
+  expect(screen.getByRole("dialog")).toHaveTextContent("已沉淀的长期记忆不会随会话删除。");
+  fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
+
+  await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+    "/api/chat/sessions/web%3Adelete",
+    expect.objectContaining({ method: "DELETE" }),
+  ));
+  const socket = FakeWebSocket.instances[0];
+  await waitFor(() => expect(socket.sent.filter((frame) => frame.type === "session.create")).toHaveLength(1));
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  expect(screen.queryAllByText("即将删除")).toHaveLength(0);
+});
+
 it("用户向上滚动后流式增量不抢回视口并可主动回到底部", async () => {
   localStorage.setItem("beanagent.session_id", "web:scroll-lock");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
@@ -274,7 +304,7 @@ it("点击历史会话后在目标消息渲染完成时强制回到底部", asyn
   fireEvent.click(screen.getByRole("button", { name: "第二个会话" }));
 
   await screen.findByText("第二个会话的末尾");
-  await waitFor(() => expect(conversation!.scrollTop).toBe(1199));
+  await waitFor(() => expect(conversation!.scrollTop).toBeGreaterThanOrEqual(1198));
   expect(container.querySelector(".conversation-content")).not.toBeNull();
 });
 

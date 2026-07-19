@@ -22,6 +22,7 @@ import {
   RefreshCw,
   SendHorizontal,
   Sun,
+  Trash2,
   Wrench,
   X,
 } from "lucide-react";
@@ -30,7 +31,7 @@ import type { ComponentPropsWithoutRef } from "react";
 import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
-import { fetchMessages, fetchSessions, mediaUrl, renameSession, uploadAttachment } from "./api";
+import { deleteSession, fetchMessages, fetchSessions, mediaUrl, renameSession, uploadAttachment } from "./api";
 import { initialChatState, reduceChatFrame, rowsToMessages } from "./chatReducer";
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
@@ -280,11 +281,24 @@ export function App() {
     });
   };
 
+  const handleDeleteSession = async (sessionId: string) => {
+    try {
+      if (sessionId === chat.sessionId) stopTurn();
+      await deleteSession(sessionId);
+      setSessions((current) => current.filter((session) => session.key !== sessionId));
+      if (sessionId === chat.sessionId) createSession();
+    } catch (error) {
+      dispatch(errorFrame(error));
+      throw error;
+    }
+  };
+
   const sidebar = (
     <SessionSidebar
       activeSessionId={chat.sessionId}
       sessions={sessions}
       onCreate={createSession}
+      onDelete={handleDeleteSession}
       onRename={handleRenameSession}
       onSelect={(id) => void loadSession(id)}
     />
@@ -406,6 +420,7 @@ function SessionSidebar(props: {
   sessions: SessionSummary[];
   activeSessionId: string;
   onCreate: () => void;
+  onDelete: (id: string) => Promise<void>;
   onRename: (id: string, title: string) => Promise<void>;
   onSelect: (id: string) => void;
 }) {
@@ -413,6 +428,8 @@ function SessionSidebar(props: {
   const [menuSessionId, setMenuSessionId] = useState("");
   const [editingSessionId, setEditingSessionId] = useState("");
   const [titleDraft, setTitleDraft] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const beginRename = (session: SessionSummary) => {
     setMenuSessionId("");
@@ -471,6 +488,7 @@ function SessionSidebar(props: {
                   {menuSessionId === session.key ? (
                     <div className="session-menu" role="menu">
                       <button role="menuitem" onClick={() => beginRename(session)}><Pencil size={15} />重命名</button>
+                      <button className="danger" role="menuitem" onClick={() => { setMenuSessionId(""); setDeleteTarget(session); }}><Trash2 size={15} />删除</button>
                     </div>
                   ) : null}
                 </div>
@@ -479,6 +497,34 @@ function SessionSidebar(props: {
           </section>
         ))}
       </nav>
+      <Dialog.Root open={deleteTarget !== null} onOpenChange={(open) => { if (!open && !deleting) setDeleteTarget(null); }}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="delete-session-dialog">
+            <Dialog.Title>删除“{deleteTarget ? (deleteTarget.title || deleteTarget.first_message_content || "未命名会话") : ""}”？</Dialog.Title>
+            <Dialog.Description>
+              该会话中的消息和工具执行记录将被永久删除。<br />
+              已沉淀的长期记忆不会随会话删除。<br />
+              此操作无法撤销。
+            </Dialog.Description>
+            <div className="delete-dialog-actions">
+              <Dialog.Close asChild><button disabled={deleting}>取消</button></Dialog.Close>
+              <button
+                className="confirm-delete"
+                disabled={deleting}
+                onClick={() => {
+                  if (!deleteTarget) return;
+                  setDeleting(true);
+                  void props.onDelete(deleteTarget.key)
+                    .then(() => setDeleteTarget(null))
+                    .catch(() => undefined)
+                    .finally(() => setDeleting(false));
+                }}
+              >确认删除</button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   );
 }

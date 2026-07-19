@@ -77,6 +77,24 @@ def test_chat_api_renames_session_and_validates_title(tmp_path: Path) -> None:
     assert missing.status_code == 404
 
 
+def test_chat_api_deletes_session_without_touching_workspace_memory(tmp_path: Path) -> None:
+    client, runtime = _client(tmp_path)
+    runtime.sessions.store.add_message(
+        NewMessage(session_key="web:delete", role="user", content="待删除")
+    )
+    memory_file = runtime.workspace / "MEMORY.md"
+    memory_file.write_text("长期记忆保留", encoding="utf-8")
+
+    with client:
+        deleted = client.delete("/api/chat/sessions/web:delete")
+        repeated = client.delete("/api/chat/sessions/web:delete")
+        assert runtime.sessions.store.get_session_meta("web:delete") is None
+
+    assert deleted.status_code == 204
+    assert repeated.status_code == 404
+    assert memory_file.read_text(encoding="utf-8") == "长期记忆保留"
+
+
 def test_upload_accepts_utf8_text_and_serves_only_workspace_media(
     tmp_path: Path,
 ) -> None:

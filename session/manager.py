@@ -247,6 +247,8 @@ class SessionManager:
         # cache 保存完整 Session 而非只保存元数据。命中缓存时历史生成不访问
         # SQLite；invalidate 后才从数据库重新构建完整消息快照。
         self._cache: dict[str, Session] = {}
+        # 已删除键用于拦截仍持有旧 Session 对象的迟到 Turn，避免删除后被异步回写重新创建。
+        self._deleted_keys: set[str] = set()
 
         # 每个 session_key 独享一把异步锁。同会话的 ID 分配、消息回填和元数据
         # 更新必须保持顺序，不同会话则不应被一把全局异步锁互相阻塞。
@@ -328,6 +330,7 @@ class SessionManager:
         # 因为持久化成功后需要在原对象上回填 id、seq 和 timestamp。
         copied = list(messages)
         async with self._lock_for(session.key):
+            self._ensure_not_deleted(session.key)
             await self._persist_messages(session, copied)
             await self._save_metadata(session)
             self._cache[session.key] = session
@@ -371,6 +374,17 @@ class SessionManager:
                 cached.metadata["title"] = str(title).strip()
             return updated
 
+    async def delete(self, session_key: str) -> bool:
+        """删除会话并封锁旧对象的后续回写；长期记忆由独立组件持有，不参与删除。"""
+
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            deleted = await asyncio.to_thread(self._store.delete_chat_session, key)
+            if deleted:
+                self._deleted_keys.add(key)
+                self._cache.pop(key, None)
+            return deleted
+
     async def close(self) -> None:
         """幂等关闭 Store，并释放完整消息缓存和会话锁。"""
 
@@ -382,6 +396,7 @@ class SessionManager:
             self._store.close()
             self._closed = True
             self._cache.clear()
+            self._deleted_keys.clear()
             self._write_locks.clear()
 
     @property
@@ -459,6 +474,10 @@ class SessionManager:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("SessionManager 已关闭")
+
+    def _ensure_not_deleted(self, session_key: str) -> None:
+        if session_key in self._deleted_keys:
+            raise RuntimeError(f"Session 已删除，拒绝迟到写入: {session_key}")
 
 
 def _parse_datetime(value: object) -> datetime:

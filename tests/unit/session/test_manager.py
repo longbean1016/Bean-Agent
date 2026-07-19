@@ -257,3 +257,21 @@ async def test_close_is_idempotent(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="已关闭"):
         await manager.get_or_create("web:chat-1")
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_cached_session_without_recreating_it(
+    manager: SessionManager,
+) -> None:
+    session = await manager.get_or_create("web:delete")
+    message = session.add_message("user", "待删除")
+    await manager.append_messages(session, [message])
+
+    assert await manager.delete("web:delete") is True
+    assert manager.store.get_session_meta("web:delete") is None
+    assert "web:delete" not in manager._cache
+
+    stale_message = session.add_message("assistant", "迟到的回复")
+    with pytest.raises(RuntimeError, match="已删除"):
+        await manager.append_messages(session, [stale_message])
+    assert manager.store.get_session_meta("web:delete") is None
