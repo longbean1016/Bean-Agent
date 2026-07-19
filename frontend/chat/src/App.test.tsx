@@ -300,9 +300,12 @@ it("将记忆引用渲染为编号并支持展开和复制ID", async () => {
 
   render(<App />);
 
-  expect(await screen.findByRole("link", { name: "[1]" })).toBeVisible();
+  await screen.findByText("记得你的电脑型号。", { exact: false });
+  expect(screen.queryByRole("link", { name: "[1]" })).not.toBeInTheDocument();
+  expect(screen.getAllByText("[1]").length).toBeGreaterThan(0);
   expect(screen.queryByText(/§cited/)).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "查看引用 1" }));
+  expect(screen.getAllByText("记忆 ID：")).toHaveLength(2);
   expect(screen.getByText("memory_1")).toBeVisible();
   expect(screen.getByText("memory-2")).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "复制记忆ID memory_1" }));

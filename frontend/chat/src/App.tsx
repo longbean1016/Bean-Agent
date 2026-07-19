@@ -510,6 +510,7 @@ function MemoryCitationList({ citations }: { citations: MemoryCitation[] }) {
           <strong>引用 {active.number}</strong>
           {active.ids.map((id) => (
             <div className="memory-citation-id" key={id}>
+              <span className="memory-citation-prefix">记忆 ID：</span>
               <code>{id}</code>
               <button
                 type="button"
