@@ -163,6 +163,35 @@ it("会话列表显示时间分组标题", async () => {
   vi.useRealTimers();
 });
 
+it("通过会话菜单重命名且不触发会话切换", async () => {
+  localStorage.setItem("beanagent.session_id", "web:rename");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (init?.method === "PATCH") {
+      return { ok: true, json: async () => ({ key: "web:rename", title: "新标题" }) } as Response;
+    }
+    const payload = url.includes("/messages") ? { items: [], total: 0 } : {
+      items: [{ key: "web:rename", first_message_content: "原始标题", title: "", created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
+      total: 1,
+    };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  render(<App />);
+  await screen.findByText("原始标题");
+  fireEvent.click(screen.getByRole("button", { name: "打开会话“原始标题”的菜单" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "重命名" }));
+  const input = screen.getByRole("textbox", { name: "会话标题" });
+  fireEvent.change(input, { target: { value: "新标题" } });
+  fireEvent.keyDown(input, { key: "Enter" });
+
+  expect(await screen.findByText("新标题")).toBeVisible();
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/chat/sessions/web%3Arename",
+    expect.objectContaining({ method: "PATCH" }),
+  );
+});
+
 it("用户向上滚动后流式增量不抢回视口并可主动回到底部", async () => {
   localStorage.setItem("beanagent.session_id", "web:scroll-lock");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
@@ -242,7 +271,7 @@ it("点击历史会话后在目标消息渲染完成时强制回到底部", asyn
     clientHeight: { configurable: true, value: 400 },
     scrollTop: { configurable: true, writable: true, value: 250 },
   });
-  fireEvent.click(screen.getByRole("button", { name: /第二个会话/ }));
+  fireEvent.click(screen.getByRole("button", { name: "第二个会话" }));
 
   await screen.findByText("第二个会话的末尾");
   await waitFor(() => expect(conversation!.scrollTop).toBe(1199));

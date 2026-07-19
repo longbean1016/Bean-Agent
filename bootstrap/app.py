@@ -14,7 +14,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
+from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
@@ -367,6 +367,24 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             offset=(page - 1) * page_size,
         )
         return {"items": items, "total": total}
+
+    @app.patch("/api/chat/sessions/{session_key:path}")
+    async def rename_session(
+        session_key: str,
+        title: str = Body(embed=True),
+    ) -> dict[str, str]:
+        """修改会话展示标题；原始消息和长期记忆均不参与该操作。"""
+
+        clean_title = str(title).strip()
+        if not clean_title or len(clean_title) > 60:
+            raise HTTPException(status_code=400, detail="会话标题长度必须为 1-60 个字符")
+        channel = application.core.config.channels.chat.channel_name
+        if not session_key.startswith(f"{channel}:"):
+            raise HTTPException(status_code=404, detail="会话不存在")
+        updated = await application.core.sessions.update_title(session_key, clean_title)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return {"key": session_key, "title": clean_title}
 
     @app.post("/api/chat/uploads")
     async def upload_file(

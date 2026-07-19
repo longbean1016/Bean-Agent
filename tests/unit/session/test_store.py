@@ -339,6 +339,25 @@ def test_list_chat_sessions_uses_first_user_time_for_display_and_order(
     assert items[0]["first_message_content"] == "较晚创建的问题"
 
 
+def test_update_chat_session_title_persists_metadata_and_list_value(store: SessionStore) -> None:
+    store.add_message(
+        NewMessage(
+            session_key="web:rename",
+            role="user",
+            content="原始问题",
+            timestamp="2026-07-18T11:00:00+08:00",
+        )
+    )
+
+    updated = store.update_chat_session_title("web:rename", "新的标题")
+    items, _ = store.list_chat_sessions(channel="web")
+
+    assert updated is not None
+    assert updated["metadata"]["title"] == "新的标题"
+    assert items[0]["title"] == "新的标题"
+    assert items[0]["first_message_content"] == "原始问题"
+
+
 def test_list_chat_messages_returns_persisted_frontend_fields(
     store: SessionStore,
 ) -> None:

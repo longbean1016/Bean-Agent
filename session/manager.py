@@ -354,6 +354,23 @@ class SessionManager:
         self._ensure_open()
         self._cache.pop(self._validate_session_key(session_key), None)
 
+    async def update_title(self, session_key: str, title: str) -> dict[str, Any] | None:
+        """在会话锁内持久化标题，并同步缓存以防后续保存覆盖新 metadata。"""
+
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            updated = await asyncio.to_thread(
+                self._store.update_chat_session_title,
+                key,
+                title,
+            )
+            if updated is None:
+                return None
+            cached = self._cache.get(key)
+            if cached is not None:
+                cached.metadata["title"] = str(title).strip()
+            return updated
+
     async def close(self) -> None:
         """幂等关闭 Store，并释放完整消息缓存和会话锁。"""
 

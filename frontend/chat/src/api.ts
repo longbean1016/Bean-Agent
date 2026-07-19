@@ -14,6 +14,19 @@ export async function fetchMessages(sessionId: string): Promise<MessageRow[]> {
   return payload.items ?? [];
 }
 
+export async function renameSession(sessionId: string, title: string): Promise<SessionSummary> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { detail?: string };
+    throw new Error(payload.detail || "无法重命名会话");
+  }
+  return response.json() as Promise<SessionSummary>;
+}
+
 export async function uploadAttachment(file: File): Promise<UploadedFile> {
   const response = await fetch(`/api/chat/uploads?filename=${encodeURIComponent(file.name)}`, {
     method: "POST",

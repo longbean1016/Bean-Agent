@@ -262,6 +262,7 @@ class SessionStore:
                            LIMIT 1
                        ), s.created_at) AS created_at,
                        s.updated_at,
+                       s.metadata,
                        COUNT(m.id) AS message_count,
                        COALESCE((
                            SELECT first.content
@@ -274,7 +275,7 @@ class SessionStore:
                 FROM sessions s
                 JOIN messages m ON m.session_key = s.key
                 WHERE s.key LIKE ?
-                GROUP BY s.key, s.created_at, s.updated_at
+                 GROUP BY s.key, s.created_at, s.updated_at, s.metadata
                 -- 列表时间和排序使用同一份首次提问时间；后续消息不能改变会话位置。
                 ORDER BY created_at DESC, s.key DESC
                 LIMIT ? OFFSET ?
@@ -282,7 +283,35 @@ class SessionStore:
                 (prefix, safe_limit, safe_offset),
             ).fetchall()
         total = int((count_row["count"] if count_row else 0) or 0)
-        return [dict(row) for row in rows], total
+        items = []
+        for row in rows:
+            item = dict(row)
+            metadata = _load_json_object(item.pop("metadata", "{}"))
+            item["title"] = str(metadata.get("title") or "")
+            items.append(item)
+        return items, total
+
+    def update_chat_session_title(self, session_key: str, title: str) -> dict[str, Any] | None:
+        """只更新会话展示标题，不改写首条消息或会话创建时间。"""
+
+        key = self._validate_session_key(session_key)
+        clean_title = str(title).strip()
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT metadata FROM sessions WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                return None
+            metadata = _load_json_object(row["metadata"])
+            metadata["title"] = clean_title
+            self._conn.execute(
+                "UPDATE sessions SET metadata = ?, updated_at = ? WHERE key = ?",
+                (json.dumps(metadata, ensure_ascii=False), _now_iso(), key),
+            )
+            self._conn.commit()
+        return self.get_session_meta(key)
 
     def list_chat_messages(
         self,

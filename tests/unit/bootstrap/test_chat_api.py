@@ -55,6 +55,28 @@ def test_chat_api_lists_sessions_and_messages(tmp_path: Path) -> None:
     assert [item["content"] for item in messages["items"]] == ["第一问", "第一答"]
 
 
+def test_chat_api_renames_session_and_validates_title(tmp_path: Path) -> None:
+    client, runtime = _client(tmp_path)
+    runtime.sessions.store.add_message(
+        NewMessage(session_key="web:rename", role="user", content="原始问题")
+    )
+
+    with client:
+        renamed = client.patch(
+            "/api/chat/sessions/web:rename",
+            json={"title": "  新标题  "},
+        )
+        empty = client.patch("/api/chat/sessions/web:rename", json={"title": "   "})
+        too_long = client.patch("/api/chat/sessions/web:rename", json={"title": "长" * 61})
+        missing = client.patch("/api/chat/sessions/web:missing", json={"title": "标题"})
+
+    assert renamed.status_code == 200
+    assert renamed.json()["title"] == "新标题"
+    assert empty.status_code == 400
+    assert too_long.status_code == 400
+    assert missing.status_code == 404
+
+
 def test_upload_accepts_utf8_text_and_serves_only_workspace_media(
     tmp_path: Path,
 ) -> None:

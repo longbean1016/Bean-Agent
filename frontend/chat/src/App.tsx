@@ -13,9 +13,11 @@ import {
   Image as ImageIcon,
   Menu,
   MessageSquarePlus,
+  MoreHorizontal,
   Monitor,
   Moon,
   Paperclip,
+  Pencil,
   PlugZap,
   RefreshCw,
   SendHorizontal,
@@ -28,7 +30,7 @@ import type { ComponentPropsWithoutRef } from "react";
 import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
-import { fetchMessages, fetchSessions, mediaUrl, uploadAttachment } from "./api";
+import { fetchMessages, fetchSessions, mediaUrl, renameSession, uploadAttachment } from "./api";
 import { initialChatState, reduceChatFrame, rowsToMessages } from "./chatReducer";
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
@@ -219,6 +221,18 @@ export function App() {
     setSidebarOpen(false);
   };
 
+  const handleRenameSession = async (sessionId: string, title: string) => {
+    try {
+      const updated = await renameSession(sessionId, title);
+      setSessions((current) => current.map((session) => (
+        session.key === sessionId ? { ...session, ...updated, title } : session
+      )));
+    } catch (error) {
+      dispatch(errorFrame(error));
+      throw error;
+    }
+  };
+
   const submit = async () => {
     const cleanText = input.trim();
     if ((!cleanText && files.length === 0) || sending || chat.activeTurnId) return;
@@ -271,6 +285,7 @@ export function App() {
       activeSessionId={chat.sessionId}
       sessions={sessions}
       onCreate={createSession}
+      onRename={handleRenameSession}
       onSelect={(id) => void loadSession(id)}
     />
   );
@@ -391,9 +406,27 @@ function SessionSidebar(props: {
   sessions: SessionSummary[];
   activeSessionId: string;
   onCreate: () => void;
+  onRename: (id: string, title: string) => Promise<void>;
   onSelect: (id: string) => void;
 }) {
   const groups = useMemo(() => groupSessionsByCreatedAt(props.sessions), [props.sessions]);
+  const [menuSessionId, setMenuSessionId] = useState("");
+  const [editingSessionId, setEditingSessionId] = useState("");
+  const [titleDraft, setTitleDraft] = useState("");
+
+  const beginRename = (session: SessionSummary) => {
+    setMenuSessionId("");
+    setEditingSessionId(session.key);
+    setTitleDraft(session.title || session.first_message_content || "未命名会话");
+  };
+
+  const commitRename = async (session: SessionSummary) => {
+    const title = titleDraft.trim();
+    if (!title) return;
+    setEditingSessionId("");
+    await props.onRename(session.key, title).catch(() => setEditingSessionId(session.key));
+  };
+
   return (
     <div className="session-panel">
       <div className="brand-lockup"><span className="brand-mark">B</span><div><strong>BeanAgent</strong><span>Local workspace</span></div></div>
@@ -402,16 +435,47 @@ function SessionSidebar(props: {
         {props.sessions.length === 0 ? <p className="session-empty">完成第一轮对话后，会话会出现在这里。</p> : groups.map((group) => (
           <section className="session-group" key={group.label}>
             <h2 className="session-group-title">{group.label}</h2>
-            {group.sessions.map((session) => (
-              <button
-                key={session.key}
-                className={`session-row ${session.key === props.activeSessionId ? "active" : ""}`}
-                onClick={() => props.onSelect(session.key)}
-              >
-                <span>{session.first_message_content || "未命名会话"}</span>
-                <time>{formatTime(session.created_at)}</time>
-              </button>
-            ))}
+            {group.sessions.map((session) => {
+              const title = session.title || session.first_message_content || "未命名会话";
+              const active = session.key === props.activeSessionId;
+              return (
+                <div key={session.key} className={`session-row ${active ? "active" : ""}`}>
+                  {editingSessionId === session.key ? (
+                    <input
+                      className="session-title-input"
+                      aria-label="会话标题"
+                      autoFocus
+                      maxLength={60}
+                      value={titleDraft}
+                      onBlur={() => void commitRename(session)}
+                      onChange={(event) => setTitleDraft(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") void commitRename(session);
+                        if (event.key === "Escape") setEditingSessionId("");
+                      }}
+                    />
+                  ) : (
+                    <button className="session-row-select" onClick={() => props.onSelect(session.key)}>
+                      <span>{title}</span>
+                      <time>{formatTime(session.created_at)}</time>
+                    </button>
+                  )}
+                  <button
+                    className="session-menu-trigger"
+                    aria-label={`打开会话“${title}”的菜单`}
+                    aria-expanded={menuSessionId === session.key}
+                    onClick={() => setMenuSessionId((current) => current === session.key ? "" : session.key)}
+                  >
+                    <MoreHorizontal size={17} />
+                  </button>
+                  {menuSessionId === session.key ? (
+                    <div className="session-menu" role="menu">
+                      <button role="menuitem" onClick={() => beginRename(session)}><Pencil size={15} />重命名</button>
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
           </section>
         ))}
       </nav>

@@ -31,6 +31,7 @@ export interface ChatState {
 
 export interface SessionSummary {
   key: string;
+  title?: string;
   created_at: string;
   updated_at: string;
   message_count: number;
