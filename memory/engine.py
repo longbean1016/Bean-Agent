@@ -702,15 +702,13 @@ def _injection_block(records: list[MemoryRecord]) -> str:
 
 
 def _should_require_scope_match(request: MemoryQuery) -> bool:
-    """按 Akashic 的 query intent 决定来源 scope 是否升级为严格过滤条件。"""
+    """默认共享 Workspace 长期记忆，仅为显式诊断请求启用来源会话过滤。"""
 
     scope = request.scope
     has_scope = bool(scope.channel and scope.chat_id)
-    if request.intent in {"answer", "interest"}:
-        return has_scope
-    if request.intent in {"context", "procedure"}:
-        return has_scope and bool(request.context.get("require_scope_match", False))
-    return False
+    # channel/chat_id 描述记忆来源而非所有者；Web 新建聊天会更换 chat_id，
+    # 因此默认过滤会让同一 Workspace 的长期记忆无法跨会话使用。
+    return has_scope and bool(request.context.get("require_scope_match", False))
 
 
 def _tool_profile() -> MemoryToolProfile:

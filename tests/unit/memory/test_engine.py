@@ -234,19 +234,18 @@ async def test_answer_query_uses_recent_six_messages_and_hyde_after_empty_result
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("intent", "expected"),
+    "intent",
     [
-        ("answer", {"会话 B 的发布记录"}),
-        ("interest", {"会话 B 的发布记录"}),
-        ("context", {"会话 A 的发布记录", "会话 B 的发布记录"}),
-        ("procedure", {"会话 A 的发布记录", "会话 B 的发布记录"}),
-        ("timeline", {"会话 A 的发布记录", "会话 B 的发布记录"}),
+        "answer",
+        "interest",
+        "context",
+        "procedure",
+        "timeline",
     ],
 )
-async def test_query_intent_controls_session_scope(
+async def test_default_query_intents_share_workspace_memories_across_sessions(
     tmp_path: Path,
     intent: str,
-    expected: set[str],
 ) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
     config = MemoryConfig(enabled=True)
@@ -273,7 +272,10 @@ async def test_query_intent_controls_session_scope(
         await engine.close()
         sessions.close()
 
-    assert {record.summary for record in result.records} == expected
+    assert {record.summary for record in result.records} == {
+        "会话 A 的发布记录",
+        "会话 B 的发布记录",
+    }
 
 
 @pytest.mark.asyncio
