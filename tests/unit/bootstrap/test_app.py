@@ -45,6 +45,9 @@ def test_build_core_runtime_wires_singletons_and_all_tools(tmp_path: Path) -> No
     ).resolve()
     assert runtime.sessions.store is runtime.memory._sessions
     assert "load_skill" in runtime.tools.get_registered_names()
+    assert runtime.mcp_registry is not None
+    assert {"mcp_add", "mcp_remove", "mcp_list"} <= runtime.tools.get_registered_names()
+    assert runtime.tools.get_metadata("mcp_add").always_on is True
 
 
 def test_build_core_runtime_injects_image_capabilities_into_pipeline(
@@ -141,12 +144,27 @@ async def test_app_runtime_shutdown_is_ordered_and_idempotent(tmp_path: Path) ->
     embedder = Embedder()
     core = build_core_runtime(config, tmp_path / "workspace", provider=provider, embedder=embedder)
     runtime = AppRuntime(core)
+    lifecycle: list[str] = []
+    original_load = core.mcp_registry.load_and_connect_all
+    original_shutdown = core.mcp_registry.shutdown
+
+    async def load_mcp() -> None:
+        lifecycle.append("mcp.load")
+        await original_load()
+
+    async def shutdown_mcp() -> None:
+        lifecycle.append("mcp.shutdown")
+        await original_shutdown()
+
+    core.mcp_registry.load_and_connect_all = load_mcp  # type: ignore[method-assign]
+    core.mcp_registry.shutdown = shutdown_mcp  # type: ignore[method-assign]
 
     await runtime.start()
     await runtime.shutdown()
     await runtime.shutdown()
 
     assert runtime.agent_task is not None and runtime.agent_task.done()
+    assert lifecycle == ["mcp.load", "mcp.shutdown"]
     assert provider.closed is True
     assert embedder.closed is True
     with pytest.raises(RuntimeError, match="SessionManager 已关闭"):

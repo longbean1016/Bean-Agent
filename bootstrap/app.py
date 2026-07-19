@@ -23,6 +23,8 @@ from agent.channel import WebChannel
 from agent.config_models import Config
 from agent.event_bus import EventBus
 from agent.message_bus import MessageBus
+from agent.mcp.manage_tools import McpAddTool, McpListTool, McpRemoveTool
+from agent.mcp.registry import McpServerRegistry
 from agent.pipeline import Pipeline
 from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
@@ -128,6 +130,9 @@ class AppRuntime:
                 return
             if self._shutdown:
                 raise RuntimeError("AppRuntime 已关闭")
+            # MCP 工具目录必须在第一条消息进入 AgentLoop 前恢复完成，避免启动
+            # 窗口内同一配置在不同 Turn 中呈现不同能力。
+            await self.core.mcp_registry.load_and_connect_all()
             # 恢复旧 outbox 必须先于 AgentLoop 接受新消息，保持事件顺序可审计。
             if self.maintenance is not None:
                 await self.maintenance.start()
@@ -147,6 +152,7 @@ class AppRuntime:
             if self.agent_task is not None and not self.agent_task.done():
                 self.agent_task.cancel()
                 await asyncio.gather(self.agent_task, return_exceptions=True)
+            await _cleanup_step("mcp_registry.shutdown", self.core.mcp_registry.shutdown)
             if self.maintenance is not None:
                 await _cleanup_step("memory_maintenance.close", self.maintenance.close)
             if self.core.memory is not None:
@@ -175,6 +181,7 @@ class CoreRuntime:
     sessions: SessionManager
     memory: MemoryEngine | None
     tools: ToolRegistry
+    mcp_registry: McpServerRegistry
     message_bus: MessageBus
     event_bus: EventBus
     assembler: PromptAssembler
@@ -233,6 +240,16 @@ def build_core_runtime(
         memory_engine=memory,
         skills=skills,
     )
+    mcp_registry = McpServerRegistry(root / "mcp_servers.json", tools)
+    # 管理工具必须与运行时持有的 Registry 共享同一实例，动态添加和关闭才能
+    # 作用于同一批 Client；三者常驻可见，远端工具本身仍需搜索解锁。
+    tools.register(
+        McpAddTool(mcp_registry),
+        risk="external-side-effect",
+        always_on=True,
+    )
+    tools.register(McpRemoveTool(mcp_registry), risk="write", always_on=True)
+    tools.register(McpListTool(mcp_registry), risk="read-only", always_on=True)
     assembler = PromptAssembler(
         SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
         MessageEnvelopeBuilder(),
@@ -263,6 +280,7 @@ def build_core_runtime(
         sessions=sessions,
         memory=memory,
         tools=tools,
+        mcp_registry=mcp_registry,
         message_bus=messages,
         event_bus=events,
         assembler=assembler,
