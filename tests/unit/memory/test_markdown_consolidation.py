@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,24 @@ def test_markdown_store_initializes_complete_memory_files_without_overwrite(tmp_
         assert (memory_dir / "SELF.md").read_text(encoding="utf-8").startswith("# BeanAgent 的自我认知")
         assert (memory_dir / "PENDING.md").read_text(encoding="utf-8") == ""
         assert (memory_dir / "RECENT_CONTEXT.md").read_text(encoding="utf-8") == ""
+    finally:
+        store.close()
+
+
+def test_markdown_store_restart_preserves_existing_file_timestamps(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True)
+    names = ("MEMORY.md", "SELF.md", "PENDING.md", "RECENT_CONTEXT.md")
+    for name in names:
+        path = memory_dir / name
+        path.write_text(f"existing {name}", encoding="utf-8")
+        os.utime(path, ns=(1_600_000_000_000_000_000, 1_600_000_000_000_000_000))
+    before = {name: (memory_dir / name).stat().st_mtime_ns for name in names}
+
+    store = MarkdownMemoryStore(tmp_path)
+    try:
+        after = {name: (memory_dir / name).stat().st_mtime_ns for name in names}
+        assert after == before
     finally:
         store.close()
 

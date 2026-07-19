@@ -38,11 +38,14 @@ class MarkdownMemoryStore:
         self._closed = False
         # 四个 Markdown 文件组成可审阅的完整记忆视图。初始化只补缺失文件，
         # 不能覆盖用户手工维护或上次运行已经生成的内容。
-        self.memory_file.touch(exist_ok=True)
+        if not self.memory_file.exists():
+            self.memory_file.touch()
         if not self.self_file.exists():
             self._atomic_write(self.self_file, DEFAULT_SELF_MD)
-        self.pending_file.touch(exist_ok=True)
-        self.recent_context_file.touch(exist_ok=True)
+        if not self.pending_file.exists():
+            self.pending_file.touch()
+        if not self.recent_context_file.exists():
+            self.recent_context_file.touch()
         self._db = sqlite3.connect(str(self.consolidation_db), check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS writes(source_ref TEXT NOT NULL, kind TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(source_ref,kind))")
         self._db.commit()
