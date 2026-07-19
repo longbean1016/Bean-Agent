@@ -90,7 +90,7 @@ class Pipeline:
             channel=message.channel,
             chat_id=message.chat_id,
             session_key=message.session_key,
-            visible_names=self._tools.get_always_on_names(),
+            visible_names=self._tools.get_always_on_order(),
         )
         history = await self._history_loader(message.session_key, self._history_limit) if self._history_loader else []
         retrieved = await self._memory.retrieve_for_turn(message) if self._memory else ""

@@ -133,6 +133,15 @@ class ToolRegistry:
             if meta.always_on and name in self._tools
         }
 
+    def get_always_on_order(self) -> list[str]:
+        """按注册顺序返回常驻工具，保证模型 Schema 前缀稳定。"""
+
+        return [
+            name
+            for name in self._tools
+            if (meta := self._metadata.get(name)) is not None and meta.always_on
+        ]
+
     def get_tool_names_by_source(self, source_type: str, source_name: str) -> list[str]:
         """按注册顺序返回同一来源的工具，供外部服务整体卸载。"""
 

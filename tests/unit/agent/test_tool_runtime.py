@@ -31,3 +31,14 @@ def test_tool_runtime_views_keep_context_and_visibility_isolated() -> None:
     assert second.visible_order == ["tool_search"]
     assert second.unlocked_names == set()
     assert first.context is not first.context
+
+
+def test_tool_runtime_preserves_explicit_registration_order() -> None:
+    view = ToolRuntimeView.create(
+        channel="web",
+        chat_id="chat",
+        session_key="web:chat",
+        visible_names=["tool_search", "mcp_add", "mcp_list"],
+    )
+
+    assert view.visible_order == ["tool_search", "mcp_add", "mcp_list"]

@@ -32,7 +32,12 @@ class ToolRuntimeView:
     ) -> "ToolRuntimeView":
         """按稳定顺序创建视图，调用方传集合时也不会产生随机 Schema 顺序。"""
 
-        ordered = list(dict.fromkeys(sorted(str(name) for name in visible_names)))
+        raw_names = [str(name) for name in visible_names]
+        # 调用方提供列表时代表 Registry 的稳定注册顺序；无序集合才需要排序，
+        # 避免同一配置因哈希顺序产生不同 Prompt。
+        if isinstance(visible_names, (set, frozenset)):
+            raw_names.sort()
+        ordered = list(dict.fromkeys(raw_names))
         return cls(
             channel=channel,
             chat_id=chat_id,

@@ -76,6 +76,7 @@ def test_registry_tracks_metadata_source_and_visible_schema_order() -> None:
     )
 
     assert registry.get_always_on_names() == {"record"}
+    assert registry.get_always_on_order() == ["record"]
     assert registry.get_tool_names_by_source("mcp", "demo") == ["second"]
     assert registry.get_metadata("second").risk == "external-side-effect"
     assert [
