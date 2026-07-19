@@ -86,6 +86,18 @@ button { color: inherit; }
 .message-body svg, .message-body img { max-width: 100%; }
 .message-body a { color: #076f68; text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .message-body [data-streamdown="link"] { display: inline; padding: 0; border: 0; color: #076f68; background: transparent; font: inherit; font-weight: 600; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; overflow-wrap: anywhere; cursor: pointer; }
+.message-body a[href^="#memory-citation-"] { display: inline-flex; min-width: 20px; height: 20px; align-items: center; justify-content: center; margin: 0 2px; padding: 0 4px; border: 1px solid #a9c9c3; border-radius: 4px; background: #edf7f4; color: #096b63; font-size: 11px; font-weight: 750; line-height: 1; text-decoration: none; vertical-align: text-top; }
+.memory-citations { display: flex; position: relative; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; padding-top: 9px; border-top: 1px solid #e0e6e3; color: #697570; font-size: 11px; }
+.memory-citations-label { margin-right: 2px; font-weight: 650; }
+.memory-citation-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.memory-citation-chip { display: inline-grid; min-width: 25px; height: 24px; padding: 0 5px; place-items: center; border: 1px solid #c4d5d0; border-radius: 4px; background: #f6f9f8; color: #31645d; cursor: pointer; font-size: 11px; font-weight: 700; }
+.memory-citation-chip:hover, .memory-citation-chip[aria-expanded="true"] { border-color: #6ea79e; background: #e7f3f0; color: #075f58; }
+.memory-citation-detail { flex-basis: 100%; display: grid; gap: 5px; max-width: 520px; margin-top: 3px; padding: 9px 10px; border: 1px solid #d5dfdc; border-radius: 6px; background: #f7f9f8; color: #4d5a56; }
+.memory-citation-detail strong { font-size: 11px; }
+.memory-citation-id { display: grid; grid-template-columns: minmax(0, 1fr) 26px; align-items: center; gap: 6px; }
+.memory-citation-id code { overflow: hidden; color: #374641; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.memory-citation-copy { display: inline-grid; width: 26px; height: 26px; padding: 0; place-items: center; border: 0; border-radius: 4px; background: transparent; color: #61706b; cursor: pointer; }
+.memory-citation-copy:hover { background: #e4ece9; color: #07675f; }
 .message-body table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
 .message-body th, .message-body td { padding: 7px 10px; border: 1px solid #d6dfdc; }
 
@@ -231,6 +243,11 @@ button { color: inherit; }
 :root[data-theme="dark"] .message-body,
 :root[data-theme="dark"] .tool-trigger strong,
 :root[data-theme="dark"] .composer textarea { color: #e2e9e6; }
+:root[data-theme="dark"] .message-body a[href^="#memory-citation-"],
+:root[data-theme="dark"] .memory-citation-chip { border-color: #46615a; background: #21332e; color: #7cc8bb; }
+:root[data-theme="dark"] .memory-citations { border-color: #34413d; color: #93a19c; }
+:root[data-theme="dark"] .memory-citation-detail { border-color: #3a4944; background: #1d2421; color: #b5c0bc; }
+:root[data-theme="dark"] .memory-citation-id code { color: #d3ddd9; }
 :root[data-theme="dark"] .user-message .message-body { border-color: #3a4944; background: #252d2a; }
 :root[data-theme="dark"] .thinking { border-color: #52625c; }
 :root[data-theme="dark"] .thinking-trigger,

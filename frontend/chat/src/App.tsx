@@ -8,6 +8,7 @@ import {
   Check,
   ChevronDown,
   CircleStop,
+  Copy,
   FileText,
   Image as ImageIcon,
   Menu,
@@ -28,6 +29,8 @@ import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
 import { fetchMessages, fetchSessions, mediaUrl, uploadAttachment } from "./api";
 import { initialChatState, reduceChatFrame, rowsToMessages } from "./chatReducer";
+import { parseMemoryCitations } from "./citations";
+import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
 import type { ChatFrame, ChatMessage, ConnectionStatus, SessionSummary, ToolActivity } from "./types";
 import { BeanWebSocketClient } from "./websocketClient";
@@ -440,6 +443,7 @@ function ThemeControl({ value, onChange }: { value: ThemePreference; onChange: (
 
 function MessageView({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
+  const parsed = useMemo(() => parseMemoryCitations(message.content), [message.content]);
   // Streamdown 在 isAnimating 期间会禁用复制和全屏按钮。Mermaid fence 一旦
   // 闭合就已经具备稳定源码，应立即放开查看大图，而不必等待 final 帧。
   const markdownAnimating = Boolean(message.streaming && !containsClosedMermaidFence(message.content));
@@ -462,13 +466,65 @@ function MessageView({ message }: { message: ChatMessage }) {
               linkSafety={markdownLinkSafety}
               translations={markdownTranslations}
             >
-              {prepareMessageMarkdown(message.content)}
+              {prepareMessageMarkdown(parsed.markdown)}
             </Streamdown>
           </div>
         ) : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
+        {!isUser && parsed.citations.length ? <MemoryCitationList citations={parsed.citations} /> : null}
         {message.status === "interrupted" ? <span className="interrupted-label">已停止</span> : null}
       </div>
     </article>
+  );
+}
+
+function MemoryCitationList({ citations }: { citations: MemoryCitation[] }) {
+  const [expanded, setExpanded] = useState<number | null>(null);
+  const [copied, setCopied] = useState("");
+  const active = citations.find((citation) => citation.number === expanded);
+
+  const copyId = async (id: string) => {
+    await navigator.clipboard.writeText(id);
+    setCopied(id);
+  };
+
+  return (
+    <aside className="memory-citations" aria-label="记忆引用">
+      <span className="memory-citations-label">记忆引用</span>
+      <div className="memory-citation-chips">
+        {citations.map((citation) => (
+          <button
+            id={`memory-citation-${citation.number}`}
+            key={citation.number}
+            type="button"
+            className="memory-citation-chip"
+            aria-label={`查看引用 ${citation.number}`}
+            aria-expanded={expanded === citation.number}
+            onClick={() => setExpanded(expanded === citation.number ? null : citation.number)}
+          >
+            [{citation.number}]
+          </button>
+        ))}
+      </div>
+      {active ? (
+        <div className="memory-citation-detail">
+          <strong>引用 {active.number}</strong>
+          {active.ids.map((id) => (
+            <div className="memory-citation-id" key={id}>
+              <code>{id}</code>
+              <button
+                type="button"
+                className="memory-citation-copy"
+                aria-label={`复制记忆ID ${id}`}
+                title={copied === id ? "已复制" : "复制记忆 ID"}
+                onClick={() => void copyId(id)}
+              >
+                {copied === id ? <Check size={14} /> : <Copy size={14} />}
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </aside>
   );
 }
 

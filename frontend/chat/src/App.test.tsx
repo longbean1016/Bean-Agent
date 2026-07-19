@@ -281,6 +281,34 @@ it("粗体包裹的裸链接不显示星号并可直接跳转", async () => {
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 
+it("将记忆引用渲染为编号并支持展开和复制ID", async () => {
+  localStorage.setItem("beanagent.session_id", "web:citations");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const payload = String(input).includes("/messages") ? {
+      items: [{
+        id: "web:citations:0",
+        role: "assistant",
+        content: "记得你的电脑型号。§cited:[memory_1,memory-2]§",
+        turn_id: "turn-citations",
+        tool_chain: [],
+        timestamp: "2026-07-19T18:00:00+08:00",
+      }],
+      total: 1,
+    } : { items: [], total: 0 };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  render(<App />);
+
+  expect(await screen.findByRole("link", { name: "[1]" })).toBeVisible();
+  expect(screen.queryByText(/§cited/)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "查看引用 1" }));
+  expect(screen.getByText("memory_1")).toBeVisible();
+  expect(screen.getByText("memory-2")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "复制记忆ID memory_1" }));
+  expect(navigator.clipboard.writeText).toHaveBeenCalledWith("memory_1");
+});
+
 it("代码复制保留原始格式并将按钮图标切换为勾选", async () => {
   localStorage.setItem("beanagent.session_id", "web:code-copy");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
