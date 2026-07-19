@@ -77,7 +77,11 @@ class MemoryEngine:
             max_procedure_preference=retrieval_config.max_procedure_preference,
             max_event_profile=retrieval_config.max_event_profile,
         )
-        self._optimizer = MemoryOptimizer(self._markdown, provider)
+        self._optimizer = MemoryOptimizer(
+            self._markdown,
+            provider,
+            step_delay_seconds=self._config.optimizer.step_delay_seconds,
+        )
         self._consolidator = Consolidator(
             sessions, self._markdown,
             consolidation_extractor or _LLMConsolidationExtractor(provider),

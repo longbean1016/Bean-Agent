@@ -140,12 +140,15 @@ async def test_below_threshold_refreshes_recent_turns_without_llm(tmp_path: Path
 
 
 class OptimizerLLM:
-    def __init__(self, *, fail_second: bool = False) -> None:
+    def __init__(self, *, fail_first: bool = False, fail_second: bool = False) -> None:
         self.calls = 0
+        self.fail_first = fail_first
         self.fail_second = fail_second
 
     async def complete(self, messages, tools=None):
         self.calls += 1
+        if self.fail_first and self.calls == 1:
+            raise RuntimeError("memory merge failed")
         if self.fail_second and self.calls == 2:
             raise RuntimeError("self update failed")
         content = "# 用户长期记忆\n- 用户是开发者" if self.calls == 1 else "# BeanAgent\n## 人格与形象\n- 直接"
@@ -168,7 +171,7 @@ async def test_optimizer_rejects_concurrent_runs(tmp_path: Path) -> None:
     store = MarkdownMemoryStore(tmp_path)
     store.append_pending("- [identity] 用户是开发者")
     provider = BlockingOptimizerLLM()
-    optimizer = MemoryOptimizer(store, provider)
+    optimizer = MemoryOptimizer(store, provider, step_delay_seconds=0)
     first = asyncio.create_task(optimizer.optimize())
     await provider.started.wait()
 
@@ -182,11 +185,11 @@ async def test_optimizer_rejects_concurrent_runs(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_optimizer_commits_snapshot_only_after_both_outputs(tmp_path: Path) -> None:
+async def test_optimizer_commits_snapshot_after_memory_output(tmp_path: Path) -> None:
     store = MarkdownMemoryStore(tmp_path)
     store.append_pending("- [identity] 用户是开发者")
 
-    result = await MemoryOptimizer(store, OptimizerLLM()).optimize()
+    result = await MemoryOptimizer(store, OptimizerLLM(), step_delay_seconds=0).optimize()
 
     assert result["pending_chars"] > 0
     assert "用户是开发者" in store.read_long_term()
@@ -195,12 +198,35 @@ async def test_optimizer_commits_snapshot_only_after_both_outputs(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_optimizer_failure_rolls_snapshot_back(tmp_path: Path) -> None:
+async def test_optimizer_memory_failure_rolls_snapshot_back(tmp_path: Path) -> None:
     store = MarkdownMemoryStore(tmp_path)
     store.append_pending("- [identity] 用户是开发者")
 
-    with pytest.raises(RuntimeError, match="self update failed"):
-        await MemoryOptimizer(store, OptimizerLLM(fail_second=True)).optimize()
+    with pytest.raises(RuntimeError, match="memory merge failed"):
+        await MemoryOptimizer(
+            store,
+            OptimizerLLM(fail_first=True),
+            step_delay_seconds=0,
+        ).optimize()
 
     assert "用户是开发者" in store.read_pending()
+    assert not store.pending_snapshot_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_optimizer_self_failure_keeps_committed_memory(tmp_path: Path) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    original_self = store.read_self()
+    store.append_pending("- [identity] 用户是开发者")
+
+    result = await MemoryOptimizer(
+        store,
+        OptimizerLLM(fail_second=True),
+        step_delay_seconds=0,
+    ).optimize()
+
+    assert result["memory_chars"] > 0
+    assert "用户是开发者" in store.read_long_term()
+    assert store.read_self() == original_self
+    assert store.read_pending() == ""
     assert not store.pending_snapshot_file.exists()
