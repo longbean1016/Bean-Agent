@@ -113,21 +113,14 @@ async def test_turn_context_retrieval_can_recall_event_from_another_session(
 
 
 @pytest.mark.asyncio
-async def test_turn_retrieval_uses_recent_history_and_distinct_queries(
+async def test_turn_retrieval_uses_only_current_message_without_llm_enhancement(
     tmp_path: Path,
 ) -> None:
-    """当前消息、历史改写和流程改写必须作为独立 query 进入检索。"""
+    """普通 Turn 必须直接检索当前消息，不能等待历史改写或 HyDE。"""
 
-    class CapturingRewriter:
-        recent_history = ""
-
+    class ForbiddenRewriter:
         async def decide(self, user_msg: str, recent_history: str):
-            self.recent_history = recent_history
-            return SimpleNamespace(
-                needs_episodic=True,
-                episodic_query="用户的手环型号",
-                procedure_query="回答设备记忆问题时查找历史依据",
-            )
+            raise AssertionError("普通 Turn 不应调用查询改写器")
 
     class CapturingRetriever:
         calls: list[tuple[str, list[str]]] = []
@@ -137,17 +130,11 @@ async def test_turn_retrieval_uses_recent_history_and_distinct_queries(
             return []
 
     sessions = SessionStore(tmp_path / "sessions.db")
-    sessions.add_message(NewMessage(
-        session_key="web:c",
-        role="user",
-        content="我用的是 Fitbit Charge 6",
-    ))
     config = MemoryConfig(enabled=True)
     config.embedding.dimensions = 2
     engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
-    rewriter = CapturingRewriter()
     retriever = CapturingRetriever()
-    engine._rewriter = rewriter
+    engine._rewriter = ForbiddenRewriter()
     engine._retriever = retriever
     try:
         await engine.retrieve_for_turn(InboundMessage(
@@ -160,29 +147,46 @@ async def test_turn_retrieval_uses_recent_history_and_distinct_queries(
         await engine.close()
         sessions.close()
 
-    assert "Fitbit Charge 6" in rewriter.recent_history
     assert retriever.calls[0] == (
         "你还记得我的设备吗",
-        ["用户的手环型号", "回答设备记忆问题时查找历史依据"],
+        [],
     )
 
 
 @pytest.mark.asyncio
-async def test_turn_retrieval_uses_hyde_only_after_empty_raw_results(
+async def test_answer_query_uses_recent_six_messages_and_hyde_after_empty_results(
     tmp_path: Path,
 ) -> None:
-    class HyDEProvider(Provider):
-        async def complete(self, messages, tools=None):
-            prompt = messages[0]["content"]
-            if "假想条目" in prompt:
-                return type("Response", (), {"content": "用户使用 Fitbit Charge 6"})()
-            return await super().complete(messages, tools)
+    class CapturingRewriter:
+        recent_history = ""
+
+        async def decide(self, user_msg: str, recent_history: str):
+            self.recent_history = recent_history
+            return SimpleNamespace(
+                needs_episodic=True,
+                episodic_query="用户使用的设备型号",
+                procedure_query="",
+            )
+
+    class CapturingHyDE:
+        context = ""
+
+        async def augment(self, *, query, context, raw_items, retrieve_fn):
+            self.context = context
+            items = await retrieve_fn("用户使用 Fitbit Charge 6")
+            return SimpleNamespace(
+                items=items,
+                used_hyde=True,
+                hypothesis="用户使用 Fitbit Charge 6",
+            )
 
     class Retriever:
         queries: list[str] = []
+        aux_queries: list[str] = []
 
         async def retrieve(self, query: str, **kwargs):
             self.queries.append(query)
+            self.aux_queries.extend(kwargs.get("aux_queries") or [])
             if query == "用户使用 Fitbit Charge 6":
                 return [{
                     "id": "device",
@@ -193,24 +197,39 @@ async def test_turn_retrieval_uses_hyde_only_after_empty_raw_results(
             return []
 
     sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(8):
+        sessions.add_message(NewMessage(
+            session_key="web:c",
+            role="user" if index % 2 == 0 else "assistant",
+            content=f"历史消息 {index}",
+        ))
     config = MemoryConfig(enabled=True)
     config.embedding.dimensions = 2
-    engine = MemoryEngine(tmp_path, Embedder(), HyDEProvider(), sessions, config=config)
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    rewriter = CapturingRewriter()
+    hyde = CapturingHyDE()
     retriever = Retriever()
+    engine._rewriter = rewriter
+    engine._hyde = hyde
     engine._retriever = retriever
     try:
-        block = await engine.retrieve_for_turn(InboundMessage(
-            channel="web",
-            sender="web",
-            chat_id="c",
-            content="我的设备是什么",
+        result = await engine.query(MemoryQuery(
+            "我的设备是什么",
+            intent="answer",
+            scope=MemoryScope(session_key="web:c", channel="web", chat_id="c"),
         ))
     finally:
         await engine.close()
         sessions.close()
 
+    assert "历史消息 1" not in rewriter.recent_history
+    assert "历史消息 2" in rewriter.recent_history
+    assert "历史消息 7" in rewriter.recent_history
+    assert hyde.context == rewriter.recent_history
+    assert retriever.queries[0] == "我的设备是什么"
+    assert retriever.aux_queries == ["用户使用的设备型号"]
     assert retriever.queries[-1] == "用户使用 Fitbit Charge 6"
-    assert "Fitbit Charge 6" in block
+    assert result.records[0].summary == "用户使用 Fitbit Charge 6"
 
 
 @pytest.mark.asyncio

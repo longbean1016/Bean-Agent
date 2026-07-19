@@ -99,6 +99,32 @@ class MemoryEngine:
     async def query(self, request: MemoryQuery) -> MemoryQueryResult:
         scope = request.scope
         require_scope_match = _should_require_scope_match(request)
+        recent_history = ""
+        aux_queries = _string_list(request.context.get("aux_queries"))
+        if request.intent == "answer":
+            # 深度回忆允许使用近期对话消解指代；普通 Turn 不经过这条 LLM 路径，避免增加首字等待。
+            session_key = scope.session_key or (
+                f"{scope.channel}:{scope.chat_id}"
+                if scope.channel and scope.chat_id
+                else ""
+            )
+            history = (
+                await asyncio.to_thread(self._sessions.load_history, session_key, 6)
+                if session_key
+                else []
+            )
+            recent_history = _format_recent_history(history)
+            try:
+                decision = await self._rewriter.decide(request.text, recent_history)
+                queries = build_memory_queries(
+                    request.text,
+                    decision.episodic_query if decision.needs_episodic else "",
+                    decision.procedure_query,
+                )
+                aux_queries = list(dict.fromkeys([*aux_queries, *queries[1:]]))
+            except Exception as error:
+                # 查询改写只是增强能力；失败时必须保留原始问题继续检索，不能让记忆工具整体失败。
+                logger.warning("深度记忆查询改写失败，使用原始问题检索: %s", error)
         items = await self._retriever.retrieve(
             request.text,
             memory_types=list(request.filters.kinds) or None,
@@ -108,12 +134,12 @@ class MemoryEngine:
             require_scope_match=require_scope_match,
             time_start=request.filters.time_start,
             time_end=request.filters.time_end,
-            aux_queries=_string_list(request.context.get("aux_queries")),
+            aux_queries=aux_queries,
         )
         hyde_used = False
         hypothesis: str | None = None
-        if bool(request.context.get("enable_hyde")) and should_enhance_retrieval(items):
-            # HyDE 只增强 Turn 上下文的空召回；显式 recall 工具保持一次确定性检索。
+        if request.intent == "answer" and should_enhance_retrieval(items):
+            # HyDE 只服务显式深度回忆的空召回；普通上下文即使未命中也要快速进入主回答。
             async def retrieve_hypothesis(query: str) -> list[dict[str, object]]:
                 return await self._retriever.retrieve(
                     query,
@@ -128,7 +154,7 @@ class MemoryEngine:
 
             augmented = await self._hyde.augment(
                 query=request.text,
-                context=str(request.context.get("hyde_context") or ""),
+                context=recent_history,
                 raw_items=items,
                 retrieve_fn=retrieve_hypothesis,
             )
@@ -222,28 +248,13 @@ class MemoryEngine:
         text = str(getattr(message, "content", getattr(message, "text", "")) or "")
         channel = str(getattr(message, "channel", "") or "")
         chat_id = str(getattr(message, "chat_id", "") or "")
-        session_key = str(getattr(message, "session_key", "") or "")
-        if not session_key and channel and chat_id:
-            session_key = f"{channel}:{chat_id}"
-        # SessionStore 是同步 SQLite 接口，放入线程执行，避免记忆 Gate 阻塞事件循环。
-        history = await asyncio.to_thread(self._sessions.load_history, session_key, 12) if session_key else []
-        decision = await self._rewriter.decide(text, _format_recent_history(history))
-        queries = build_memory_queries(
-            text,
-            decision.episodic_query if decision.needs_episodic else "",
-            decision.procedure_query,
-        )
-        if not queries:
+        if not text.strip():
             return ""
+        # 每轮自动召回只使用当前问题做低延迟检索；LLM 改写和 HyDE 由显式 answer 查询按需承担。
         result = await self.query(MemoryQuery(
-            queries[0],
+            text,
             intent="context",
             scope=_scope(channel, chat_id),
-            context={
-                "aux_queries": queries[1:],
-                "enable_hyde": True,
-                "hyde_context": _format_recent_history(history),
-            },
         ))
         return _injection_block(result.records)
 
@@ -704,8 +715,8 @@ def _should_require_scope_match(request: MemoryQuery) -> bool:
 
 def _tool_profile() -> MemoryToolProfile:
     recall = MemoryToolSpec(
-        "检索用户长期记忆，返回带原始消息 evidence 的事件、偏好、画像和流程；使用结果时必须输出引用标记。",
-        {"type": "object", "properties": {"query": {"type": "string"}, "intent": {"type": "string", "enum": ["context", "answer", "timeline", "interest", "procedure"]}, "memory_kind": {"type": "string"}, "time_filter": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}, "required": ["query"]},
+        "检索用户长期记忆中的历史事实、经历、偏好和既往处理记录。用户明确询问以前说过、做过或发生过的内容，要求列举、汇总、确认历史，或自动注入不足以可靠回答时调用；通用知识、闲聊和仅凭当前对话即可回答的问题不要调用。answer 用于深度主题检索，timeline 用于按时间回顾。结果不足时不得编造；使用结果时必须输出引用标记。",
+        {"type": "object", "properties": {"query": {"type": "string", "description": "写成脱离当前对话也能理解的检索主题，保留关键人物、时间、型号和事件。"}, "intent": {"type": "string", "enum": ["answer", "timeline"], "default": "answer", "description": "answer=深度主题检索；timeline=按 time_filter 回顾历史事件。"}, "memory_kind": {"type": "string"}, "time_filter": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}, "required": ["query"]},
     )
     memorize = MemoryToolSpec(
         "记住用户明确要求长期保留的信息、稳定偏好或可复用流程；不要记录普通闲聊。",
