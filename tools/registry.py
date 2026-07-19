@@ -229,6 +229,12 @@ class ToolRegistry:
             # 系统身份只属于当前 Turn，通过调用参数显式传入；模型参数放在
             # 后面，继续允许显式值覆盖同名默认值。
             merged: dict[str, Any] = {**(context or {}), **arguments}
+            if context and "current_user_source_ref" in context:
+                # 来源 ID 是 evidence 的系统身份，不能被模型生成的隐藏参数伪造；
+                # 其他上下文仍维持原有的低优先级默认值契约。
+                merged["current_user_source_ref"] = context[
+                    "current_user_source_ref"
+                ]
             return await tool.execute(**merged)
         except Exception as error:
             logger.error("工具 %s 执行出错: %s", name, error, exc_info=True)

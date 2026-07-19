@@ -43,6 +43,20 @@ async def test_get_or_create_caches_complete_session_and_reloads_after_invalidat
     assert first.created_at.utcoffset().total_seconds() == 8 * 60 * 60
 
 
+@pytest.mark.asyncio
+async def test_peek_next_message_id_uses_persisted_next_sequence(
+    manager: SessionManager,
+) -> None:
+    assert await manager.peek_next_message_id("web:chat-1") == "web:chat-1:0"
+
+    session = await manager.get_or_create("web:chat-1")
+    user = session.add_message("user", "问题")
+    assistant = session.add_message("assistant", "回答")
+    await manager.append_messages(session, [user, assistant])
+
+    assert await manager.peek_next_message_id("web:chat-1") == "web:chat-1:2"
+
+
 def test_manager_creates_akashic_workspace_layout(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
 

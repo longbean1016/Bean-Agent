@@ -91,6 +91,11 @@ class AgentLoop:
     async def _process_message(self, message: InboundMessage, turn_id: str) -> None:
         request_id = str(message.metadata.get("request_id") or "")
         resumed = await self._persist_pending_interrupt(message.session_key)
+        # 用户消息在推理结束后才批量落库，因此工具执行前只能从 Session 的
+        # 权威 next_seq 预测 ID。系统值必须覆盖入站同名字段，避免伪造 evidence。
+        message.metadata["current_user_source_ref"] = (
+            await self._sessions.peek_next_message_id(message.session_key)
+        )
         await self._events.emit(TurnStarted(message.session_key, turn_id, request_id, message.content))
         try:
             # 正常被动 Turn 对齐参考实现：Pipeline 推理期间不提前把 user 放进 Session；

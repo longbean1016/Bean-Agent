@@ -23,7 +23,10 @@ class MemorizeTool(Tool):
         payload.update(extra)
         if tool_requirement is not None: payload["tool_requirement"] = tool_requirement
         if steps is not None: payload["steps"] = steps
-        result = await self._memory.mutate(MemoryMutation(kind="remember", summary=summary, memory_kind=memory_kind.strip(), source_ref=str(current_user_source_ref or "").strip(), scope=MemoryScope(session_key=f"{channel}:{chat_id}" if channel and chat_id else "", channel=channel or "", chat_id=chat_id or ""), metadata=payload))
+        # 正常 Turn 使用当前用户消息 ID；非聊天入口也必须留下明确来源，不能
+        # 用空字符串伪装成可回查的 evidence。
+        source_ref = str(current_user_source_ref or "").strip() or "memorize_tool"
+        result = await self._memory.mutate(MemoryMutation(kind="remember", summary=summary, memory_kind=memory_kind.strip(), source_ref=source_ref, scope=MemoryScope(session_key=f"{channel}:{chat_id}" if channel and chat_id else "", channel=channel or "", chat_id=chat_id or ""), metadata=payload))
         kind = f"；kind={result.actual_kind}" if result.actual_kind else ""
         return f"已记住（item_id={result.item_id}{kind}；status={result.status}）：{summary}"
 

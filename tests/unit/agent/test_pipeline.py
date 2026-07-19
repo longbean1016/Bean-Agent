@@ -306,6 +306,46 @@ async def test_pipeline_runs_tool_loop_and_emits_lifecycle_events() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pipeline_passes_current_user_source_ref_to_tools() -> None:
+    class SourceTool(Tool):
+        name = "source"
+        description = "返回当前用户消息来源"
+        parameters = {"type": "object", "properties": {}}
+
+        async def execute(self, current_user_source_ref: str = "", **kwargs):
+            return current_user_source_ref
+
+    class SourceProvider:
+        calls = 0
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(None, [ToolCall("source-1", "source", {})])
+            return LLMResponse("完成")
+
+    tools = ToolRegistry()
+    tools.register(SourceTool())
+    pipeline = Pipeline(
+        SourceProvider(),
+        tools,
+        EventBus(),
+        PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        ),
+        workspace="D:/workspace",
+    )
+    message = InboundMessage("web", "u", "c", "记住", metadata={
+        "current_user_source_ref": "web:c:4",
+    })
+
+    result = await pipeline.process(message, turn_id="source-turn")
+
+    assert result.tool_chain[0]["calls"][0]["result"] == "web:c:4"
+
+
+@pytest.mark.asyncio
 async def test_pipeline_keeps_full_tool_chain_while_model_receives_budgeted_result() -> None:
     full_result = "r" * 10_500
 

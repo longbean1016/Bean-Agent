@@ -140,6 +140,21 @@ async def test_execute_merges_context_as_low_priority_defaults() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_protects_current_user_source_ref_from_model_arguments() -> None:
+    registry = ToolRegistry()
+    tool = _RecordingTool()
+    registry.register(tool)
+
+    await registry.execute(
+        "record",
+        {"current_user_source_ref": "forged:9"},
+        context={"current_user_source_ref": "web:c:4"},
+    )
+
+    assert tool.calls[0]["current_user_source_ref"] == "web:c:4"
+
+
+@pytest.mark.asyncio
 async def test_unknown_tool_degrades_or_raises_on_request() -> None:
     registry = ToolRegistry()
 

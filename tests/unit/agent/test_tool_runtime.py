@@ -10,6 +10,7 @@ def test_tool_runtime_views_keep_context_and_visibility_isolated() -> None:
         channel="web",
         chat_id="chat-a",
         session_key="web:chat-a",
+        current_user_source_ref="web:chat-a:8",
         visible_names={"tool_search"},
     )
     second = ToolRuntimeView.create(
@@ -25,6 +26,7 @@ def test_tool_runtime_views_keep_context_and_visibility_isolated() -> None:
         "channel": "web",
         "chat_id": "chat-a",
         "session_key": "web:chat-a",
+        "current_user_source_ref": "web:chat-a:8",
     }
     assert first.visible_order == ["tool_search", "mcp_files__read"]
     assert first.unlocked_names == {"mcp_files__read"}

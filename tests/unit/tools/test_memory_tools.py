@@ -102,6 +102,16 @@ async def test_memorize_maps_source_scope_and_procedure_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_memorize_uses_explicit_fallback_when_user_source_is_missing() -> None:
+    memory = FakeMemory()
+    tool = MemorizeTool(memory, spec("写入"))
+
+    await tool.execute(summary="用户使用中文回答", memory_kind="preference")
+
+    assert memory.mutations[0].source_ref == "memorize_tool"
+
+
+@pytest.mark.asyncio
 async def test_forget_deduplicates_ids_and_returns_soft_delete_details() -> None:
     memory = FakeMemory()
     tool = ForgetMemoryTool(memory, spec("遗忘"))

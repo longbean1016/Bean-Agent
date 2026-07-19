@@ -45,6 +45,30 @@ async def test_run_once_persists_complete_turn_before_committed_and_outbound(tmp
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_injects_user_source_ref_before_pipeline(tmp_path: Path) -> None:
+    class CapturingPipeline:
+        source_ref = ""
+
+        async def process(self, message, *, turn_id):
+            self.source_ref = str(message.metadata.get("current_user_source_ref") or "")
+            return PipelineResult("回答")
+
+    bus = MessageBus()
+    sessions = SessionManager(tmp_path)
+    pipeline = CapturingPipeline()
+    loop = AgentLoop(bus, EventBus(), pipeline, sessions)
+    await bus.publish_inbound(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="记住这句话")
+    )
+
+    await loop.run_once()
+
+    rows = sessions.store.fetch_session_messages("web:c")
+    assert pipeline.source_ref == rows[0]["id"] == "web:c:0"
+    await sessions.close()
+
+
+@pytest.mark.asyncio
 async def test_pipeline_failure_persists_error_turn_without_committed(tmp_path: Path) -> None:
     class FailingPipeline:
         async def process(self, message, *, turn_id):

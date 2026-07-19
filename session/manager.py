@@ -286,6 +286,18 @@ class SessionManager:
             self._cache[key] = session
             return session
 
+    async def peek_next_message_id(self, session_key: str) -> str:
+        """预测当前会话下一条持久化消息 ID，供 Turn 内工具记录原文来源。"""
+
+        key = self._validate_session_key(session_key)
+        # 先确保 Session 元数据存在，再读取由消息写事务维护的 next_seq；不能用
+        # 缓存消息数量推算，因为删除、恢复或中断补写后两者不一定相等。
+        await self.get_or_create(key)
+        async with self._lock_for(key):
+            meta = self._store.get_session_meta(key)
+            next_seq = int(meta.get("next_seq", 0)) if meta is not None else 0
+        return f"{key}:{next_seq}"
+
     async def save_async(self, session: Session) -> None:
         """保存完整 Session 中所有尚未落库的消息。
 

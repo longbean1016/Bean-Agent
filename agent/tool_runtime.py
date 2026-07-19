@@ -17,6 +17,7 @@ class ToolRuntimeView:
     channel: str
     chat_id: str
     session_key: str
+    current_user_source_ref: str = ""
     visible_names: set[str] = field(default_factory=set)
     visible_order: list[str] = field(default_factory=list)
     unlocked_names: set[str] = field(default_factory=set)
@@ -28,6 +29,7 @@ class ToolRuntimeView:
         channel: str,
         chat_id: str,
         session_key: str,
+        current_user_source_ref: str = "",
         visible_names: Iterable[str] = (),
     ) -> "ToolRuntimeView":
         """按稳定顺序创建视图，调用方传集合时也不会产生随机 Schema 顺序。"""
@@ -42,6 +44,7 @@ class ToolRuntimeView:
             channel=channel,
             chat_id=chat_id,
             session_key=session_key,
+            current_user_source_ref=str(current_user_source_ref or "").strip(),
             visible_names=set(ordered),
             visible_order=ordered,
         )
@@ -54,6 +57,7 @@ class ToolRuntimeView:
             "channel": self.channel,
             "chat_id": self.chat_id,
             "session_key": self.session_key,
+            "current_user_source_ref": self.current_user_source_ref,
         }
 
     def unlock(self, names: Iterable[str]) -> list[str]:
