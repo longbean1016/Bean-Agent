@@ -27,6 +27,21 @@ def test_pending_snapshot_rollback_and_startup_recovery(tmp_path: Path) -> None:
     assert not recovered.pending_snapshot_file.exists()
 
 
+def test_markdown_store_initializes_complete_memory_files_without_overwrite(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "MEMORY.md").write_text("已有长期记忆", encoding="utf-8")
+
+    store = MarkdownMemoryStore(tmp_path)
+    try:
+        assert (memory_dir / "MEMORY.md").read_text(encoding="utf-8") == "已有长期记忆"
+        assert (memory_dir / "SELF.md").read_text(encoding="utf-8").startswith("# BeanAgent 的自我认知")
+        assert (memory_dir / "PENDING.md").read_text(encoding="utf-8") == ""
+        assert (memory_dir / "RECENT_CONTEXT.md").read_text(encoding="utf-8") == ""
+    finally:
+        store.close()
+
+
 def test_append_pending_once_is_idempotent(tmp_path: Path) -> None:
     store = MarkdownMemoryStore(tmp_path)
 
