@@ -29,6 +29,20 @@ class ConsolidationExtractor(Protocol):
     async def extract(self, messages: list[dict[str, object]], previous_recent_context: str) -> ConsolidationDraft: ...
 
 
+def render_consolidation_conversation(messages: list[dict[str, object]]) -> str:
+    """保留 Session 的原始时间证据，供所有归档提取链路共同使用。
+
+    时间缺失时显式标记 unknown，不用当前时间代填，避免模型把写入时间误当成
+    事件发生时间，或自行猜测年份。
+    """
+
+    return "\n".join(
+        f"[{str(item.get('timestamp') or 'unknown')}][{str(item.get('role') or 'unknown')}] "
+        f"{str(item.get('content') or '')}"
+        for item in messages
+    )
+
+
 class Consolidator:
     def __init__(self, sessions: SessionStore, markdown: MarkdownMemoryStore, extractor: ConsolidationExtractor, *, keep_count: int = 20, threshold: int | None = None) -> None:
         self._sessions = sessions
@@ -61,14 +75,16 @@ class Consolidator:
             self._markdown.append_pending_once("\n".join(pending_lines), source_ref=source_ref)
         if draft.recent_context.strip():
             self._markdown.write_recent_context(draft.recent_context)
-        conversation = "\n".join(
-            f"[{str(item.get('role') or 'unknown')}] {str(item.get('content') or '')}"
-            for item in window
-        )
+        conversation = render_consolidation_conversation(window)
         # 对齐参考实现：cursor 表示 Markdown 归档已经提交，而不是所有向量派生数据
         # 已同步。后者由 ConsolidationCommitted/outbox 作为独立事务恢复。
         self._sessions.set_cursor(session_key, end)
         return ConsolidationResult(session_key, source_ref, end, draft.history_entries, conversation)
 
 
-__all__ = ["ConsolidationDraft", "ConsolidationResult", "Consolidator"]
+__all__ = [
+    "ConsolidationDraft",
+    "ConsolidationResult",
+    "Consolidator",
+    "render_consolidation_conversation",
+]

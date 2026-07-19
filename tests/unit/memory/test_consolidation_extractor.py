@@ -23,13 +23,19 @@ class Provider:
 async def test_consolidation_uses_separate_event_and_recent_context_prompts() -> None:
     provider = Provider()
     draft = await _LLMConsolidationExtractor(provider).extract(
-        [{"role": "user", "content": "我完成了记忆模块"}],
+        [{
+            "role": "user",
+            "content": "我完成了记忆模块",
+            "timestamp": "2026-07-16T10:00:00+08:00",
+        }],
         "## Compression\n- 旧语境",
     )
 
     assert len(provider.prompts) == 2
     assert "transcript" in provider.prompts[0]
     assert "agent_context" in provider.prompts[0]
+    assert "2026-07-16T10:00:00+08:00" in provider.prompts[0]
+    assert "没有消息时间证据时不得猜测或补写具体日期" in provider.prompts[0]
     assert "ongoing_threads" in provider.prompts[1]
     assert draft.history_entries[0]["emotional_weight"] == 10
     assert draft.pending_items == [{"tag": "identity", "content": "用户是开发者"}]

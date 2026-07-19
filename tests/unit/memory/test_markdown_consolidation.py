@@ -55,7 +55,12 @@ async def test_consolidation_advances_cursor_only_after_markdown_commit(tmp_path
     markdown = MarkdownMemoryStore(tmp_path)
     try:
         for index in range(6):
-            sessions.add_message(NewMessage(session_key="web:c", role="user" if index % 2 == 0 else "assistant", content=f"消息 {index}"))
+            sessions.add_message(NewMessage(
+                session_key="web:c",
+                role="user" if index % 2 == 0 else "assistant",
+                content=f"消息 {index}",
+                timestamp=f"2026-07-16T10:0{index}:00+08:00",
+            ))
         consolidator = Consolidator(sessions, markdown, Extractor(), keep_count=2, threshold=4)
 
         result = await consolidator.consolidate("web:c")
@@ -64,6 +69,7 @@ async def test_consolidation_advances_cursor_only_after_markdown_commit(tmp_path
 
     assert result is not None
     assert result.cursor == 4
+    assert "[2026-07-16T10:00:00+08:00][user] 消息 0" in result.conversation
     assert "用户是开发者" in markdown.read_pending()
     assert "正在开发项目" in markdown.read_recent_context()
 

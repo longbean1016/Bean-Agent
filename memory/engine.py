@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent.config_models import MemoryConfig
-from memory.consolidator import ConsolidationDraft, ConsolidationExtractor, ConsolidationResult, Consolidator
+from memory.consolidator import (
+    ConsolidationDraft,
+    ConsolidationExtractor,
+    ConsolidationResult,
+    Consolidator,
+    render_consolidation_conversation,
+)
 from memory.contracts import (
     EvidenceRef, MemoryIngestRequest, MemoryIngestResult, MemoryMutation,
     MemoryMutationResult, MemoryQuery, MemoryQueryResult, MemoryRecord,
@@ -566,7 +572,7 @@ class _LLMConsolidationExtractor:
         self._provider = provider
 
     async def extract(self, messages: list[dict[str, object]], previous_recent_context: str) -> ConsolidationDraft:
-        conversation = "\n".join(f"[{item.get('role')}] {item.get('content')}" for item in messages)
+        conversation = render_consolidation_conversation(messages)
         event_data = await self._complete_json(_event_extraction_prompt(conversation, previous_recent_context))
         recent_data = await self._complete_json(_recent_context_prompt(conversation, previous_recent_context))
         history_entries = []
@@ -606,6 +612,8 @@ def _event_extraction_prompt(conversation: str, recent_context: str) -> str:
     return f"""你是记忆提取代理。从对话中精确提取 history_entries 和 pending_items，只返回合法 JSON。
 
 history_entries：每个独立主题一条，summary 用第三人称并以 [YYYY-MM-DD HH:MM] 开头，emotional_weight 为 0-10。
+- 日期和时间只能取自对应 USER 消息前的 Session 时间戳；不得使用模型知识、当前时间或写入时间推测。
+- 时间戳为 unknown，或无法确定哪条 USER 消息是事件证据时，不输出该 history_entry；没有消息时间证据时不得猜测或补写具体日期。
 - 只写 USER 明确表达的行动、经历、计划和状态；ASSISTANT 的建议、解释和推荐不作证据。
 - 保留地点、人名、数量、价格、型号等细节，不复制 USER:/ASSISTANT: 标记。
 - 若 USER 展示外部聊天记录或 transcript，默认 speaker 身份不明确，只允许一条“用户展示了一段聊天记录”的高层 event；禁止把材料中的人物事实归给当前用户。
