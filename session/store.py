@@ -18,7 +18,7 @@ _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 _MESSAGE_ROLES = {"user", "assistant", "tool"}
 _MESSAGE_COLUMNS = "id, session_key, seq, role, content, tool_chain, extra, ts"
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
-_DEFAULT_TITLE_LIMIT = 40
+_DEFAULT_TITLE_LIMIT = 80
 
 
 def _default_session_title(content: str, media: object) -> str:
@@ -26,9 +26,8 @@ def _default_session_title(content: str, media: object) -> str:
 
     normalized = " ".join(str(content).split())
     if normalized:
-        if len(normalized) <= _DEFAULT_TITLE_LIMIT:
-            return normalized
-        return normalized[: _DEFAULT_TITLE_LIMIT - 3] + "..."
+        # 数据库存放可复用的标题正文，省略号仅由前端根据实际宽度渲染。
+        return normalized[:_DEFAULT_TITLE_LIMIT]
 
     paths = [str(item) for item in media] if isinstance(media, list) else []
     if not paths:
