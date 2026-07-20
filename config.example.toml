@@ -25,6 +25,7 @@ enable_thinking = true # 开启 DeepSeek 推理模式，Provider 会转换为 th
 [memory]
 enabled = true # 是否启用长期记忆
 engine_name = "default" # 当前最小版本使用的记忆引擎
+context_window = 40 # 上下文基准窗口，热历史与压缩阈值由此派生
 
 [memory.embedding]
 model = "text-embedding-v3"
@@ -50,9 +51,6 @@ max_forced_procedures = 3 # 带工具要求的强制流程单次注入上限
 supersede_threshold = 0.90 # 新事实替代旧事实的相似度阈值
 event_dedup_threshold = 0.92 # 重复事件的相似度阈值
 event_dedup_window_days = 7 # 事件去重的时间窗口天数
-
-[session]
-history_window = 40 # 每轮加载的最近历史消息数量
 
 [agent]
 workdir = "." # 工具相对工作目录，实际根路径由 workspace 注入

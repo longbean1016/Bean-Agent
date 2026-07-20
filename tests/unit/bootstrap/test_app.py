@@ -35,6 +35,12 @@ def test_build_core_runtime_wires_singletons_and_all_tools(tmp_path: Path) -> No
 
     runtime = build_core_runtime(config, tmp_path / "workspace", provider=provider, embedder=embedder)
 
+    assert runtime.sessions._history_window == config.memory.context_window
+    assert runtime.pipeline._history_limit == config.memory.context_window
+    assert runtime.memory is not None
+    assert runtime.memory._consolidator._keep_count == config.memory.keep_count
+    assert runtime.memory._consolidator._threshold == config.memory.consolidation_min_new_messages
+
     assert runtime.provider is provider
     assert runtime.embedder is embedder
     assert runtime.memory is not None

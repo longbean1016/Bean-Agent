@@ -27,7 +27,6 @@ class TurnContext:
     chat_id: str
     memory: MemoryPromptApi | None = None
     retrieved_memory_block: str = ""
-    tools_summary: str = ""
     active_tool_names: list[str] = field(default_factory=list)
     skills: SkillsPromptApi | None = None
     active_skill_names: list[str] = field(default_factory=list)
@@ -100,14 +99,6 @@ class BehaviorRulesPromptBlock(_Block):
             "- 工具失败时说明原因，不得编造执行结果。"
         )
     def cache_signature(self, ctx: TurnContext) -> str: return ctx.workspace
-
-
-class ToolsCatalogPromptBlock(_Block):
-    priority, label, is_static = 20, "tools_catalog", True
-    def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
-        summary = cached_signature if cached_signature is not None else ctx.tools_summary
-        return f"## 可用工具目录\n{summary}" if summary.strip() else None
-    def cache_signature(self, ctx: TurnContext) -> str | None: return ctx.tools_summary or None
 
 
 class SkillsCatalogPromptBlock(_Block):
@@ -206,7 +197,7 @@ class SystemPromptBuilder:
 
 
 def default_prompt_blocks() -> list[PromptBlock]:
-    return [IdentityPromptBlock(), BehaviorRulesPromptBlock(), ToolsCatalogPromptBlock(), SkillsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), RecentContextPromptBlock(), ActiveToolsPromptBlock(), ActiveSkillsPromptBlock(), RetrievedMemoryPromptBlock()]
+    return [IdentityPromptBlock(), BehaviorRulesPromptBlock(), SkillsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), RecentContextPromptBlock(), ActiveToolsPromptBlock(), ActiveSkillsPromptBlock(), RetrievedMemoryPromptBlock()]
 
 
 __all__ = ["PromptSectionMeta", "PromptSectionRender", "SectionCache", "SystemPromptBuilder", "TurnContext", "default_prompt_blocks"]

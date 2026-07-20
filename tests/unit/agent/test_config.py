@@ -18,7 +18,6 @@ def test_config_defaults_and_nested_instances_are_independent() -> None:
     assert [item.name for item in fields(Config)] == [
         "llm",
         "memory",
-        "session",
         "agent",
         "channels",
     ]
@@ -28,7 +27,11 @@ def test_config_defaults_and_nested_instances_are_independent() -> None:
     assert first.memory.retrieval.procedure_threshold == 0.66
     assert first.memory.retrieval.max_forced_procedures == 3
     assert first.memory.retrieval.max_event_profile == 4
-    assert first.session.history_window == 40
+    assert first.memory.context_window == 40
+    assert first.memory.aligned_context_window == 40
+    assert first.memory.keep_count == 20
+    assert first.memory.consolidation_min_new_messages == 10
+    assert first.memory.context_guard_threshold == 30
     assert first.agent.max_concurrent_turns == 5
     assert first.agent.max_queued_turns == 20
     assert first.channels.chat.port == 6322
@@ -68,6 +71,7 @@ max_tokens = 2048
 [memory]
 enabled = true
 engine_name = "local"
+context_window = 44
 
 [memory.embedding]
 model = "text-embedding-v3"
@@ -99,9 +103,6 @@ max_event_profile = 2
 supersede_threshold = 0.8
 event_dedup_threshold = 0.85
 event_dedup_window_days = 5
-
-[session]
-history_window = 25
 
 [agent]
 workdir = "runtime"
@@ -140,13 +141,47 @@ port = 8000
     assert config.memory.retrieval.max_forced_procedures == 2
     assert config.memory.retrieval.max_event_profile == 2
     assert config.memory.dedup.event_dedup_window_days == 5
-    assert config.session.history_window == 25
+    assert config.memory.context_window == 44
+    assert config.memory.keep_count == 22
+    assert config.memory.consolidation_min_new_messages == 11
+    assert config.memory.context_guard_threshold == 33
     assert config.agent.workdir == "runtime"
     assert config.agent.max_concurrent_turns == 3
     assert config.agent.max_queued_turns == 12
     assert config.channels.chat.host == "0.0.0.0"
     assert config.channels.chat.port == 8000
     assert config.channels.chat.channel_name == "web"
+
+
+def test_session_history_window_does_not_override_memory_default(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "legacy.toml"
+    config_path.write_text(
+        "[session]\nhistory_window = 28\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.memory.context_window == 40
+    assert config.memory.keep_count == 20
+    assert not hasattr(config, "session")
+
+
+def test_memory_context_window_rounds_up_to_message_boundary(tmp_path: Path) -> None:
+    config_path = tmp_path / "rounding.toml"
+    config_path.write_text(
+        "[memory]\ncontext_window = 41\n",
+        encoding="utf-8",
+    )
+
+    memory = load_config(config_path).memory
+
+    assert memory.aligned_context_window == 44
+    assert memory.keep_count == 22
+    assert memory.consolidation_min_new_messages == 11
+    assert memory.context_guard_threshold == 33
 
 
 def test_explicit_base_url_overrides_provider_preset(tmp_path: Path) -> None:

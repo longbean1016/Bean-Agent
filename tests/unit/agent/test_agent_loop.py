@@ -22,6 +22,16 @@ class Pipeline:
         return PipelineResult("回答", thinking="思考", tool_chain=[{"iteration": 1, "calls": []}], tools_used=["echo"])
 
 
+class BlockingContextGuard:
+    def __init__(self, ready: bool) -> None:
+        self.ready = ready
+        self.calls: list[str] = []
+
+    async def ensure_context_ready(self, session_key: str) -> bool:
+        self.calls.append(session_key)
+        return self.ready
+
+
 @pytest.mark.asyncio
 async def test_run_once_persists_complete_turn_before_committed_and_outbound(tmp_path: Path) -> None:
     bus = MessageBus()
@@ -89,6 +99,95 @@ async def test_pipeline_failure_persists_error_turn_without_committed(tmp_path: 
     assert rows[1]["status"] == "error"
     assert committed == []
     assert "模型失败" in outbound.content
+    await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_persists_and_dispatches_context_retry_trace(
+    tmp_path: Path,
+) -> None:
+    class RetriedPipeline:
+        async def process(self, message, *, turn_id):
+            return PipelineResult(
+                "回答",
+                context_retry={
+                    "selected_plan": "half_history",
+                    "history_messages": 4,
+                    "disabled_sections": ["long_term_memory"],
+                    "attempts": [{"name": "full"}, {"name": "half_history"}],
+                },
+            )
+
+    bus = MessageBus()
+    sessions = SessionManager(tmp_path)
+    loop = AgentLoop(bus, EventBus(), RetriedPipeline(), sessions)
+    await bus.publish_inbound(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="问题")
+    )
+
+    await loop.run_once()
+
+    rows = sessions.store.fetch_session_messages("web:c")
+    outbound = await bus.consume_outbound()
+    assert rows[1]["metadata"]["context_retry"]["selected_plan"] == "half_history"
+    assert outbound.metadata["context_retry"]["history_messages"] == 4
+    await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_context_guard_blocks_pipeline_without_persisting_error_turn(
+    tmp_path: Path,
+) -> None:
+    class ForbiddenPipeline:
+        async def process(self, message, *, turn_id):
+            raise AssertionError("积压保护失败时不应进入 Pipeline")
+
+    bus = MessageBus()
+    sessions = SessionManager(tmp_path)
+    guard = BlockingContextGuard(False)
+    loop = AgentLoop(
+        bus,
+        EventBus(),
+        ForbiddenPipeline(),
+        sessions,
+        context_guard=guard,
+    )
+    await bus.publish_inbound(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="问题")
+    )
+
+    await loop.run_once()
+
+    outbound = await bus.consume_outbound()
+    assert guard.calls == ["web:c"]
+    assert "记忆归档" in outbound.content
+    assert sessions.store.fetch_session_messages("web:c") == []
+    await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_context_guard_can_be_explicitly_skipped_for_internal_turn(
+    tmp_path: Path,
+) -> None:
+    bus = MessageBus()
+    sessions = SessionManager(tmp_path)
+    guard = BlockingContextGuard(False)
+    loop = AgentLoop(bus, EventBus(), Pipeline(), sessions, context_guard=guard)
+    await bus.publish_inbound(
+        InboundMessage(
+            channel="scheduler",
+            sender="system",
+            chat_id="job",
+            content="内部任务",
+            metadata={"skip_memory_context_guard": True},
+        )
+    )
+
+    await loop.run_once()
+
+    outbound = await bus.consume_outbound()
+    assert outbound.content == "回答"
+    assert guard.calls == []
     await sessions.close()
 
 

@@ -76,9 +76,8 @@ class Consolidator:
         if draft.recent_context.strip():
             self._markdown.write_recent_context(draft.recent_context)
         conversation = render_consolidation_conversation(window)
-        # 对齐参考实现：cursor 表示 Markdown 归档已经提交，而不是所有向量派生数据
-        # 已同步。后者由 ConsolidationCommitted/outbox 作为独立事务恢复。
-        self._sessions.set_cursor(session_key, end)
+        # 此处只返回候选 cursor。MemoryEngine 必须先持久化 outbox 再推进它，
+        # 否则进程在两步之间失败会让原文退出模型历史却没有可恢复的派生任务。
         return ConsolidationResult(session_key, source_ref, end, draft.history_entries, conversation)
 
 

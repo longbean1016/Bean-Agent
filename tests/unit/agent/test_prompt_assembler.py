@@ -32,7 +32,7 @@ def test_static_prefix_cache_and_dynamic_context_frame_are_separated() -> None:
     assembler = PromptAssembler(builder, MessageEnvelopeBuilder())
     context = TurnContext(
         workspace="D:/workspace", channel="web", chat_id="c", memory=Memory(),
-        retrieved_memory_block="用户偏好中文", tools_summary="- read_file: 读取文件",
+        retrieved_memory_block="用户偏好中文",
         active_tool_names=["read_file"],
     )
 
@@ -42,13 +42,46 @@ def test_static_prefix_cache_and_dynamic_context_frame_are_separated() -> None:
     assert first.messages[0]["role"] == "system"
     assert first.messages[0]["content"] == second.messages[0]["content"]
     assert {item.name for item in second.debug_breakdown if item.cache_hit} == {
-        "identity", "behavior_rules", "tools_catalog"
+        "identity", "behavior_rules"
     }
     reminder = first.messages[-2]["content"]
     assert reminder.startswith('<system-reminder data-system-context-frame="true">')
     assert "用户偏好中文" in reminder
     assert "项目开发" in reminder
     assert "重复消息" not in reminder
+
+
+def test_visible_tools_only_change_dynamic_frame_not_system_prompt() -> None:
+    assembler = PromptAssembler(
+        SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
+        MessageEnvelopeBuilder(),
+    )
+    first = assembler.assemble(
+        turn_ctx=TurnContext(
+            workspace="D:/workspace",
+            channel="web",
+            chat_id="c",
+            active_tool_names=["tool_search"],
+        ),
+        history=[],
+        current_message="第一次",
+    )
+    second = assembler.assemble(
+        turn_ctx=TurnContext(
+            workspace="D:/workspace",
+            channel="web",
+            chat_id="c",
+            active_tool_names=["tool_search", "mcp_demo__lookup"],
+        ),
+        history=[],
+        current_message="第二次",
+    )
+
+    assert first.messages[0]["content"] == second.messages[0]["content"]
+    assert "tool_search" in str(first.messages[-2]["content"])
+    assert "mcp_demo__lookup" not in str(first.messages[-2]["content"])
+    assert "mcp_demo__lookup" in str(second.messages[-2]["content"])
+    assert "可用工具目录" not in str(second.messages[0]["content"])
 
 
 def test_envelope_order_is_system_history_reminder_current_message() -> None:

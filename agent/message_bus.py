@@ -45,6 +45,7 @@ class PipelineResult:
     media: list[str] = field(default_factory=list)
     tool_chain: list[dict[str, Any]] = field(default_factory=list)
     tools_used: list[str] = field(default_factory=list)
+    context_retry: dict[str, Any] = field(default_factory=dict)
 
 
 OutboundCallback: TypeAlias = Callable[[OutboundMessage], Awaitable[None] | None]

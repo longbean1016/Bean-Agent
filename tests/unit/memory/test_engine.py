@@ -522,6 +522,141 @@ async def test_turn_committed_only_enqueues_background_memory_work(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_context_guard_skips_consolidation_below_threshold(tmp_path: Path) -> None:
+    class ForbiddenExtractor:
+        async def extract(self, messages, previous_recent_context):
+            raise AssertionError("低于积压阈值时不应调用压缩模型")
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(3):
+        sessions.add_message(
+            NewMessage(session_key="web:c", role="user", content=f"消息 {index}")
+        )
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path,
+        Embedder(),
+        Provider(),
+        sessions,
+        config=config,
+        consolidation_extractor=ForbiddenExtractor(),
+        keep_count=1,
+        consolidation_threshold=3,
+    )
+    try:
+        ready = await engine.ensure_context_ready("web:c")
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert ready is True
+
+
+@pytest.mark.asyncio
+async def test_context_guard_consolidates_and_requires_cursor_progress(
+    tmp_path: Path,
+) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(4):
+        sessions.add_message(
+            NewMessage(session_key="web:c", role="user", content=f"消息 {index}")
+        )
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path,
+        Embedder(),
+        Provider(),
+        sessions,
+        config=config,
+        consolidation_extractor=Extractor(),
+        keep_count=1,
+        consolidation_threshold=3,
+    )
+    try:
+        ready = await engine.ensure_context_ready("web:c")
+        cursor = sessions.get_cursor("web:c")
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert ready is True
+    assert cursor == 3
+
+
+@pytest.mark.asyncio
+async def test_context_guard_blocks_when_consolidation_fails(tmp_path: Path) -> None:
+    class FailingExtractor:
+        async def extract(self, messages, previous_recent_context):
+            raise RuntimeError("压缩失败")
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(4):
+        sessions.add_message(
+            NewMessage(session_key="web:c", role="user", content=f"消息 {index}")
+        )
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path,
+        Embedder(),
+        Provider(),
+        sessions,
+        config=config,
+        consolidation_extractor=FailingExtractor(),
+        keep_count=1,
+        consolidation_threshold=3,
+    )
+    try:
+        ready = await engine.ensure_context_ready("web:c")
+        cursor = sessions.get_cursor("web:c")
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert ready is False
+    assert cursor == 0
+
+
+@pytest.mark.asyncio
+async def test_context_guard_does_not_advance_cursor_when_outbox_fails(
+    tmp_path: Path,
+) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(4):
+        sessions.add_message(
+            NewMessage(session_key="web:c", role="user", content=f"消息 {index}")
+        )
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path,
+        Embedder(),
+        Provider(),
+        sessions,
+        config=config,
+        consolidation_extractor=Extractor(),
+        keep_count=1,
+        consolidation_threshold=3,
+    )
+
+    def fail_outbox(source_ref, payload):
+        raise RuntimeError("outbox 写入失败")
+
+    engine._store.enqueue_consolidation = fail_outbox
+    try:
+        ready = await engine.ensure_context_ready("web:c")
+        cursor = sessions.get_cursor("web:c")
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert ready is False
+    assert cursor == 0
+
+
+@pytest.mark.asyncio
 async def test_ingest_rejects_unknown_source_kind(tmp_path: Path) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
     config = MemoryConfig(enabled=True)

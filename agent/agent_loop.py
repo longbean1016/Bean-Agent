@@ -27,6 +27,12 @@ class PipelineApi(Protocol):
     async def process(self, message: InboundMessage, *, turn_id: str) -> PipelineResult: ...
 
 
+class ContextGuardApi(Protocol):
+    """普通 Turn 在推理前调用的记忆积压保护接口。"""
+
+    async def ensure_context_ready(self, session_key: str) -> bool: ...
+
+
 @dataclass(frozen=True, slots=True)
 class InterruptResult:
     status: str
@@ -63,6 +69,7 @@ class AgentLoop:
         pipeline: PipelineApi,
         sessions: SessionManager,
         *,
+        context_guard: ContextGuardApi | None = None,
         max_concurrent_turns: int = 5,
         max_queued_turns: int = 20,
     ) -> None:
@@ -70,6 +77,7 @@ class AgentLoop:
         self._events = event_bus
         self._pipeline = pipeline
         self._sessions = sessions
+        self._context_guard = context_guard
         self._active_tasks: dict[str, asyncio.Task[None]] = {}
         self._active_turn_ids: dict[str, str] = {}
         self._active_turn_states: dict[str, TurnInterruptState] = {}
@@ -169,6 +177,27 @@ class AgentLoop:
             await self._sessions.peek_next_message_id(message.session_key)
         )
         await self._events.emit(TurnStarted(message.session_key, turn_id, request_id, message.content))
+        if (
+            self._context_guard is not None
+            and not bool(message.metadata.get("skip_memory_context_guard"))
+            and not await self._context_guard.ensure_context_ready(message.session_key)
+        ):
+            # 维护异常不写入用户 Session，否则错误文本会被后续记忆提取误当成
+            # 对话事实；前端仍通过本次 Turn 的 final 事件获得明确状态。
+            await self._bus.publish_outbound(
+                OutboundMessage(
+                    message.channel,
+                    message.chat_id,
+                    "记忆归档当前处于异常积压状态，本轮已暂停，请稍后重试。",
+                    metadata={
+                        "turn_id": turn_id,
+                        "request_id": request_id,
+                        "status": "error",
+                        "reason": "memory_context_guard",
+                    },
+                )
+            )
+            return
         try:
             # 正常被动 Turn 对齐参考实现：Pipeline 推理期间不提前把 user 放进 Session；
             # 推理完成后才把 user 与 assistant 作为一个提交批次写入 SQLite。
@@ -186,11 +215,13 @@ class AgentLoop:
             return
 
         session = await self._sessions.get_or_create(message.session_key)
+        context_retry = dict(getattr(result, "context_retry", {}) or {})
         user = session.add_message("user", message.content, media=message.media, turn_id=turn_id)
         assistant = session.add_message(
             "assistant", result.content, media=result.media, turn_id=turn_id,
             reasoning_content=result.thinking, tool_chain=result.tool_chain,
             tools_used=result.tools_used, status="ok",
+            metadata={"context_retry": context_retry},
         )
         # append_messages 依次写入同一批的两条消息并原地回填稳定 ID。只有它完整返回，
         # 后台记忆才能看到完整 Turn，因此 TurnCommitted 必须位于此调用之后。
@@ -200,7 +231,12 @@ class AgentLoop:
         ))
         await self._bus.publish_outbound(OutboundMessage(
             message.channel, message.chat_id, result.content, result.thinking, result.media,
-            {"turn_id": turn_id, "request_id": request_id, "status": "ok"},
+            {
+                "turn_id": turn_id,
+                "request_id": request_id,
+                "status": "ok",
+                "context_retry": context_retry,
+            },
         ))
         if resumed:
             self.interrupt_states.pop(message.session_key, None)

@@ -197,6 +197,50 @@ async def test_load_history_aligns_only_to_nearest_user_boundary(
     ]
 
 
+def test_load_history_starts_after_consolidation_cursor(
+    store: SessionStore,
+) -> None:
+    for role, content in [
+        ("user", "已压缩问题"),
+        ("assistant", "已压缩回答"),
+        ("user", "活动问题"),
+        ("assistant", "活动回答"),
+    ]:
+        store.add_message(
+            NewMessage(session_key="web:chat-1", role=role, content=content)
+        )
+    store.set_cursor("web:chat-1", 2)
+
+    history = store.load_history("web:chat-1", limit=40)
+
+    assert history == [
+        {"role": "user", "content": "活动问题"},
+        {"role": "assistant", "content": "活动回答"},
+    ]
+
+
+def test_load_history_never_aligns_before_consolidation_cursor(
+    store: SessionStore,
+) -> None:
+    for role, content in [
+        ("user", "已压缩问题"),
+        ("assistant", "cursor 落点"),
+        ("user", "活动问题"),
+        ("assistant", "活动回答"),
+    ]:
+        store.add_message(
+            NewMessage(session_key="web:chat-1", role=role, content=content)
+        )
+    store.set_cursor("web:chat-1", 1)
+
+    history = store.load_history("web:chat-1", limit=40)
+
+    assert history == [
+        {"role": "user", "content": "活动问题"},
+        {"role": "assistant", "content": "活动回答"},
+    ]
+
+
 @pytest.mark.asyncio
 async def test_fetch_messages_expands_context_and_marks_source(
     store: SessionStore,

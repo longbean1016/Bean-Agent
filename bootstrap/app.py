@@ -245,7 +245,7 @@ def build_core_runtime(
     # 主 Provider 是应用级共享资源，由 Runtime 最终关闭；MemoryEngine 只借用它执行
     # QueryRewriter/Consolidation，不拥有其生命周期。
     main_provider = provider or LLMProvider(config.llm)
-    sessions = SessionManager(root, history_window=config.session.history_window)
+    sessions = SessionManager(root, history_window=config.memory.context_window)
     events = EventBus()
     messages = MessageBus()
     proactive_store = ProactiveStore(root / "proactive.db")
@@ -308,7 +308,7 @@ def build_core_runtime(
         skills=skills,
         prompt_cache_log=prompt_cache_log,
         history_loader=sessions.load_history,
-        history_limit=config.session.history_window,
+        history_limit=config.memory.context_window,
         max_iterations=config.llm.max_iterations or 10,
         # 主模型和独立视觉模型是两条互斥的图片消费路径：前者直接接收图片块，
         # 后者只通过 read_image_vision 工具读取本地上传路径。
@@ -320,6 +320,7 @@ def build_core_runtime(
         events,
         pipeline,
         sessions,
+        context_guard=memory,
         max_concurrent_turns=config.agent.max_concurrent_turns,
         max_queued_turns=config.agent.max_queued_turns,
     )

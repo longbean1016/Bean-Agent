@@ -144,6 +144,59 @@ async def test_tool_search_unlocks_only_the_current_turn_schema() -> None:
 
 
 @pytest.mark.asyncio
+async def test_allowed_tools_do_not_change_system_prompt(tmp_path: Path) -> None:
+    class CapturingProvider:
+        def __init__(self) -> None:
+            self.messages: list[list[dict[str, object]]] = []
+            self.schema_names: list[list[str]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages.append(messages)
+            self.schema_names.append(
+                [item["function"]["name"] for item in (tools or [])]
+            )
+            return LLMResponse("完成")
+
+    tools = ToolRegistry()
+    tools.register(EchoTool())
+    tools.register(ToolSearchTool(tools), always_on=True)
+    provider = CapturingProvider()
+    pipeline = Pipeline(
+        provider,
+        tools,
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+    )
+
+    await pipeline.process(
+        InboundMessage(
+            channel="web",
+            sender="u",
+            chat_id="c",
+            content="第一次",
+            metadata={"allowed_tools": ["tool_search"]},
+        ),
+        turn_id="tools-first",
+    )
+    await pipeline.process(
+        InboundMessage(
+            channel="web",
+            sender="u",
+            chat_id="c",
+            content="第二次",
+            metadata={"allowed_tools": ["echo"]},
+        ),
+        turn_id="tools-second",
+    )
+
+    assert provider.messages[0][0]["content"] == provider.messages[1][0]["content"]
+    assert provider.schema_names == [["tool_search"], ["echo"]]
+    assert "tool_search" in str(provider.messages[0][-2]["content"])
+    assert "echo" in str(provider.messages[1][-2]["content"])
+
+
+@pytest.mark.asyncio
 async def test_pipeline_injects_explicit_skill_mention_into_dynamic_frame(
     tmp_path: Path,
 ) -> None:
@@ -602,7 +655,7 @@ def _assembler(tmp_path: Path) -> PromptAssembler:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_trims_old_history_by_complete_turn_and_keeps_memory(
+async def test_pipeline_trims_history_by_complete_turn_after_prompt_sections(
     tmp_path: Path,
 ) -> None:
     class OverflowProvider:
@@ -611,7 +664,7 @@ async def test_pipeline_trims_old_history_by_complete_turn_and_keeps_memory(
 
         async def chat(self, messages, tools=None, **kwargs):
             self.messages.append(messages)
-            if len(self.messages) < 3:
+            if len(self.messages) < 6:
                 raise ContextLengthError("maximum context length exceeded")
             return LLMResponse("裁剪成功")
 
@@ -651,17 +704,26 @@ async def test_pipeline_trims_old_history_by_complete_turn_and_keeps_memory(
     )
 
     assert result.content == "裁剪成功"
-    assert [item["role"] for item in provider.messages[2][1:5]] == [
+    assert [item["role"] for item in provider.messages[5][1:5]] == [
         "user",
         "assistant",
         "tool",
         "assistant",
     ]
-    assert "历史工具结果" in str(provider.messages[2])
-    assert "最近问题" in str(provider.messages[2])
-    assert "当前问题" in str(provider.messages[2])
-    assert "必须保留的长期记忆" in str(provider.messages[2][0]["content"])
-    assert "用户偏好简洁" in str(provider.messages[2])
+    assert "历史工具结果" in str(provider.messages[5])
+    assert "最近问题" in str(provider.messages[5])
+    assert "当前问题" in str(provider.messages[5])
+    assert "必须保留的长期记忆" not in str(provider.messages[5][0]["content"])
+    assert "用户偏好简洁" not in str(provider.messages[5])
+    assert result.context_retry["selected_plan"] == "half_history"
+    assert [item["name"] for item in result.context_retry["attempts"]] == [
+        "full",
+        "trim_skills_catalog",
+        "trim_auxiliary_context",
+        "trim_retrieved_memory",
+        "trim_long_term_memory",
+        "half_history",
+    ]
 
 
 @pytest.mark.asyncio
@@ -712,11 +774,11 @@ async def test_pipeline_disables_low_priority_sections_after_latest_turn(
     assert "最近回答" in final_payload
     assert "当前问题" in final_payload
     assert "关键长期记忆" in final_payload
-    assert "用户偏好简洁" in final_payload
+    assert "用户偏好简洁" not in final_payload
     assert "当前活跃工具" not in final_payload
-    assert "可裁剪的近期上下文" not in final_payload
+    assert "可裁剪的近期上下文" in final_payload
     assert "会话环境" not in final_payload
-    assert "可裁剪的自我认知" in final_payload
+    assert "可裁剪的自我认知" not in final_payload
 
 
 @pytest.mark.asyncio
@@ -746,7 +808,7 @@ async def test_pipeline_context_trimming_is_finite_and_reraises_original_error(
             turn_id="trim-bottom",
         )
 
-    assert provider.calls == 5
+    assert provider.calls == 7
 
 
 @pytest.mark.asyncio
@@ -792,3 +854,4 @@ async def test_pipeline_context_retry_after_tool_does_not_execute_tool_twice(
 
     assert result.content == "工具续轮成功"
     assert tool.calls == 1
+    assert result.context_retry["selected_plan"] == "trim_skills_catalog"

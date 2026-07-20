@@ -21,7 +21,6 @@ from agent.config_models import (
     MemoryConfig,
     OptimizerConfig,
     RetrievalConfig,
-    SessionConfig,
     WebChatConfig,
     VisionConfig,
 )
@@ -71,7 +70,6 @@ def load_config(path: str | Path = "config.toml") -> Config:
         extra_body=_load_llm_extra_body(llm_raw),
     )
 
-    session_raw = _as_dict(data.get("session"))
     agent_raw = _as_dict(data.get("agent"))
 
     # 根 Config 是所有配置的统一出口。记忆和通道存在多层嵌套，交给专用
@@ -79,9 +77,6 @@ def load_config(path: str | Path = "config.toml") -> Config:
     return Config(
         llm=llm,
         memory=_load_memory_config(data),
-        session=SessionConfig(
-            history_window=int(session_raw.get("history_window", 40))
-        ),
         agent=AgentConfig(
             workdir=str(agent_raw.get("workdir", ".")),
             max_concurrent_turns=int(agent_raw.get("max_concurrent_turns", 5)),
@@ -189,6 +184,8 @@ def _load_memory_config(data: dict[str, Any]) -> MemoryConfig:
         # enabled=False 时，后续 bootstrap 会跳过整个记忆引擎的创建。
         enabled=bool(raw.get("enabled", False)),
         engine_name=str(raw.get("engine_name", "default")),
+        # 历史加载和记忆压缩共用同一窗口，避免两套阈值产生分歧。
+        context_window=int(raw.get("context_window", 40)),
         # Embedding 密钥支持环境变量；若配置为空，后续组装层可复用 LLM 密钥。
         embedding=EmbeddingConfig(
             model=str(embedding_raw.get("model", "text-embedding-v3")),
