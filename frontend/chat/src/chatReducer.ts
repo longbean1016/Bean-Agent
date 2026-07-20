@@ -1,4 +1,4 @@
-import type { ChatAction, ChatMessage, ChatState, MessageRow, ToolActivity } from "./types";
+import type { ChatAction, ChatMessage, ChatState, MessageRow, ProactiveNotificationRow, ToolActivity } from "./types";
 
 export const initialChatState: ChatState = {
   sessionId: "",
@@ -18,6 +18,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
   if (action.type === "session.created") {
     return { ...initialChatState, sessionId: action.session_id };
   }
+  if (action.type === "session.subscribed") return state;
   if (action.type === "error") return { ...state, error: action.message };
   if (action.type === "pong") return state;
   if ("session_id" in action && state.sessionId && action.session_id !== state.sessionId) {
@@ -79,6 +80,27 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     }));
   }
   if (action.type === "message.final") {
+    if (!action.turn_id && (action.metadata?.proactive || action.metadata?.notification)) {
+      const id = action.message_id || String(action.metadata.message_id || `proactive-${state.messages.length}`);
+      if (state.messages.some((message) => message.id === id)) return state;
+      const source = String(action.metadata.source || "") as ChatMessage["source"];
+      return {
+        ...state,
+        messages: [...state.messages, {
+          id,
+          role: "assistant",
+          content: action.content,
+          thinking: action.thinking ?? "",
+          media: action.media ?? [],
+          tools: [],
+          streaming: false,
+          proactive: Boolean(action.metadata.proactive),
+          source,
+          scheduledAt: String(action.metadata.scheduled_at || "") || undefined,
+          timestamp: String(action.metadata.generated_at || "") || undefined,
+        }],
+      };
+    }
     // final 是服务端的权威快照，必须覆盖草稿，不能继续追加 delta。
     const next = updateTurn(state, action.turn_id, (message) => ({
       ...message,
@@ -125,7 +147,35 @@ export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {
     streaming: false,
     status: row.status,
     timestamp: row.timestamp,
+    proactive: Boolean(row.proactive),
+    source: row.proactive
+      ? (String(row.metadata?.source || "proactive_conversation") as ChatMessage["source"])
+      : undefined,
   }));
+}
+
+export function notificationRowsToMessages(rows: ProactiveNotificationRow[]): ChatMessage[] {
+  return rows.map((row) => ({
+    id: row.id,
+    role: "assistant",
+    content: row.content,
+    thinking: "",
+    media: [],
+    tools: [],
+    streaming: false,
+    source: row.source,
+    scheduledAt: row.scheduled_at,
+    timestamp: row.generated_at,
+  }));
+}
+
+export function mergeTimeline(...groups: ChatMessage[][]): ChatMessage[] {
+  return groups.flat().sort((left, right) => {
+    const leftTime = Date.parse(left.timestamp || "");
+    const rightTime = Date.parse(right.timestamp || "");
+    if (Number.isNaN(leftTime) || Number.isNaN(rightTime)) return 0;
+    return leftTime - rightTime;
+  });
 }
 
 function toolChainToActivities(chain: MessageRow["tool_chain"]): ToolActivity[] {

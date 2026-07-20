@@ -86,6 +86,17 @@ class Pipeline:
             "tools_used": [],
             "tool_chain_partial": [],
         }
+        raw_allowed_tools = message.metadata.get("allowed_tools")
+        allowed_tools = (
+            [str(name) for name in raw_allowed_tools if str(name).strip()]
+            if isinstance(raw_allowed_tools, (list, tuple, set))
+            else None
+        )
+        initial_tool_names = (
+            [name for name in allowed_tools if self._tools.has_tool(name)]
+            if allowed_tools is not None
+            else self._tools.get_always_on_order()
+        )
         tool_view = ToolRuntimeView.create(
             channel=message.channel,
             chat_id=message.chat_id,
@@ -93,10 +104,19 @@ class Pipeline:
             current_user_source_ref=str(
                 message.metadata.get("current_user_source_ref") or ""
             ),
-            visible_names=self._tools.get_always_on_order(),
+            visible_names=initial_tool_names,
         )
-        history = await self._history_loader(message.session_key, self._history_limit) if self._history_loader else []
-        retrieved = await self._memory.retrieve_for_turn(message) if self._memory else ""
+        # Scheduler soft Turn 与目标 Web 会话隔离；普通 Turn 不设置这些系统字段，
+        # 因而继续使用原有历史、记忆、流式事件和工具可见性。
+        skip_history = bool(message.metadata.get("skip_history"))
+        skip_memory = bool(message.metadata.get("skip_memory_retrieval"))
+        suppress_stream = bool(message.metadata.get("suppress_stream_events"))
+        history = (
+            await self._history_loader(message.session_key, self._history_limit)
+            if self._history_loader and not skip_history
+            else []
+        )
+        retrieved = await self._memory.retrieve_for_turn(message) if self._memory and not skip_memory else ""
         names = list(tool_view.visible_order)
         summary = "\n".join(
             f"- {name}: {tool.description}"
@@ -113,7 +133,7 @@ class Pipeline:
             workspace=self._workspace,
             channel=message.channel,
             chat_id=message.chat_id,
-            memory=self._memory,
+            memory=None if skip_memory else self._memory,
             retrieved_memory_block=retrieved,
             tools_summary=summary,
             active_tool_names=names,
@@ -136,6 +156,8 @@ class Pipeline:
             snapshot = self._interrupt_snapshots[turn_id]
             snapshot["partial_reply"] += str(delta.get("content_delta") or "")
             snapshot["partial_thinking"] += str(delta.get("thinking_delta") or "")
+            if suppress_stream:
+                return
             await self._events.emit(StreamDeltaReady(
                 session_key=message.session_key,
                 turn_id=turn_id,
@@ -239,8 +261,20 @@ class Pipeline:
             react_messages.append(assistant_message)
             group: dict[str, Any] = {"iteration": iteration, "text": response.content or "", "calls": [], "provider_fields": dict(response.provider_fields)}
             for call in response.tool_calls:
-                await self._events.emit(ToolCallStarted(message.session_key, turn_id, call.id, call.name, dict(call.arguments)))
+                if call.name not in tool_view.visible_names:
+                    result = normalize_tool_result(f"工具 '{call.name}' 未被当前执行上下文授权")
+                    append_tool_result(react_messages, tool_call_id=call.id, content=result, tool_name=call.name)
+                    group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "status": "error"})
+                    continue
+                if not suppress_stream:
+                    await self._events.emit(ToolCallStarted(message.session_key, turn_id, call.id, call.name, dict(call.arguments)))
                 execution_context: dict[str, Any] = tool_view.context
+                execution_context.update({
+                    "session_key": message.session_key,
+                    "channel": message.channel,
+                    "chat_id": message.chat_id,
+                    "request_time": str(message.metadata.get("request_time") or message.metadata.get("received_at") or ""),
+                })
                 if call.name == "tool_search":
                     # 搜索工具需要知道哪些 Schema 已在当前 Turn 可见，但不能
                     # 持有 View 本身，否则状态会重新泄漏到全局工具实例。
@@ -264,7 +298,8 @@ class Pipeline:
                         logger.warning("tool_search 返回了无法解析的结果")
                 status = "error" if result.text.startswith("工具执行出错:") or result.text.startswith("工具 '") else "ok"
                 append_tool_result(react_messages, tool_call_id=call.id, content=result, tool_name=call.name)
-                await self._events.emit(ToolCallCompleted(message.session_key, turn_id, call.id, call.name, status, result.preview()[:500]))
+                if not suppress_stream:
+                    await self._events.emit(ToolCallCompleted(message.session_key, turn_id, call.id, call.name, status, result.preview()[:500]))
                 group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "status": status})
                 tools_used.append(call.name)
                 # 一组内后续工具也可能阻塞或被取消；每完成一个调用就刷新快照，避免丢失已完成结果。

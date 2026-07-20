@@ -20,6 +20,9 @@ export interface ChatMessage {
   streaming?: boolean;
   status?: string;
   timestamp?: string;
+  proactive?: boolean;
+  source?: "scheduled_reminder" | "scheduled_soft" | "proactive_conversation";
+  scheduledAt?: string;
 }
 
 export interface ChatState {
@@ -48,6 +51,8 @@ export interface MessageRow {
   tool_chain?: Array<{ calls?: Array<{ call_id?: string; name?: string; arguments?: unknown; result?: string; status?: string }> }>;
   status?: string;
   timestamp?: string;
+  proactive?: boolean;
+  metadata?: Record<string, unknown>;
 }
 
 export interface UploadedFile {
@@ -57,14 +62,53 @@ export interface UploadedFile {
   media_type: string;
 }
 
+export interface ProactiveSettings {
+  session_key: string;
+  reminders_enabled: boolean;
+  reminder_quiet_policy: "delay" | "send" | "skip";
+  conversation_enabled: boolean;
+  activity_level: "restrained" | "balanced" | "active";
+  min_conversation_interval_hours: number;
+  daily_conversation_limit: number;
+  quiet_hours_enabled: boolean;
+  quiet_start: string;
+  quiet_end: string;
+  timezone: string;
+}
+
+export interface ScheduledReminder {
+  id: string;
+  name: string;
+  tier: "instant" | "soft";
+  trigger: "at" | "after" | "every";
+  fire_at: string;
+  enabled: boolean;
+  status: string;
+  run_count: number;
+  last_error: string;
+}
+
+export interface ProactiveNotificationRow {
+  id: string;
+  content: string;
+  source: "scheduled_reminder" | "scheduled_soft";
+  source_id: string;
+  scheduled_at: string;
+  generated_at: string;
+  delivered_at?: string | null;
+  status: "pending" | "delivered" | "seen";
+  recurring: boolean;
+}
+
 export type ChatFrame =
   | { type: "session.created"; request_id: string; session_id: string }
+  | { type: "session.subscribed"; request_id: string; session_id: string }
   | { type: "turn.started"; request_id?: string; session_id: string; turn_id: string }
   | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.thinking.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.tool.started"; session_id: string; turn_id: string; call_id: string; tool_name: string; arguments: unknown }
   | { type: "react.tool.completed"; session_id: string; turn_id: string; call_id: string; tool_name: string; status: string; result_preview: string }
-  | { type: "message.final"; request_id?: string; session_id: string; turn_id: string; content: string; thinking?: string; media?: string[] }
+  | { type: "message.final"; request_id?: string; session_id: string; turn_id: string; content: string; thinking?: string; media?: string[]; message_id?: string; metadata?: Record<string, unknown> }
   | { type: "turn.interrupted"; request_id: string; session_id: string; turn_id?: string; status: string; message?: string }
   | { type: "error"; request_id: string; code?: string; message: string }
   | { type: "pong"; request_id: string };

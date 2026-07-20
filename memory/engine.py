@@ -115,6 +115,11 @@ class MemoryEngine:
         recent_history = ""
         aux_queries = _string_list(request.context.get("aux_queries"))
         memory_types = list(request.filters.kinds) or None
+        if request.intent == "interest":
+            # 主动 Agent 只需要了解用户稳定兴趣与个人画像。这里固定收窄类型并丢弃
+            # 外部辅助查询，避免调用方借 filters/上下文扩大到事件或执行规则。
+            memory_types = ["preference", "profile"]
+            aux_queries = []
         if request.intent == "procedure":
             # 专用流程查询只查看规则和服务偏好，不触发任何 LLM 改写；调用方
             # 可提供一个已生成的辅助 query，原始行动描述始终保留为主 query。
@@ -210,6 +215,8 @@ class MemoryEngine:
         return MemoryQueryResult(records=records, trace={
             "engine": "default",
             "intent": request.intent,
+            "memory_types": memory_types,
+            "read_only": request.intent == "interest",
             "vector_keyword_fusion": True,
             "hyde_used": hyde_used,
             "hyde_hypothesis": hypothesis,

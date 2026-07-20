@@ -86,7 +86,13 @@ class AgentLoop:
             discard = getattr(self._pipeline, "discard_interrupt_snapshot", None)
             if callable(discard):
                 discard(turn_id)
-            self._bus.complete_inbound()
+            await self._bus.complete_inbound(message)
+
+    def is_session_busy(self, session_key: str) -> bool:
+        """供主动循环查询普通 Turn 占用状态，避免与用户请求并发发言。"""
+
+        task = self._active_tasks.get(session_key)
+        return task is not None and not task.done()
 
     async def _process_message(self, message: InboundMessage, turn_id: str) -> None:
         request_id = str(message.metadata.get("request_id") or "")
