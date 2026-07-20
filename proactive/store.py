@@ -78,6 +78,11 @@ class ProactiveStore:
                     ON proactive_notifications(session_key, status, generated_at);
                 """
             )
+            # 旧版本会把已完成或被勿扰策略跳过的一次性任务留在列表中。
+            # 新版本的通知已独立持久化，这些任务不再承担展示职责，可安全清理。
+            self._conn.execute(
+                "DELETE FROM scheduled_jobs WHERE status IN ('completed', 'skipped')"
+            )
             self._conn.commit()
 
     def get_settings(self, session_key: str) -> SessionProactiveSettings:

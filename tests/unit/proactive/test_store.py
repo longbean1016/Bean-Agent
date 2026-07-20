@@ -70,3 +70,18 @@ def test_recurring_notification_only_replaces_pending_occurrence(tmp_path) -> No
     assert third.id != latest.id
     assert [item.content for item in store.list_notifications("web:a")] == ["第二次", "第三次"]
     store.close()
+
+
+def test_reopen_removes_legacy_completed_jobs(tmp_path) -> None:
+    db_path = tmp_path / "proactive.db"
+    store = ProactiveStore(db_path)
+    job = ScheduledJob(
+        session_key="web:a", trigger="at", tier="instant",
+        fire_at=datetime.now(timezone.utc), message="旧提醒", status="completed", enabled=False,
+    )
+    store.add_job(job)
+    store.close()
+
+    reopened = ProactiveStore(db_path)
+    assert reopened.get_job(job.id) is None
+    reopened.close()
