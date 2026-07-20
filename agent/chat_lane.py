@@ -72,17 +72,20 @@ class ChatLaneManager:
         send: Callable[[], Awaitable[_T]],
     ) -> _T:
         state = self._state(channel, chat_id)
-        async with state.condition:
-            while state.sending:
-                await state.condition.wait()
-            state.sending = True
+        acquired = False
         try:
+            async with state.condition:
+                while state.sending:
+                    await state.condition.wait()
+                state.sending = True
+                acquired = True
             return await send()
         finally:
             async with state.condition:
                 if state.passive_sends > 0:
                     state.passive_sends -= 1
-                state.sending = False
+                if acquired:
+                    state.sending = False
                 state.condition.notify_all()
 
     async def run_non_passive(

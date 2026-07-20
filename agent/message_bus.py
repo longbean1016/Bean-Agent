@@ -61,7 +61,12 @@ class MessageBus:
 
     async def publish_inbound(self, message: InboundMessage) -> None:
         await self._chat_lane.mark_passive_pending(message.channel, message.chat_id)
-        await self._inbound.put(message)
+        try:
+            await self._inbound.put(message)
+        except BaseException:
+            # 入队在取消或关闭边界失败时必须回滚占用，否则主动消息会永久等待。
+            await self._chat_lane.mark_passive_done(message.channel, message.chat_id)
+            raise
 
     async def consume_inbound(self) -> InboundMessage:
         return await self._inbound.get()

@@ -65,5 +65,36 @@ async def test_cancelled_non_passive_ticket_does_not_block_next_sender() -> None
     assert sent == ["following"]
 
 
+@pytest.mark.asyncio
+async def test_cancelled_waiting_passive_send_releases_pending_count() -> None:
+    lane = ChatLaneManager()
+    blocker_started = asyncio.Event()
+    release_blocker = asyncio.Event()
+
+    async def block() -> None:
+        blocker_started.set()
+        await release_blocker.wait()
+
+    blocker = asyncio.create_task(lane.run_non_passive("web", "a", block))
+    await blocker_started.wait()
+    await lane.mark_passive_send_pending("web", "a")
+    waiting = asyncio.create_task(
+        lane.run_passive("web", "a", lambda: _append([], "never"))
+    )
+    await asyncio.sleep(0)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    release_blocker.set()
+    await blocker
+
+    sent: list[str] = []
+    await asyncio.wait_for(
+        lane.run_non_passive("web", "a", lambda: _append(sent, "recovered")),
+        timeout=0.1,
+    )
+    assert sent == ["recovered"]
+
+
 async def _append(target: list[str], value: str) -> None:
     target.append(value)
