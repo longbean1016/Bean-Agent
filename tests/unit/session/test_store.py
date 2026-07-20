@@ -386,17 +386,17 @@ def test_first_user_message_persists_default_title(
     assert meta["metadata"]["title"] == expected
 
 
-def test_default_title_truncates_to_forty_characters(store: SessionStore) -> None:
+def test_default_title_stores_eighty_characters_without_ellipsis(store: SessionStore) -> None:
     store.add_message(NewMessage(
         session_key="web:long-title",
         role="user",
-        content="项" * 45,
+        content="项" * 100,
     ))
 
     meta = store.get_session_meta("web:long-title")
 
     assert meta is not None
-    assert meta["metadata"]["title"] == "项" * 37 + "..."
+    assert meta["metadata"]["title"] == "项" * 80
 
 
 def test_default_title_does_not_replace_manual_title(store: SessionStore) -> None:
