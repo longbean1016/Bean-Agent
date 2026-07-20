@@ -139,8 +139,7 @@ body { overflow: hidden; }
 button, textarea, input { font: inherit; letter-spacing: 0; }
 button { color: inherit; }
 /* 可交互元素统一过渡，避免零散 hover 各自定义。transform 不影响布局断言。 */
-button, .icon-button, .send-button, .new-chat-button, .session-row, .session-menu button, .example-prompts button, .scroll-latest, .memory-citation-chip, .theme-control button, .connection-state, .toggle, .help-button, .mermaid-tabs button, .mermaid-actions button, .mermaid-zoom-controls button, .mermaid-fullscreen-close, [data-streamdown="code-block-copy-button"] { transition: background-color .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease, transform .08s ease, opacity .15s ease; }
-button:active, .icon-button:active, .send-button:active, .new-chat-button:active, .session-menu button:active, .example-prompts button:active, .scroll-latest:active, .memory-citation-chip:active, .theme-control button:active, .mermaid-tabs button:active, .mermaid-actions button:active, .mermaid-zoom-controls button:active, .mermaid-fullscreen-close:active, [data-streamdown="code-block-copy-button"]:active { transform: scale(0.97); }
+button, .icon-button, .send-button, .new-chat-button, .session-row, .session-menu button, .example-prompts button, .scroll-latest, .memory-citation-chip, .theme-control button, .connection-state, .toggle, .help-button, .mermaid-tabs button, .mermaid-actions button, .mermaid-zoom-controls button, .mermaid-fullscreen-close, [data-streamdown="code-block-copy-button"] { transition: background-color .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease, opacity .15s ease; }
 
 .app-shell { display: grid; grid-template-columns: 272px minmax(0, 1fr); min-height: 0; height: 100%; overflow: hidden; background: var(--bg); }
 .desktop-sidebar { min-width: 0; min-height: 0; height: 100%; overflow: hidden; border-right: 1px solid var(--border); background: var(--surface-muted); }
