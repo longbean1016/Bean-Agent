@@ -253,6 +253,54 @@ def test_get_history_aligns_turn_and_expands_tools_with_truncation() -> None:
     assert history[3]["reasoning_content"] == "最终思考"
 
 
+@pytest.mark.asyncio
+async def test_load_history_uses_cursor_without_deleting_full_session(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path, history_window=40)
+    session = await manager.get_or_create("web:chat-1")
+    for role, content in [
+        ("user", "已压缩问题"),
+        ("assistant", "已压缩回答"),
+        ("user", "活动问题"),
+        ("assistant", "活动回答"),
+    ]:
+        session.add_message(role, content)
+    session.last_consolidated = 2
+
+    history = await manager.load_history(session.key)
+
+    assert [item["content"] for item in history] == ["活动问题", "活动回答"]
+    assert [item["content"] for item in session.messages] == [
+        "已压缩问题",
+        "已压缩回答",
+        "活动问题",
+        "活动回答",
+    ]
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_load_history_does_not_align_before_misaligned_cursor(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path, history_window=40)
+    session = await manager.get_or_create("web:chat-1")
+    for role, content in [
+        ("user", "已压缩问题"),
+        ("assistant", "cursor 落点"),
+        ("user", "活动问题"),
+        ("assistant", "活动回答"),
+    ]:
+        session.add_message(role, content)
+    session.last_consolidated = 1
+
+    history = await manager.load_history(session.key)
+
+    assert [item["content"] for item in history] == ["活动问题", "活动回答"]
+    await manager.close()
+
+
 def test_clear_resets_cached_messages_and_cursor() -> None:
     session = Session(session_key="web:chat-1", last_consolidated=9)
     session.add_message("user", "待清理")

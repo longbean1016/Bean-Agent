@@ -721,15 +721,20 @@ class SessionStore:
 
         with self._lock:
             self._ensure_open()
+            meta = self._conn.execute(
+                "SELECT last_consolidated FROM sessions WHERE key = ?",
+                (key,),
+            ).fetchone()
+            cursor = max(0, int(meta["last_consolidated"] or 0)) if meta else 0
             rows = self._conn.execute(
                 f"""
                 SELECT {_MESSAGE_COLUMNS}
                 FROM messages
-                WHERE session_key = ?
+                WHERE session_key = ? AND seq >= ?
                 ORDER BY seq DESC
                 LIMIT ?
                 """,
-                (key, safe_limit),
+                (key, cursor, safe_limit),
             ).fetchall()
 
             # limit 只决定基础窗口大小。若窗口从 assistant 开始，继续向前
@@ -740,11 +745,11 @@ class SessionStore:
                     """
                     SELECT seq
                     FROM messages
-                    WHERE session_key = ? AND role = ? AND seq < ?
+                    WHERE session_key = ? AND role = ? AND seq >= ? AND seq < ?
                     ORDER BY seq DESC
                     LIMIT 1
                     """,
-                    (key, "user", int(rows[-1]["seq"])),
+                    (key, "user", cursor, int(rows[-1]["seq"])),
                 ).fetchone()
                 if boundary is not None:
                     rows = self._conn.execute(
@@ -757,6 +762,10 @@ class SessionStore:
                         (key, int(boundary["seq"])),
                     ).fetchall()
         persisted = [self._row_to_message(row) for row in reversed(rows)]
+        # cursor 可能来自旧版本或人工修复并落在 assistant 上。没有合法 user
+        # 边界时丢弃孤立前缀，绝不能越过 cursor 重新加载已压缩原文。
+        while persisted and persisted[0]["role"] != "user":
+            persisted.pop(0)
 
         history: list[dict[str, Any]] = []
         for message in persisted:

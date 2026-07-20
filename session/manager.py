@@ -134,19 +134,27 @@ class Session:
         max_messages: int = 500,
         *,
         start_index: int | None = None,
+        boundary_floor: int = 0,
     ) -> list[dict[str, Any]]:
-        """从完整消息缓存构建 OpenAI 格式历史，并保持完整 user Turn。"""
+        """从完整消息缓存构建 OpenAI 格式历史，并保持完整 user Turn。
+
+        boundary_floor 是已压缩区的右边界。窗口可以在活动区内向前补齐，
+        但不能跨过该边界重新加载已由近期摘要承接的原文。
+        """
 
         if start_index is not None:
             if max_messages <= 0:
                 return []
-            start = max(0, int(start_index))
+            floor = max(0, min(int(boundary_floor), len(self.messages)))
+            start = max(floor, int(start_index))
             if start >= len(self.messages):
                 return []
             # 窗口落在 assistant 上时向前回退到最近 user，不能截断其工具链。
-            while start > 0 and self.messages[start].get("role") != "user":
+            while start > floor and self.messages[start].get("role") != "user":
                 start -= 1
             messages = self.messages[start:]
+            # cursor 异常落在 assistant 上时，不能越过 cursor 找已压缩 user；
+            # 丢弃孤立前缀直到下一个合法 Turn，比发送残缺工具链更安全。
             while messages and messages[0].get("role") != "user":
                 messages = messages[1:]
         elif max_messages <= 0:
@@ -340,7 +348,7 @@ class SessionManager:
         session_key: str,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """从完整 Session 缓存生成最近历史，并向前补齐 user Turn。
+        """从 cursor 后的活动 Session 生成历史，并向前补齐 user Turn。
 
         limit 表示基础消息窗口，不是严格返回数量。若窗口落在 assistant 上，
         会向前扩展到最近 user，确保工具调用与最终回复不会脱离所属 Turn。
@@ -348,8 +356,13 @@ class SessionManager:
 
         session = await self.get_or_create(session_key)
         actual_limit = self._history_window if limit is None else max(0, int(limit))
-        start = max(0, len(session.messages) - actual_limit)
-        return session.get_history(max_messages=actual_limit, start_index=start)
+        cursor = max(0, min(int(session.last_consolidated), len(session.messages)))
+        start = max(cursor, len(session.messages) - actual_limit)
+        return session.get_history(
+            max_messages=actual_limit,
+            start_index=start,
+            boundary_floor=cursor,
+        )
 
     def invalidate(self, session_key: str) -> None:
         """丢弃整个 Session 缓存，下次访问从 SQLite 完整重载。"""
