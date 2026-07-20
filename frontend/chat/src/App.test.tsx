@@ -120,6 +120,18 @@ it("首次连接创建 Session 并发送用户消息", async () => {
   expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
 });
 
+it("新建会话会清空其他会话中尚未发送的输入", async () => {
+  render(<App />);
+  await screen.findByText("已连接");
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
+  fireEvent.change(input, { target: { value: "不应带到新会话" } });
+
+  fireEvent.click(screen.getByRole("button", { name: "新建会话" }));
+
+  expect(input).toHaveValue("");
+});
+
 it("延迟返回的旧会话列表不会移除正在排队的新会话", async () => {
   let resolveSessions!: (response: Response) => void;
   const delayedSessions = new Promise<Response>((resolve) => { resolveSessions = resolve; });
@@ -151,6 +163,7 @@ it("排队时展示动态位置并允许停止取消", async () => {
   const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
   fireEvent.change(input, { target: { value: "需要排队的问题" } });
   fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send")).toBe(true));
   const sent = socket.sent.find((frame) => frame.type === "message.send");
 
   socket.onmessage?.({ data: JSON.stringify({
@@ -175,8 +188,11 @@ it("排队时展示动态位置并允许停止取消", async () => {
 });
 
 it("切回后台运行会话时恢复用户问题流式内容和工具状态", async () => {
+  let resolveComponentHistory!: (response: Response) => void;
+  const delayedComponentHistory = new Promise<Response>((resolve) => { resolveComponentHistory = resolve; });
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.includes("web%3Acomponent/messages")) return delayedComponentHistory;
     const payload = url.includes("/messages") || url.includes("/notifications")
       ? { items: [], total: 0 }
       : {
@@ -195,7 +211,12 @@ it("切回后台运行会话时恢复用户问题流式内容和工具状态", a
   const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
   fireEvent.change(input, { target: { value: "分析当前项目" } });
   fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send")).toBe(true));
   const sent = socket.sent.find((frame) => frame.type === "message.send");
+  await act(async () => {
+    resolveComponentHistory({ ok: true, json: async () => ({ items: [], total: 0 }) } as Response);
+    await delayedComponentHistory;
+  });
   socket.onmessage?.({ data: JSON.stringify({
     type: "turn.queued", request_id: sent?.request_id, session_id: "web:component", position: 1,
   }) } as MessageEvent);

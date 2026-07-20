@@ -150,7 +150,7 @@ export function App() {
   const chatRef = useRef(chat);
   chatRef.current = chat;
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
-  const turnActive = currentTurn.status === "queued" || currentTurn.status === "running";
+  const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running";
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -247,6 +247,8 @@ export function App() {
     localStorage.removeItem(SESSION_STORAGE_KEY);
     dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
     clientRef.current?.send({ type: "session.create", request_id: crypto.randomUUID() });
+    setInput("");
+    setFiles([]);
     setSidebarOpen(false);
   };
 
@@ -282,6 +284,7 @@ export function App() {
         tools: [],
       };
       dispatch({ type: "ui.user.append", message: optimistic });
+      dispatch({ type: "ui.turn.submitted", sessionId: chat.sessionId, requestId });
       const sent = clientRef.current?.send({
         type: "message.send",
         request_id: requestId,
@@ -289,7 +292,16 @@ export function App() {
         text: cleanText,
         media: uploaded.map((item) => item.upload_path),
       });
-      if (!sent) throw new Error("消息未发送，WebSocket 已断开");
+      if (!sent) {
+        dispatch({
+          type: "error",
+          request_id: requestId,
+          session_id: chat.sessionId,
+          code: "closed",
+          message: "消息未发送，WebSocket 已断开",
+        });
+        return;
+      }
       const submittedAt = new Date().toISOString();
       // 新会话的首轮可能长期运行或排队，发送成功后先放入目录，最终再由服务端标题覆盖。
       setSessions((current) => current.some((session) => session.key === chat.sessionId)
@@ -917,7 +929,7 @@ function AttachmentGallery({ paths }: { paths: string[] }) {
 }
 
 function Composer(props: {
-  input: string; files: File[]; active: boolean; turnStatus: "idle" | "queued" | "running"; queuePosition: number | null; connected: boolean; sending: boolean;
+  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running"; queuePosition: number | null; connected: boolean; sending: boolean;
   onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
@@ -1023,6 +1035,7 @@ function Composer(props: {
               {props.queuePosition === 1 ? "排队中 · 即将开始" : `排队中 · 前面还有 ${(props.queuePosition ?? 1) - 1} 个会话`}
             </span>
           ) : null}
+          {props.turnStatus === "submitting" ? <span className="queue-status" role="status">正在提交...</span> : null}
           {props.active ? (
             <button className="send-button stop" aria-label="停止" onClick={props.onStop}><CircleStop size={18} /><span>停止</span></button>
           ) : (

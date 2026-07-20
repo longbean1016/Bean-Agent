@@ -19,9 +19,10 @@ export const initialChatState: ChatState = {
 export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState {
   if (action.type === "ui.session.select") {
     const turn = state.turnStates[action.sessionId] ?? idleTurnState;
-    const active = turn.status === "queued" || turn.status === "running";
+    const active = turn.status === "submitting" || turn.status === "queued" || turn.status === "running";
     const cached = state.sessionMessages[action.sessionId];
-    let messages = active && cached ? cached : action.messages;
+    // HTTP 历史可能在发送确认前返回空结果；只要本地有快照，就不能用空历史覆盖它。
+    let messages = cached && (active || action.messages.length === 0) ? cached : action.messages;
     if (turn.status === "running" && turn.turnId
       && !messages.some((message) => message.turnId === turn.turnId)) {
       messages = [...messages, createDraft(turn.turnId)];
@@ -42,6 +43,17 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       messages,
       sessionMessages: setSessionMessages(state, state.sessionId, messages),
       error: "",
+    };
+  }
+  if (action.type === "ui.turn.submitted") {
+    return {
+      ...state,
+      turnStates: setTurnState(state, action.sessionId, {
+        status: "submitting",
+        queuePosition: null,
+        turnId: "",
+        requestId: action.requestId,
+      }),
     };
   }
   if (action.type === "ui.error.clear") return { ...state, error: "" };

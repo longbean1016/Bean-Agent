@@ -3,6 +3,17 @@ import { describe, expect, it } from "vitest";
 import { initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame } from "./chatReducer";
 
 describe("reduceChatFrame", () => {
+  it("提交确认后会从提交中切换到排队状态", () => {
+    let state = { ...initialChatState, sessionId: "web:one" };
+    state = reduceChatFrame(state, {
+      type: "ui.turn.submitted", sessionId: "web:one", requestId: "r1",
+    });
+    state = reduceChatFrame(state, {
+      type: "turn.queued", session_id: "web:one", request_id: "r1", position: 1,
+    });
+    expect(state.turnStates["web:one"].status).toBe("queued");
+  });
+
   it("排队会话切走再切回仍保留用户问题", () => {
     let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
       type: "ui.user.append",
