@@ -89,6 +89,7 @@ class MemoryEngine:
             if consolidation_threshold is None
             else consolidation_threshold
         )
+        self._context_guard_threshold = derived_keep_count + derived_threshold
         self._consolidator = Consolidator(
             sessions, self._markdown,
             consolidation_extractor or _LLMConsolidationExtractor(provider),
@@ -388,14 +389,59 @@ class MemoryEngine:
             scope_chat_id=event.chat_id,
             conversation=result.conversation,
         )
-        # outbox 必须先于事件派发持久化。cursor 已代表 Markdown 提交；若进程在派发前
-        # 崩溃，下次 Turn 仍能从 SQLite 重放向量同步，而不会重新归档旧窗口。
+        # outbox 必须先于 cursor 和事件派发持久化；若进程在派发前崩溃，
+        # 下次 Turn 仍能从 SQLite 重放向量同步，而不会丢失已归档窗口的派生任务。
         self._store.enqueue_consolidation(result.source_ref, _consolidation_payload(committed))
+        # cursor 是模型历史的排除边界，只有 Markdown 和 outbox 都可恢复后才能推进。
+        self._sessions.set_cursor(event.session_key, result.cursor)
         if self._event_bus is not None:
             await self._event_bus.emit(committed)
         else:
             await self.on_consolidation_committed(committed)
         return result
+
+    async def ensure_context_ready(self, session_key: str) -> bool:
+        """在普通 Turn 前确保未归档历史没有越过安全阈值。
+
+        正常压缩仍由 TurnCommitted 后台触发；这里只处理后台尚未完成或曾经
+        失败的积压。cursor 必须真实推进才算恢复，避免压缩器静默跳过后继续
+        把过量原文送入模型。
+        """
+
+        key = str(session_key or "").strip()
+        if not key:
+            raise ValueError("session_key 不能为空")
+        messages = self._sessions.fetch_session_messages(key)
+        before = max(0, min(self._sessions.get_cursor(key), len(messages)))
+        if len(messages) - before < self._context_guard_threshold:
+            return True
+
+        channel, _, chat_id = key.partition(":")
+        event = TurnIngested(
+            session_key=key,
+            channel=channel,
+            chat_id=chat_id,
+            user_message="",
+            assistant_response="",
+            tool_chain=[],
+            source_ref=key,
+        )
+        try:
+            await self._run_consolidation_serialized(event)
+        except Exception:
+            logger.exception("Turn 前记忆归档失败: session_key=%s", key)
+            return False
+        return self._sessions.get_cursor(key) > before
+
+    async def _run_consolidation_serialized(
+        self,
+        event: TurnIngested,
+    ) -> ConsolidationResult | None:
+        """让后台维护与 Turn 前保护共享同一 Session 的压缩临界区。"""
+
+        lock = self._maintenance_locks.setdefault(event.session_key, asyncio.Lock())
+        async with lock:
+            return await self._run_consolidation(event)
 
     async def on_consolidation_committed(self, event: ConsolidationCommitted) -> None:
         for index, (summary, emotional_weight) in enumerate(event.history_entry_payloads):
@@ -493,27 +539,24 @@ class MemoryEngine:
         self._maintenance_tasks[event.session_key] = task
 
     async def _run_maintenance_queue(self, session_key: str) -> None:
-        lock = self._maintenance_locks.setdefault(session_key, asyncio.Lock())
         try:
-            async with lock:
-                while True:
-                    queue = self._maintenance_queues.get(session_key)
-                    if not queue:
-                        return
-                    event = queue.popleft()
-                    try:
-                        await self._run_consolidation(event)
-                    except Exception:
-                        # Session 已提交，维护失败只保留 cursor 供后续重试，不能终止其它
-                        # Session 的独立任务，也不能回滚正常回复。
-                        logger.exception("会话记忆归档失败: session_key=%s", session_key)
+            while True:
+                queue = self._maintenance_queues.get(session_key)
+                if not queue:
+                    return
+                event = queue.popleft()
+                try:
+                    await self._run_consolidation_serialized(event)
+                except Exception:
+                    # Session 已提交，维护失败只保留 cursor 供后续重试，不能终止其它
+                    # Session 的独立任务，也不能回滚正常回复。
+                    logger.exception("会话记忆归档失败: session_key=%s", session_key)
         finally:
             current = asyncio.current_task()
             if self._maintenance_tasks.get(session_key) is current:
                 self._maintenance_tasks.pop(session_key, None)
             if not self._maintenance_queues.get(session_key):
                 self._maintenance_queues.pop(session_key, None)
-                self._maintenance_locks.pop(session_key, None)
 
     def _build_turn_snapshot(self, event: Any) -> TurnIngested:
         def value(name: str, default: Any = "") -> Any:
@@ -576,6 +619,7 @@ class MemoryEngine:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._maintenance_locks.clear()
         # 最后关闭本地数据库和 Embedder HTTP 客户端；Provider 由应用组装层共享。
         self._store.close()
         self._markdown.close()
