@@ -266,8 +266,10 @@ async def test_two_turn_closed_loop_restores_history_and_memory(tmp_path: Path) 
         await memory.drain()
 
         rows = sessions.store.fetch_session_messages("web:c")
+        listed, _ = sessions.store.list_chat_sessions(channel="web")
         second_prompt = provider.pipeline_messages[-1]
         assert [row["role"] for row in rows] == ["user", "assistant", "user", "assistant"]
+        assert listed[0]["title"] == "执行第一轮"
         assert rows[1]["tool_chain"][0]["calls"][0]["name"] == "echo"
         assert any(item.get("role") == "tool" and "echo:第一轮" in item.get("content", "") for item in second_prompt)
         assert any("用户偏好中文回答" in str(item.get("content")) for item in second_prompt)

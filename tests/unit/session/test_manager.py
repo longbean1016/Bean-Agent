@@ -136,6 +136,21 @@ async def test_completed_turn_persists_user_and_assistant_in_one_batch(
 
 
 @pytest.mark.asyncio
+async def test_append_first_user_message_keeps_default_title_in_cache(
+    manager: SessionManager,
+) -> None:
+    session = await manager.get_or_create("web:title-cache")
+    user = session.add_message("user", "分析缓存标题", turn_id="turn-1")
+
+    await manager.append_messages(session, [user])
+
+    assert session.metadata["title"] == "分析缓存标题"
+    persisted = manager.store.get_session_meta(session.key)
+    assert persisted is not None
+    assert persisted["metadata"]["title"] == "分析缓存标题"
+
+
+@pytest.mark.asyncio
 async def test_stale_cached_session_cannot_regress_consolidation_cursor(
     manager: SessionManager,
 ) -> None:

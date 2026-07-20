@@ -440,6 +440,17 @@ class SessionManager:
                     extra=extra,
                 )
             )
+            if str(message.get("role") or "") == "user" and not session.metadata.get("title"):
+                # Store 在首条用户消息事务内生成标题；这里同步缓存，防止随后的
+                # metadata upsert 用旧内存快照覆盖刚生成的默认标题。
+                stored_meta = self._store.get_session_meta(session.key)
+                stored_title = (
+                    stored_meta.get("metadata", {}).get("title")
+                    if stored_meta is not None
+                    else ""
+                )
+                if stored_title:
+                    session.metadata["title"] = str(stored_title)
             # 原地更新很关键：调用方持有的消息字典立即获得稳定 ID，后续
             # TurnCommitted 和重复保存都以同一对象为准。
             message.update(row)
