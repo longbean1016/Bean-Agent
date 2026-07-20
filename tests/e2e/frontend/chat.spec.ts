@@ -60,6 +60,19 @@ test("展示结构化错误并停止活跃 Turn", async ({ page }) => {
   await expect(page.getByText("已停止")).toBeVisible();
 });
 
+test("展示排队位置并允许取消等待任务", async ({ page }) => {
+  const input = page.getByPlaceholder("输入消息，或附加文本与图片");
+  await input.fill("排队测试");
+  await page.getByRole("button", { name: "发送" }).click();
+
+  await expect(page.getByText("排队中 · 即将开始")).toBeVisible();
+  await expect(page.getByText("排队中 · 前面还有 1 个会话")).toBeVisible();
+  await page.getByRole("button", { name: "停止" }).click();
+
+  await expect(page.getByText("排队中 · 前面还有 1 个会话")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "发送" })).toBeVisible();
+});
+
 test("上传文本附件并在断线后自动重连", async ({ page }) => {
   const chooser = page.locator('input[type="file"]');
   await chooser.setInputFiles([

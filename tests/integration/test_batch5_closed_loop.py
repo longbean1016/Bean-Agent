@@ -69,6 +69,104 @@ class WebSocket:
 
 
 @pytest.mark.asyncio
+async def test_web_concurrent_queue_cancel_and_promotion_closed_loop(
+    tmp_path: Path,
+) -> None:
+    """真实总线和 WebChannel 必须保持排队位置、取消与晋升事件顺序。"""
+
+    class BlockingPipeline:
+        def __init__(self) -> None:
+            self.started: dict[str, asyncio.Event] = {}
+            self.release: dict[str, asyncio.Event] = {}
+
+        def started_event(self, chat_id: str) -> asyncio.Event:
+            return self.started.setdefault(chat_id, asyncio.Event())
+
+        def release_event(self, chat_id: str) -> asyncio.Event:
+            return self.release.setdefault(chat_id, asyncio.Event())
+
+        async def process(self, message, *, turn_id):
+            self.started_event(message.chat_id).set()
+            await self.release_event(message.chat_id).wait()
+            return SimpleNamespace(
+                content=f"完成-{message.chat_id}",
+                thinking="",
+                media=[],
+                tool_chain=[],
+                tools_used=[],
+            )
+
+    bus = MessageBus()
+    events = EventBus()
+    sessions = SessionManager(tmp_path)
+    pipeline = BlockingPipeline()
+    loop = AgentLoop(
+        bus,
+        events,
+        pipeline,
+        sessions,
+        max_concurrent_turns=1,
+        max_queued_turns=2,
+    )
+    channel = WebChannel(bus, events, loop)
+    websocket = WebSocket()
+    runner = asyncio.create_task(loop.run())
+    try:
+        for chat_id in ("a", "b", "c"):
+            await channel.handle_frame(websocket, {
+                "type": "message.send",
+                "request_id": f"r-{chat_id}",
+                "session_id": f"web:{chat_id}",
+                "text": f"问题-{chat_id}",
+            })
+        await asyncio.wait_for(pipeline.started_event("a").wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        queued = [frame for frame in websocket.frames if frame["type"] == "turn.queued"]
+        assert [(frame["session_id"], frame["position"]) for frame in queued[-2:]] == [
+            ("web:b", 1),
+            ("web:c", 2),
+        ]
+
+        await channel.handle_frame(websocket, {
+            "type": "turn.stop",
+            "request_id": "stop-b",
+            "session_id": "web:b",
+        })
+        assert websocket.frames[-1]["status"] == "cancelled"
+        assert any(
+            frame["type"] == "turn.queued"
+            and frame["session_id"] == "web:c"
+            and frame["position"] == 1
+            for frame in websocket.frames
+        )
+
+        pipeline.release_event("a").set()
+        await asyncio.wait_for(pipeline.started_event("c").wait(), timeout=1)
+        pipeline.release_event("c").set()
+        await asyncio.sleep(0.05)
+
+        assert any(
+            frame["type"] == "turn.started" and frame["session_id"] == "web:c"
+            for frame in websocket.frames
+        )
+        assert any(
+            frame["type"] == "message.final"
+            and frame["session_id"] == "web:c"
+            and frame["content"] == "完成-c"
+            for frame in websocket.frames
+        )
+    finally:
+        for event in pipeline.release.values():
+            event.set()
+        await loop.close()
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        await channel.close()
+        await sessions.close()
+
+
+@pytest.mark.asyncio
 async def test_web_message_explicit_builtin_skill_uses_dynamic_context(
     tmp_path: Path,
 ) -> None:
