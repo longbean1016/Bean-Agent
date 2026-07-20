@@ -175,7 +175,6 @@ def _load_memory_config(data: dict[str, Any]) -> MemoryConfig:
     # 先把四个 TOML 子表拆开，随后逐一映射到对应 dataclass。
     # 每个子配置由 default_factory 独立创建，不会在 Config 实例间共享状态。
     raw = _as_dict(data.get("memory"))
-    legacy_session = _as_dict(data.get("session"))
     embedding_raw = _as_dict(raw.get("embedding"))
     optimizer_raw = _as_dict(raw.get("optimizer"))
     retrieval_raw = _as_dict(raw.get("retrieval"))
@@ -185,10 +184,8 @@ def _load_memory_config(data: dict[str, Any]) -> MemoryConfig:
         # enabled=False 时，后续 bootstrap 会跳过整个记忆引擎的创建。
         enabled=bool(raw.get("enabled", False)),
         engine_name=str(raw.get("engine_name", "default")),
-        # 旧字段只作为配置读取兼容入口；装配完成后不再保留第二套窗口。
-        context_window=int(
-            raw.get("context_window", legacy_session.get("history_window", 40))
-        ),
+        # 历史加载和记忆压缩共用同一窗口，避免两套阈值产生分歧。
+        context_window=int(raw.get("context_window", 40)),
         # Embedding 密钥支持环境变量；若配置为空，后续组装层可复用 LLM 密钥。
         embedding=EmbeddingConfig(
             model=str(embedding_raw.get("model", "text-embedding-v3")),

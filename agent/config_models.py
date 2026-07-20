@@ -105,7 +105,7 @@ class MemoryConfig:
 
     @property
     def aligned_context_window(self) -> int:
-        """按 Akashic 的四消息边界向上对齐活动窗口。"""
+        """将活动窗口向上对齐到四消息边界。"""
 
         return max(4, ((self.context_window + 3) // 4) * 4)
 

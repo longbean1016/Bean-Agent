@@ -104,9 +104,6 @@ supersede_threshold = 0.8
 event_dedup_threshold = 0.85
 event_dedup_window_days = 5
 
-[session]
-history_window = 25
-
 [agent]
 workdir = "runtime"
 max_concurrent_turns = 3
@@ -156,7 +153,7 @@ port = 8000
     assert config.channels.chat.channel_name == "web"
 
 
-def test_legacy_session_history_window_maps_to_memory_context_window(
+def test_session_history_window_does_not_override_memory_default(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "legacy.toml"
@@ -167,12 +164,12 @@ def test_legacy_session_history_window_maps_to_memory_context_window(
 
     config = load_config(config_path)
 
-    assert config.memory.context_window == 28
-    assert config.memory.keep_count == 14
+    assert config.memory.context_window == 40
+    assert config.memory.keep_count == 20
     assert not hasattr(config, "session")
 
 
-def test_memory_context_window_rounds_up_like_akashic(tmp_path: Path) -> None:
+def test_memory_context_window_rounds_up_to_message_boundary(tmp_path: Path) -> None:
     config_path = tmp_path / "rounding.toml"
     config_path.write_text(
         "[memory]\ncontext_window = 41\n",
