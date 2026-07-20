@@ -138,6 +138,9 @@ html, body, #root { width: 100%; min-width: 320px; height: 100%; margin: 0; }
 body { overflow: hidden; }
 button, textarea, input { font: inherit; letter-spacing: 0; }
 button { color: inherit; }
+/* 可交互元素统一过渡，避免零散 hover 各自定义。transform 不影响布局断言。 */
+button, .icon-button, .send-button, .new-chat-button, .session-row, .session-menu button, .example-prompts button, .scroll-latest, .memory-citation-chip, .theme-control button, .connection-state, .toggle, .help-button, .mermaid-tabs button, .mermaid-actions button, .mermaid-zoom-controls button, .mermaid-fullscreen-close, [data-streamdown="code-block-copy-button"] { transition: background-color .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease, transform .08s ease, opacity .15s ease; }
+button:active, .icon-button:active, .send-button:active, .new-chat-button:active, .session-menu button:active, .example-prompts button:active, .scroll-latest:active, .memory-citation-chip:active, .theme-control button:active, .mermaid-tabs button:active, .mermaid-actions button:active, .mermaid-zoom-controls button:active, .mermaid-fullscreen-close:active, [data-streamdown="code-block-copy-button"]:active { transform: scale(0.97); }
 
 .app-shell { display: grid; grid-template-columns: 272px minmax(0, 1fr); min-height: 0; height: 100%; overflow: hidden; background: var(--bg); }
 .desktop-sidebar { min-width: 0; min-height: 0; height: 100%; overflow: hidden; border-right: 1px solid var(--border); background: var(--surface-muted); }
@@ -173,7 +176,7 @@ button { color: inherit; }
 .session-menu button:hover { background: var(--surface-3); }
 .session-menu button.danger { color: var(--danger); }
 .session-title-input { align-self: center; min-width: 0; height: 30px; margin-left: 6px; padding: 0 7px; border: 1px solid var(--primary); border-radius: 4px; outline: none; background: var(--surface); color: inherit; font-size: 13px; }
-.delete-session-dialog { position: fixed; z-index: 31; top: 50%; left: 50%; width: min(420px, calc(100vw - 32px)); padding: 22px; transform: translate(-50%, -50%); border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow-lg); }
+.delete-session-dialog { position: fixed; z-index: 31; top: 50%; left: 50%; width: min(420px, calc(100vw - 32px)); padding: 22px; transform: translate(-50%, -50%); border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow-lg); animation: dialog-in .18s ease-out; }
 .delete-session-dialog h2 { margin: 0; font-size: 17px; }
 .delete-session-dialog p { margin: 14px 0 20px; color: var(--text-muted); font-size: 13px; line-height: 1.7; }
 .delete-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
@@ -206,7 +209,7 @@ button { color: inherit; }
 .conversation-content { min-width: 0; min-height: 100%; padding: 28px max(24px, calc((100% - 880px) / 2)) 90px; }
 .scroll-latest { position: absolute; z-index: 3; right: max(24px, calc((100% - 880px) / 2)); bottom: 116px; display: inline-grid; width: 36px; height: 36px; padding: 0; place-items: center; border: 1px solid #bdcbc6; border-radius: 50%; background: var(--surface); color: #27514b; box-shadow: 0 5px 16px rgba(35, 54, 48, .14); cursor: pointer; }
 .scroll-latest:hover { border-color: var(--primary); color: var(--primary-hover); background: var(--primary-tint); }
-.message { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 18px; width: 100%; margin-bottom: 28px; }
+.message { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 18px; width: 100%; margin-bottom: 28px; animation: msg-in .22s ease-out; }
 .message-label { padding-top: 3px; color: var(--text-muted); font-size: 12px; font-weight: 700; text-align: right; }
 .message-body { position: relative; min-width: 0; max-width: 780px; color: var(--text-strong); font-size: 15px; line-height: 1.72; }
 .user-message .message-body { width: fit-content; max-width: min(680px, 100%); padding: 12px 15px; border: 1px solid var(--border); border-radius: 10px; background: var(--primary-soft); box-shadow: var(--shadow-sm); }
@@ -284,7 +287,13 @@ button { color: inherit; }
 :root[data-theme="dark"] .mermaid-tabs { background: #17201d; }
 :root[data-theme="dark"] .mermaid-tabs button[aria-pressed="true"] { background: #3a4642; color: #eef4f1; }
 :root[data-theme="dark"] .mermaid-preview, :root[data-theme="dark"] .mermaid-source { background: #121715; color: #dce5e1; }
-.stream-caret { display: inline-block; width: 7px; height: 18px; background: var(--primary); animation: blink .85s steps(1) infinite; vertical-align: text-bottom; }
+/* 流式生成指示器：单个 span 通过 box-shadow 拓出三个点，错峰跳动。
+   仅新增消息触发，避免滚动时整页闪烁；reduced-motion 下回退为静态省略号。 */
+.stream-caret { display: inline-block; width: 5px; height: 5px; margin: 0 2px 2px; border-radius: 50%; background: var(--primary); box-shadow: 9px 0 0 var(--primary), 18px 0 0 var(--primary); animation: dot-bounce 1.2s infinite ease-in-out; vertical-align: middle; }
+@keyframes dot-bounce {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
+  40% { transform: scale(1); opacity: 1; }
+}
 @keyframes blink { 50% { opacity: 0; } }
 .interrupted-label { display: inline-block; margin-top: 10px; color: #8c4f24; font-size: 12px; }
 
@@ -293,7 +302,7 @@ button { color: inherit; }
 .primary-action { border: 1px solid #0b6d66; color: #fff; background: var(--primary); }
 .primary-action:hover { background: var(--primary-hover); }
 
-.proactive-dialog { position: fixed; z-index: 30; top: 50%; left: 50%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; width: min(620px, calc(100vw - 28px)); max-height: min(820px, calc(100vh - 28px)); overflow: hidden; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface-raised); box-shadow: 0 20px 60px rgba(22, 37, 32, .22); transform: translate(-50%, -50%); }
+.proactive-dialog { position: fixed; z-index: 30; top: 50%; left: 50%; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; width: min(620px, calc(100vw - 28px)); max-height: min(820px, calc(100vh - 28px)); overflow: hidden; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface-raised); box-shadow: 0 20px 60px rgba(22, 37, 32, .22); transform: translate(-50%, -50%); animation: dialog-in .18s ease-out; }
 .proactive-dialog-header, .proactive-dialog-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 18px; border-bottom: 1px solid var(--border); }
 .proactive-dialog-header h2 { margin: 0 0 3px; font-size: 17px; }
 .proactive-dialog-header p { max-width: 480px; margin: 0; overflow: hidden; color: var(--text-muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
@@ -343,6 +352,7 @@ button { color: inherit; }
 .message-source time { color: var(--text-subtle); }
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes dialog-in { from { opacity: 0; transform: translate(-50%, calc(-50% + 8px)); } }
+@keyframes msg-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
 
 .thinking { margin-bottom: 11px; border-left: 2px solid #b8c7c2; padding-left: 12px; }
 .thinking-trigger, .tool-trigger { display: flex; align-items: center; gap: 7px; width: 100%; padding: 5px 0; border: 0; background: transparent; cursor: pointer; color: var(--text-muted); font-size: 12px; text-align: left; }
@@ -354,6 +364,8 @@ button { color: inherit; }
 .tool-step::before { position: absolute; top: 15px; left: -17px; width: 7px; height: 7px; border: 2px solid var(--surface-raised); border-radius: 50%; background: var(--tool-pending); content: ""; }
 .tool-step.completed::before { background: var(--primary); }
 .tool-step.error::before { background: var(--danger-strong); }
+.tool-step.running::before { animation: tool-pulse 1.4s ease-in-out infinite; }
+@keyframes tool-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(168, 120, 49, .45); } 50% { box-shadow: 0 0 0 5px rgba(168, 120, 49, 0); } }
 .tool-trigger strong { color: #303b37; font-size: 12px; }
 .tool-trigger span:not(.tool-icon) { color: var(--text-subtle); }
 .tool-icon { display: inline-grid; place-items: center; width: 20px; height: 20px; color: var(--tool-pending-icon); }
