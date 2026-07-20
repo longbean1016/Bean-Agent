@@ -88,6 +88,12 @@ class AgentLoop:
                 discard(turn_id)
             self._bus.complete_inbound()
 
+    def is_session_busy(self, session_key: str) -> bool:
+        """供主动循环查询普通 Turn 占用状态，避免与用户请求并发发言。"""
+
+        task = self._active_tasks.get(session_key)
+        return task is not None and not task.done()
+
     async def _process_message(self, message: InboundMessage, turn_id: str) -> None:
         request_id = str(message.metadata.get("request_id") or "")
         resumed = await self._persist_pending_interrupt(message.session_key)

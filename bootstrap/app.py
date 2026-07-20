@@ -8,7 +8,7 @@ import logging
 from datetime import datetime
 from io import BytesIO
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -34,8 +34,15 @@ from agent.provider import LLMProvider, create_vision_provider
 from agent.skills import SkillsLoader
 from memory.embedder import Embedder
 from memory.engine import MemoryEngine
+from proactive.chat_loop import ProactiveChatLoop
+from proactive.models import SessionProactiveSettings
+from proactive.scheduler import SchedulerService
+from proactive.soft_executor import SoftTaskExecutor
+from proactive.store import ProactiveStore
+from proactive.turn_service import ProactiveTurnService
 from session.manager import SessionManager
 from tools import ToolRegistry, register_all
+from tools.schedule import CancelScheduleTool, ListSchedulesTool, ScheduleTool
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +160,8 @@ class AppRuntime:
             if self.maintenance is not None:
                 await self.maintenance.start()
             self.agent_task = asyncio.create_task(self.core.agent_loop.run(), name="beanagent-loop")
+            await self.core.scheduler.start()
+            await self.core.proactive_chat.start()
             self._started = True
 
     async def shutdown(self) -> None:
@@ -164,6 +173,8 @@ class AppRuntime:
             # 顺序与参考 AppRuntime 一致：先阻止新工作进入，再等待/取消执行任务，
             # 最后按所有权从上层服务向底层 HTTP/SQLite 资源释放。
             await _cleanup_step("web_channel.close", self.channel.close)
+            await _cleanup_step("proactive_chat.close", self.core.proactive_chat.close)
+            await _cleanup_step("proactive_scheduler.close", self.core.scheduler.close)
             self.core.agent_loop.stop()
             if self.agent_task is not None and not self.agent_task.done():
                 self.agent_task.cancel()
@@ -173,15 +184,16 @@ class AppRuntime:
                 await _cleanup_step("memory_maintenance.close", self.maintenance.close)
             if self.core.memory is not None:
                 await _cleanup_step("memory.close", self.core.memory.close)
+            await _cleanup_step("proactive_store.close", asyncio.to_thread, self.core.proactive_store.close)
             await _cleanup_step("sessions.close", self.core.sessions.close)
             if self.core.vision_provider is not None:
                 await _cleanup_step("vision_provider.close", self.core.vision_provider.close)
             await _cleanup_step("provider.close", self.core.provider.close)
 
 
-async def _cleanup_step(name: str, callback: Any) -> None:
+async def _cleanup_step(name: str, callback: Any, *args: Any) -> None:
     try:
-        await callback()
+        await callback(*args)
     except Exception:
         logger.exception("应用关闭步骤失败: %s", name)
 
@@ -203,6 +215,10 @@ class CoreRuntime:
     assembler: PromptAssembler
     pipeline: Pipeline
     agent_loop: AgentLoop
+    proactive_store: ProactiveStore
+    proactive_turns: ProactiveTurnService
+    scheduler: SchedulerService
+    proactive_chat: ProactiveChatLoop
     vision_provider: Any | None = None
 
 
@@ -226,6 +242,7 @@ def build_core_runtime(
     sessions = SessionManager(root, history_window=config.session.history_window)
     events = EventBus()
     messages = MessageBus()
+    proactive_store = ProactiveStore(root / "proactive.db")
 
     memory: MemoryEngine | None = None
     actual_embedder = embedder
@@ -256,6 +273,11 @@ def build_core_runtime(
         memory_engine=memory,
         skills=skills,
     )
+    # 提醒工具从当前 Turn 的系统执行上下文取得 session_key，模型不需要也不能
+    # 选择其他 Web 会话作为目标。
+    tools.register(ScheduleTool(proactive_store), risk="write", always_on=True)
+    tools.register(ListSchedulesTool(proactive_store), risk="read-only", always_on=True)
+    tools.register(CancelScheduleTool(proactive_store), risk="write", always_on=True)
     mcp_registry = McpServerRegistry(root / "mcp_servers.json", tools)
     # 管理工具必须与运行时持有的 Registry 共享同一实例，动态添加和关闭才能
     # 作用于同一批 Client；三者常驻可见，远端工具本身仍需搜索解锁。
@@ -288,6 +310,20 @@ def build_core_runtime(
         vl_available=vision_provider is not None,
     )
     agent_loop = AgentLoop(messages, events, pipeline, sessions)
+    proactive_turns = ProactiveTurnService(proactive_store, sessions, messages)
+    soft_executor = SoftTaskExecutor(pipeline)
+    scheduler = SchedulerService(
+        proactive_store,
+        proactive_turns,
+        soft_executor=soft_executor.execute,
+    )
+    proactive_chat = ProactiveChatLoop(
+        proactive_store,
+        sessions.store,
+        main_provider,
+        proactive_turns,
+        is_session_busy=agent_loop.is_session_busy,
+    )
     return CoreRuntime(
         config=config,
         workspace=root,
@@ -302,6 +338,10 @@ def build_core_runtime(
         assembler=assembler,
         pipeline=pipeline,
         agent_loop=agent_loop,
+        proactive_store=proactive_store,
+        proactive_turns=proactive_turns,
+        scheduler=scheduler,
+        proactive_chat=proactive_chat,
         vision_provider=vision_provider,
     )
 
@@ -367,6 +407,85 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             offset=(page - 1) * page_size,
         )
         return {"items": items, "total": total}
+
+    def require_web_session(session_key: str) -> None:
+        """主动设置只属于当前 Web channel，禁止借 path 参数访问其他渠道。"""
+
+        channel_name = application.core.config.channels.chat.channel_name
+        if not session_key.startswith(f"{channel_name}:"):
+            raise HTTPException(status_code=404, detail="会话不存在")
+        if application.core.sessions.store.get_session_meta(session_key) is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+
+    @app.get("/api/chat/sessions/{session_key:path}/proactive")
+    def get_proactive_settings(session_key: str) -> dict[str, Any]:
+        """返回前端语义配置与只读运行状态，不暴露内部算法参数。"""
+
+        require_web_session(session_key)
+        settings = application.core.proactive_store.get_settings(session_key)
+        state = application.core.proactive_store.get_state(session_key)
+        return {"settings": asdict(settings), "status": asdict(state)}
+
+    @app.put("/api/chat/sessions/{session_key:path}/proactive")
+    def update_proactive_settings(
+        session_key: str,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        """整体校验后保存允许修改的字段，未知字段不会进入持久化配置。"""
+
+        require_web_session(session_key)
+        current = asdict(application.core.proactive_store.get_settings(session_key))
+        editable = {
+            "reminders_enabled", "reminder_quiet_policy", "conversation_enabled",
+            "activity_level", "min_conversation_interval_hours",
+            "daily_conversation_limit", "quiet_hours_enabled", "quiet_start",
+            "quiet_end", "timezone",
+        }
+        for key in editable:
+            if key in payload:
+                current[key] = payload[key]
+        current["session_key"] = session_key
+        try:
+            saved = application.core.proactive_store.upsert_settings(
+                SessionProactiveSettings(**current)
+            )
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {"settings": asdict(saved)}
+
+    @app.get("/api/chat/sessions/{session_key:path}/reminders")
+    def list_reminders(session_key: str) -> dict[str, Any]:
+        """列出由对话创建的 instant/soft 任务，Web 只负责管理。"""
+
+        require_web_session(session_key)
+        jobs = application.core.proactive_store.list_jobs(session_key)
+        return {"items": [_scheduled_job_payload(job) for job in jobs]}
+
+    @app.patch("/api/chat/sessions/{session_key:path}/reminders/{job_id}")
+    def update_reminder(
+        session_key: str,
+        job_id: str,
+        enabled: bool = Body(..., embed=True),
+    ) -> dict[str, Any]:
+        """暂停或恢复现有任务；不允许在管理页面改写原始提醒含义。"""
+
+        require_web_session(session_key)
+        job = application.core.proactive_store.get_job(job_id)
+        if job is None or job.session_key != session_key:
+            raise HTTPException(status_code=404, detail="提醒不存在")
+        job.enabled = enabled
+        job.status = "pending" if enabled else "paused"
+        application.core.proactive_store.update_job(job)
+        return _scheduled_job_payload(job)
+
+    @app.delete("/api/chat/sessions/{session_key:path}/reminders/{job_id}", status_code=204)
+    def delete_reminder(session_key: str, job_id: str) -> Response:
+        """按会话归属删除提醒，阻止跨会话 ID 猜测。"""
+
+        require_web_session(session_key)
+        if not application.core.proactive_store.delete_job(job_id, session_key=session_key):
+            raise HTTPException(status_code=404, detail="提醒不存在")
+        return Response(status_code=204)
 
     @app.patch("/api/chat/sessions/{session_key:path}")
     async def rename_session(
@@ -470,6 +589,22 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
         await channel.handle_websocket(websocket)
 
     return app
+
+
+def _scheduled_job_payload(job: Any) -> dict[str, Any]:
+    """将内部任务转换为稳定的 Web 展示字段。"""
+
+    return {
+        "id": job.id,
+        "name": job.name,
+        "tier": job.tier,
+        "trigger": job.trigger,
+        "fire_at": job.fire_at.isoformat(),
+        "enabled": job.enabled,
+        "status": job.status,
+        "run_count": job.run_count,
+        "last_error": job.last_error,
+    }
 
 
 __all__ = ["AppRuntime", "CoreRuntime", "MemoryMaintenanceLoop", "build_core_runtime", "create_fastapi_app"]
