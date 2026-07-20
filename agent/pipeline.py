@@ -113,11 +113,6 @@ class Pipeline:
         )
         retrieved = await self._memory.retrieve_for_turn(message) if self._memory and not skip_memory else ""
         names = list(tool_view.visible_order)
-        summary = "\n".join(
-            f"- {name}: {tool.description}"
-            for name in names
-            if (tool := self._tools.get_tool(name)) is not None
-        )
         available_skills = (
             [record.name for record in self._skills.list_skill_records()]
             if self._skills
@@ -130,7 +125,6 @@ class Pipeline:
             chat_id=message.chat_id,
             memory=None if skip_memory else self._memory,
             retrieved_memory_block=retrieved,
-            tools_summary=summary,
             active_tool_names=names,
             skills=self._skills,
             active_skill_names=active_skills,

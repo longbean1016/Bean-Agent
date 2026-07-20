@@ -144,6 +144,59 @@ async def test_tool_search_unlocks_only_the_current_turn_schema() -> None:
 
 
 @pytest.mark.asyncio
+async def test_allowed_tools_do_not_change_system_prompt(tmp_path: Path) -> None:
+    class CapturingProvider:
+        def __init__(self) -> None:
+            self.messages: list[list[dict[str, object]]] = []
+            self.schema_names: list[list[str]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages.append(messages)
+            self.schema_names.append(
+                [item["function"]["name"] for item in (tools or [])]
+            )
+            return LLMResponse("完成")
+
+    tools = ToolRegistry()
+    tools.register(EchoTool())
+    tools.register(ToolSearchTool(tools), always_on=True)
+    provider = CapturingProvider()
+    pipeline = Pipeline(
+        provider,
+        tools,
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+    )
+
+    await pipeline.process(
+        InboundMessage(
+            channel="web",
+            sender="u",
+            chat_id="c",
+            content="第一次",
+            metadata={"allowed_tools": ["tool_search"]},
+        ),
+        turn_id="tools-first",
+    )
+    await pipeline.process(
+        InboundMessage(
+            channel="web",
+            sender="u",
+            chat_id="c",
+            content="第二次",
+            metadata={"allowed_tools": ["echo"]},
+        ),
+        turn_id="tools-second",
+    )
+
+    assert provider.messages[0][0]["content"] == provider.messages[1][0]["content"]
+    assert provider.schema_names == [["tool_search"], ["echo"]]
+    assert "tool_search" in str(provider.messages[0][-2]["content"])
+    assert "echo" in str(provider.messages[1][-2]["content"])
+
+
+@pytest.mark.asyncio
 async def test_pipeline_injects_explicit_skill_mention_into_dynamic_frame(
     tmp_path: Path,
 ) -> None:
