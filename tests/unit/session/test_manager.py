@@ -266,7 +266,7 @@ async def test_load_history_uses_cursor_without_deleting_full_session(
         ("assistant", "活动回答"),
     ]:
         session.add_message(role, content)
-    session.last_consolidated = 2
+    manager.store.set_cursor(session.key, 2)
 
     history = await manager.load_history(session.key)
 
@@ -293,10 +293,34 @@ async def test_load_history_does_not_align_before_misaligned_cursor(
         ("assistant", "活动回答"),
     ]:
         session.add_message(role, content)
-    session.last_consolidated = 1
+    manager.store.set_cursor(session.key, 1)
 
     history = await manager.load_history(session.key)
 
+    assert [item["content"] for item in history] == ["活动问题", "活动回答"]
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_load_history_refreshes_cursor_advanced_by_memory_engine(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path, history_window=40)
+    session = await manager.get_or_create("web:chat-1")
+    messages = []
+    for role, content in [
+        ("user", "已压缩问题"),
+        ("assistant", "已压缩回答"),
+        ("user", "活动问题"),
+        ("assistant", "活动回答"),
+    ]:
+        messages.append(session.add_message(role, content))
+    await manager.append_messages(session, messages)
+    manager.store.set_cursor(session.key, 2)
+
+    history = await manager.load_history(session.key)
+
+    assert session.last_consolidated == 2
     assert [item["content"] for item in history] == ["活动问题", "活动回答"]
     await manager.close()
 

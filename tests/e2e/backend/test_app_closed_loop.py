@@ -110,3 +110,75 @@ def test_websocket_tool_turn_reconnects_with_history_and_memory(tmp_path: Path) 
 
     assert second_provider.closed is True
     assert second_embedder.closed is True
+
+
+class CompressionProvider:
+    def __init__(self) -> None:
+        self.pipeline_messages: list[list[dict[str, object]]] = []
+
+    async def complete(self, messages, tools=None, **kwargs):
+        prompt = str(messages[0]["content"])
+        if "记忆提取代理" in prompt:
+            return SimpleNamespace(content='{"history_entries":[],"pending_items":[]}')
+        if "近期语境压缩代理" in prompt:
+            return SimpleNamespace(
+                content=(
+                    '{"active_topics":["第一阶段"],"user_preferences":[],'
+                    '"follow_ups":[],"avoidances":[],"ongoing_threads":[]}'
+                )
+            )
+        if "记忆检索决策器" in prompt:
+            return SimpleNamespace(content="<decision>SKIP</decision>")
+        if "长期记忆提取专家" in prompt:
+            return SimpleNamespace(content='{"profile":[],"preference":[],"procedure":[]}')
+        return SimpleNamespace(content="[]")
+
+    async def chat(self, messages, tools=None, on_content_delta=None, **kwargs):
+        self.pipeline_messages.append(list(messages))
+        content = f"完成-{len(self.pipeline_messages)}"
+        if on_content_delta:
+            await on_content_delta({"content_delta": content})
+        return LLMResponse(content)
+
+    async def close(self):
+        self.closed = True
+
+
+def test_websocket_consolidation_advances_cursor_and_next_turn_uses_summary(
+    tmp_path: Path,
+) -> None:
+    config = Config()
+    config.memory.enabled = True
+    config.memory.context_window = 4
+    config.memory.embedding.dimensions = 2
+    config.memory.optimizer.enabled = False
+    config.agent.workdir = str(tmp_path / "workdir")
+    provider = CompressionProvider()
+    core = build_core_runtime(
+        config,
+        tmp_path / "workspace",
+        provider=provider,
+        embedder=Embedder(),
+    )
+    app = create_fastapi_app(core)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as websocket:
+            for turn in range(1, 6):
+                websocket.send_json(
+                    {
+                        "type": "message.send",
+                        "request_id": f"r{turn}",
+                        "session_id": "web:c",
+                        "text": f"问题{turn}",
+                    }
+                )
+                frames = _receive_final(websocket)
+                assert frames[-1]["request_id"] == f"r{turn}"
+
+        assert core.sessions.store.get_cursor("web:c") == 6
+        fifth_prompt = provider.pipeline_messages[4]
+        assert "问题1" not in str(fifth_prompt)
+        assert "问题3" not in str(fifth_prompt)
+        assert "问题4" in str(fifth_prompt)
+        assert "第一阶段" in str(fifth_prompt)

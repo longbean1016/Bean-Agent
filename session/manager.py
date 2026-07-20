@@ -356,7 +356,11 @@ class SessionManager:
 
         session = await self.get_or_create(session_key)
         actual_limit = self._history_window if limit is None else max(0, int(limit))
-        cursor = max(0, min(int(session.last_consolidated), len(session.messages)))
+        # MemoryEngine 直接持有同一个 Store 并在后台推进 cursor；缓存 Session
+        # 不会自动收到该变更，因此每次模型加载前以 SQLite 元数据为权威同步。
+        persisted_cursor = self._store.get_cursor(session.key)
+        cursor = max(0, min(int(persisted_cursor), len(session.messages)))
+        session.last_consolidated = cursor
         start = max(cursor, len(session.messages) - actual_limit)
         return session.get_history(
             max_messages=actual_limit,
