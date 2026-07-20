@@ -150,7 +150,7 @@ button:active, .icon-button:active, .send-button:active, .new-chat-button:active
 .brand-lockup div, .brand-compact div { display: flex; flex-direction: column; min-width: 0; }
 .brand-lockup strong, .brand-compact strong { font-size: 14px; line-height: 1.25; }
 .brand-lockup span:last-child, .brand-compact span:last-child { overflow: hidden; color: var(--text-subtle); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.brand-mark, .empty-mark { display: grid; flex: 0 0 auto; place-items: center; width: 34px; height: 34px; border-radius: 7px; background: var(--primary-icon); color: white; font-family: Georgia, serif; font-weight: 700; }
+.brand-mark, .empty-mark { display: grid; flex: 0 0 auto; place-items: center; width: 34px; height: 34px; border-radius: 8px; background: linear-gradient(135deg, var(--primary-icon), var(--primary)); color: white; font-family: Georgia, serif; font-weight: 700; box-shadow: 0 1px 3px rgba(17, 111, 104, .25); }
 .new-chat-button { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; border: 1px solid #b9c6c2; border-radius: 6px; background: var(--surface-2); cursor: pointer; font-weight: 650; }
 .new-chat-button:hover { border-color: var(--primary); color: var(--primary-hover); }
 .session-list { flex: 1 1 0; min-height: 0; margin-top: 14px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-color: transparent transparent; scrollbar-gutter: stable; scrollbar-width: thin; }
@@ -380,15 +380,16 @@ button:active, .icon-button:active, .send-button:active, .new-chat-button:active
 .file-attachment { display: inline-flex; align-items: center; gap: 8px; min-height: 38px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px; background: #f5f8f7; text-decoration: none; }
 
 .empty-conversation { display: flex; flex-direction: column; align-items: flex-start; max-width: 620px; margin: 9vh auto 0; }
-.empty-mark { width: 46px; height: 46px; margin-bottom: 20px; font-size: 20px; }
-.empty-conversation h1 { margin: 0 0 8px; font-family: Georgia, "Microsoft YaHei UI", serif; font-size: 28px; font-weight: 600; }
-.empty-conversation p { margin: 0 0 24px; color: var(--text-muted); }
-.example-prompts { display: grid; gap: 8px; width: 100%; }
-.example-prompts button { min-height: 42px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 5px; background: transparent; cursor: pointer; text-align: left; }
-.example-prompts button:hover { border-color: #8eb6b0; background: var(--primary-tint); }
+.empty-mark { width: 52px; height: 52px; margin-bottom: 22px; font-size: 22px; box-shadow: 0 4px 14px rgba(17, 111, 104, .22); }
+.empty-conversation h1 { margin: 0 0 8px; font-family: Georgia, "Microsoft YaHei UI", serif; font-size: 30px; font-weight: 500; letter-spacing: -0.01em; }
+.empty-conversation p { margin: 0 0 24px; color: var(--text-muted); font-size: 14px; line-height: 1.6; }
+.example-prompts { display: grid; gap: 10px; width: 100%; }
+.example-prompts button { min-height: 46px; padding: 11px 14px; border: 1px solid var(--border); border-radius: 8px; background: transparent; cursor: pointer; text-align: left; font-size: 13.5px; line-height: 1.5; }
+.example-prompts button:hover { border-color: var(--primary); background: var(--primary-tint); box-shadow: 0 2px 8px rgba(11, 118, 110, .08); }
 
 .composer-wrap { grid-area: composer; position: relative; z-index: 2; align-self: end; min-width: 0; width: 100%; padding: 0 max(24px, calc((100% - 880px) / 2)) 18px; background: var(--surface-raised); }
-.composer { border: 1px solid var(--border-input); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow-md); }
+.composer { border: 1px solid var(--border-input); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow-md); transition: border-color .15s ease, box-shadow .15s ease; }
+.composer:focus-within { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-tint), var(--shadow-md); }
 .composer.dragging { border-color: var(--accent); background: #f2f8f6; box-shadow: 0 0 0 3px rgba(11, 118, 110, .12), var(--shadow-md); }
 .composer textarea { display: block; width: 100%; min-height: 72px; max-height: 180px; resize: vertical; padding: 13px 15px 6px; border: 0; outline: 0; background: transparent; color: var(--text-strong); line-height: 1.5; }
 .composer textarea::placeholder { color: var(--text-faint); }
@@ -397,9 +398,9 @@ button:active, .icon-button:active, .send-button:active, .new-chat-button:active
 .attach-button input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .composer-hint { margin-left: 2px; color: var(--text-faint); font-size: 11px; }
 .queue-status { margin-left: 2px; color: var(--warning); font-size: 12px; font-weight: 600; }
-.send-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-width: 82px; min-height: 34px; margin-left: auto; padding: 0 12px; border: 1px solid #086860; border-radius: 6px; background: var(--primary); color: #fff; cursor: pointer; font-weight: 650; }
-.send-button:hover { background: var(--primary-hover); }
-.send-button:disabled { border-color: #c6cfcc; background: #dfe5e2; color: #7e8985; cursor: default; }
+.send-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-width: 82px; min-height: 34px; margin-left: auto; padding: 0 14px; border: 1px solid #086860; border-radius: 8px; background: linear-gradient(135deg, var(--primary), var(--primary-hover)); color: #fff; cursor: pointer; font-weight: 650; box-shadow: 0 1px 2px rgba(11, 118, 110, .2); }
+.send-button:hover { background: linear-gradient(135deg, var(--primary-hover), var(--primary-active)); box-shadow: 0 2px 6px rgba(11, 118, 110, .28); }
+.send-button:disabled { border-color: #c6cfcc; background: #dfe5e2; color: #7e8985; cursor: default; box-shadow: none; }
 .send-button.stop { border-color: #994037; background: var(--danger-hover); }
 .pending-files { display: flex; gap: 8px; overflow-x: auto; padding: 10px 10px 0; }
 .pending-file { display: grid; grid-template-columns: 28px minmax(60px, 150px) 28px; align-items: center; gap: 6px; min-width: 140px; height: 42px; padding: 4px 5px 4px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-overlay); }
