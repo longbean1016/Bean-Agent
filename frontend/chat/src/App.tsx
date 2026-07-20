@@ -5,6 +5,7 @@ import {
   AlertCircle,
   ArrowDown,
   Brain,
+  Bell,
   Check,
   ChevronDown,
   CircleStop,
@@ -27,17 +28,17 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import type { ComponentPropsWithoutRef } from "react";
+import type { ComponentPropsWithoutRef, ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
-import { deleteSession, fetchMessages, fetchSessions, mediaUrl, renameSession, uploadAttachment } from "./api";
+import { deleteReminder, deleteSession, fetchMessages, fetchProactiveSettings, fetchReminders, fetchSessions, mediaUrl, renameSession, saveProactiveSettings, setReminderEnabled, uploadAttachment } from "./api";
 import { initialChatState, reduceChatFrame, rowsToMessages } from "./chatReducer";
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
 import { groupSessionsByUpdatedAt } from "./sessionGroups";
-import type { ChatFrame, ChatMessage, ConnectionStatus, SessionSummary, ToolActivity } from "./types";
+import type { ChatFrame, ChatMessage, ConnectionStatus, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity } from "./types";
 import { BeanWebSocketClient } from "./websocketClient";
 
 const SESSION_STORAGE_KEY = "beanagent.session_id";
@@ -204,6 +205,11 @@ export function App() {
     void refreshSessions();
     return () => client.close();
   }, [handleFrame, refreshSessions]);
+
+  useEffect(() => {
+    if (connection !== "connected" || !chat.sessionId) return;
+    clientRef.current?.send({ type: "session.subscribe", request_id: crypto.randomUUID(), session_id: chat.sessionId });
+  }, [chat.sessionId, connection]);
 
   useEffect(() => {
     if (!chat.sessionId || chat.messages.length > 0) return;
@@ -437,6 +443,7 @@ function SessionSidebar(props: {
   const [editingSessionId, setEditingSessionId] = useState("");
   const [titleDraft, setTitleDraft] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
+  const [proactiveTarget, setProactiveTarget] = useState<SessionSummary | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [scrollbarVisible, setScrollbarVisible] = useState(false);
   const scrollbarHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -539,6 +546,7 @@ function SessionSidebar(props: {
                   </button>
                   {menuSessionId === session.key ? (
                     <div className="session-menu" role="menu">
+                      <button role="menuitem" onClick={() => { setMenuSessionId(""); setProactiveTarget(session); }}><Bell size={15} />主动设置</button>
                       <button role="menuitem" onClick={() => beginRename(session)}><Pencil size={15} />重命名</button>
                       <button className="danger" role="menuitem" onClick={() => { setMenuSessionId(""); setDeleteTarget(session); }}><Trash2 size={15} />删除</button>
                     </div>
@@ -577,8 +585,127 @@ function SessionSidebar(props: {
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
+      <ProactiveSettingsDialog target={proactiveTarget} onClose={() => setProactiveTarget(null)} />
     </div>
   );
+}
+
+function ProactiveSettingsDialog({ target, onClose }: { target: SessionSummary | null; onClose: () => void }) {
+  const [settings, setSettings] = useState<ProactiveSettings | null>(null);
+  const [reminders, setReminders] = useState<ScheduledReminder[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [help, setHelp] = useState("");
+
+  useEffect(() => {
+    if (!target) return;
+    setLoading(true);
+    setError("");
+    Promise.all([fetchProactiveSettings(target.key), fetchReminders(target.key)])
+      .then(([nextSettings, nextReminders]) => { setSettings(nextSettings); setReminders(nextReminders); })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : "加载失败"))
+      .finally(() => setLoading(false));
+  }, [target]);
+
+  useEffect(() => {
+    if (!help) return;
+    const close = () => setHelp("");
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [help]);
+
+  const update = <K extends keyof ProactiveSettings>(key: K, value: ProactiveSettings[K]) => {
+    setSettings((current) => current ? { ...current, [key]: value } : current);
+  };
+  const save = async () => {
+    if (!target || !settings) return;
+    setSaving(true);
+    setError("");
+    try {
+      setSettings(await saveProactiveSettings(target.key, settings));
+      onClose();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "保存失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+  const refreshReminderList = async () => {
+    if (target) setReminders(await fetchReminders(target.key));
+  };
+
+  return (
+    <Dialog.Root open={target !== null} onOpenChange={(open) => { if (!open && !saving) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="dialog-overlay" />
+        <Dialog.Content className="proactive-dialog">
+          <header className="proactive-dialog-header">
+            <div><Dialog.Title>主动设置</Dialog.Title><Dialog.Description>{target?.title || target?.first_message_content || "当前会话"}</Dialog.Description></div>
+            <Dialog.Close asChild><button className="icon-button" aria-label="关闭"><X size={17} /></button></Dialog.Close>
+          </header>
+          {loading || !settings ? <div className="proactive-loading">{error || "正在加载…"}</div> : (
+            <div className="proactive-dialog-body">
+              <SettingsSection title="提醒" enabled={settings.reminders_enabled} onEnabled={(value) => update("reminders_enabled", value)}>
+                <SettingRow label="勿扰时段处理" helpId="reminder-policy" help={help} onHelp={setHelp} helpText="延后：勿扰结束后发送；照常发送：仍按原时间；跳过：本次不发送。">
+                  <select value={settings.reminder_quiet_policy} onChange={(event) => update("reminder_quiet_policy", event.target.value as ProactiveSettings["reminder_quiet_policy"])}>
+                    <option value="delay">延后发送</option><option value="send">照常发送</option><option value="skip">跳过本次</option>
+                  </select>
+                </SettingRow>
+                <div className="reminder-list">
+                  <div className="reminder-list-title"><span>已创建的提醒</span><small>通过对话创建</small></div>
+                  {reminders.length === 0 ? <p className="reminder-empty">暂无提醒</p> : reminders.map((item) => (
+                    <div className="reminder-item" key={item.id}>
+                      <div><strong>{item.name || (item.tier === "instant" ? "固定提醒" : "AI 定时任务")}</strong><small>{new Date(item.fire_at).toLocaleString()} · {item.tier === "instant" ? "固定文本" : "到期执行 prompt"}</small></div>
+                      <button className="text-action" onClick={() => { if (!target) return; void setReminderEnabled(target.key, item.id, !item.enabled).then(refreshReminderList).catch((reason) => setError(String(reason))); }}>{item.enabled ? "暂停" : "恢复"}</button>
+                      <button className="icon-button danger" aria-label="删除提醒" onClick={() => { if (!target) return; void deleteReminder(target.key, item.id).then(refreshReminderList).catch((reason) => setError(String(reason))); }}><Trash2 size={15} /></button>
+                    </div>
+                  ))}
+                </div>
+              </SettingsSection>
+
+              <SettingsSection title="主动聊天" enabled={settings.conversation_enabled} onEnabled={(value) => update("conversation_enabled", value)}>
+                <SettingRow label="主动程度" helpId="activity" help={help} onHelp={setHelp} helpText="算法倾向：克制更少尝试，均衡适合日常，积极更愿意延续明确未完成的话题；仍受间隔、次数和勿扰限制。">
+                  <select value={settings.activity_level} onChange={(event) => update("activity_level", event.target.value as ProactiveSettings["activity_level"])}>
+                    <option value="restrained">克制</option><option value="balanced">均衡</option><option value="active">积极</option>
+                  </select>
+                </SettingRow>
+                <SettingRow label="最短间隔" helpId="interval" help={help} onHelp={setHelp} helpText="一次主动聊天后，至少等待这么久再尝试。这是明确的频率边界，主动程度不会越过它。">
+                  <NumberSetting value={settings.min_conversation_interval_hours} min={1} max={168} suffix="小时" onChange={(value) => update("min_conversation_interval_hours", value)} />
+                </SettingRow>
+                <SettingRow label="每日最多" helpId="daily" help={help} onHelp={setHelp} helpText="当天最多主动聊天的次数，可输入 1 到 20。普通问题的正常回答不计入。">
+                  <NumberSetting value={settings.daily_conversation_limit} min={1} max={20} suffix="次" onChange={(value) => update("daily_conversation_limit", value)} />
+                </SettingRow>
+              </SettingsSection>
+
+              <section className="settings-section quiet-section">
+                <div className="settings-section-title"><div><strong>勿扰时间</strong><span>提醒和主动聊天共用</span></div><Toggle checked={settings.quiet_hours_enabled} onChange={(value) => update("quiet_hours_enabled", value)} /></div>
+                <div className="quiet-time-row"><input type="time" value={settings.quiet_start} onChange={(event) => update("quiet_start", event.target.value)} /><span>至</span><input type="time" value={settings.quiet_end} onChange={(event) => update("quiet_end", event.target.value)} /></div>
+              </section>
+              {error ? <div className="settings-error" role="alert">{error}</div> : null}
+            </div>
+          )}
+          <footer className="proactive-dialog-footer"><Dialog.Close asChild><button className="secondary-action" disabled={saving}>取消</button></Dialog.Close><button className="primary-action" disabled={saving || loading || !settings} onClick={() => void save()}>{saving ? "保存中…" : "保存设置"}</button></footer>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
+function SettingsSection({ title, enabled, onEnabled, children }: { title: string; enabled: boolean; onEnabled: (value: boolean) => void; children: ReactNode }) {
+  return <section className={`settings-section${enabled ? "" : " disabled"}`}><div className="settings-section-title"><strong>{title}</strong><Toggle checked={enabled} onChange={onEnabled} /></div><div className="settings-section-content">{children}</div></section>;
+}
+
+function SettingRow({ label, helpId, help, onHelp, helpText, children }: { label: string; helpId: string; help: string; onHelp: (id: string) => void; helpText: string; children: ReactNode }) {
+  return <div className="setting-row"><div className="setting-label"><span>{label}</span><span className="help-owner" onPointerDown={(event) => event.stopPropagation()}><button className="help-button" aria-label={`说明：${label}`} onClick={() => onHelp(help === helpId ? "" : helpId)}><AlertCircle size={13} /></button>{help === helpId ? <span className="help-popover">{helpText}</span> : null}</span></div>{children}</div>;
+}
+
+function Toggle({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }) {
+  return <button type="button" className={`toggle${checked ? " on" : ""}`} role="switch" aria-checked={checked} onClick={() => onChange(!checked)}><span /></button>;
+}
+
+function NumberSetting({ value, min, max, suffix, onChange }: { value: number; min: number; max: number; suffix: string; onChange: (value: number) => void }) {
+  return <label className="number-setting"><input type="number" min={min} max={max} value={value} onChange={(event) => onChange(Math.max(min, Math.min(max, Number(event.target.value) || min)))} /><span>{suffix}</span></label>;
 }
 
 function ConnectionControl({ status, onReconnect }: { status: ConnectionStatus; onReconnect: () => void }) {

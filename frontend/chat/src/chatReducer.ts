@@ -18,6 +18,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
   if (action.type === "session.created") {
     return { ...initialChatState, sessionId: action.session_id };
   }
+  if (action.type === "session.subscribed") return state;
   if (action.type === "error") return { ...state, error: action.message };
   if (action.type === "pong") return state;
   if ("session_id" in action && state.sessionId && action.session_id !== state.sessionId) {
@@ -79,6 +80,23 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     }));
   }
   if (action.type === "message.final") {
+    if (!action.turn_id && action.metadata?.proactive) {
+      const id = action.message_id || String(action.metadata.message_id || `proactive-${state.messages.length}`);
+      if (state.messages.some((message) => message.id === id)) return state;
+      return {
+        ...state,
+        messages: [...state.messages, {
+          id,
+          role: "assistant",
+          content: action.content,
+          thinking: action.thinking ?? "",
+          media: action.media ?? [],
+          tools: [],
+          streaming: false,
+          proactive: true,
+        }],
+      };
+    }
     // final 是服务端的权威快照，必须覆盖草稿，不能继续追加 delta。
     const next = updateTurn(state, action.turn_id, (message) => ({
       ...message,
@@ -125,6 +143,7 @@ export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {
     streaming: false,
     status: row.status,
     timestamp: row.timestamp,
+    proactive: Boolean((row as MessageRow & { proactive?: boolean }).proactive),
   }));
 }
 

@@ -77,4 +77,22 @@ describe("reduceChatFrame", () => {
 
     expect(next).toEqual(current);
   });
+
+  it("主动 final 没有 turn.started 时直接追加并按 message_id 去重", () => {
+    const current = { ...initialChatState, sessionId: "web:one" };
+    const frame = {
+      type: "message.final" as const,
+      session_id: "web:one",
+      turn_id: "",
+      message_id: "message-1",
+      content: "顺着上次没做完的部分，我补充一点。",
+      metadata: { proactive: true, message_id: "message-1" },
+    };
+
+    const once = reduceChatFrame(current, frame);
+    const twice = reduceChatFrame(once, frame);
+
+    expect(twice.messages).toHaveLength(1);
+    expect(twice.messages[0]).toMatchObject({ id: "message-1", proactive: true, streaming: false });
+  });
 });

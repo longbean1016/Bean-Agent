@@ -1,4 +1,4 @@
-import type { MessageRow, SessionSummary, UploadedFile } from "./types";
+import type { MessageRow, ProactiveSettings, ScheduledReminder, SessionSummary, UploadedFile } from "./types";
 
 export async function fetchSessions(): Promise<SessionSummary[]> {
   const response = await fetch("/api/chat/sessions?page=1&page_size=100");
@@ -52,4 +52,41 @@ export async function uploadAttachment(file: File): Promise<UploadedFile> {
 
 export function mediaUrl(path: string): string {
   return `/api/chat/media?path=${encodeURIComponent(path)}`;
+}
+
+export async function fetchProactiveSettings(sessionId: string): Promise<ProactiveSettings> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/proactive`);
+  if (!response.ok) throw new Error("无法加载主动设置");
+  return ((await response.json()) as { settings: ProactiveSettings }).settings;
+}
+
+export async function saveProactiveSettings(sessionId: string, settings: ProactiveSettings): Promise<ProactiveSettings> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/proactive`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+  const payload = await response.json().catch(() => ({})) as { settings?: ProactiveSettings; detail?: string };
+  if (!response.ok || !payload.settings) throw new Error(payload.detail || "无法保存主动设置");
+  return payload.settings;
+}
+
+export async function fetchReminders(sessionId: string): Promise<ScheduledReminder[]> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/reminders`);
+  if (!response.ok) throw new Error("无法加载提醒列表");
+  return ((await response.json()) as { items?: ScheduledReminder[] }).items ?? [];
+}
+
+export async function setReminderEnabled(sessionId: string, reminderId: string, enabled: boolean): Promise<void> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/reminders/${encodeURIComponent(reminderId)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+  if (!response.ok) throw new Error("无法更新提醒状态");
+}
+
+export async function deleteReminder(sessionId: string, reminderId: string): Promise<void> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/reminders/${encodeURIComponent(reminderId)}`, { method: "DELETE" });
+  if (!response.ok) throw new Error("无法删除提醒");
 }

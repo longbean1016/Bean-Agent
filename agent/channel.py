@@ -65,6 +65,14 @@ class WebChannel:
             await websocket.send_json({"type": "session.created", "request_id": request_id, "session_id": session_key})
             return
         session_key = normalize_web_session_id(frame.get("session_id"))
+        if frame_type == "session.subscribe" and session_key is not None:
+            await self._register(session_key, websocket)
+            await websocket.send_json({
+                "type": "session.subscribed",
+                "request_id": request_id,
+                "session_id": session_key,
+            })
+            return
         if frame_type == "message.send":
             if session_key is None:
                 session_key = f"web:{uuid4().hex}"
@@ -105,10 +113,12 @@ class WebChannel:
 
     async def _on_response(self, message: OutboundMessage) -> None:
         session_key = f"{message.channel}:{message.chat_id}"
+        metadata = dict(message.metadata)
         await self._broadcast(session_key, {
             "type": "message.final", "request_id": str(message.metadata.get("request_id") or ""),
             "session_id": session_key, "turn_id": str(message.metadata.get("turn_id") or ""),
             "content": message.content, "thinking": message.thinking, "media": list(message.media),
+            "message_id": str(metadata.get("message_id") or ""), "metadata": metadata,
         })
 
     async def _on_turn_started(self, event: TurnStarted) -> None:
