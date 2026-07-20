@@ -11,6 +11,7 @@ export const initialChatState: ChatState = {
   sessionId: "",
   activeTurnId: "",
   messages: [],
+  sessionMessages: {},
   error: "",
   turnStates: {},
 };
@@ -18,36 +19,54 @@ export const initialChatState: ChatState = {
 export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState {
   if (action.type === "ui.session.select") {
     const turn = state.turnStates[action.sessionId] ?? idleTurnState;
-    const messages = turn.status === "running" && turn.turnId
-      && !action.messages.some((message) => message.turnId === turn.turnId)
-      ? [...action.messages, createDraft(turn.turnId)]
-      : action.messages;
+    const active = turn.status === "queued" || turn.status === "running";
+    const cached = state.sessionMessages[action.sessionId];
+    let messages = active && cached ? cached : action.messages;
+    if (turn.status === "running" && turn.turnId
+      && !messages.some((message) => message.turnId === turn.turnId)) {
+      messages = [...messages, createDraft(turn.turnId)];
+    }
     return {
       ...state,
       sessionId: action.sessionId,
       activeTurnId: turn.status === "running" ? turn.turnId : "",
       messages,
+      sessionMessages: setSessionMessages(state, action.sessionId, messages),
       error: "",
     };
   }
   if (action.type === "ui.user.append") {
-    return { ...state, messages: [...state.messages, action.message], error: "" };
+    const messages = [...state.messages, action.message];
+    return {
+      ...state,
+      messages,
+      sessionMessages: setSessionMessages(state, state.sessionId, messages),
+      error: "",
+    };
   }
   if (action.type === "ui.error.clear") return { ...state, error: "" };
   if (action.type === "session.created") {
-    return { ...state, sessionId: action.session_id, activeTurnId: "", messages: [], error: "" };
+    return {
+      ...state,
+      sessionId: action.session_id,
+      activeTurnId: "",
+      messages: [],
+      sessionMessages: setSessionMessages(state, action.session_id, []),
+      error: "",
+    };
   }
   if (action.type === "session.subscribed") return state;
   if (action.type === "error") {
     const rejected = action.code === "queue_full" || action.code === "session_busy" || action.code === "closed";
     if (!rejected || !action.session_id) return { ...state, error: action.message };
     const current = action.session_id === state.sessionId;
+    const sessionMessages = getSessionMessages(state, action.session_id)
+      .filter((message) => message.id !== `user-${action.request_id}`);
     return {
       ...state,
       activeTurnId: current ? "" : state.activeTurnId,
-      messages: current
-        ? state.messages.filter((message) => message.id !== `user-${action.request_id}`)
-        : state.messages,
+      messages: current ? sessionMessages : state.messages,
+      sessionMessages: setSessionMessages(state, action.session_id, sessionMessages),
       error: current ? action.message : state.error,
       turnStates: setTurnState(state, action.session_id, idleTurnState),
     };
@@ -72,16 +91,25 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       turnId: action.turn_id,
       requestId: action.request_id ?? "",
     });
-    if (state.sessionId && action.session_id !== state.sessionId) {
-      return { ...state, turnStates };
-    }
     const draft = createDraft(action.turn_id);
+    const sessionMessages = [
+      ...getSessionMessages(state, action.session_id).filter((item) => item.turnId !== action.turn_id),
+      draft,
+    ];
+    if (state.sessionId && action.session_id !== state.sessionId) {
+      return {
+        ...state,
+        turnStates,
+        sessionMessages: setSessionMessages(state, action.session_id, sessionMessages),
+      };
+    }
     return {
       ...state,
       sessionId: action.session_id,
       activeTurnId: action.turn_id,
       turnStates,
-      messages: [...state.messages.filter((item) => item.turnId !== action.turn_id), draft],
+      messages: sessionMessages,
+      sessionMessages: setSessionMessages(state, action.session_id, sessionMessages),
       error: "",
     };
   }
@@ -90,46 +118,46 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       ...state,
       turnStates: setTurnState(state, action.session_id, idleTurnState),
     };
-    if (state.sessionId && action.session_id !== state.sessionId) return nextState;
     state = nextState;
   }
   if (action.type === "turn.interrupted") {
     const current = action.session_id === state.sessionId;
-    const interruptedTurnId = action.turn_id || state.activeTurnId;
+    const interruptedTurnId = action.turn_id
+      || state.turnStates[action.session_id]?.turnId
+      || (current ? state.activeTurnId : "");
+    const sessionMessages = interruptedTurnId
+      ? getSessionMessages(state, action.session_id).map((message) => message.turnId === interruptedTurnId
+        ? { ...message, streaming: false, status: "interrupted" }
+        : message)
+      : getSessionMessages(state, action.session_id);
     const nextState = {
       ...state,
       activeTurnId: current ? "" : state.activeTurnId,
       turnStates: setTurnState(state, action.session_id, idleTurnState),
+      sessionMessages: setSessionMessages(state, action.session_id, sessionMessages),
     };
     if (!current) return nextState;
     return {
       ...nextState,
-      messages: interruptedTurnId
-        ? state.messages.map((message) => message.turnId === interruptedTurnId
-          ? { ...message, streaming: false, status: "interrupted" }
-          : message)
-        : state.messages,
+      messages: sessionMessages,
     };
   }
-  if ("session_id" in action && state.sessionId && action.session_id !== state.sessionId) {
-    return state;
-  }
   if (action.type === "answer.delta") {
-    return updateTurn(state, action.turn_id, (message) => ({
+    return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
       ...message,
       content: message.content + action.delta,
       streaming: true,
     }));
   }
   if (action.type === "react.thinking.delta") {
-    return updateTurn(state, action.turn_id, (message) => ({
+    return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
       ...message,
       thinking: message.thinking + action.delta,
       streaming: true,
     }));
   }
   if (action.type === "react.tool.started") {
-    return updateTurn(state, action.turn_id, (message) => ({
+    return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
       ...message,
       tools: [...message.tools, {
         callId: action.call_id,
@@ -141,7 +169,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     }));
   }
   if (action.type === "react.tool.completed") {
-    return updateTurn(state, action.turn_id, (message) => ({
+    return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
       ...message,
       tools: message.tools.map((tool) => tool.callId === action.call_id ? {
         ...tool,
@@ -153,11 +181,10 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
   if (action.type === "message.final") {
     if (!action.turn_id && (action.metadata?.proactive || action.metadata?.notification)) {
       const id = action.message_id || String(action.metadata.message_id || `proactive-${state.messages.length}`);
-      if (state.messages.some((message) => message.id === id)) return state;
+      const existing = getSessionMessages(state, action.session_id);
+      if (existing.some((message) => message.id === id)) return state;
       const source = String(action.metadata.source || "") as ChatMessage["source"];
-      return {
-        ...state,
-        messages: [...state.messages, {
+      const proactiveMessage: ChatMessage = {
           id,
           role: "assistant",
           content: action.content,
@@ -169,18 +196,26 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
           source,
           scheduledAt: String(action.metadata.scheduled_at || "") || undefined,
           timestamp: String(action.metadata.generated_at || "") || undefined,
-        }],
+        };
+      const messages = [...existing, proactiveMessage];
+      return {
+        ...state,
+        messages: action.session_id === state.sessionId ? messages : state.messages,
+        sessionMessages: setSessionMessages(state, action.session_id, messages),
       };
     }
     // final 是服务端的权威快照，必须覆盖草稿，不能继续追加 delta。
-    const next = updateTurn(state, action.turn_id, (message) => ({
+    const next = updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
       ...message,
       content: action.content || message.content,
       thinking: action.thinking || message.thinking,
       media: action.media ?? message.media,
       streaming: false,
     }));
-    return { ...next, activeTurnId: "" };
+    return {
+      ...next,
+      activeTurnId: action.session_id === state.sessionId ? "" : next.activeTurnId,
+    };
   }
   return state;
 }
@@ -206,16 +241,38 @@ function setTurnState(
   return { ...state.turnStates, [sessionId]: { ...value } };
 }
 
-function updateTurn(
+function getSessionMessages(state: ChatState, sessionId: string): ChatMessage[] {
+  if (Object.prototype.hasOwnProperty.call(state.sessionMessages, sessionId)) {
+    return state.sessionMessages[sessionId];
+  }
+  return sessionId === state.sessionId ? state.messages : [];
+}
+
+function setSessionMessages(
   state: ChatState,
+  sessionId: string,
+  messages: ChatMessage[],
+): Record<string, ChatMessage[]> {
+  if (!sessionId) return state.sessionMessages;
+  return { ...state.sessionMessages, [sessionId]: messages };
+}
+
+function updateSessionTurn(
+  state: ChatState,
+  sessionId: string,
   turnId: string,
   updater: (message: ChatMessage) => ChatMessage,
 ): ChatState {
-  const index = state.messages.findIndex((message) => message.turnId === turnId);
+  const source = getSessionMessages(state, sessionId);
+  const index = source.findIndex((message) => message.turnId === turnId);
   if (index < 0) return state;
-  const messages = [...state.messages];
+  const messages = [...source];
   messages[index] = updater(messages[index]);
-  return { ...state, messages };
+  return {
+    ...state,
+    messages: sessionId === state.sessionId ? messages : state.messages,
+    sessionMessages: setSessionMessages(state, sessionId, messages),
+  };
 }
 
 export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {

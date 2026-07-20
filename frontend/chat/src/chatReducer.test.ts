@@ -3,6 +3,69 @@ import { describe, expect, it } from "vitest";
 import { initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame } from "./chatReducer";
 
 describe("reduceChatFrame", () => {
+  it("排队会话切走再切回仍保留用户问题", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "ui.user.append",
+      message: {
+        id: "user-r1", role: "user", content: "等待执行的问题", thinking: "", media: [], tools: [],
+      },
+    });
+    state = reduceChatFrame(state, {
+      type: "turn.queued", request_id: "r1", session_id: "web:one", position: 1,
+    });
+    state = reduceChatFrame(state, {
+      type: "ui.session.select", sessionId: "web:two", messages: [],
+    });
+    state = reduceChatFrame(state, {
+      type: "ui.session.select", sessionId: "web:one", messages: [],
+    });
+
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({ role: "user", content: "等待执行的问题" });
+    expect(state.turnStates["web:one"].status).toBe("queued");
+  });
+
+  it("后台会话的流式文本思考和工具状态在切回后完整恢复", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "ui.user.append",
+      message: {
+        id: "user-r1", role: "user", content: "分析项目", thinking: "", media: [], tools: [],
+      },
+    });
+    state = reduceChatFrame(state, {
+      type: "ui.session.select", sessionId: "web:two", messages: [],
+    });
+    state = reduceChatFrame(state, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+    state = reduceChatFrame(state, {
+      type: "react.thinking.delta", session_id: "web:one", turn_id: "turn-1", delta: "正在检查",
+    });
+    state = reduceChatFrame(state, {
+      type: "answer.delta", session_id: "web:one", turn_id: "turn-1", delta: "阶段结果",
+    });
+    state = reduceChatFrame(state, {
+      type: "react.tool.started", session_id: "web:one", turn_id: "turn-1",
+      call_id: "call-1", tool_name: "list_dir", arguments: { path: "." },
+    });
+    state = reduceChatFrame(state, {
+      type: "react.tool.completed", session_id: "web:one", turn_id: "turn-1",
+      call_id: "call-1", tool_name: "list_dir", status: "ok", result_preview: "agent, tests",
+    });
+    state = reduceChatFrame(state, {
+      type: "ui.session.select", sessionId: "web:one", messages: [],
+    });
+
+    expect(state.messages).toHaveLength(2);
+    expect(state.messages[0]).toMatchObject({ role: "user", content: "分析项目" });
+    expect(state.messages[1]).toMatchObject({
+      turnId: "turn-1",
+      content: "阶段结果",
+      thinking: "正在检查",
+      tools: [{ callId: "call-1", status: "completed", resultPreview: "agent, tests" }],
+    });
+  });
+
   it("按 session 保存排队位置并在切换会话后保留", () => {
     const current = { ...initialChatState, sessionId: "web:current" };
     const queued = reduceChatFrame(current, {

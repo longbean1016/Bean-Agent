@@ -29,6 +29,7 @@ export interface ChatState {
   sessionId: string;
   activeTurnId: string;
   messages: ChatMessage[];
+  sessionMessages: Record<string, ChatMessage[]>;
   error: string;
   turnStates: Record<string, TurnRuntimeState>;
 }

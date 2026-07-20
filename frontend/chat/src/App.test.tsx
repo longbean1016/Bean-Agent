@@ -174,6 +174,56 @@ it("排队时展示动态位置并允许停止取消", async () => {
   expect(socket.sent.at(-1)).toMatchObject({ type: "turn.stop", session_id: "web:component" });
 });
 
+it("切回后台运行会话时恢复用户问题流式内容和工具状态", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    const payload = url.includes("/messages") || url.includes("/notifications")
+      ? { items: [], total: 0 }
+      : {
+          items: [{
+            key: "web:other", title: "其他会话", first_message_content: "其他会话",
+            created_at: new Date().toISOString(), updated_at: new Date().toISOString(), message_count: 2,
+          }],
+          total: 1,
+        };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+  render(<App />);
+  await screen.findByText("已连接");
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  const socket = FakeWebSocket.instances[0];
+  const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
+  fireEvent.change(input, { target: { value: "分析当前项目" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  const sent = socket.sent.find((frame) => frame.type === "message.send");
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.queued", request_id: sent?.request_id, session_id: "web:component", position: 1,
+  }) } as MessageEvent);
+  fireEvent.click(await screen.findByRole("button", { name: "其他会话" }));
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:other"));
+
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.started", request_id: sent?.request_id, session_id: "web:component", turn_id: "turn-background",
+  }) } as MessageEvent);
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "answer.delta", session_id: "web:component", turn_id: "turn-background", delta: "阶段结果",
+  }) } as MessageEvent);
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "react.tool.started", session_id: "web:component", turn_id: "turn-background",
+    call_id: "call-1", tool_name: "list_dir", arguments: { path: "." },
+  }) } as MessageEvent);
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "react.tool.completed", session_id: "web:component", turn_id: "turn-background",
+    call_id: "call-1", tool_name: "list_dir", status: "ok", result_preview: "agent, tests",
+  }) } as MessageEvent);
+
+  fireEvent.click(screen.getByRole("button", { name: "新对话" }));
+  expect(await screen.findByText("分析当前项目")).toBeVisible();
+  expect(screen.getByText("阶段结果")).toBeVisible();
+  expect(screen.getByText("list_dir")).toBeVisible();
+  expect(screen.queryByText("排队中 · 即将开始")).not.toBeInTheDocument();
+});
+
 it("会话列表使用最近更新时间分组", async () => {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages")
