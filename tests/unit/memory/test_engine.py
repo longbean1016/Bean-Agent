@@ -354,7 +354,6 @@ async def test_procedure_query_limits_types_without_llm_enhancement(
     "intent",
     [
         "answer",
-        "interest",
         "context",
     ],
 )
@@ -391,6 +390,56 @@ async def test_default_query_intents_share_workspace_memories_across_sessions(
         "会话 A 的发布记录",
         "会话 B 的发布记录",
     }
+
+
+@pytest.mark.asyncio
+async def test_interest_query_only_reads_workspace_preferences_and_profile(
+    tmp_path: Path,
+) -> None:
+    class ForbiddenRewriter:
+        async def decide(self, user_msg: str, recent_history: str):
+            raise AssertionError("interest 不应调用查询改写器")
+
+    class CapturingRetriever:
+        kwargs: dict[str, object] = {}
+
+        async def retrieve(self, query: str, **kwargs):
+            self.kwargs = kwargs
+            return [{
+                "id": "preference-1",
+                "memory_type": "preference",
+                "summary": "用户喜欢徒步",
+                "score": 0.9,
+            }]
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    retriever = CapturingRetriever()
+    engine._rewriter = ForbiddenRewriter()
+    engine._retriever = retriever
+    try:
+        result = await engine.query(MemoryQuery(
+            "用户最近可能关心什么",
+            intent="interest",
+            scope=MemoryScope(channel="web", chat_id="session-b"),
+            filters=MemoryQueryFilters(kinds=("event", "procedure")),
+            context={"aux_queries": ["不应使用的扩展查询"]},
+            limit=2,
+        ))
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert retriever.kwargs["memory_types"] == ["preference", "profile"]
+    assert retriever.kwargs["aux_queries"] == []
+    assert retriever.kwargs["require_scope_match"] is False
+    assert retriever.kwargs["top_k"] == 2
+    assert [record.kind for record in result.records] == ["preference"]
+    assert result.trace["intent"] == "interest"
+    assert result.trace["memory_types"] == ["preference", "profile"]
+    assert result.trace["read_only"] is True
 
 
 @pytest.mark.asyncio
