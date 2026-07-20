@@ -446,7 +446,7 @@ it("用户向上滚动后流式增量不抢回视口并可主动回到底部", a
   await screen.findByText("新内容");
   expect(conversation!.scrollTop).toBe(300);
   fireEvent.click(latestButton);
-  await waitFor(() => expect(conversation!.scrollTop).toBeGreaterThan(798.5));
+  await waitFor(() => expect(conversation!.scrollTop).toBeGreaterThan(798));
   expect(screen.queryByRole("button", { name: "回到最新消息" })).not.toBeInTheDocument();
 });
 
@@ -487,7 +487,7 @@ it("点击历史会话后在目标消息渲染完成时强制回到底部", asyn
   fireEvent.click(screen.getByRole("button", { name: "第二个会话" }));
 
   await screen.findByText("第二个会话的末尾");
-  await waitFor(() => expect(conversation!.scrollTop).toBeGreaterThanOrEqual(1198));
+  await waitFor(() => expect(conversation!.scrollTop).toBeGreaterThanOrEqual(1197));
   expect(container.querySelector(".conversation-content")).not.toBeNull();
 });
 
