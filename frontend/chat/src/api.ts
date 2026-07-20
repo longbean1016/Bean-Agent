@@ -1,4 +1,4 @@
-import type { MessageRow, ProactiveSettings, ScheduledReminder, SessionSummary, UploadedFile } from "./types";
+import type { MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, UploadedFile } from "./types";
 
 export async function fetchSessions(): Promise<SessionSummary[]> {
   const response = await fetch("/api/chat/sessions?page=1&page_size=100");
@@ -12,6 +12,12 @@ export async function fetchMessages(sessionId: string): Promise<MessageRow[]> {
   if (!response.ok) throw new Error("无法加载会话历史");
   const payload = await response.json() as { items?: MessageRow[] };
   return payload.items ?? [];
+}
+
+export async function fetchNotifications(sessionId: string): Promise<ProactiveNotificationRow[]> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/notifications`);
+  if (!response.ok) throw new Error("无法加载提醒通知");
+  return ((await response.json()) as { items?: ProactiveNotificationRow[] }).items ?? [];
 }
 
 export async function renameSession(sessionId: string, title: string): Promise<SessionSummary> {
@@ -75,15 +81,6 @@ export async function fetchReminders(sessionId: string): Promise<ScheduledRemind
   const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/reminders`);
   if (!response.ok) throw new Error("无法加载提醒列表");
   return ((await response.json()) as { items?: ScheduledReminder[] }).items ?? [];
-}
-
-export async function setReminderEnabled(sessionId: string, reminderId: string, enabled: boolean): Promise<void> {
-  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/reminders/${encodeURIComponent(reminderId)}`, {
-    method: "PATCH",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ enabled }),
-  });
-  if (!response.ok) throw new Error("无法更新提醒状态");
 }
 
 export async function deleteReminder(sessionId: string, reminderId: string): Promise<void> {

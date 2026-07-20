@@ -32,8 +32,8 @@ import type { ComponentPropsWithoutRef, ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
-import { deleteReminder, deleteSession, fetchMessages, fetchProactiveSettings, fetchReminders, fetchSessions, mediaUrl, renameSession, saveProactiveSettings, setReminderEnabled, uploadAttachment } from "./api";
-import { initialChatState, reduceChatFrame, rowsToMessages } from "./chatReducer";
+import { deleteReminder, deleteSession, fetchMessages, fetchNotifications, fetchProactiveSettings, fetchReminders, fetchSessions, mediaUrl, renameSession, saveProactiveSettings, uploadAttachment } from "./api";
+import { initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
@@ -220,7 +220,8 @@ export function App() {
 
   const loadSession = async (sessionId: string, closeSidebar = true) => {
     try {
-      const messages = rowsToMessages(await fetchMessages(sessionId));
+      const [rows, notifications] = await Promise.all([fetchMessages(sessionId), fetchNotifications(sessionId)]);
+      const messages = mergeTimeline(rowsToMessages(rows), notificationRowsToMessages(notifications));
       localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
       dispatch({ type: "ui.session.select", sessionId, messages });
       if (closeSidebar) setSidebarOpen(false);
@@ -656,8 +657,7 @@ function ProactiveSettingsDialog({ target, onClose }: { target: SessionSummary |
                   <div className="reminder-list-title"><span>已创建的提醒</span><small>通过对话创建</small></div>
                   {reminders.length === 0 ? <p className="reminder-empty">暂无提醒</p> : reminders.map((item) => (
                     <div className="reminder-item" key={item.id}>
-                      <div><strong>{item.name || (item.tier === "instant" ? "固定提醒" : "AI 定时任务")}</strong><small>{new Date(item.fire_at).toLocaleString()} · {item.tier === "instant" ? "固定文本" : "到期执行 prompt"}</small></div>
-                      <button className="text-action" onClick={() => { if (!target) return; void setReminderEnabled(target.key, item.id, !item.enabled).then(refreshReminderList).catch((reason) => setError(String(reason))); }}>{item.enabled ? "暂停" : "恢复"}</button>
+                      <div><strong>{item.name || (item.tier === "instant" ? "固定提醒" : "AI 定时任务")}</strong><small>{item.trigger === "every" ? "周期 · " : ""}{new Date(item.fire_at).toLocaleString()} · {item.tier === "instant" ? "固定文本" : "到期执行 prompt"}{item.status === "failed" ? ` · 失败：${item.last_error}` : ""}</small></div>
                       <button className="icon-button danger" aria-label="删除提醒" onClick={() => { if (!target) return; void deleteReminder(target.key, item.id).then(refreshReminderList).catch((reason) => setError(String(reason))); }}><Trash2 size={15} /></button>
                     </div>
                   ))}
@@ -756,6 +756,7 @@ function MessageView({ message }: { message: ChatMessage }) {
     <article className={`message ${isUser ? "user-message" : "assistant-message"}`}>
       <div className="message-label">{isUser ? "你" : "BeanAgent"}</div>
       <div className="message-body">
+        {!isUser && message.source ? <MessageSourceBadge message={message} /> : null}
         {message.media.length ? <AttachmentGallery paths={message.media} /> : null}
         {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} /> : null}
         {message.tools.length ? <div className="tool-timeline">{message.tools.map((tool) => <ToolStep key={tool.callId} tool={tool} />)}</div> : null}
@@ -779,6 +780,20 @@ function MessageView({ message }: { message: ChatMessage }) {
         {message.status === "interrupted" ? <span className="interrupted-label">已停止</span> : null}
       </div>
     </article>
+  );
+}
+
+function MessageSourceBadge({ message }: { message: ChatMessage }) {
+  const details = message.source === "scheduled_reminder"
+    ? { label: "提醒", icon: <Bell size={13} /> }
+    : message.source === "scheduled_soft"
+      ? { label: "定时任务", icon: <Wrench size={13} /> }
+      : { label: "主动聊天", icon: <MessageSquarePlus size={13} /> };
+  return (
+    <div className={`message-source ${message.source}`}>
+      <span>{details.icon}{details.label}</span>
+      {message.scheduledAt ? <time>原定时间：{new Date(message.scheduledAt).toLocaleString()}</time> : null}
+    </div>
   );
 }
 

@@ -21,6 +21,8 @@ export interface ChatMessage {
   status?: string;
   timestamp?: string;
   proactive?: boolean;
+  source?: "scheduled_reminder" | "scheduled_soft" | "proactive_conversation";
+  scheduledAt?: string;
 }
 
 export interface ChatState {
@@ -49,6 +51,8 @@ export interface MessageRow {
   tool_chain?: Array<{ calls?: Array<{ call_id?: string; name?: string; arguments?: unknown; result?: string; status?: string }> }>;
   status?: string;
   timestamp?: string;
+  proactive?: boolean;
+  metadata?: Record<string, unknown>;
 }
 
 export interface UploadedFile {
@@ -82,6 +86,18 @@ export interface ScheduledReminder {
   status: string;
   run_count: number;
   last_error: string;
+}
+
+export interface ProactiveNotificationRow {
+  id: string;
+  content: string;
+  source: "scheduled_reminder" | "scheduled_soft";
+  source_id: string;
+  scheduled_at: string;
+  generated_at: string;
+  delivered_at?: string | null;
+  status: "pending" | "delivered" | "seen";
+  recurring: boolean;
 }
 
 export type ChatFrame =

@@ -212,7 +212,7 @@ button { color: inherit; }
 .reminder-list-title { display: flex; align-items: center; justify-content: space-between; padding: 9px 10px; border-bottom: 1px solid #e1e7e5; font-size: 12px; }
 .reminder-list-title small, .reminder-item small { color: #7b8682; font-size: 10px; }
 .reminder-empty { margin: 0; padding: 16px 10px; color: #7a8581; font-size: 12px; text-align: center; }
-.reminder-item { display: grid; grid-template-columns: minmax(0, 1fr) auto 28px; min-height: 52px; align-items: center; gap: 8px; padding: 7px 8px 7px 10px; border-top: 1px solid #edf1ef; }
+.reminder-item { display: grid; grid-template-columns: minmax(0, 1fr) 28px; min-height: 52px; align-items: center; gap: 8px; padding: 7px 8px 7px 10px; border-top: 1px solid #edf1ef; }
 .reminder-item:first-of-type { border-top: 0; }
 .reminder-item > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
 .reminder-item strong, .reminder-item small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -221,6 +221,11 @@ button { color: inherit; }
 .proactive-dialog-footer { justify-content: flex-end; border-top: 1px solid #d8e0dd; border-bottom: 0; }
 .proactive-dialog-footer button { min-width: 82px; min-height: 34px; border-radius: 5px; cursor: pointer; }
 .settings-error { padding: 8px 10px; border: 1px solid #e0b5af; border-radius: 5px; color: #8d362f; background: #fff4f2; font-size: 12px; }
+.message-source { display: flex; align-items: center; gap: 10px; margin: 0 0 8px; color: #66736e; font-size: 11px; }
+.message-source > span { display: inline-flex; height: 23px; align-items: center; gap: 5px; padding: 0 7px; border: 1px solid #cbd8d3; border-radius: 4px; color: #176d65; background: #edf6f3; font-weight: 700; }
+.message-source.scheduled_reminder > span { border-color: #ddcfaa; color: #795c1d; background: #fbf6e8; }
+.message-source.scheduled_soft > span { border-color: #c9d2df; color: #405f7a; background: #eef3f8; }
+.message-source time { color: #7b8682; }
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes dialog-in { from { opacity: 0; transform: translate(-50%, calc(-50% + 8px)); } }
 

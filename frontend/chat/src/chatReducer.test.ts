@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { initialChatState, reduceChatFrame } from "./chatReducer";
+import { initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame } from "./chatReducer";
 
 describe("reduceChatFrame", () => {
   it("用 message.final 覆盖同一 turn 的流式草稿", () => {
@@ -94,5 +94,25 @@ describe("reduceChatFrame", () => {
 
     expect(twice.messages).toHaveLength(1);
     expect(twice.messages[0]).toMatchObject({ id: "message-1", proactive: true, streaming: false });
+  });
+
+  it("把独立提醒按生成时间合并进会话展示层", () => {
+    const notifications = notificationRowsToMessages([{
+      id: "notice-1",
+      content: "起来活动一下",
+      source: "scheduled_reminder",
+      source_id: "job-1",
+      scheduled_at: "2026-07-20T09:00:00+08:00",
+      generated_at: "2026-07-20T09:00:01+08:00",
+      status: "delivered",
+      recurring: false,
+    }]);
+    const timeline = mergeTimeline([{
+      id: "user-1", role: "user", content: "早上好", thinking: "", media: [], tools: [],
+      timestamp: "2026-07-20T08:00:00+08:00",
+    }], notifications);
+
+    expect(timeline.map((message) => message.id)).toEqual(["user-1", "notice-1"]);
+    expect(timeline[1]).toMatchObject({ source: "scheduled_reminder", scheduledAt: "2026-07-20T09:00:00+08:00" });
   });
 });
