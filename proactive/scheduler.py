@@ -24,8 +24,9 @@ class ScheduledDeliveryApi(Protocol):
         session_key: str,
         content: str,
         source: str,
-        delivery_key: str,
         source_id: str,
+        scheduled_at: datetime,
+        recurring: bool,
     ) -> object: ...
 
 
@@ -82,12 +83,16 @@ class SchedulerService:
         for job in jobs:
             if job.id in self._in_flight or job.fire_at.astimezone(timezone.utc) > now:
                 continue
+            if job.trigger == "every":
+                # 停机期间可能跨过多个周期；只执行最近一次应触发时间，旧周期不逐条补发。
+                job.fire_at = latest_recurring_fire(job, at=now)
             self._in_flight.add(job.id)
             tasks.append(asyncio.create_task(self._execute_and_reschedule(job), name=f"scheduled:{job.id}"))
         if tasks:
             await asyncio.gather(*tasks)
 
     async def _execute_and_reschedule(self, job: ScheduledJob) -> None:
+        delete_job = False
         try:
             settings = await asyncio.to_thread(self._store.get_settings, job.session_key)
             if not settings.reminders_enabled:
@@ -95,6 +100,7 @@ class SchedulerService:
                 return
             quiet_action, resume_at = _reminder_quiet_action(settings, self._now_fn())
             if quiet_action == "delay":
+                job.scheduled_for = job.scheduled_for or job.fire_at
                 job.fire_at = resume_at
                 job.status = "pending"
                 return
@@ -105,8 +111,7 @@ class SchedulerService:
                     job.fire_at = next_recurring_fire(job, after=self._now_fn())
                     job.status = "pending"
                 else:
-                    job.enabled = False
-                    job.status = "skipped"
+                    delete_job = True
                 return
             content = job.message
             source = "scheduled_reminder"
@@ -121,25 +126,36 @@ class SchedulerService:
                 session_key=job.session_key,
                 content=content,
                 source=source,
-                delivery_key=f"schedule:{job.id}:{job.fire_at.isoformat()}",
                 source_id=job.id,
+                scheduled_at=job.scheduled_for or job.fire_at,
+                recurring=job.trigger == "every",
             )
             job.run_count += 1
             job.last_error = ""
             if job.trigger == "every":
+                if job.scheduled_for is not None:
+                    job.fire_at = job.scheduled_for
+                    job.scheduled_for = None
                 job.fire_at = next_recurring_fire(job, after=self._now_fn())
                 job.status = "pending"
             else:
-                job.enabled = False
-                job.status = "completed"
+                # 一次性任务已经转化为独立通知，不再留在“已创建提醒”中堆积。
+                delete_job = True
         except Exception as error:
             job.last_error = str(error)
             job.status = "failed"
             logger.exception("定时任务执行失败: job_id=%s", job.id)
-            if job.trigger != "every":
+            if job.trigger == "every":
+                # 周期任务失败只影响本次；推进到下一个周期，避免每秒重试形成风暴。
+                job.fire_at = next_recurring_fire(job, after=self._now_fn())
+            else:
+                # 一次性失败任务保留给用户查看和删除，但不再自动重复执行。
                 job.enabled = False
         finally:
-            await asyncio.to_thread(self._store.update_job, job)
+            if delete_job:
+                await asyncio.to_thread(self._store.delete_job, job.id, session_key=job.session_key)
+            else:
+                await asyncio.to_thread(self._store.update_job, job)
             self._in_flight.discard(job.id)
 
     async def close(self) -> None:
@@ -206,6 +222,25 @@ def next_recurring_fire(job: ScheduledJob, *, after: datetime) -> datetime:
     return _next_daily_cron(job.cron_expr, ZoneInfo(job.timezone), after)
 
 
+def latest_recurring_fire(job: ScheduledJob, *, at: datetime) -> datetime:
+    """折叠停机期间的重复周期，返回不晚于当前时间的最近一次边界。"""
+
+    current = job.fire_at
+    target = at.astimezone(current.tzinfo)
+    if job.interval_seconds:
+        elapsed = max(0.0, (target - current).total_seconds())
+        steps = int(elapsed // job.interval_seconds)
+        return current + timedelta(seconds=steps * job.interval_seconds)
+    latest = current
+    # 当前只支持每日 Cron；循环仍设置上限，避免损坏数据导致启动卡死。
+    for _ in range(3660):
+        candidate = _next_daily_cron(job.cron_expr, ZoneInfo(job.timezone), latest)
+        if candidate > at.astimezone(candidate.tzinfo):
+            return latest
+        latest = candidate
+    raise RuntimeError("周期任务跨越时间过长，无法计算最近触发时间")
+
+
 def _next_daily_cron(expression: str, tz: ZoneInfo, after: datetime) -> datetime:
     parts = expression.split()
     if len(parts) != 5 or parts[2:] != ["*", "*", "*"]:
@@ -240,4 +275,4 @@ def _reminder_quiet_action(settings: object, now: datetime) -> tuple[str, dateti
     return "delay", resume.astimezone(timezone.utc)
 
 
-__all__ = ["SchedulerService", "compute_fire_at", "next_recurring_fire", "parse_duration"]
+__all__ = ["SchedulerService", "compute_fire_at", "latest_recurring_fire", "next_recurring_fire", "parse_duration"]

@@ -36,6 +36,7 @@ from memory.embedder import Embedder
 from memory.engine import MemoryEngine
 from proactive.chat_loop import ProactiveChatLoop
 from proactive.models import SessionProactiveSettings
+from proactive.notification_service import NotificationService
 from proactive.scheduler import SchedulerService
 from proactive.soft_executor import SoftTaskExecutor
 from proactive.store import ProactiveStore
@@ -132,6 +133,7 @@ class AppRuntime:
             core.event_bus,
             core.agent_loop,
             media_root=core.workspace / "uploads",
+            proactive_store=core.proactive_store,
         )
         self.maintenance = (
             MemoryMaintenanceLoop(
@@ -217,6 +219,7 @@ class CoreRuntime:
     agent_loop: AgentLoop
     proactive_store: ProactiveStore
     proactive_turns: ProactiveTurnService
+    proactive_notifications: NotificationService
     scheduler: SchedulerService
     proactive_chat: ProactiveChatLoop
     vision_provider: Any | None = None
@@ -311,10 +314,11 @@ def build_core_runtime(
     )
     agent_loop = AgentLoop(messages, events, pipeline, sessions)
     proactive_turns = ProactiveTurnService(proactive_store, sessions, messages)
+    proactive_notifications = NotificationService(proactive_store, messages)
     soft_executor = SoftTaskExecutor(pipeline)
     scheduler = SchedulerService(
         proactive_store,
-        proactive_turns,
+        proactive_notifications,
         soft_executor=soft_executor.execute,
     )
     proactive_chat = ProactiveChatLoop(
@@ -340,6 +344,7 @@ def build_core_runtime(
         agent_loop=agent_loop,
         proactive_store=proactive_store,
         proactive_turns=proactive_turns,
+        proactive_notifications=proactive_notifications,
         scheduler=scheduler,
         proactive_chat=proactive_chat,
         vision_provider=vision_provider,
@@ -461,22 +466,13 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
         jobs = application.core.proactive_store.list_jobs(session_key)
         return {"items": [_scheduled_job_payload(job) for job in jobs]}
 
-    @app.patch("/api/chat/sessions/{session_key:path}/reminders/{job_id}")
-    def update_reminder(
-        session_key: str,
-        job_id: str,
-        enabled: bool = Body(..., embed=True),
-    ) -> dict[str, Any]:
-        """暂停或恢复现有任务；不允许在管理页面改写原始提醒含义。"""
+    @app.get("/api/chat/sessions/{session_key:path}/notifications")
+    def list_notifications(session_key: str) -> dict[str, Any]:
+        """返回独立通知供前端合并展示，不把内容注入 Agent 会话历史。"""
 
         require_web_session(session_key)
-        job = application.core.proactive_store.get_job(job_id)
-        if job is None or job.session_key != session_key:
-            raise HTTPException(status_code=404, detail="提醒不存在")
-        job.enabled = enabled
-        job.status = "pending" if enabled else "paused"
-        application.core.proactive_store.update_job(job)
-        return _scheduled_job_payload(job)
+        items = application.core.proactive_store.list_notifications(session_key)
+        return {"items": [_notification_payload(item) for item in items]}
 
     @app.delete("/api/chat/sessions/{session_key:path}/reminders/{job_id}", status_code=204)
     def delete_reminder(session_key: str, job_id: str) -> Response:
@@ -604,6 +600,22 @@ def _scheduled_job_payload(job: Any) -> dict[str, Any]:
         "status": job.status,
         "run_count": job.run_count,
         "last_error": job.last_error,
+    }
+
+
+def _notification_payload(item: Any) -> dict[str, Any]:
+    """将通知记录转换为前端时间线格式。"""
+
+    return {
+        "id": item.id,
+        "content": item.content,
+        "source": item.source,
+        "source_id": item.source_id,
+        "scheduled_at": item.scheduled_at.isoformat(),
+        "generated_at": item.generated_at.isoformat(),
+        "delivered_at": item.delivered_at.isoformat() if item.delivered_at else None,
+        "status": item.status,
+        "recurring": item.recurring,
     }
 
 

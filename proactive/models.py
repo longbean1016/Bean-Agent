@@ -47,6 +47,7 @@ class ScheduledJob:
     timezone: str = "Asia/Shanghai"
     interval_seconds: int | None = None
     cron_expr: str = ""
+    scheduled_for: datetime | None = None
     enabled: bool = True
     run_count: int = 0
     status: str = "pending"

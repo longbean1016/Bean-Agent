@@ -362,6 +362,7 @@ def _job_payload(job: ScheduledJob) -> dict[str, object]:
     payload = asdict(job)
     payload["fire_at"] = job.fire_at.astimezone(timezone.utc).isoformat()
     payload["created_at"] = job.created_at.astimezone(timezone.utc).isoformat()
+    payload["scheduled_for"] = job.scheduled_for.astimezone(timezone.utc).isoformat() if job.scheduled_for else None
     return payload
 
 
@@ -369,6 +370,8 @@ def _job_from_payload(payload: dict[str, object]) -> ScheduledJob:
     data = dict(payload)
     data["fire_at"] = datetime.fromisoformat(str(data["fire_at"]))
     data["created_at"] = datetime.fromisoformat(str(data["created_at"]))
+    if data.get("scheduled_for"):
+        data["scheduled_for"] = datetime.fromisoformat(str(data["scheduled_for"]))
     return ScheduledJob(**data)  # type: ignore[arg-type]
 
 

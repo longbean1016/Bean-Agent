@@ -11,6 +11,8 @@ from uuid import uuid4
 from agent.agent_loop import InterruptResult
 from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted, TurnStarted
 from agent.message_bus import InboundMessage, MessageBus, OutboundMessage
+from proactive.notification_service import notification_metadata
+from proactive.store import ProactiveStore
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +30,12 @@ class InterruptController(Protocol):
 class WebChannel:
     name = "web"
 
-    def __init__(self, bus: MessageBus, event_bus: EventBus, interrupt_controller: InterruptController, *, media_root: Path | None = None) -> None:
+    def __init__(self, bus: MessageBus, event_bus: EventBus, interrupt_controller: InterruptController, *, media_root: Path | None = None, proactive_store: ProactiveStore | None = None) -> None:
         self._bus = bus
         self._events = event_bus
         self._interrupt = interrupt_controller
         self._media_root = media_root.resolve() if media_root is not None else None
+        self._proactive_store = proactive_store
         self._connections: dict[str, set[WebSocketApi]] = {}
         self._lock = asyncio.Lock()
         bus.subscribe_outbound(self.name, self._on_response)
@@ -72,6 +75,7 @@ class WebChannel:
                 "request_id": request_id,
                 "session_id": session_key,
             })
+            await self._replay_pending_notifications(session_key, websocket)
             return
         if frame_type == "message.send":
             if session_key is None:
@@ -114,12 +118,42 @@ class WebChannel:
     async def _on_response(self, message: OutboundMessage) -> None:
         session_key = f"{message.channel}:{message.chat_id}"
         metadata = dict(message.metadata)
-        await self._broadcast(session_key, {
+        sent = await self._broadcast(session_key, {
             "type": "message.final", "request_id": str(message.metadata.get("request_id") or ""),
             "session_id": session_key, "turn_id": str(message.metadata.get("turn_id") or ""),
             "content": message.content, "thinking": message.thinking, "media": list(message.media),
             "message_id": str(metadata.get("message_id") or ""), "metadata": metadata,
         })
+        notification_id = str(metadata.get("notification_id") or "")
+        if sent and notification_id and self._proactive_store is not None:
+            await asyncio.to_thread(self._proactive_store.mark_notification_delivered, notification_id)
+
+    async def _replay_pending_notifications(self, session_key: str, websocket: WebSocketApi) -> None:
+        """订阅会话时补发离线通知；失败时保持 pending，供下一次连接重试。"""
+
+        if self._proactive_store is None:
+            return
+        items = await asyncio.to_thread(
+            self._proactive_store.list_notifications,
+            session_key,
+            pending_only=True,
+        )
+        for item in items:
+            try:
+                await websocket.send_json({
+                    "type": "message.final",
+                    "request_id": "",
+                    "session_id": session_key,
+                    "turn_id": "",
+                    "content": item.content,
+                    "thinking": "",
+                    "media": [],
+                    "message_id": item.id,
+                    "metadata": notification_metadata(item),
+                })
+            except Exception:
+                return
+            await asyncio.to_thread(self._proactive_store.mark_notification_delivered, item.id)
 
     async def _on_turn_started(self, event: TurnStarted) -> None:
         await self._broadcast(event.session_key, {"type": "turn.started", "request_id": event.request_id, "session_id": event.session_key, "turn_id": event.turn_id})
@@ -147,17 +181,20 @@ class WebChannel:
                 if not self._connections[key]:
                     self._connections.pop(key, None)
 
-    async def _broadcast(self, session_key: str, payload: dict[str, Any]) -> None:
+    async def _broadcast(self, session_key: str, payload: dict[str, Any]) -> int:
         async with self._lock:
             targets = list(self._connections.get(session_key, ()))
         failed: list[WebSocketApi] = []
+        sent = 0
         for websocket in targets:
             try:
                 await websocket.send_json(payload)
+                sent += 1
             except Exception:
                 failed.append(websocket)
         for websocket in failed:
             await self._unregister(websocket)
+        return sent
 
     @staticmethod
     async def _error(websocket: WebSocketApi, request_id: str, code: str, message: str) -> None:
