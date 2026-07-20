@@ -246,7 +246,7 @@ async def test_interrupted_turn_is_expanded_into_next_provider_messages(
         )
         interrupted_turn = asyncio.create_task(loop.run_once())
         await provider.waiting.wait()
-        assert loop.request_interrupt("web:c").status == "interrupted"
+        assert (await loop.request_interrupt("web:c")).status == "interrupted"
         await interrupted_turn
 
         # 中断发生时不落库；同一会话的下一条消息负责补写中断标记。

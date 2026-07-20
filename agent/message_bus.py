@@ -71,6 +71,19 @@ class MessageBus:
     async def consume_inbound(self) -> InboundMessage:
         return await self._inbound.get()
 
+    async def discard_pending_inbound(self) -> list[InboundMessage]:
+        """关闭时释放尚未交给调度器的消息，避免 ChatLane 遗留普通 Turn 占用。"""
+
+        discarded: list[InboundMessage] = []
+        while True:
+            try:
+                message = self._inbound.get_nowait()
+            except asyncio.QueueEmpty:
+                return discarded
+            await self._chat_lane.mark_passive_done(message.channel, message.chat_id)
+            self._inbound.task_done()
+            discarded.append(message)
+
     async def complete_inbound(self, message: InboundMessage) -> None:
         await self._chat_lane.mark_passive_done(message.channel, message.chat_id)
         self._inbound.task_done()

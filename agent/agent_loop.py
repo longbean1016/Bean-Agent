@@ -9,8 +9,15 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import uuid4
 
-from agent.event_bus import EventBus, TurnCommitted, TurnStarted
+from agent.event_bus import (
+    EventBus,
+    TurnCommitted,
+    TurnQueued,
+    TurnQueueRejected,
+    TurnStarted,
+)
 from agent.message_bus import InboundMessage, MessageBus, OutboundMessage, PipelineResult
+from agent.turn_scheduler import QueuePosition, TurnScheduler
 from session.manager import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -49,7 +56,16 @@ class TurnInterruptState:
 class AgentLoop:
     """唯一 Turn 编排者：推理、批量持久化、提交事件和最终出站。"""
 
-    def __init__(self, bus: MessageBus, event_bus: EventBus, pipeline: PipelineApi, sessions: SessionManager) -> None:
+    def __init__(
+        self,
+        bus: MessageBus,
+        event_bus: EventBus,
+        pipeline: PipelineApi,
+        sessions: SessionManager,
+        *,
+        max_concurrent_turns: int = 5,
+        max_queued_turns: int = 20,
+    ) -> None:
         self._bus = bus
         self._events = event_bus
         self._pipeline = pipeline
@@ -58,26 +74,59 @@ class AgentLoop:
         self._active_turn_ids: dict[str, str] = {}
         self._active_turn_states: dict[str, TurnInterruptState] = {}
         self.interrupt_states: dict[str, TurnInterruptState] = {}
+        self._completion_waiters: dict[int, asyncio.Event] = {}
+        self._scheduler = TurnScheduler(
+            max_running=max_concurrent_turns,
+            max_queued=max_queued_turns,
+            start_turn=self._run_scheduled_turn,
+            on_queue_positions=self._on_queue_positions,
+            on_queued_cancelled=self._on_queued_cancelled,
+        )
         self._running = False
+        self._closed = False
 
     async def run(self) -> None:
         self._running = True
         while self._running:
-            await self.run_once()
+            message = await self._bus.consume_inbound()
+            await self._submit(message)
 
     async def run_once(self) -> None:
+        """提交并等待单条消息结束，保留单元测试和手动驱动的确定性语义。"""
+
         message = await self._bus.consume_inbound()
+        completed = asyncio.Event()
+        self._completion_waiters[id(message)] = completed
+        await self._submit(message)
+        await completed.wait()
+
+    async def _submit(self, message: InboundMessage) -> None:
+        result = await self._scheduler.submit(message)
+        if result.status != "rejected":
+            return
+        request_id = str(message.metadata.get("request_id") or "")
+        await self._events.emit(TurnQueueRejected(
+            message.session_key,
+            request_id,
+            result.reason,
+        ))
+        await self._bus.complete_inbound(message)
+        self._finish_waiter(message)
+
+    async def _run_scheduled_turn(self, message: InboundMessage) -> None:
         turn_id = uuid4().hex
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("调度 Turn 缺少当前 asyncio Task")
         self._active_turn_states[message.session_key] = TurnInterruptState(
             session_key=message.session_key,
             original_user_message=message.content,
             original_metadata=dict(message.metadata),
         )
-        task = asyncio.create_task(self._process_message(message, turn_id), name=f"agent-turn:{message.session_key}")
         self._active_tasks[message.session_key] = task
         self._active_turn_ids[message.session_key] = turn_id
         try:
-            await task
+            await self._process_message(message, turn_id)
         finally:
             if self._active_tasks.get(message.session_key) is task:
                 self._active_tasks.pop(message.session_key, None)
@@ -87,12 +136,29 @@ class AgentLoop:
             if callable(discard):
                 discard(turn_id)
             await self._bus.complete_inbound(message)
+            self._finish_waiter(message)
+
+    async def _on_queue_positions(self, positions: list[QueuePosition]) -> None:
+        for item in positions:
+            await self._events.emit(TurnQueued(
+                item.message.session_key,
+                str(item.message.metadata.get("request_id") or ""),
+                item.position,
+            ))
+
+    async def _on_queued_cancelled(self, message: InboundMessage) -> None:
+        await self._bus.complete_inbound(message)
+        self._finish_waiter(message)
+
+    def _finish_waiter(self, message: InboundMessage) -> None:
+        waiter = self._completion_waiters.pop(id(message), None)
+        if waiter is not None:
+            waiter.set()
 
     def is_session_busy(self, session_key: str) -> bool:
         """供主动循环查询普通 Turn 占用状态，避免与用户请求并发发言。"""
 
-        task = self._active_tasks.get(session_key)
-        return task is not None and not task.done()
+        return self._scheduler.is_busy(session_key)
 
     async def _process_message(self, message: InboundMessage, turn_id: str) -> None:
         request_id = str(message.metadata.get("request_id") or "")
@@ -171,13 +237,11 @@ class AgentLoop:
         # error/interrupted 表示推理结果不完整，不发 TurnCommitted，避免记忆模块把错误文本
         # 当作正常 assistant 证据进行归档或隐式提取。
 
-    def request_interrupt(self, session_key: str) -> InterruptResult:
+    async def request_interrupt(self, session_key: str) -> InterruptResult:
         task = self._active_tasks.get(session_key)
-        if task is None or task.done():
-            return InterruptResult("idle", session_key)
         turn_id = self._active_turn_ids.get(session_key, "")
         state = self._active_turn_states.get(session_key)
-        if state is not None:
+        if task is not None and not task.done() and state is not None:
             snapshotter = getattr(self._pipeline, "snapshot_interrupt_state", None)
             snapshot = snapshotter(turn_id) if callable(snapshotter) else {}
             self.interrupt_states[session_key] = TurnInterruptState(
@@ -189,11 +253,23 @@ class AgentLoop:
                 tools_used=list(snapshot.get("tools_used") or []),
                 tool_chain_partial=list(snapshot.get("tool_chain_partial") or []),
             )
-        task.cancel()
-        return InterruptResult("interrupted", session_key, turn_id)
+        result = await self._scheduler.cancel(session_key)
+        return InterruptResult(result.status, session_key, turn_id)
 
     def stop(self) -> None:
         self._running = False
+
+    async def close(self) -> None:
+        """停止准入并回收排队、运行和尚未消费的消息；可重复调用。"""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._running = False
+        await self._scheduler.close()
+        discarded = await self._bus.discard_pending_inbound()
+        for message in discarded:
+            self._finish_waiter(message)
 
 
 __all__ = ["AgentLoop", "InterruptResult", "TurnInterruptState"]

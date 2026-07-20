@@ -179,7 +179,7 @@ class AppRuntime:
             await _cleanup_step("web_channel.close", self.channel.close)
             await _cleanup_step("proactive_chat.close", self.core.proactive_chat.close)
             await _cleanup_step("proactive_scheduler.close", self.core.scheduler.close)
-            self.core.agent_loop.stop()
+            await _cleanup_step("agent_loop.close", self.core.agent_loop.close)
             if self.agent_task is not None and not self.agent_task.done():
                 self.agent_task.cancel()
                 await asyncio.gather(self.agent_task, return_exceptions=True)
@@ -315,7 +315,14 @@ def build_core_runtime(
         multimodal=config.llm.multimodal,
         vl_available=vision_provider is not None,
     )
-    agent_loop = AgentLoop(messages, events, pipeline, sessions)
+    agent_loop = AgentLoop(
+        messages,
+        events,
+        pipeline,
+        sessions,
+        max_concurrent_turns=config.agent.max_concurrent_turns,
+        max_queued_turns=config.agent.max_queued_turns,
+    )
     proactive_turns = ProactiveTurnService(proactive_store, sessions, messages)
     proactive_notifications = NotificationService(proactive_store, messages)
     proactive_tools = ProactiveToolFactory(sessions.store, memory, tools)

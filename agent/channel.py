@@ -11,7 +11,15 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from agent.agent_loop import InterruptResult
-from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted, TurnStarted
+from agent.event_bus import (
+    EventBus,
+    StreamDeltaReady,
+    ToolCallCompleted,
+    ToolCallStarted,
+    TurnQueued,
+    TurnQueueRejected,
+    TurnStarted,
+)
 from agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from proactive.notification_service import notification_metadata
 from proactive.store import ProactiveStore
@@ -26,7 +34,7 @@ class WebSocketApi(Protocol):
 
 
 class InterruptController(Protocol):
-    def request_interrupt(self, session_key: str) -> InterruptResult: ...
+    async def request_interrupt(self, session_key: str) -> InterruptResult: ...
 
 
 class WebChannel:
@@ -55,6 +63,8 @@ class WebChannel:
         self._lock = asyncio.Lock()
         bus.subscribe_outbound(self.name, self._on_response)
         event_bus.on(TurnStarted, self._on_turn_started)
+        event_bus.on(TurnQueued, self._on_turn_queued)
+        event_bus.on(TurnQueueRejected, self._on_turn_queue_rejected)
         event_bus.on(StreamDeltaReady, self._on_stream_delta)
         event_bus.on(ToolCallStarted, self._on_tool_started)
         event_bus.on(ToolCallCompleted, self._on_tool_completed)
@@ -112,7 +122,7 @@ class WebChannel:
             await self._bus.publish_inbound(InboundMessage(self.name, "web", chat_id, text, list(media), {"request_id": request_id}))
             return
         if frame_type == "turn.stop" and session_key is not None:
-            result = self._interrupt.request_interrupt(session_key)
+            result = await self._interrupt.request_interrupt(session_key)
             await self._send_json(websocket, {"type": "turn.interrupted", "request_id": request_id, "session_id": session_key, "turn_id": result.turn_id, "status": result.status})
             return
         await self._error(websocket, request_id, "invalid_frame", f"不支持的帧类型: {frame_type or 'empty'}")
@@ -185,6 +195,28 @@ class WebChannel:
     async def _on_turn_started(self, event: TurnStarted) -> None:
         await self._broadcast(event.session_key, {"type": "turn.started", "request_id": event.request_id, "session_id": event.session_key, "turn_id": event.turn_id})
 
+    async def _on_turn_queued(self, event: TurnQueued) -> None:
+        await self._broadcast(event.session_key, {
+            "type": "turn.queued",
+            "request_id": event.request_id,
+            "session_id": event.session_key,
+            "position": event.position,
+        })
+
+    async def _on_turn_queue_rejected(self, event: TurnQueueRejected) -> None:
+        messages = {
+            "queue_full": "当前任务较多，请稍后再试",
+            "session_busy": "当前会话正在处理消息",
+            "closed": "服务正在关闭，请稍后再试",
+        }
+        await self._broadcast(event.session_key, {
+            "type": "error",
+            "request_id": event.request_id,
+            "session_id": event.session_key,
+            "code": event.reason,
+            "message": messages.get(event.reason, "消息暂时无法处理"),
+        })
+
     async def _on_stream_delta(self, event: StreamDeltaReady) -> None:
         if event.content_delta:
             await self._broadcast(event.session_key, {"type": "answer.delta", "session_id": event.session_key, "turn_id": event.turn_id, "delta": event.content_delta})
@@ -244,6 +276,8 @@ class WebChannel:
     async def close(self) -> None:
         self._bus.unsubscribe_outbound(self.name, self._on_response)
         self._events.off(TurnStarted, self._on_turn_started)
+        self._events.off(TurnQueued, self._on_turn_queued)
+        self._events.off(TurnQueueRejected, self._on_turn_queue_rejected)
         self._events.off(StreamDeltaReady, self._on_stream_delta)
         self._events.off(ToolCallStarted, self._on_tool_started)
         self._events.off(ToolCallCompleted, self._on_tool_completed)
