@@ -119,6 +119,37 @@ it("首次连接创建 Session 并发送用户消息", async () => {
   expect(screen.getByText("组件测试消息")).toBeVisible();
 });
 
+it("排队时展示动态位置并允许停止取消", async () => {
+  render(<App />);
+  await screen.findByText("已连接");
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  const socket = FakeWebSocket.instances[0];
+  const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
+  fireEvent.change(input, { target: { value: "需要排队的问题" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  const sent = socket.sent.find((frame) => frame.type === "message.send");
+
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.queued",
+    request_id: sent?.request_id,
+    session_id: "web:component",
+    position: 1,
+  }) } as MessageEvent);
+  expect(await screen.findByText("排队中 · 即将开始")).toBeVisible();
+  expect(screen.getByRole("button", { name: "停止" })).toBeVisible();
+
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.queued",
+    request_id: sent?.request_id,
+    session_id: "web:component",
+    position: 2,
+  }) } as MessageEvent);
+  expect(await screen.findByText("排队中 · 前面还有 1 个会话")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "停止" }));
+  expect(socket.sent.at(-1)).toMatchObject({ type: "turn.stop", session_id: "web:component" });
+});
+
 it("会话列表使用最近更新时间分组", async () => {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages")

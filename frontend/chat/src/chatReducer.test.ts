@@ -3,6 +3,97 @@ import { describe, expect, it } from "vitest";
 import { initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame } from "./chatReducer";
 
 describe("reduceChatFrame", () => {
+  it("按 session 保存排队位置并在切换会话后保留", () => {
+    const current = { ...initialChatState, sessionId: "web:current" };
+    const queued = reduceChatFrame(current, {
+      type: "turn.queued",
+      request_id: "r-other",
+      session_id: "web:other",
+      position: 2,
+    });
+    const selected = reduceChatFrame(queued, {
+      type: "ui.session.select",
+      sessionId: "web:other",
+      messages: [],
+    });
+
+    expect(selected.turnStates["web:other"]).toEqual({
+      status: "queued",
+      queuePosition: 2,
+      turnId: "",
+      requestId: "r-other",
+    });
+  });
+
+  it("非当前会话开始和结束时也更新运行状态", () => {
+    const current = { ...initialChatState, sessionId: "web:current" };
+    const running = reduceChatFrame(current, {
+      type: "turn.started",
+      request_id: "r-other",
+      session_id: "web:other",
+      turn_id: "turn-other",
+    });
+    const finished = reduceChatFrame(running, {
+      type: "message.final",
+      request_id: "r-other",
+      session_id: "web:other",
+      turn_id: "turn-other",
+      content: "完成",
+    });
+
+    expect(running.turnStates["web:other"].status).toBe("running");
+    expect(finished.turnStates["web:other"].status).toBe("idle");
+    expect(finished.messages).toEqual([]);
+  });
+
+  it("队列拒绝会清理乐观消息和会话忙碌状态", () => {
+    const current = {
+      ...initialChatState,
+      sessionId: "web:one",
+      messages: [{
+        id: "user-r-full", role: "user" as const, content: "问题", thinking: "", media: [], tools: [],
+      }],
+      turnStates: {
+        "web:one": { status: "queued" as const, queuePosition: 1, turnId: "", requestId: "r-full" },
+      },
+    };
+
+    const rejected = reduceChatFrame(current, {
+      type: "error",
+      request_id: "r-full",
+      session_id: "web:one",
+      code: "queue_full",
+      message: "当前任务较多，请稍后再试",
+    });
+
+    expect(rejected.turnStates["web:one"].status).toBe("idle");
+    expect(rejected.messages).toEqual([]);
+    expect(rejected.error).toBe("当前任务较多，请稍后再试");
+  });
+
+  it("取消排队不会把用户消息标记为中断回答", () => {
+    const current = {
+      ...initialChatState,
+      sessionId: "web:one",
+      messages: [{
+        id: "user-r1", role: "user" as const, content: "等待中的问题", thinking: "", media: [], tools: [],
+      }],
+      turnStates: {
+        "web:one": { status: "queued" as const, queuePosition: 1, turnId: "", requestId: "r1" },
+      },
+    };
+
+    const cancelled = reduceChatFrame(current, {
+      type: "turn.interrupted",
+      request_id: "stop-1",
+      session_id: "web:one",
+      status: "cancelled",
+    });
+
+    expect(cancelled.messages[0].status).toBeUndefined();
+    expect(cancelled.turnStates["web:one"].status).toBe("idle");
+  });
+
   it("用 message.final 覆盖同一 turn 的流式草稿", () => {
     let state = reduceChatFrame(initialChatState, {
       type: "turn.started",

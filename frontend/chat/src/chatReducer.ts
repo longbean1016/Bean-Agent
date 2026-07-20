@@ -1,47 +1,118 @@
-import type { ChatAction, ChatMessage, ChatState, MessageRow, ProactiveNotificationRow, ToolActivity } from "./types";
+import type { ChatAction, ChatMessage, ChatState, MessageRow, ProactiveNotificationRow, ToolActivity, TurnRuntimeState } from "./types";
+
+export const idleTurnState: TurnRuntimeState = {
+  status: "idle",
+  queuePosition: null,
+  turnId: "",
+  requestId: "",
+};
 
 export const initialChatState: ChatState = {
   sessionId: "",
   activeTurnId: "",
   messages: [],
   error: "",
+  turnStates: {},
 };
 
 export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState {
   if (action.type === "ui.session.select") {
-    return { ...initialChatState, sessionId: action.sessionId, messages: action.messages };
+    const turn = state.turnStates[action.sessionId] ?? idleTurnState;
+    const messages = turn.status === "running" && turn.turnId
+      && !action.messages.some((message) => message.turnId === turn.turnId)
+      ? [...action.messages, createDraft(turn.turnId)]
+      : action.messages;
+    return {
+      ...state,
+      sessionId: action.sessionId,
+      activeTurnId: turn.status === "running" ? turn.turnId : "",
+      messages,
+      error: "",
+    };
   }
   if (action.type === "ui.user.append") {
     return { ...state, messages: [...state.messages, action.message], error: "" };
   }
   if (action.type === "ui.error.clear") return { ...state, error: "" };
   if (action.type === "session.created") {
-    return { ...initialChatState, sessionId: action.session_id };
+    return { ...state, sessionId: action.session_id, activeTurnId: "", messages: [], error: "" };
   }
   if (action.type === "session.subscribed") return state;
-  if (action.type === "error") return { ...state, error: action.message };
+  if (action.type === "error") {
+    const rejected = action.code === "queue_full" || action.code === "session_busy" || action.code === "closed";
+    if (!rejected || !action.session_id) return { ...state, error: action.message };
+    const current = action.session_id === state.sessionId;
+    return {
+      ...state,
+      activeTurnId: current ? "" : state.activeTurnId,
+      messages: current
+        ? state.messages.filter((message) => message.id !== `user-${action.request_id}`)
+        : state.messages,
+      error: current ? action.message : state.error,
+      turnStates: setTurnState(state, action.session_id, idleTurnState),
+    };
+  }
   if (action.type === "pong") return state;
-  if ("session_id" in action && state.sessionId && action.session_id !== state.sessionId) {
-    return state;
+  if (action.type === "turn.queued") {
+    return {
+      ...state,
+      error: action.session_id === state.sessionId ? "" : state.error,
+      turnStates: setTurnState(state, action.session_id, {
+        status: "queued",
+        queuePosition: action.position,
+        turnId: "",
+        requestId: action.request_id,
+      }),
+    };
   }
   if (action.type === "turn.started") {
-    const draft: ChatMessage = {
-      id: action.turn_id,
+    const turnStates = setTurnState(state, action.session_id, {
+      status: "running",
+      queuePosition: null,
       turnId: action.turn_id,
-      role: "assistant",
-      content: "",
-      thinking: "",
-      media: [],
-      tools: [],
-      streaming: true,
-    };
+      requestId: action.request_id ?? "",
+    });
+    if (state.sessionId && action.session_id !== state.sessionId) {
+      return { ...state, turnStates };
+    }
+    const draft = createDraft(action.turn_id);
     return {
       ...state,
       sessionId: action.session_id,
       activeTurnId: action.turn_id,
+      turnStates,
       messages: [...state.messages.filter((item) => item.turnId !== action.turn_id), draft],
       error: "",
     };
+  }
+  if (action.type === "message.final" && action.turn_id) {
+    const nextState = {
+      ...state,
+      turnStates: setTurnState(state, action.session_id, idleTurnState),
+    };
+    if (state.sessionId && action.session_id !== state.sessionId) return nextState;
+    state = nextState;
+  }
+  if (action.type === "turn.interrupted") {
+    const current = action.session_id === state.sessionId;
+    const interruptedTurnId = action.turn_id || state.activeTurnId;
+    const nextState = {
+      ...state,
+      activeTurnId: current ? "" : state.activeTurnId,
+      turnStates: setTurnState(state, action.session_id, idleTurnState),
+    };
+    if (!current) return nextState;
+    return {
+      ...nextState,
+      messages: interruptedTurnId
+        ? state.messages.map((message) => message.turnId === interruptedTurnId
+          ? { ...message, streaming: false, status: "interrupted" }
+          : message)
+        : state.messages,
+    };
+  }
+  if ("session_id" in action && state.sessionId && action.session_id !== state.sessionId) {
+    return state;
   }
   if (action.type === "answer.delta") {
     return updateTurn(state, action.turn_id, (message) => ({
@@ -111,16 +182,28 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     }));
     return { ...next, activeTurnId: "" };
   }
-  if (action.type === "turn.interrupted") {
-    return {
-      ...state,
-      activeTurnId: "",
-      messages: state.messages.map((message) => message.turnId === action.turn_id || message.turnId === state.activeTurnId
-        ? { ...message, streaming: false, status: "interrupted" }
-        : message),
-    };
-  }
   return state;
+}
+
+function createDraft(turnId: string): ChatMessage {
+  return {
+    id: turnId,
+    turnId,
+    role: "assistant",
+    content: "",
+    thinking: "",
+    media: [],
+    tools: [],
+    streaming: true,
+  };
+}
+
+function setTurnState(
+  state: ChatState,
+  sessionId: string,
+  value: TurnRuntimeState,
+): Record<string, TurnRuntimeState> {
+  return { ...state.turnStates, [sessionId]: { ...value } };
 }
 
 function updateTurn(
@@ -155,7 +238,10 @@ export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {
 }
 
 export function notificationRowsToMessages(rows: ProactiveNotificationRow[]): ChatMessage[] {
-  return rows.map((row) => ({
+  // HTTP 边界仍需运行时校验；异常条目不能让 MessageView 因 content 缺失而崩溃。
+  return rows.filter((row) => (
+    typeof row?.id === "string" && typeof row?.content === "string"
+  )).map((row) => ({
     id: row.id,
     role: "assistant",
     content: row.content,

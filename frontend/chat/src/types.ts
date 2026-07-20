@@ -30,6 +30,14 @@ export interface ChatState {
   activeTurnId: string;
   messages: ChatMessage[];
   error: string;
+  turnStates: Record<string, TurnRuntimeState>;
+}
+
+export interface TurnRuntimeState {
+  status: "idle" | "queued" | "running";
+  queuePosition: number | null;
+  turnId: string;
+  requestId: string;
 }
 
 export interface SessionSummary {
@@ -103,6 +111,7 @@ export interface ProactiveNotificationRow {
 export type ChatFrame =
   | { type: "session.created"; request_id: string; session_id: string }
   | { type: "session.subscribed"; request_id: string; session_id: string }
+  | { type: "turn.queued"; request_id: string; session_id: string; position: number }
   | { type: "turn.started"; request_id?: string; session_id: string; turn_id: string }
   | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.thinking.delta"; session_id: string; turn_id: string; delta: string }
@@ -110,7 +119,7 @@ export type ChatFrame =
   | { type: "react.tool.completed"; session_id: string; turn_id: string; call_id: string; tool_name: string; status: string; result_preview: string }
   | { type: "message.final"; request_id?: string; session_id: string; turn_id: string; content: string; thinking?: string; media?: string[]; message_id?: string; metadata?: Record<string, unknown> }
   | { type: "turn.interrupted"; request_id: string; session_id: string; turn_id?: string; status: string; message?: string }
-  | { type: "error"; request_id: string; code?: string; message: string }
+  | { type: "error"; request_id: string; session_id?: string; code?: string; message: string }
   | { type: "pong"; request_id: string };
 
 export type ChatAction =
