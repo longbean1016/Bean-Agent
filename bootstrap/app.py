@@ -34,6 +34,7 @@ from agent.provider import LLMProvider, create_vision_provider
 from agent.skills import SkillsLoader
 from memory.embedder import Embedder
 from memory.engine import MemoryEngine
+from proactive.agent_tools import ProactiveToolFactory
 from proactive.chat_loop import ProactiveChatLoop
 from proactive.models import SessionProactiveSettings
 from proactive.notification_service import NotificationService
@@ -223,6 +224,7 @@ class CoreRuntime:
     proactive_notifications: NotificationService
     scheduler: SchedulerService
     proactive_chat: ProactiveChatLoop
+    proactive_tools: ProactiveToolFactory
     vision_provider: Any | None = None
 
 
@@ -316,6 +318,7 @@ def build_core_runtime(
     agent_loop = AgentLoop(messages, events, pipeline, sessions)
     proactive_turns = ProactiveTurnService(proactive_store, sessions, messages)
     proactive_notifications = NotificationService(proactive_store, messages)
+    proactive_tools = ProactiveToolFactory(sessions.store, memory, tools)
     soft_executor = SoftTaskExecutor(pipeline)
     scheduler = SchedulerService(
         proactive_store,
@@ -348,6 +351,7 @@ def build_core_runtime(
         proactive_notifications=proactive_notifications,
         scheduler=scheduler,
         proactive_chat=proactive_chat,
+        proactive_tools=proactive_tools,
         vision_provider=vision_provider,
     )
 
