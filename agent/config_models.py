@@ -93,17 +93,39 @@ class MemoryConfig:
 
     enabled: bool = False  # 是否启用长期记忆闭环
     engine_name: str = "default"  # 记忆引擎名称，当前最小版本仅支持 default
+    context_window: int = 40  # 活动历史窗口；压缩批次与积压阈值均从此值派生
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)  # 向量配置
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)  # 整理配置
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)  # 检索配置
     dedup: DedupConfig = field(default_factory=DedupConfig)  # 去重配置
 
+    def __post_init__(self) -> None:
+        if self.context_window < 1:
+            raise ValueError("context_window 必须大于等于 1")
 
-@dataclass
-class SessionConfig:
-    """会话历史加载参数。"""
+    @property
+    def aligned_context_window(self) -> int:
+        """按 Akashic 的四消息边界向上对齐活动窗口。"""
 
-    history_window: int = 40  # 每轮加载的最近历史消息数量
+        return max(4, ((self.context_window + 3) // 4) * 4)
+
+    @property
+    def keep_count(self) -> int:
+        """返回 consolidation 后保留的热历史消息数。"""
+
+        return self.aligned_context_window // 2
+
+    @property
+    def consolidation_min_new_messages(self) -> int:
+        """返回触发一次增量归档所需的最少新消息数。"""
+
+        return max(5, self.keep_count // 2)
+
+    @property
+    def context_guard_threshold(self) -> int:
+        """返回 Turn 前必须处理压缩积压的未归档消息阈值。"""
+
+        return self.keep_count + self.consolidation_min_new_messages
 
 
 @dataclass
@@ -144,7 +166,6 @@ class Config:
 
     llm: LLMConfig = field(default_factory=LLMConfig)  # 主模型与循环参数
     memory: MemoryConfig = field(default_factory=MemoryConfig)  # 长期记忆参数
-    session: SessionConfig = field(default_factory=SessionConfig)  # 会话参数
     agent: AgentConfig = field(default_factory=AgentConfig)  # Agent 运行参数
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)  # 通道参数
 
@@ -167,7 +188,6 @@ __all__ = [
     "MemoryConfig",
     "OptimizerConfig",
     "RetrievalConfig",
-    "SessionConfig",
     "WebChatConfig",
     "VisionConfig",
 ]

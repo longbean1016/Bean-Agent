@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 class MemoryEngine:
     """组装记忆读写、归档和工具能力，不持有共享 LLMProvider 的所有权。"""
 
-    def __init__(self, workspace: Path, embedder: Any, provider: Any, sessions: SessionStore, *, config: MemoryConfig | None = None, consolidation_extractor: ConsolidationExtractor | None = None, implicit_extractor: Any | None = None, keep_count: int = 20, consolidation_threshold: int | None = None) -> None:
+    def __init__(self, workspace: Path, embedder: Any, provider: Any, sessions: SessionStore, *, config: MemoryConfig | None = None, consolidation_extractor: ConsolidationExtractor | None = None, implicit_extractor: Any | None = None, keep_count: int | None = None, consolidation_threshold: int | None = None) -> None:
         self._config = config or MemoryConfig()
         self._embedder = embedder
         self._provider = provider
@@ -82,10 +82,17 @@ class MemoryEngine:
             provider,
             step_delay_seconds=self._config.optimizer.step_delay_seconds,
         )
+        # 生产运行只配置 context_window；显式覆盖仅用于小窗口确定性测试。
+        derived_keep_count = self._config.keep_count if keep_count is None else keep_count
+        derived_threshold = (
+            self._config.consolidation_min_new_messages
+            if consolidation_threshold is None
+            else consolidation_threshold
+        )
         self._consolidator = Consolidator(
             sessions, self._markdown,
             consolidation_extractor or _LLMConsolidationExtractor(provider),
-            keep_count=keep_count, threshold=consolidation_threshold,
+            keep_count=derived_keep_count, threshold=derived_threshold,
         )
         self._implicit_extractor = implicit_extractor or ImplicitLongTermExtractor(provider)
         self._post_response = PostResponseMemoryWorker(
