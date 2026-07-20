@@ -136,7 +136,7 @@ async def test_interrupt_defers_persistence_until_next_message_and_preserves_too
     running = asyncio.create_task(loop.run_once())
     await pipeline.started.wait()
 
-    result = loop.request_interrupt("web:c")
+    result = await loop.request_interrupt("web:c")
     await running
 
     assert result.status == "interrupted"

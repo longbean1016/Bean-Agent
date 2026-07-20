@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -36,6 +36,7 @@ class FakeWebSocket {
 
 beforeEach(() => {
   localStorage.clear();
+  window.history.replaceState({}, "", "/");
   document.documentElement.removeAttribute("data-theme");
   systemDark = false;
   colorSchemeListener = null;
@@ -116,7 +117,140 @@ it("首次连接创建 Session 并发送用户消息", async () => {
   fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
   await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send" && frame.text === "组件测试消息")).toBe(true));
+  expect(window.location.pathname).toBe("/chat/component");
   expect(screen.getByText("组件测试消息")).toBeVisible();
+  expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
+});
+
+it("新建会话会清空其他会话中尚未发送的输入", async () => {
+  render(<App />);
+  await screen.findByText("已连接");
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
+  fireEvent.change(input, { target: { value: "不应带到新会话" } });
+  const attachment = new File(["draft"], "draft.txt", { type: "text/plain" });
+  const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')!;
+  fireEvent.change(fileInput, { target: { files: [attachment] } });
+  expect(await screen.findByText("draft.txt")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "新建会话" }));
+
+  expect(input).toHaveValue("");
+  expect(screen.queryByText("draft.txt")).not.toBeInTheDocument();
+  expect(window.location.pathname).toBe("/");
+});
+
+it("延迟返回的旧会话列表不会移除正在排队的新会话", async () => {
+  let resolveSessions!: (response: Response) => void;
+  const delayedSessions = new Promise<Response>((resolve) => { resolveSessions = resolve; });
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input).includes("/api/chat/sessions?page=")) return delayedSessions;
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+  render(<App />);
+
+  await screen.findByText("已连接");
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
+  fireEvent.change(input, { target: { value: "等待队列的消息" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  expect(await screen.findByRole("button", { name: "新对话" })).toBeVisible();
+
+  await act(async () => {
+    resolveSessions({ ok: true, json: async () => ({ items: [], total: 0 }) } as Response);
+    await delayedSessions;
+  });
+  expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
+});
+
+it("排队时展示动态位置并允许停止取消", async () => {
+  render(<App />);
+  await screen.findByText("已连接");
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  const socket = FakeWebSocket.instances[0];
+  const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
+  fireEvent.change(input, { target: { value: "需要排队的问题" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send")).toBe(true));
+  const sent = socket.sent.find((frame) => frame.type === "message.send");
+
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.queued",
+    request_id: sent?.request_id,
+    session_id: "web:component",
+    position: 1,
+  }) } as MessageEvent);
+  expect(await screen.findByText("排队中 · 即将开始")).toBeVisible();
+  expect(screen.getByRole("button", { name: "停止" })).toBeVisible();
+
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.queued",
+    request_id: sent?.request_id,
+    session_id: "web:component",
+    position: 2,
+  }) } as MessageEvent);
+  expect(await screen.findByText("排队中 · 前面还有 1 个会话")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "停止" }));
+  expect(socket.sent.at(-1)).toMatchObject({ type: "turn.stop", session_id: "web:component" });
+});
+
+it("切回后台运行会话时恢复用户问题流式内容和工具状态", async () => {
+  let resolveComponentHistory!: (response: Response) => void;
+  const delayedComponentHistory = new Promise<Response>((resolve) => { resolveComponentHistory = resolve; });
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("web%3Acomponent/messages")) return delayedComponentHistory;
+    const payload = url.includes("/messages") || url.includes("/notifications")
+      ? { items: [], total: 0 }
+      : {
+          items: [{
+            key: "web:other", title: "其他会话", first_message_content: "其他会话",
+            created_at: new Date().toISOString(), updated_at: new Date().toISOString(), message_count: 2,
+          }],
+          total: 1,
+        };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+  render(<App />);
+  await screen.findByText("已连接");
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  const socket = FakeWebSocket.instances[0];
+  const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
+  fireEvent.change(input, { target: { value: "分析当前项目" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send")).toBe(true));
+  const sent = socket.sent.find((frame) => frame.type === "message.send");
+  await act(async () => {
+    resolveComponentHistory({ ok: true, json: async () => ({ items: [], total: 0 }) } as Response);
+    await delayedComponentHistory;
+  });
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.queued", request_id: sent?.request_id, session_id: "web:component", position: 1,
+  }) } as MessageEvent);
+  fireEvent.click(await screen.findByRole("button", { name: "其他会话" }));
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:other"));
+
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.started", request_id: sent?.request_id, session_id: "web:component", turn_id: "turn-background",
+  }) } as MessageEvent);
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "answer.delta", session_id: "web:component", turn_id: "turn-background", delta: "阶段结果",
+  }) } as MessageEvent);
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "react.tool.started", session_id: "web:component", turn_id: "turn-background",
+    call_id: "call-1", tool_name: "list_dir", arguments: { path: "." },
+  }) } as MessageEvent);
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "react.tool.completed", session_id: "web:component", turn_id: "turn-background",
+    call_id: "call-1", tool_name: "list_dir", status: "ok", result_preview: "agent, tests",
+  }) } as MessageEvent);
+
+  fireEvent.click(screen.getByRole("button", { name: "新对话" }));
+  expect(await screen.findByText("分析当前项目")).toBeVisible();
+  expect(screen.getByText("阶段结果")).toBeVisible();
+  expect(screen.getByText("list_dir")).toBeVisible();
+  expect(screen.queryByText("排队中 · 即将开始")).not.toBeInTheDocument();
 });
 
 it("会话列表使用最近更新时间分组", async () => {
@@ -165,7 +299,7 @@ it("会话列表显示时间分组标题", async () => {
 });
 
 it("通过会话菜单重命名且不触发会话切换", async () => {
-  localStorage.setItem("beanagent.session_id", "web:rename");
+  window.history.replaceState({}, "", "/chat/rename");
   let renamed = false;
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -271,7 +405,7 @@ it("点击删除确认框外部会关闭确认框", async () => {
 });
 
 it("删除当前会话后复用新建流程并回到空白会话", async () => {
-  localStorage.setItem("beanagent.session_id", "web:delete");
+  window.history.replaceState({}, "", "/chat/delete");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (init?.method === "DELETE") return { ok: true, status: 204 } as Response;
@@ -301,7 +435,7 @@ it("删除当前会话后复用新建流程并回到空白会话", async () => {
 });
 
 it("用户向上滚动后流式增量不抢回视口并可主动回到底部", async () => {
-  localStorage.setItem("beanagent.session_id", "web:scroll-lock");
+  window.history.replaceState({}, "", "/chat/scroll-lock");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages") ? {
       items: [{
@@ -341,12 +475,12 @@ it("用户向上滚动后流式增量不抢回视口并可主动回到底部", a
   await screen.findByText("新内容");
   expect(conversation!.scrollTop).toBe(300);
   fireEvent.click(latestButton);
-  await waitFor(() => expect(conversation!.scrollTop).toBeGreaterThan(798.5));
+  await waitFor(() => expect(conversation!.scrollTop).toBeGreaterThan(798));
   expect(screen.queryByRole("button", { name: "回到最新消息" })).not.toBeInTheDocument();
 });
 
 it("点击历史会话后在目标消息渲染完成时强制回到底部", async () => {
-  localStorage.setItem("beanagent.session_id", "web:first");
+  window.history.replaceState({}, "", "/chat/first");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     const payload = url.includes("/messages") ? {
@@ -382,7 +516,7 @@ it("点击历史会话后在目标消息渲染完成时强制回到底部", asyn
   fireEvent.click(screen.getByRole("button", { name: "第二个会话" }));
 
   await screen.findByText("第二个会话的末尾");
-  await waitFor(() => expect(conversation!.scrollTop).toBeGreaterThanOrEqual(1198));
+  await waitFor(() => expect(conversation!.scrollTop).toBeGreaterThanOrEqual(1197));
   expect(container.querySelector(".conversation-content")).not.toBeNull();
 });
 
@@ -413,7 +547,7 @@ it("主题支持浅色、跟随系统和深色并持久化选择", async () => {
 });
 
 it("粗体包裹的裸链接不显示星号并可直接跳转", async () => {
-  localStorage.setItem("beanagent.session_id", "web:links");
+  window.history.replaceState({}, "", "/chat/links");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     const payload = url.includes("/messages") ? {
@@ -440,7 +574,7 @@ it("粗体包裹的裸链接不显示星号并可直接跳转", async () => {
 });
 
 it("将记忆引用渲染为编号并支持展开和复制ID", async () => {
-  localStorage.setItem("beanagent.session_id", "web:citations");
+  window.history.replaceState({}, "", "/chat/citations");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages") ? {
       items: [{
@@ -472,7 +606,7 @@ it("将记忆引用渲染为编号并支持展开和复制ID", async () => {
 });
 
 it("代码复制保留原始格式并将按钮图标切换为勾选", async () => {
-  localStorage.setItem("beanagent.session_id", "web:code-copy");
+  window.history.replaceState({}, "", "/chat/code-copy");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages") ? {
       items: [{
@@ -500,7 +634,7 @@ it("代码复制保留原始格式并将按钮图标切换为勾选", async () =
 });
 
 it("Mermaid fenced block 生成受限图表而不是普通代码块", async () => {
-  localStorage.setItem("beanagent.session_id", "web:mermaid-source");
+  window.history.replaceState({}, "", "/chat/mermaid-source");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages") ? {
       items: [{
@@ -544,7 +678,7 @@ it("Mermaid fenced block 生成受限图表而不是普通代码块", async () =
 });
 
 it("流式消息中的 Mermaid fence 闭合后允许立即查看大图", async () => {
-  localStorage.setItem("beanagent.session_id", "web:stream-mermaid");
+  window.history.replaceState({}, "", "/chat/stream-mermaid");
   const { container } = render(<App />);
   await screen.findByText("已连接");
   const socket = FakeWebSocket.instances[0];

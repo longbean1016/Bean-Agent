@@ -17,6 +17,28 @@ logger = logging.getLogger(__name__)
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 _MESSAGE_ROLES = {"user", "assistant", "tool"}
 _MESSAGE_COLUMNS = "id, session_key, seq, role, content, tool_chain, extra, ts"
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_DEFAULT_TITLE_LIMIT = 40
+
+
+def _default_session_title(content: str, media: object) -> str:
+    """从首条用户消息生成稳定标题；文字优先，附件只在无文字时兜底。"""
+
+    normalized = " ".join(str(content).split())
+    if normalized:
+        if len(normalized) <= _DEFAULT_TITLE_LIMIT:
+            return normalized
+        return normalized[: _DEFAULT_TITLE_LIMIT - 3] + "..."
+
+    paths = [str(item) for item in media] if isinstance(media, list) else []
+    if not paths:
+        return "新对话"
+    image_count = sum(Path(path).suffix.lower() in _IMAGE_SUFFIXES for path in paths)
+    if image_count == len(paths):
+        return "分析图片内容"
+    if image_count == 0:
+        return "分析文件内容"
+    return "分析附件内容"
 
 
 @dataclass(slots=True)
@@ -443,7 +465,39 @@ class SessionStore:
                 # 基础表仍可使用，搜索在运行时自动走 LIKE 路径。
                 self._has_fts = False
                 logger.info("FTS5 trigram 不可用，消息搜索退化为 LIKE: %s", error)
+            self._backfill_default_titles_locked()
             self._conn.commit()
+
+    def _backfill_default_titles_locked(self) -> None:
+        """幂等补齐旧会话标题，不改变原创建时间、更新时间和手动标题。"""
+
+        rows = self._conn.execute(
+            """
+            SELECT s.key, s.metadata, first.content, first.extra
+            FROM sessions s
+            JOIN messages first ON first.id = (
+                SELECT candidate.id
+                FROM messages candidate
+                WHERE candidate.session_key = s.key
+                  AND candidate.role = 'user'
+                ORDER BY candidate.seq ASC
+                LIMIT 1
+            )
+            """
+        ).fetchall()
+        for row in rows:
+            metadata = _load_json_object(row["metadata"])
+            if str(metadata.get("title") or "").strip():
+                continue
+            extra = _load_json_object(row["extra"])
+            metadata["title"] = _default_session_title(
+                str(row["content"] or ""),
+                extra.get("media"),
+            )
+            self._conn.execute(
+                "UPDATE sessions SET metadata = ? WHERE key = ?",
+                (json.dumps(metadata, ensure_ascii=False), str(row["key"])),
+            )
 
     def _create_session_sync(self, session_key: str) -> dict[str, Any]:
         key = self._validate_session_key(session_key)
@@ -513,13 +567,33 @@ class SessionStore:
                     (session_key, now, now),
                 )
                 session_row = self._conn.execute(
-                    "SELECT next_seq FROM sessions WHERE key = ?",
+                    "SELECT next_seq, metadata FROM sessions WHERE key = ?",
                     (session_key,),
                 ).fetchone()
                 if session_row is None:
                     raise RuntimeError(f"无法读取会话序号: {session_key}")
                 seq = int(session_row["next_seq"] or 0)
                 message_id = f"{session_key}:{seq}"
+                if role == "user":
+                    first_user = self._conn.execute(
+                        """
+                        SELECT 1 FROM messages
+                        WHERE session_key = ? AND role = 'user'
+                        LIMIT 1
+                        """,
+                        (session_key,),
+                    ).fetchone()
+                    metadata = _load_json_object(session_row["metadata"])
+                    if first_user is None and not str(metadata.get("title") or "").strip():
+                        # 标题与首条用户消息属于同一事务，进程中断不能留下半套目录状态。
+                        metadata["title"] = _default_session_title(
+                            message.content,
+                            message.extra.get("media"),
+                        )
+                        self._conn.execute(
+                            "UPDATE sessions SET metadata = ? WHERE key = ?",
+                            (json.dumps(metadata, ensure_ascii=False), session_key),
+                        )
                 self._conn.execute(
                     """
                     INSERT INTO messages (

@@ -56,6 +56,11 @@ def messages(session_key: str) -> dict[str, object]:
     return {"items": [], "total": 0, "session_id": session_key}
 
 
+@app.get("/api/chat/sessions/{session_key:path}/notifications")
+def notifications(session_key: str) -> dict[str, object]:
+    return {"items": [], "total": 0, "session_id": session_key}
+
+
 @app.post("/api/chat/uploads")
 async def upload(request: Request, filename: str = Query("upload.txt")) -> dict[str, str]:
     suffix = Path(filename).suffix or ".txt"
@@ -81,6 +86,7 @@ def media(path: str = Query(...)) -> FileResponse:
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     active_turn = ""
+    queued_request = ""
     try:
         while True:
             frame = await websocket.receive_json()
@@ -91,14 +97,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "session.created", "request_id": request_id, "session_id": "web:playwright"})
                 continue
             if frame_type == "turn.stop":
-                await websocket.send_json({"type": "turn.interrupted", "request_id": request_id, "session_id": session_id, "turn_id": active_turn, "status": "interrupted", "message": "已停止"})
+                status = "cancelled" if queued_request else "interrupted"
+                await websocket.send_json({"type": "turn.interrupted", "request_id": request_id, "session_id": session_id, "turn_id": active_turn, "status": status, "message": "已停止"})
                 active_turn = ""
+                queued_request = ""
                 continue
             if frame_type != "message.send":
                 continue
             text = str(frame.get("text") or "")
             if text == "触发错误":
                 await websocket.send_json({"type": "error", "request_id": request_id, "code": "fake_error", "message": "Fake 结构化错误"})
+                continue
+            if text == "排队测试":
+                queued_request = request_id
+                await websocket.send_json({"type": "turn.queued", "request_id": request_id, "session_id": session_id, "position": 1})
+                await asyncio.sleep(0.05)
+                await websocket.send_json({"type": "turn.queued", "request_id": request_id, "session_id": session_id, "position": 2})
                 continue
             active_turn = f"turn-{request_id}"
             await websocket.send_json({"type": "turn.started", "request_id": request_id, "session_id": session_id, "turn_id": active_turn})

@@ -121,6 +121,14 @@ class AgentConfig:
     """Agent 运行目录参数。"""
 
     workdir: str = "."  # 工具执行的相对工作目录，由 workspace 约束实际根路径
+    max_concurrent_turns: int = 5  # 不同会话同时进入 Pipeline 的上限
+    max_queued_turns: int = 20  # 并发占满后允许保存在内存中的等待会话数
+
+    def __post_init__(self) -> None:
+        if self.max_concurrent_turns < 1:
+            raise ValueError("max_concurrent_turns 必须大于等于 1")
+        if self.max_queued_turns < 0:
+            raise ValueError("max_queued_turns 必须大于等于 0")
 
 
 @dataclass

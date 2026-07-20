@@ -358,6 +358,83 @@ def test_update_chat_session_title_persists_metadata_and_list_value(store: Sessi
     assert items[0]["first_message_content"] == "原始问题"
 
 
+@pytest.mark.parametrize(
+    ("content", "media", "expected"),
+    [
+        ("  请分析\n当前   项目结构  ", [], "请分析 当前 项目结构"),
+        ("", ["D:/uploads/photo.png"], "分析图片内容"),
+        ("", ["D:/uploads/report.pdf"], "分析文件内容"),
+        ("", ["D:/uploads/photo.png", "D:/uploads/report.pdf"], "分析附件内容"),
+    ],
+)
+def test_first_user_message_persists_default_title(
+    store: SessionStore,
+    content: str,
+    media: list[str],
+    expected: str,
+) -> None:
+    store.add_message(NewMessage(
+        session_key="web:auto-title",
+        role="user",
+        content=content,
+        extra={"media": media},
+    ))
+
+    meta = store.get_session_meta("web:auto-title")
+
+    assert meta is not None
+    assert meta["metadata"]["title"] == expected
+
+
+def test_default_title_truncates_to_forty_characters(store: SessionStore) -> None:
+    store.add_message(NewMessage(
+        session_key="web:long-title",
+        role="user",
+        content="项" * 45,
+    ))
+
+    meta = store.get_session_meta("web:long-title")
+
+    assert meta is not None
+    assert meta["metadata"]["title"] == "项" * 37 + "..."
+
+
+def test_default_title_does_not_replace_manual_title(store: SessionStore) -> None:
+    store.create_session("web:manual-title")
+    store.update_chat_session_title("web:manual-title", "用户标题")
+
+    store.add_message(NewMessage(
+        session_key="web:manual-title",
+        role="user",
+        content="首条用户问题",
+    ))
+
+    meta = store.get_session_meta("web:manual-title")
+    assert meta is not None
+    assert meta["metadata"]["title"] == "用户标题"
+
+
+def test_reopen_backfills_default_title_for_legacy_session(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy-sessions.db"
+    first = SessionStore(db_path)
+    first.add_message(NewMessage(
+        session_key="web:legacy",
+        role="user",
+        content="旧会话的首条问题",
+    ))
+    first.update_chat_session_title("web:legacy", "")
+    first.close()
+
+    second = SessionStore(db_path)
+    try:
+        meta = second.get_session_meta("web:legacy")
+    finally:
+        second.close()
+
+    assert meta is not None
+    assert meta["metadata"]["title"] == "旧会话的首条问题"
+
+
 def test_delete_chat_session_cascades_messages_and_is_idempotent(store: SessionStore) -> None:
     store.add_message(NewMessage(session_key="web:delete", role="user", content="待删除内容"))
     store.add_message(NewMessage(session_key="web:keep", role="user", content="保留内容"))

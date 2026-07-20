@@ -8,12 +8,12 @@ import pytest
 
 from agent.agent_loop import InterruptResult
 from agent.channel import WebChannel
-from agent.event_bus import EventBus
+from agent.event_bus import EventBus, TurnQueued, TurnQueueRejected
 from agent.message_bus import MessageBus
 
 
 class Interrupt:
-    def request_interrupt(self, session_key: str) -> InterruptResult:
+    async def request_interrupt(self, session_key: str) -> InterruptResult:
         return InterruptResult("idle", "")
 
 
@@ -51,4 +51,31 @@ async def test_web_channel_rejects_media_outside_upload_root(tmp_path: Path) -> 
 
     assert socket.frames[-1]["code"] == "invalid_media"
     assert bus._inbound.empty()
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_web_channel_maps_turn_queue_events_to_websocket_frames() -> None:
+    bus = MessageBus()
+    events = EventBus()
+    channel = WebChannel(bus, events, Interrupt())
+    socket = Socket()
+    await channel.handle_frame(socket, {
+        "type": "session.subscribe",
+        "request_id": "subscribe",
+        "session_id": "web:chat",
+    })
+
+    await events.emit(TurnQueued("web:chat", "r-queued", 2))
+    await events.emit(TurnQueueRejected("web:chat", "r-full", "queue_full"))
+
+    assert socket.frames[-2] == {
+        "type": "turn.queued",
+        "request_id": "r-queued",
+        "session_id": "web:chat",
+        "position": 2,
+    }
+    assert socket.frames[-1]["type"] == "error"
+    assert socket.frames[-1]["code"] == "queue_full"
+    assert socket.frames[-1]["message"] == "当前任务较多，请稍后再试"
     await channel.close()

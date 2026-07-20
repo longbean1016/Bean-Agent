@@ -23,6 +23,24 @@ class TurnStarted:
 
 
 @dataclass(frozen=True, slots=True)
+class TurnQueued:
+    """普通 Turn 已进入全局等待队列，position 从 1 开始。"""
+
+    session_key: str
+    request_id: str
+    position: int
+
+
+@dataclass(frozen=True, slots=True)
+class TurnQueueRejected:
+    """消息因同会话忙碌、队列已满或关闭而未被调度。"""
+
+    session_key: str
+    request_id: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class StreamDeltaReady:
     session_key: str
     turn_id: str
@@ -110,5 +128,7 @@ __all__ = [
     "ToolCallCompleted",
     "ToolCallStarted",
     "TurnCommitted",
+    "TurnQueued",
+    "TurnQueueRejected",
     "TurnStarted",
 ]

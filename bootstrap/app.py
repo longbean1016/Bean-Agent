@@ -179,7 +179,7 @@ class AppRuntime:
             await _cleanup_step("web_channel.close", self.channel.close)
             await _cleanup_step("proactive_chat.close", self.core.proactive_chat.close)
             await _cleanup_step("proactive_scheduler.close", self.core.scheduler.close)
-            self.core.agent_loop.stop()
+            await _cleanup_step("agent_loop.close", self.core.agent_loop.close)
             if self.agent_task is not None and not self.agent_task.done():
                 self.agent_task.cancel()
                 await asyncio.gather(self.agent_task, return_exceptions=True)
@@ -315,7 +315,14 @@ def build_core_runtime(
         multimodal=config.llm.multimodal,
         vl_available=vision_provider is not None,
     )
-    agent_loop = AgentLoop(messages, events, pipeline, sessions)
+    agent_loop = AgentLoop(
+        messages,
+        events,
+        pipeline,
+        sessions,
+        max_concurrent_turns=config.agent.max_concurrent_turns,
+        max_queued_turns=config.agent.max_queued_turns,
+    )
     proactive_turns = ProactiveTurnService(proactive_store, sessions, messages)
     proactive_notifications = NotificationService(proactive_store, messages)
     proactive_tools = ProactiveToolFactory(sessions.store, memory, tools)
@@ -390,6 +397,14 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
 
     @app.get("/", response_model=None)
     def chat_index() -> FileResponse | dict[str, str]:
+        if index_file.is_file():
+            return FileResponse(index_file)
+        return {"status": "ok", "message": "聊天前端尚未构建，请运行 npm run build"}
+
+    @app.get("/chat/{session_id}", response_model=None)
+    def chat_session_index(session_id: str) -> FileResponse | dict[str, str]:
+        """会话详情使用前端路由，直接访问或刷新时仍返回同一 SPA 入口。"""
+
         if index_file.is_file():
             return FileResponse(index_file)
         return {"status": "ok", "message": "聊天前端尚未构建，请运行 npm run build"}

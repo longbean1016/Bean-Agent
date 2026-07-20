@@ -33,10 +33,11 @@ import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
 import { deleteReminder, deleteSession, fetchMessages, fetchNotifications, fetchProactiveSettings, fetchReminders, fetchSessions, mediaUrl, renameSession, saveProactiveSettings, uploadAttachment } from "./api";
-import { initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
+import { idleTurnState, initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
+import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupSessionsByUpdatedAt } from "./sessionGroups";
 import type { ChatFrame, ChatMessage, ConnectionStatus, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity } from "./types";
 import { BeanWebSocketClient } from "./websocketClient";
@@ -134,21 +135,29 @@ function containsClosedMermaidFence(markdown: string): boolean {
 }
 
 export function App() {
+  const initialRouteSession = sessionFromPath(window.location.pathname);
   const [chat, dispatch] = useReducer(reduceChatFrame, {
     ...initialChatState,
-    sessionId: localStorage.getItem(SESSION_STORAGE_KEY) ?? "",
+    sessionId: initialRouteSession,
   });
+  const [routeSession, setRouteSession] = useState(initialRouteSession);
   const [connection, setConnection] = useState<ConnectionStatus>("connecting");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [input, setInput] = useState("");
   const [files, setFiles] = useState<File[]>([]);
+  const [textDrafts, setTextDrafts] = useState<Record<string, string>>({});
+  const [fileDrafts, setFileDrafts] = useState<Record<string, File[]>>({});
   const [sending, setSending] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<ThemePreference>(() => readThemePreference());
   const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
   const clientRef = useRef<BeanWebSocketClient | null>(null);
   const chatRef = useRef(chat);
+  const routeSessionRef = useRef(routeSession);
   chatRef.current = chat;
+  routeSessionRef.current = routeSession;
+  const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
+  const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running";
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -167,7 +176,17 @@ export function App() {
 
   const refreshSessions = useCallback(async () => {
     try {
-      setSessions(await fetchSessions());
+      const loaded = await fetchSessions();
+      setSessions((current) => {
+        const loadedKeys = new Set(loaded.map((session) => session.key));
+        // 初始列表请求可能晚于发送请求返回；保留尚未被服务端目录确认的临时会话。
+        const pending = current.filter((session) => (
+          session.title === "新对话"
+          && session.message_count === 0
+          && !loadedKeys.has(session.key)
+        ));
+        return [...pending, ...loaded];
+      });
     } catch (error) {
       dispatch(errorFrame(error));
     }
@@ -195,7 +214,7 @@ export function App() {
       onFrame: handleFrame,
       onStatus: (status) => {
         setConnection(status);
-        if (status === "connected" && !chatRef.current.sessionId) {
+        if (status === "connected" && !routeSessionRef.current && !chatRef.current.sessionId) {
           client.send({ type: "session.create", request_id: crypto.randomUUID() });
         }
       },
@@ -233,10 +252,44 @@ export function App() {
   const createSession = () => {
     if (connection !== "connected") return;
     localStorage.removeItem(SESSION_STORAGE_KEY);
+    window.history.pushState({}, "", "/");
+    setRouteSession("");
     dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
     clientRef.current?.send({ type: "session.create", request_id: crypto.randomUUID() });
+    // 每次点击新建都创建全新的根页面草稿，不影响任何已有会话的独立草稿。
+    setTextDrafts((current) => ({ ...current, [routeKey("")]: "" }));
+    setFileDrafts((current) => ({ ...current, [routeKey("")]: [] }));
+    setInput("");
+    setFiles([]);
     setSidebarOpen(false);
   };
+
+  const selectSession = (sessionId: string) => {
+    window.history.pushState({}, "", pathForSession(sessionId));
+    setRouteSession(sessionId);
+    setInput(textDrafts[routeKey(sessionId)] ?? "");
+    setFiles(fileDrafts[routeKey(sessionId)] ?? []);
+    void loadSession(sessionId);
+  };
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const sessionId = sessionFromPath(window.location.pathname);
+      setRouteSession(sessionId);
+      setInput(textDrafts[routeKey(sessionId)] ?? "");
+      setFiles(fileDrafts[routeKey(sessionId)] ?? []);
+      if (sessionId) {
+        void loadSession(sessionId);
+        return;
+      }
+      dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
+      if (connection === "connected") {
+        clientRef.current?.send({ type: "session.create", request_id: crypto.randomUUID() });
+      }
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [connection, fileDrafts, textDrafts]);
 
   const handleRenameSession = async (sessionId: string, title: string) => {
     try {
@@ -251,7 +304,7 @@ export function App() {
 
   const submit = async () => {
     const cleanText = input.trim();
-    if ((!cleanText && files.length === 0) || sending || chat.activeTurnId) return;
+    if ((!cleanText && files.length === 0) || sending || turnActive) return;
     if (connection !== "connected" || !chat.sessionId) {
       dispatch({ type: "error", request_id: "", code: "offline", message: "连接尚未就绪，请重连后再发送" });
       return;
@@ -270,6 +323,7 @@ export function App() {
         tools: [],
       };
       dispatch({ type: "ui.user.append", message: optimistic });
+      dispatch({ type: "ui.turn.submitted", sessionId: chat.sessionId, requestId });
       const sent = clientRef.current?.send({
         type: "message.send",
         request_id: requestId,
@@ -277,9 +331,36 @@ export function App() {
         text: cleanText,
         media: uploaded.map((item) => item.upload_path),
       });
-      if (!sent) throw new Error("消息未发送，WebSocket 已断开");
+      if (!sent) {
+        dispatch({
+          type: "error",
+          request_id: requestId,
+          session_id: chat.sessionId,
+          code: "closed",
+          message: "消息未发送，WebSocket 已断开",
+        });
+        return;
+      }
+      if (!routeSession) {
+        window.history.pushState({}, "", pathForSession(chat.sessionId));
+        setRouteSession(chat.sessionId);
+      }
+      const submittedAt = new Date().toISOString();
+      // 新会话的首轮可能长期运行或排队，发送成功后先放入目录，最终再由服务端标题覆盖。
+      setSessions((current) => current.some((session) => session.key === chat.sessionId)
+        ? current
+        : [{
+            key: chat.sessionId,
+            title: "新对话",
+            created_at: submittedAt,
+            updated_at: submittedAt,
+            message_count: 0,
+            first_message_content: "",
+          }, ...current]);
       setInput("");
       setFiles([]);
+      setTextDrafts((current) => ({ ...current, [routeKey(routeSession || chat.sessionId)]: "", [routeKey("")]: "" }));
+      setFileDrafts((current) => ({ ...current, [routeKey(routeSession || chat.sessionId)]: [], [routeKey("")]: [] }));
     } catch (error) {
       dispatch(errorFrame(error));
     } finally {
@@ -288,7 +369,7 @@ export function App() {
   };
 
   const stopTurn = () => {
-    if (!chat.sessionId || !chat.activeTurnId) return;
+    if (!chat.sessionId || !turnActive) return;
     clientRef.current?.send({
       type: "turn.stop",
       request_id: crypto.randomUUID(),
@@ -315,7 +396,7 @@ export function App() {
       onCreate={createSession}
       onDelete={handleDeleteSession}
       onRename={handleRenameSession}
-      onSelect={(id) => void loadSession(id)}
+      onSelect={selectSession}
     />
   );
 
@@ -362,18 +443,26 @@ export function App() {
               <MessageView key={message.id} message={message} />
             ))}
           </StickToBottom.Content>
-          <ConversationAutoScroll sessionId={chat.sessionId} messages={chat.messages} active={Boolean(chat.activeTurnId)} />
+          <ConversationAutoScroll sessionId={chat.sessionId} messages={chat.messages} active={currentTurn.status === "running"} />
           <ConversationScrollButton />
         </StickToBottom>
 
         <Composer
-          active={Boolean(chat.activeTurnId)}
+          active={turnActive}
+          turnStatus={currentTurn.status}
+          queuePosition={currentTurn.queuePosition}
           connected={connection === "connected"}
           files={files}
           input={input}
           sending={sending}
-          onFiles={setFiles}
-          onInput={setInput}
+          onFiles={(next) => {
+            setFiles(next);
+            setFileDrafts((current) => ({ ...current, [routeKey(routeSession)]: next }));
+          }}
+          onInput={(value) => {
+            setInput(value);
+            setTextDrafts((current) => ({ ...current, [routeKey(routeSession)]: value }));
+          }}
           onSend={() => void submit()}
           onStop={stopTurn}
         />
@@ -891,7 +980,7 @@ function AttachmentGallery({ paths }: { paths: string[] }) {
 }
 
 function Composer(props: {
-  input: string; files: File[]; active: boolean; connected: boolean; sending: boolean;
+  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running"; queuePosition: number | null; connected: boolean; sending: boolean;
   onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
@@ -983,7 +1072,7 @@ function Composer(props: {
             if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); props.onSend(); }
           }}
           placeholder={props.connected ? "输入消息，或附加文本与图片" : "等待连接恢复"}
-          disabled={!props.connected}
+          disabled={!props.connected || props.active}
           rows={3}
         />
         <div className="composer-actions">
@@ -992,6 +1081,12 @@ function Composer(props: {
             <input type="file" multiple accept={ATTACHMENT_ACCEPT} onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />
           </label>
           <span className="composer-hint">Enter 发送 · Shift+Enter 换行</span>
+          {props.turnStatus === "queued" ? (
+            <span className="queue-status" role="status">
+              {props.queuePosition === 1 ? "排队中 · 即将开始" : `排队中 · 前面还有 ${(props.queuePosition ?? 1) - 1} 个会话`}
+            </span>
+          ) : null}
+          {props.turnStatus === "submitting" ? <span className="queue-status" role="status">正在提交...</span> : null}
           {props.active ? (
             <button className="send-button stop" aria-label="停止" onClick={props.onStop}><CircleStop size={18} /><span>停止</span></button>
           ) : (

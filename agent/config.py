@@ -82,7 +82,11 @@ def load_config(path: str | Path = "config.toml") -> Config:
         session=SessionConfig(
             history_window=int(session_raw.get("history_window", 40))
         ),
-        agent=AgentConfig(workdir=str(agent_raw.get("workdir", "."))),
+        agent=AgentConfig(
+            workdir=str(agent_raw.get("workdir", ".")),
+            max_concurrent_turns=int(agent_raw.get("max_concurrent_turns", 5)),
+            max_queued_turns=int(agent_raw.get("max_queued_turns", 20)),
+        ),
         channels=_load_channels_config(data),
     )
 

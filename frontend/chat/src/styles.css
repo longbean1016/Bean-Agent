@@ -269,6 +269,7 @@ button { color: inherit; }
 .attach-button { position: relative; }
 .attach-button input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .composer-hint { margin-left: 2px; color: #8a9591; font-size: 11px; }
+.queue-status { margin-left: 2px; color: #8b5d18; font-size: 12px; font-weight: 600; }
 .send-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-width: 82px; min-height: 34px; margin-left: auto; padding: 0 12px; border: 1px solid #086860; border-radius: 6px; background: #0b766e; color: #fff; cursor: pointer; font-weight: 650; }
 .send-button:hover { background: #075f59; }
 .send-button:disabled { border-color: #c6cfcc; background: #dfe5e2; color: #7e8985; cursor: default; }
