@@ -114,6 +114,15 @@ def test_fastapi_exposes_real_websocket_route(tmp_path: Path) -> None:
             created = websocket.receive_json()
             assert created["type"] == "session.created"
             assert created["session_id"].startswith("web:")
+            session_key = created["session_id"]
+
+            # session.created 返回前必须已经落库，否则前端紧接着加载通知会得到 404。
+            notifications = client.get(
+                f"/api/chat/sessions/{session_key}/notifications"
+            )
+            assert notifications.status_code == 200
+            assert notifications.json()["items"] == []
+            assert runtime.sessions.store.get_session_meta(session_key)["next_seq"] == 0
 
 
 @pytest.mark.asyncio

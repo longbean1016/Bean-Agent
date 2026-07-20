@@ -134,6 +134,7 @@ class AppRuntime:
             core.agent_loop,
             media_root=core.workspace / "uploads",
             proactive_store=core.proactive_store,
+            ensure_session=core.sessions.get_or_create,
         )
         self.maintenance = (
             MemoryMaintenanceLoop(

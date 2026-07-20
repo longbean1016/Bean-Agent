@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -30,12 +31,22 @@ class InterruptController(Protocol):
 class WebChannel:
     name = "web"
 
-    def __init__(self, bus: MessageBus, event_bus: EventBus, interrupt_controller: InterruptController, *, media_root: Path | None = None, proactive_store: ProactiveStore | None = None) -> None:
+    def __init__(
+        self,
+        bus: MessageBus,
+        event_bus: EventBus,
+        interrupt_controller: InterruptController,
+        *,
+        media_root: Path | None = None,
+        proactive_store: ProactiveStore | None = None,
+        ensure_session: Callable[[str], Awaitable[object]] | None = None,
+    ) -> None:
         self._bus = bus
         self._events = event_bus
         self._interrupt = interrupt_controller
         self._media_root = media_root.resolve() if media_root is not None else None
         self._proactive_store = proactive_store
+        self._ensure_session = ensure_session
         self._connections: dict[str, set[WebSocketApi]] = {}
         self._lock = asyncio.Lock()
         bus.subscribe_outbound(self.name, self._on_response)
@@ -63,7 +74,7 @@ class WebChannel:
             await websocket.send_json({"type": "pong", "request_id": request_id})
             return
         if frame_type == "session.create":
-            session_key = f"web:{uuid4().hex}"
+            session_key = await self._create_session()
             await self._register(session_key, websocket)
             await websocket.send_json({"type": "session.created", "request_id": request_id, "session_id": session_key})
             return
@@ -79,7 +90,7 @@ class WebChannel:
             return
         if frame_type == "message.send":
             if session_key is None:
-                session_key = f"web:{uuid4().hex}"
+                session_key = await self._create_session()
                 await websocket.send_json({"type": "session.created", "request_id": request_id, "session_id": session_key})
             text = str(frame.get("text") or "")
             media = [str(item).strip() for item in frame.get("media", []) if isinstance(item, str) and str(item).strip()] if isinstance(frame.get("media"), list) else []
@@ -101,6 +112,14 @@ class WebChannel:
             await websocket.send_json({"type": "turn.interrupted", "request_id": request_id, "session_id": session_key, "turn_id": result.turn_id, "status": result.status})
             return
         await self._error(websocket, request_id, "invalid_frame", f"不支持的帧类型: {frame_type or 'empty'}")
+
+    async def _create_session(self) -> str:
+        """创建 Web 会话并先持久化空元数据，保证随后 HTTP 查询不会短暂返回 404。"""
+
+        session_key = f"web:{uuid4().hex}"
+        if self._ensure_session is not None:
+            await self._ensure_session(session_key)
+        return session_key
 
     def _media_is_allowed(self, media: list[str]) -> bool:
         if not media or self._media_root is None:
