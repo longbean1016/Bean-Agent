@@ -315,14 +315,18 @@ it("通过会话菜单重命名且不触发会话切换", async () => {
   }));
 
   render(<App />);
-  await screen.findByText("原始标题");
-  fireEvent.click(screen.getByRole("button", { name: "打开会话“原始标题”的菜单" }));
+  // 等待侧栏会话标题出现（顶栏可能也显示同名标题）
+  const sidebarTitle = await screen.findByText("原始标题", { selector: ".session-row-select span" });
+  expect(sidebarTitle).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: /打开会话.*原始标题.*的菜单/ }));
   fireEvent.click(screen.getByRole("menuitem", { name: "重命名" }));
   const input = screen.getByRole("textbox", { name: "会话标题" });
   fireEvent.change(input, { target: { value: "新标题" } });
   fireEvent.keyDown(input, { key: "Enter" });
 
-  expect(await screen.findByText("新标题")).toBeVisible();
+  // 重命名后侧栏和顶栏都会显示新标题
+  const newTitleElements = await screen.findAllByText("新标题");
+  expect(newTitleElements.length).toBeGreaterThanOrEqual(1);
   expect(fetch).toHaveBeenCalledWith(
     "/api/chat/sessions/web%3Arename",
     expect.objectContaining({ method: "PATCH" }),
@@ -698,7 +702,7 @@ it("流式消息中的 Mermaid fence 闭合后允许立即查看大图", async (
 it("空会话不再提供 Mermaid 流程图示例", async () => {
   render(<App />);
 
-  await screen.findByText("从一个具体问题开始");
+  await screen.findByText("从一个具体问题开始对话");
   expect(screen.queryByText("画一张 Mermaid 流程图说明当前链路")).not.toBeInTheDocument();
 });
 

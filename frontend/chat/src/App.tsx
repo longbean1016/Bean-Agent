@@ -151,6 +151,8 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<ThemePreference>(() => readThemePreference());
   const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
   const clientRef = useRef<BeanWebSocketClient | null>(null);
   const chatRef = useRef(chat);
   const routeSessionRef = useRef(routeSession);
@@ -424,6 +426,49 @@ export function App() {
             <span className="brand-mark">B</span>
             <div><strong>BeanAgent</strong><span>{shortSession(chat.sessionId)}</span></div>
           </div>
+          {(() => {
+            const current = sessions.find((s) => s.key === chat.sessionId);
+            const title = current?.title || current?.first_message_content || "";
+            return chat.sessionId && title && title !== "新对话" ? (
+              <div className="topbar-session-title">
+                {editingTitle ? (
+                  <input
+                    className="topbar-title-input"
+                    autoFocus
+                    maxLength={60}
+                    value={titleDraft}
+                    onBlur={() => {
+                      const t = titleDraft.trim();
+                      const orig = current?.title || current?.first_message_content || "新对话";
+                      if (t && t !== orig) void handleRenameSession(chat.sessionId, t);
+                      setEditingTitle(false);
+                    }}
+                    onChange={(e) => setTitleDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        const t = titleDraft.trim();
+                        const orig = current?.title || current?.first_message_content || "新对话";
+                        if (t && t !== orig) void handleRenameSession(chat.sessionId, t);
+                        setEditingTitle(false);
+                      }
+                      if (e.key === "Escape") setEditingTitle(false);
+                    }}
+                  />
+                ) : (
+                  <button
+                    className="topbar-title-display"
+                    onClick={() => {
+                      setTitleDraft(title);
+                      setEditingTitle(true);
+                    }}
+                    title="点击重命名"
+                  >
+                    {title.length > 30 ? title.slice(0, 30) + "…" : title}
+                  </button>
+                )}
+              </div>
+            ) : null;
+          })()}
           <div className="topbar-actions">
             <ConnectionControl status={connection} onReconnect={() => clientRef.current?.reconnectNow()} />
             <ThemeControl value={theme} onChange={setTheme} />
@@ -439,7 +484,7 @@ export function App() {
 
         <StickToBottom className="conversation" initial="instant" resize="smooth" role="log">
           <StickToBottom.Content className="conversation-content" scrollClassName="conversation-scroll">
-            {chat.messages.length === 0 ? <EmptyConversation onExample={setInput} /> : chat.messages.map((message) => (
+            {chat.messages.length === 0 ? <EmptyConversation /> : chat.messages.map((message) => (
               <MessageView key={message.id} message={message} />
             ))}
           </StickToBottom.Content>
@@ -537,6 +582,21 @@ function SessionSidebar(props: {
   const [deleting, setDeleting] = useState(false);
   const [scrollbarVisible, setScrollbarVisible] = useState(false);
   const scrollbarHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sessionListRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    // 新会话发送消息后出现在侧栏时，自动滚动定位到该会话
+    if (sessionListRef.current) {
+      const activeRow = sessionListRef.current.querySelector(".session-row.active");
+      if (activeRow && typeof activeRow.scrollIntoView === "function") {
+        try {
+          activeRow.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        } catch {
+          // jsdom 环境可能不支持 scrollIntoView，忽略
+        }
+      }
+    }
+  }, [props.activeSessionId, props.sessions]);
 
   useEffect(() => () => {
     if (scrollbarHideTimerRef.current !== null) clearTimeout(scrollbarHideTimerRef.current);
@@ -580,16 +640,24 @@ function SessionSidebar(props: {
 
   const commitRename = async (session: SessionSummary) => {
     const title = titleDraft.trim();
-    if (!title) return;
+    const original = session.title || session.first_message_content || "未命名会话";
+    if (!title || title === original) {
+      setEditingSessionId("");
+      return;
+    }
     setEditingSessionId("");
     await props.onRename(session.key, title).catch(() => setEditingSessionId(session.key));
   };
 
   return (
     <div className="session-panel">
-      <div className="brand-lockup"><span className="brand-mark">B</span><div><strong>BeanAgent</strong><span>Local workspace</span></div></div>
+      <div className="brand-lockup">
+        <span className="brand-mark">B</span>
+        <strong>BeanAgent</strong>
+      </div>
       <button className="new-chat-button" onClick={props.onCreate}><MessageSquarePlus size={17} />新建会话</button>
       <nav
+        ref={sessionListRef}
         className={`session-list ${scrollbarVisible ? "scrollbar-visible" : ""}`}
         aria-label="会话列表"
         onPointerEnter={showSessionScrollbar}
@@ -1098,13 +1166,11 @@ function Composer(props: {
   );
 }
 
-function EmptyConversation({ onExample }: { onExample: (text: string) => void }) {
+function EmptyConversation() {
   return (
     <div className="empty-conversation">
-      <span className="empty-mark">B</span><h1>从一个具体问题开始</h1><p>BeanAgent 可以读取工作区、调用工具并记住重要信息。</p>
-      <div className="example-prompts">
-        {["列出当前工作目录并概括项目结构", "记住我的项目偏好", "解释一段代码并指出潜在风险"].map((text) => <button key={text} onClick={() => onExample(text)}>{text}</button>)}
-      </div>
+      <span className="empty-mark">B</span>
+      <h1>从一个具体问题开始对话</h1>
     </div>
   );
 }
