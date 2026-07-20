@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from agent.attachment_content import build_current_user_content
+from agent.context_budget import DEFAULT_CONTEXT_RETRY_PLANS, slice_complete_turns
 from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted
 from agent.message_bus import InboundMessage, PipelineResult
 from agent.prompt_assembler import PromptAssembler
@@ -32,12 +33,6 @@ HistoryLoader = Callable[[str, int], Awaitable[list[dict[str, Any]]]]
 
 logger = logging.getLogger(__name__)
 
-_LOW_PRIORITY_SECTIONS = (
-    "active_tools",
-    "recent_context",
-    "session_context",
-    "self_model",
-)
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -147,7 +142,13 @@ class Pipeline:
             vl_available=self._vl_available,
         )
         message_timestamp = datetime.now(_LOCAL_TZ)
-        disabled_sections: set[str] = set()
+        retry_plan_index = 0
+        context_retry: dict[str, Any] = {
+            "attempts": [],
+            "selected_plan": None,
+            "history_messages": len(history),
+            "disabled_sections": [],
+        }
         react_messages: list[dict[str, Any]] = []
         tool_chain: list[dict[str, Any]] = []
         tools_used: list[str] = []
@@ -166,11 +167,21 @@ class Pipeline:
             ))
 
         async def chat_with_context_retry() -> LLMResponse:
-            nonlocal history
+            nonlocal retry_plan_index
             while True:
+                plan = DEFAULT_CONTEXT_RETRY_PLANS[retry_plan_index]
+                history_for_attempt = slice_complete_turns(history, plan.history_ratio)
+                disabled_sections = set(plan.drop_sections)
+                context_retry["attempts"].append(
+                    {
+                        "name": plan.name,
+                        "history_messages": len(history_for_attempt),
+                        "disabled_sections": sorted(disabled_sections),
+                    }
+                )
                 assembled = self._assembler.assemble(
                     turn_ctx=context,
-                    history=history,
+                    history=history_for_attempt,
                     current_message=current_content,
                     message_timestamp=message_timestamp,
                     disabled_sections=disabled_sections,
@@ -179,7 +190,7 @@ class Pipeline:
                 # Prompt，原样保留该后缀，避免重复执行有副作用的工具。
                 model_messages = [*assembled.messages, *react_messages]
                 try:
-                    return await self._provider.chat(
+                    response = await self._provider.chat(
                         model_messages,
                         self._tools.get_schemas(
                             visible_names=tool_view.visible_names,
@@ -188,31 +199,19 @@ class Pipeline:
                         tool_choice="auto",
                         on_content_delta=on_delta,
                     )
+                    context_retry["selected_plan"] = plan.name
+                    context_retry["history_messages"] = len(history_for_attempt)
+                    context_retry["disabled_sections"] = sorted(disabled_sections)
+                    return response
                 except ContextLengthError:
-                    trimmed = _trim_oldest_complete_turn(history)
-                    if trimmed is not None:
-                        logger.info(
-                            "上下文超限，移除最旧完整 Turn: session=%s history=%d->%d",
-                            message.session_key,
-                            len(history),
-                            len(trimmed),
-                        )
-                        history = trimmed
-                        continue
-
-                    section = next(
-                        (name for name in _LOW_PRIORITY_SECTIONS if name not in disabled_sections),
-                        None,
-                    )
-                    if section is None:
-                        # system、最近完整 Turn、当前消息及关键记忆均不可再裁剪；
-                        # 此时保留 Provider 原始异常，交给 AgentLoop 结构化处理。
+                    if retry_plan_index >= len(DEFAULT_CONTEXT_RETRY_PLANS) - 1:
                         raise
-                    disabled_sections.add(section)
+                    retry_plan_index += 1
+                    next_plan = DEFAULT_CONTEXT_RETRY_PLANS[retry_plan_index]
                     logger.info(
-                        "上下文超限，关闭低优先级 Prompt 区块: session=%s section=%s",
+                        "上下文超限，切换退避计划: session=%s plan=%s",
                         message.session_key,
-                        section,
+                        next_plan.name,
                     )
 
         for iteration in range(1, self._max_iterations + 1):
@@ -245,6 +244,7 @@ class Pipeline:
                     thinking=str(response.thinking or ""),
                     tool_chain=tool_chain,
                     tools_used=list(dict.fromkeys(tools_used)),
+                    context_retry=context_retry,
                 )
 
             # 工具调用 assistant 消息必须原样进入下一轮，尤其要保留 DeepSeek 的
@@ -318,25 +318,6 @@ class Pipeline:
         """Turn 结束后幂等释放纯内存快照。"""
 
         self._interrupt_snapshots.pop(turn_id, None)
-
-
-def _trim_oldest_complete_turn(
-    history: list[dict[str, Any]],
-) -> list[dict[str, Any]] | None:
-    """删除最旧完整 Turn，并保证最近 Turn 不被拆散。
-
-    SessionLoader 正常会从 user 边界返回历史。这里仍防御异常输入：没有
-    user 的 assistant/tool 孤链整体丢弃，绝不把无法配对的工具消息发给模型。
-    """
-
-    user_indexes = [
-        index for index, item in enumerate(history) if item.get("role") == "user"
-    ]
-    if len(user_indexes) >= 2:
-        return history[user_indexes[1]:]
-    if not user_indexes and history:
-        return []
-    return None
 
 
 def _log_prompt_cache_usage(

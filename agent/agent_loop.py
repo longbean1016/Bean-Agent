@@ -215,11 +215,13 @@ class AgentLoop:
             return
 
         session = await self._sessions.get_or_create(message.session_key)
+        context_retry = dict(getattr(result, "context_retry", {}) or {})
         user = session.add_message("user", message.content, media=message.media, turn_id=turn_id)
         assistant = session.add_message(
             "assistant", result.content, media=result.media, turn_id=turn_id,
             reasoning_content=result.thinking, tool_chain=result.tool_chain,
             tools_used=result.tools_used, status="ok",
+            metadata={"context_retry": context_retry},
         )
         # append_messages 依次写入同一批的两条消息并原地回填稳定 ID。只有它完整返回，
         # 后台记忆才能看到完整 Turn，因此 TurnCommitted 必须位于此调用之后。
@@ -229,7 +231,12 @@ class AgentLoop:
         ))
         await self._bus.publish_outbound(OutboundMessage(
             message.channel, message.chat_id, result.content, result.thinking, result.media,
-            {"turn_id": turn_id, "request_id": request_id, "status": "ok"},
+            {
+                "turn_id": turn_id,
+                "request_id": request_id,
+                "status": "ok",
+                "context_retry": context_retry,
+            },
         ))
         if resumed:
             self.interrupt_states.pop(message.session_key, None)

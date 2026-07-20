@@ -103,6 +103,38 @@ async def test_pipeline_failure_persists_error_turn_without_committed(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_persists_and_dispatches_context_retry_trace(
+    tmp_path: Path,
+) -> None:
+    class RetriedPipeline:
+        async def process(self, message, *, turn_id):
+            return PipelineResult(
+                "回答",
+                context_retry={
+                    "selected_plan": "half_history",
+                    "history_messages": 4,
+                    "disabled_sections": ["long_term_memory"],
+                    "attempts": [{"name": "full"}, {"name": "half_history"}],
+                },
+            )
+
+    bus = MessageBus()
+    sessions = SessionManager(tmp_path)
+    loop = AgentLoop(bus, EventBus(), RetriedPipeline(), sessions)
+    await bus.publish_inbound(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="问题")
+    )
+
+    await loop.run_once()
+
+    rows = sessions.store.fetch_session_messages("web:c")
+    outbound = await bus.consume_outbound()
+    assert rows[1]["metadata"]["context_retry"]["selected_plan"] == "half_history"
+    assert outbound.metadata["context_retry"]["history_messages"] == 4
+    await sessions.close()
+
+
+@pytest.mark.asyncio
 async def test_context_guard_blocks_pipeline_without_persisting_error_turn(
     tmp_path: Path,
 ) -> None:
