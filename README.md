@@ -2,14 +2,14 @@
 
 # BeanAgent
 
-### 🤖 在记忆与实践中，成为更懂你的个人助手
+### 🤖 在理解、记忆与主动陪伴中，成为更懂你的伙伴
 
-<p><em>从聊天对话与任务实践中提炼可复用的记忆<br>理解文本、图片等多模态内容，并通过工具与技能协助完成实际任务。</em></p>
+<p><em>在聊天与实践中逐渐了解你，能够理解文本、图片等多模态内容<br>通过工具与技能帮你完成任务，并在合适的时候主动提醒、主动找你聊天。</em></p>
 
-![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.134%2B-009688?logo=fastapi&logoColor=white)
-![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=20232A)
-![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.134%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=20232A)](https://react.dev/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 
 </div>
 
