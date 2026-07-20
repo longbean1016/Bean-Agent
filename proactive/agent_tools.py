@@ -72,6 +72,7 @@ class ProactiveToolSession:
         self._topic = ""
         self._push_reason = ""
         self._decision: ProactiveToolDecision | None = None
+        self._recent_chat_read = False
 
     @property
     def decision(self) -> ProactiveToolDecision | None:
@@ -134,11 +135,10 @@ class ProactiveToolSession:
 
     async def _get_recent_chat(self, arguments: dict[str, Any]) -> str:
         limit = _integer(arguments.get("limit", 20), "limit", minimum=1, maximum=20)
-        rows, _ = await asyncio.to_thread(
-            self._sessions.list_chat_messages,
+        rows = await asyncio.to_thread(
+            _recent_rows,
+            self._sessions,
             self.session_key,
-            limit=500,
-            offset=0,
         )
         chat = [row for row in rows if row.get("role") in {"user", "assistant"}]
         passive: list[dict[str, object]] = []
@@ -160,6 +160,7 @@ class ProactiveToolSession:
         passive = passive[-limit:]
         # 主动历史只用于避免重复打扰，不与普通聊天争夺 20 条上下文预算。
         proactive = proactive[-limit:]
+        self._recent_chat_read = True
         return json.dumps(
             {"recent_chat": passive, "recent_proactive": proactive},
             ensure_ascii=False,
@@ -200,6 +201,8 @@ class ProactiveToolSession:
         )
 
     def _message_push(self, arguments: dict[str, Any]) -> str:
+        if not self._recent_chat_read:
+            raise ProactiveToolError("message_push 前必须先调用 get_recent_chat")
         if self._draft:
             raise ProactiveToolError("每次主动 tick 最多生成一条消息草稿")
         message = str(arguments.get("message") or "").strip()
@@ -212,6 +215,8 @@ class ProactiveToolSession:
         return json.dumps({"drafted": True}, ensure_ascii=False)
 
     def _finish_turn(self, arguments: dict[str, Any]) -> str:
+        if not self._recent_chat_read:
+            raise ProactiveToolError("finish_turn 前必须先调用 get_recent_chat")
         decision = str(arguments.get("decision") or "").strip()
         reason = str(arguments.get("reason") or "").strip()
         if decision == "reply":
@@ -242,6 +247,18 @@ def _integer(value: object, name: str, *, minimum: int, maximum: int) -> int:
     if result < minimum or result > maximum:
         raise ProactiveToolError(f"{name} 必须在 {minimum} 到 {maximum} 之间")
     return result
+
+
+def _recent_rows(session_store: Any, session_key: str) -> list[dict[str, Any]]:
+    """读取会话尾部窗口，避免长会话永远只返回最早的消息。"""
+
+    _head, total = session_store.list_chat_messages(session_key, limit=1, offset=0)
+    rows, _ = session_store.list_chat_messages(
+        session_key,
+        limit=500,
+        offset=max(0, total - 500),
+    )
+    return rows
 
 
 _GET_RECENT_CHAT_SCHEMA = {

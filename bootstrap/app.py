@@ -330,6 +330,7 @@ def build_core_runtime(
         sessions.store,
         main_provider,
         proactive_turns,
+        proactive_tools,
         is_session_busy=agent_loop.is_session_busy,
     )
     return CoreRuntime(

@@ -86,6 +86,7 @@ async def test_proactive_tools_expose_only_allowlist_and_read_interest_memory() 
 async def test_message_push_requires_single_draft_then_reply_finish() -> None:
     tools = ProactiveToolFactory(_Sessions(), None, ToolRegistry()).create("web:a")
 
+    await tools.execute("get_recent_chat", {"limit": 20})
     await tools.execute("message_push", {
         "message": "周末想不想去走走？",
         "topic": "徒步",
