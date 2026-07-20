@@ -169,7 +169,17 @@ export function App() {
 
   const refreshSessions = useCallback(async () => {
     try {
-      setSessions(await fetchSessions());
+      const loaded = await fetchSessions();
+      setSessions((current) => {
+        const loadedKeys = new Set(loaded.map((session) => session.key));
+        // 初始列表请求可能晚于发送请求返回；保留尚未被服务端目录确认的临时会话。
+        const pending = current.filter((session) => (
+          session.title === "新对话"
+          && session.message_count === 0
+          && !loadedKeys.has(session.key)
+        ));
+        return [...pending, ...loaded];
+      });
     } catch (error) {
       dispatch(errorFrame(error));
     }

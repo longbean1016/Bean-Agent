@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -117,6 +117,29 @@ it("首次连接创建 Session 并发送用户消息", async () => {
 
   await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send" && frame.text === "组件测试消息")).toBe(true));
   expect(screen.getByText("组件测试消息")).toBeVisible();
+  expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
+});
+
+it("延迟返回的旧会话列表不会移除正在排队的新会话", async () => {
+  let resolveSessions!: (response: Response) => void;
+  const delayedSessions = new Promise<Response>((resolve) => { resolveSessions = resolve; });
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input).includes("/api/chat/sessions?page=")) return delayedSessions;
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+  render(<App />);
+
+  await screen.findByText("已连接");
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
+  fireEvent.change(input, { target: { value: "等待队列的消息" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  expect(await screen.findByRole("button", { name: "新对话" })).toBeVisible();
+
+  await act(async () => {
+    resolveSessions({ ok: true, json: async () => ({ items: [], total: 0 }) } as Response);
+    await delayedSessions;
+  });
   expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
 });
 
