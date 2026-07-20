@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 
+from agent.chat_lane import ChatLaneManager
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,22 +53,43 @@ OutboundCallback: TypeAlias = Callable[[OutboundMessage], Awaitable[None] | None
 class MessageBus:
     """单 AgentLoop 消费的无界消息队列。"""
 
-    def __init__(self) -> None:
+    def __init__(self, chat_lane: ChatLaneManager | None = None) -> None:
         self._inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
         self._outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
         self._subscribers: dict[str, list[OutboundCallback]] = {}
+        self._chat_lane = chat_lane or ChatLaneManager()
 
     async def publish_inbound(self, message: InboundMessage) -> None:
+        await self._chat_lane.mark_passive_pending(message.channel, message.chat_id)
         await self._inbound.put(message)
 
     async def consume_inbound(self) -> InboundMessage:
         return await self._inbound.get()
 
-    def complete_inbound(self) -> None:
+    async def complete_inbound(self, message: InboundMessage) -> None:
+        await self._chat_lane.mark_passive_done(message.channel, message.chat_id)
         self._inbound.task_done()
 
     async def publish_outbound(self, message: OutboundMessage) -> None:
         await self._outbound.put(message)
+        non_passive = bool(
+            message.metadata.get("notification")
+            or message.metadata.get("proactive")
+        )
+        if not non_passive:
+            await self._chat_lane.mark_passive_send_pending(
+                message.channel, message.chat_id
+            )
+        runner = (
+            self._chat_lane.run_non_passive
+            if non_passive
+            else self._chat_lane.run_passive
+        )
+        await runner(message.channel, message.chat_id, lambda: self._dispatch(message))
+
+    async def _dispatch(self, message: OutboundMessage) -> None:
+        """在 lane 占用期间通知全部订阅者，单个订阅者失败不破坏状态释放。"""
+
         for callback in list(self._subscribers.get(message.channel, ())):
             try:
                 result = callback(message)
@@ -75,6 +98,10 @@ class MessageBus:
             except Exception:
                 # 一个 WebSocket 发送失败不能阻止同渠道其它连接收到最终消息。
                 logger.exception("出站消息订阅者执行失败: channel=%s", message.channel)
+
+    @property
+    def chat_lane(self) -> ChatLaneManager:
+        return self._chat_lane
 
     async def consume_outbound(self) -> OutboundMessage:
         return await self._outbound.get()

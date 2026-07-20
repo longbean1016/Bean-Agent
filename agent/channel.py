@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -48,6 +49,9 @@ class WebChannel:
         self._proactive_store = proactive_store
         self._ensure_session = ensure_session
         self._connections: dict[str, set[WebSocketApi]] = {}
+        self._socket_send_locks: weakref.WeakKeyDictionary[WebSocketApi, asyncio.Lock] = (
+            weakref.WeakKeyDictionary()
+        )
         self._lock = asyncio.Lock()
         bus.subscribe_outbound(self.name, self._on_response)
         event_bus.on(TurnStarted, self._on_turn_started)
@@ -71,17 +75,17 @@ class WebChannel:
         frame_type = str(frame.get("type") or "")
         request_id = str(frame.get("request_id") or "")
         if frame_type == "ping":
-            await websocket.send_json({"type": "pong", "request_id": request_id})
+            await self._send_json(websocket, {"type": "pong", "request_id": request_id})
             return
         if frame_type == "session.create":
             session_key = await self._create_session()
             await self._register(session_key, websocket)
-            await websocket.send_json({"type": "session.created", "request_id": request_id, "session_id": session_key})
+            await self._send_json(websocket, {"type": "session.created", "request_id": request_id, "session_id": session_key})
             return
         session_key = normalize_web_session_id(frame.get("session_id"))
         if frame_type == "session.subscribe" and session_key is not None:
             await self._register(session_key, websocket)
-            await websocket.send_json({
+            await self._send_json(websocket, {
                 "type": "session.subscribed",
                 "request_id": request_id,
                 "session_id": session_key,
@@ -91,7 +95,7 @@ class WebChannel:
         if frame_type == "message.send":
             if session_key is None:
                 session_key = await self._create_session()
-                await websocket.send_json({"type": "session.created", "request_id": request_id, "session_id": session_key})
+                await self._send_json(websocket, {"type": "session.created", "request_id": request_id, "session_id": session_key})
             text = str(frame.get("text") or "")
             media = [str(item).strip() for item in frame.get("media", []) if isinstance(item, str) and str(item).strip()] if isinstance(frame.get("media"), list) else []
             if not text.strip() and not media:
@@ -109,7 +113,7 @@ class WebChannel:
             return
         if frame_type == "turn.stop" and session_key is not None:
             result = self._interrupt.request_interrupt(session_key)
-            await websocket.send_json({"type": "turn.interrupted", "request_id": request_id, "session_id": session_key, "turn_id": result.turn_id, "status": result.status})
+            await self._send_json(websocket, {"type": "turn.interrupted", "request_id": request_id, "session_id": session_key, "turn_id": result.turn_id, "status": result.status})
             return
         await self._error(websocket, request_id, "invalid_frame", f"不支持的帧类型: {frame_type or 'empty'}")
 
@@ -159,17 +163,21 @@ class WebChannel:
         )
         for item in items:
             try:
-                await websocket.send_json({
-                    "type": "message.final",
-                    "request_id": "",
-                    "session_id": session_key,
-                    "turn_id": "",
-                    "content": item.content,
-                    "thinking": "",
-                    "media": [],
-                    "message_id": item.id,
-                    "metadata": notification_metadata(item),
-                })
+                async def send() -> None:
+                    await self._send_json(websocket, {
+                        "type": "message.final",
+                        "request_id": "",
+                        "session_id": session_key,
+                        "turn_id": "",
+                        "content": item.content,
+                        "thinking": "",
+                        "media": [],
+                        "message_id": item.id,
+                        "metadata": notification_metadata(item),
+                    })
+
+                channel, chat_id = session_key.split(":", 1)
+                await self._bus.chat_lane.run_non_passive(channel, chat_id, send)
             except Exception:
                 return
             await asyncio.to_thread(self._proactive_store.mark_notification_delivered, item.id)
@@ -192,6 +200,7 @@ class WebChannel:
     async def _register(self, session_key: str, websocket: WebSocketApi) -> None:
         async with self._lock:
             self._connections.setdefault(session_key, set()).add(websocket)
+            self._socket_send_locks.setdefault(websocket, asyncio.Lock())
 
     async def _unregister(self, websocket: WebSocketApi) -> None:
         async with self._lock:
@@ -199,6 +208,8 @@ class WebChannel:
                 self._connections[key].discard(websocket)
                 if not self._connections[key]:
                     self._connections.pop(key, None)
+            # 发送锁使用弱引用保存；连接对象仍存活时始终复用同一把锁，断开且无引用后
+            # 自动回收，避免清理与并发发送之间出现双锁竞态。
 
     async def _broadcast(self, session_key: str, payload: dict[str, Any]) -> int:
         async with self._lock:
@@ -207,7 +218,7 @@ class WebChannel:
         sent = 0
         for websocket in targets:
             try:
-                await websocket.send_json(payload)
+                await self._send_json(websocket, payload)
                 sent += 1
             except Exception:
                 failed.append(websocket)
@@ -215,9 +226,20 @@ class WebChannel:
             await self._unregister(websocket)
         return sent
 
-    @staticmethod
-    async def _error(websocket: WebSocketApi, request_id: str, code: str, message: str) -> None:
-        await websocket.send_json({"type": "error", "request_id": request_id, "code": code, "message": message})
+    async def _send_json(
+        self,
+        websocket: WebSocketApi,
+        payload: dict[str, Any],
+    ) -> None:
+        """同一 WebSocket 的流式帧和后台消息必须串行写入，避免并发发送异常。"""
+
+        async with self._lock:
+            send_lock = self._socket_send_locks.setdefault(websocket, asyncio.Lock())
+        async with send_lock:
+            await websocket.send_json(payload)
+
+    async def _error(self, websocket: WebSocketApi, request_id: str, code: str, message: str) -> None:
+        await self._send_json(websocket, {"type": "error", "request_id": request_id, "code": code, "message": message})
 
     async def close(self) -> None:
         self._bus.unsubscribe_outbound(self.name, self._on_response)
@@ -227,6 +249,7 @@ class WebChannel:
         self._events.off(ToolCallCompleted, self._on_tool_completed)
         async with self._lock:
             self._connections.clear()
+            self._socket_send_locks.clear()
 
 
 def normalize_web_session_id(value: object) -> str | None:
