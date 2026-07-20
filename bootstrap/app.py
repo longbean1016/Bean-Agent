@@ -401,6 +401,14 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             return FileResponse(index_file)
         return {"status": "ok", "message": "聊天前端尚未构建，请运行 npm run build"}
 
+    @app.get("/chat/{session_id}", response_model=None)
+    def chat_session_index(session_id: str) -> FileResponse | dict[str, str]:
+        """会话详情使用前端路由，直接访问或刷新时仍返回同一 SPA 入口。"""
+
+        if index_file.is_file():
+            return FileResponse(index_file)
+        return {"status": "ok", "message": "聊天前端尚未构建，请运行 npm run build"}
+
     @app.get("/api/chat/sessions")
     def list_sessions(
         page: int = Query(1, ge=1),

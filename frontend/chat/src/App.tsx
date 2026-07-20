@@ -37,6 +37,7 @@ import { idleTurnState, initialChatState, mergeTimeline, notificationRowsToMessa
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
+import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupSessionsByUpdatedAt } from "./sessionGroups";
 import type { ChatFrame, ChatMessage, ConnectionStatus, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity } from "./types";
 import { BeanWebSocketClient } from "./websocketClient";
@@ -134,21 +135,27 @@ function containsClosedMermaidFence(markdown: string): boolean {
 }
 
 export function App() {
+  const initialRouteSession = sessionFromPath(window.location.pathname);
   const [chat, dispatch] = useReducer(reduceChatFrame, {
     ...initialChatState,
-    sessionId: localStorage.getItem(SESSION_STORAGE_KEY) ?? "",
+    sessionId: initialRouteSession,
   });
+  const [routeSession, setRouteSession] = useState(initialRouteSession);
   const [connection, setConnection] = useState<ConnectionStatus>("connecting");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [input, setInput] = useState("");
   const [files, setFiles] = useState<File[]>([]);
+  const [textDrafts, setTextDrafts] = useState<Record<string, string>>({});
+  const [fileDrafts, setFileDrafts] = useState<Record<string, File[]>>({});
   const [sending, setSending] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<ThemePreference>(() => readThemePreference());
   const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
   const clientRef = useRef<BeanWebSocketClient | null>(null);
   const chatRef = useRef(chat);
+  const routeSessionRef = useRef(routeSession);
   chatRef.current = chat;
+  routeSessionRef.current = routeSession;
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
   const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running";
 
@@ -207,7 +214,7 @@ export function App() {
       onFrame: handleFrame,
       onStatus: (status) => {
         setConnection(status);
-        if (status === "connected" && !chatRef.current.sessionId) {
+        if (status === "connected" && !routeSessionRef.current && !chatRef.current.sessionId) {
           client.send({ type: "session.create", request_id: crypto.randomUUID() });
         }
       },
@@ -245,12 +252,44 @@ export function App() {
   const createSession = () => {
     if (connection !== "connected") return;
     localStorage.removeItem(SESSION_STORAGE_KEY);
+    window.history.pushState({}, "", "/");
+    setRouteSession("");
     dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
     clientRef.current?.send({ type: "session.create", request_id: crypto.randomUUID() });
+    // 每次点击新建都创建全新的根页面草稿，不影响任何已有会话的独立草稿。
+    setTextDrafts((current) => ({ ...current, [routeKey("")]: "" }));
+    setFileDrafts((current) => ({ ...current, [routeKey("")]: [] }));
     setInput("");
     setFiles([]);
     setSidebarOpen(false);
   };
+
+  const selectSession = (sessionId: string) => {
+    window.history.pushState({}, "", pathForSession(sessionId));
+    setRouteSession(sessionId);
+    setInput(textDrafts[routeKey(sessionId)] ?? "");
+    setFiles(fileDrafts[routeKey(sessionId)] ?? []);
+    void loadSession(sessionId);
+  };
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const sessionId = sessionFromPath(window.location.pathname);
+      setRouteSession(sessionId);
+      setInput(textDrafts[routeKey(sessionId)] ?? "");
+      setFiles(fileDrafts[routeKey(sessionId)] ?? []);
+      if (sessionId) {
+        void loadSession(sessionId);
+        return;
+      }
+      dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
+      if (connection === "connected") {
+        clientRef.current?.send({ type: "session.create", request_id: crypto.randomUUID() });
+      }
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [connection, fileDrafts, textDrafts]);
 
   const handleRenameSession = async (sessionId: string, title: string) => {
     try {
@@ -302,6 +341,10 @@ export function App() {
         });
         return;
       }
+      if (!routeSession) {
+        window.history.pushState({}, "", pathForSession(chat.sessionId));
+        setRouteSession(chat.sessionId);
+      }
       const submittedAt = new Date().toISOString();
       // 新会话的首轮可能长期运行或排队，发送成功后先放入目录，最终再由服务端标题覆盖。
       setSessions((current) => current.some((session) => session.key === chat.sessionId)
@@ -316,6 +359,8 @@ export function App() {
           }, ...current]);
       setInput("");
       setFiles([]);
+      setTextDrafts((current) => ({ ...current, [routeKey(routeSession || chat.sessionId)]: "", [routeKey("")]: "" }));
+      setFileDrafts((current) => ({ ...current, [routeKey(routeSession || chat.sessionId)]: [], [routeKey("")]: [] }));
     } catch (error) {
       dispatch(errorFrame(error));
     } finally {
@@ -351,7 +396,7 @@ export function App() {
       onCreate={createSession}
       onDelete={handleDeleteSession}
       onRename={handleRenameSession}
-      onSelect={(id) => void loadSession(id)}
+      onSelect={selectSession}
     />
   );
 
@@ -410,8 +455,14 @@ export function App() {
           files={files}
           input={input}
           sending={sending}
-          onFiles={setFiles}
-          onInput={setInput}
+          onFiles={(next) => {
+            setFiles(next);
+            setFileDrafts((current) => ({ ...current, [routeKey(routeSession)]: next }));
+          }}
+          onInput={(value) => {
+            setInput(value);
+            setTextDrafts((current) => ({ ...current, [routeKey(routeSession)]: value }));
+          }}
           onSend={() => void submit()}
           onStop={stopTurn}
         />

@@ -36,6 +36,7 @@ class FakeWebSocket {
 
 beforeEach(() => {
   localStorage.clear();
+  window.history.replaceState({}, "", "/");
   document.documentElement.removeAttribute("data-theme");
   systemDark = false;
   colorSchemeListener = null;
@@ -116,6 +117,7 @@ it("首次连接创建 Session 并发送用户消息", async () => {
   fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
   await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send" && frame.text === "组件测试消息")).toBe(true));
+  expect(window.location.pathname).toBe("/chat/component");
   expect(screen.getByText("组件测试消息")).toBeVisible();
   expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
 });
@@ -126,10 +128,16 @@ it("新建会话会清空其他会话中尚未发送的输入", async () => {
   await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
   const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
   fireEvent.change(input, { target: { value: "不应带到新会话" } });
+  const attachment = new File(["draft"], "draft.txt", { type: "text/plain" });
+  const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')!;
+  fireEvent.change(fileInput, { target: { files: [attachment] } });
+  expect(await screen.findByText("draft.txt")).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "新建会话" }));
 
   expect(input).toHaveValue("");
+  expect(screen.queryByText("draft.txt")).not.toBeInTheDocument();
+  expect(window.location.pathname).toBe("/");
 });
 
 it("延迟返回的旧会话列表不会移除正在排队的新会话", async () => {
@@ -291,7 +299,7 @@ it("会话列表显示时间分组标题", async () => {
 });
 
 it("通过会话菜单重命名且不触发会话切换", async () => {
-  localStorage.setItem("beanagent.session_id", "web:rename");
+  window.history.replaceState({}, "", "/chat/rename");
   let renamed = false;
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -397,7 +405,7 @@ it("点击删除确认框外部会关闭确认框", async () => {
 });
 
 it("删除当前会话后复用新建流程并回到空白会话", async () => {
-  localStorage.setItem("beanagent.session_id", "web:delete");
+  window.history.replaceState({}, "", "/chat/delete");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (init?.method === "DELETE") return { ok: true, status: 204 } as Response;
@@ -427,7 +435,7 @@ it("删除当前会话后复用新建流程并回到空白会话", async () => {
 });
 
 it("用户向上滚动后流式增量不抢回视口并可主动回到底部", async () => {
-  localStorage.setItem("beanagent.session_id", "web:scroll-lock");
+  window.history.replaceState({}, "", "/chat/scroll-lock");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages") ? {
       items: [{
@@ -472,7 +480,7 @@ it("用户向上滚动后流式增量不抢回视口并可主动回到底部", a
 });
 
 it("点击历史会话后在目标消息渲染完成时强制回到底部", async () => {
-  localStorage.setItem("beanagent.session_id", "web:first");
+  window.history.replaceState({}, "", "/chat/first");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     const payload = url.includes("/messages") ? {
@@ -539,7 +547,7 @@ it("主题支持浅色、跟随系统和深色并持久化选择", async () => {
 });
 
 it("粗体包裹的裸链接不显示星号并可直接跳转", async () => {
-  localStorage.setItem("beanagent.session_id", "web:links");
+  window.history.replaceState({}, "", "/chat/links");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     const payload = url.includes("/messages") ? {
@@ -566,7 +574,7 @@ it("粗体包裹的裸链接不显示星号并可直接跳转", async () => {
 });
 
 it("将记忆引用渲染为编号并支持展开和复制ID", async () => {
-  localStorage.setItem("beanagent.session_id", "web:citations");
+  window.history.replaceState({}, "", "/chat/citations");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages") ? {
       items: [{
@@ -598,7 +606,7 @@ it("将记忆引用渲染为编号并支持展开和复制ID", async () => {
 });
 
 it("代码复制保留原始格式并将按钮图标切换为勾选", async () => {
-  localStorage.setItem("beanagent.session_id", "web:code-copy");
+  window.history.replaceState({}, "", "/chat/code-copy");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages") ? {
       items: [{
@@ -626,7 +634,7 @@ it("代码复制保留原始格式并将按钮图标切换为勾选", async () =
 });
 
 it("Mermaid fenced block 生成受限图表而不是普通代码块", async () => {
-  localStorage.setItem("beanagent.session_id", "web:mermaid-source");
+  window.history.replaceState({}, "", "/chat/mermaid-source");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages") ? {
       items: [{
@@ -670,7 +678,7 @@ it("Mermaid fenced block 生成受限图表而不是普通代码块", async () =
 });
 
 it("流式消息中的 Mermaid fence 闭合后允许立即查看大图", async () => {
-  localStorage.setItem("beanagent.session_id", "web:stream-mermaid");
+  window.history.replaceState({}, "", "/chat/stream-mermaid");
   const { container } = render(<App />);
   await screen.findByText("已连接");
   const socket = FakeWebSocket.instances[0];

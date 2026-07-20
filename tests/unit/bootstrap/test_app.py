@@ -125,6 +125,19 @@ def test_fastapi_exposes_real_websocket_route(tmp_path: Path) -> None:
             assert runtime.sessions.store.get_session_meta(session_key)["next_seq"] == 0
 
 
+def test_chat_session_route_returns_spa_index(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    runtime = build_core_runtime(config, tmp_path / "workspace", provider=Provider())
+    app = create_fastapi_app(runtime)
+
+    with TestClient(app) as client:
+        response = client.get("/chat/example-session")
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+
+
 @pytest.mark.asyncio
 async def test_memory_maintenance_replays_outbox_and_runs_optimizer() -> None:
     class Memory:
