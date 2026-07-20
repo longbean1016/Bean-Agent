@@ -29,6 +29,8 @@ def test_config_defaults_and_nested_instances_are_independent() -> None:
     assert first.memory.retrieval.max_forced_procedures == 3
     assert first.memory.retrieval.max_event_profile == 4
     assert first.session.history_window == 40
+    assert first.agent.max_concurrent_turns == 5
+    assert first.agent.max_queued_turns == 20
     assert first.channels.chat.port == 6322
     assert first.channels.chat.channel_name == "web"
 
@@ -103,6 +105,8 @@ history_window = 25
 
 [agent]
 workdir = "runtime"
+max_concurrent_turns = 3
+max_queued_turns = 12
 
 [channels.chat]
 enabled = false
@@ -138,6 +142,8 @@ port = 8000
     assert config.memory.dedup.event_dedup_window_days == 5
     assert config.session.history_window == 25
     assert config.agent.workdir == "runtime"
+    assert config.agent.max_concurrent_turns == 3
+    assert config.agent.max_queued_turns == 12
     assert config.channels.chat.host == "0.0.0.0"
     assert config.channels.chat.port == 8000
     assert config.channels.chat.channel_name == "web"
@@ -175,6 +181,17 @@ def test_load_config_rejects_non_toml_file(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="主配置仅支持 TOML"):
         load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [("max_concurrent_turns", 0), ("max_queued_turns", -1)],
+)
+def test_agent_config_rejects_invalid_turn_limits(field_name: str, value: int) -> None:
+    values = {"max_concurrent_turns": 5, "max_queued_turns": 20, field_name: value}
+
+    with pytest.raises(ValueError, match=field_name):
+        Config().agent.__class__(**values)
 
 
 def test_config_template_uses_project_runtime_defaults() -> None:
