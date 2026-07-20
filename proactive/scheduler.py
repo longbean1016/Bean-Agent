@@ -89,6 +89,25 @@ class SchedulerService:
 
     async def _execute_and_reschedule(self, job: ScheduledJob) -> None:
         try:
+            settings = await asyncio.to_thread(self._store.get_settings, job.session_key)
+            if not settings.reminders_enabled:
+                # 关闭提醒时保留任务本身，用户重新开启后仍可管理和恢复。
+                return
+            quiet_action, resume_at = _reminder_quiet_action(settings, self._now_fn())
+            if quiet_action == "delay":
+                job.fire_at = resume_at
+                job.status = "pending"
+                return
+            if quiet_action == "skip":
+                job.run_count += 1
+                job.last_error = ""
+                if job.trigger == "every":
+                    job.fire_at = next_recurring_fire(job, after=self._now_fn())
+                    job.status = "pending"
+                else:
+                    job.enabled = False
+                    job.status = "skipped"
+                return
             content = job.message
             source = "scheduled_reminder"
             if job.tier == "soft":
@@ -197,6 +216,28 @@ def _next_daily_cron(expression: str, tz: ZoneInfo, after: datetime) -> datetime
     local = after.astimezone(tz)
     result = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
     return result + timedelta(days=1) if result <= local else result
+
+
+def _reminder_quiet_action(settings: object, now: datetime) -> tuple[str, datetime]:
+    """解释提醒勿扰策略；send 明确表示按原定时间发送。"""
+
+    if not bool(getattr(settings, "quiet_hours_enabled")):
+        return "send", now
+    tz = ZoneInfo(str(getattr(settings, "timezone")))
+    local = now.astimezone(tz)
+    start = datetime.strptime(str(getattr(settings, "quiet_start")), "%H:%M").time()
+    end = datetime.strptime(str(getattr(settings, "quiet_end")), "%H:%M").time()
+    current = local.time().replace(second=0, microsecond=0)
+    in_quiet = start == end or (start < end and start <= current < end) or (start > end and (current >= start or current < end))
+    if not in_quiet:
+        return "send", now
+    policy = str(getattr(settings, "reminder_quiet_policy"))
+    if policy != "delay":
+        return policy, now
+    resume = local.replace(hour=end.hour, minute=end.minute, second=0, microsecond=0)
+    if resume <= local:
+        resume += timedelta(days=1)
+    return "delay", resume.astimezone(timezone.utc)
 
 
 __all__ = ["SchedulerService", "compute_fire_at", "next_recurring_fire", "parse_duration"]
