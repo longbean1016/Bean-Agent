@@ -117,6 +117,7 @@ it("首次连接创建 Session 并发送用户消息", async () => {
 
   await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send" && frame.text === "组件测试消息")).toBe(true));
   expect(screen.getByText("组件测试消息")).toBeVisible();
+  expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
 });
 
 it("排队时展示动态位置并允许停止取消", async () => {

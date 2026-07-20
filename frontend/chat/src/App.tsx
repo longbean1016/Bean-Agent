@@ -280,6 +280,18 @@ export function App() {
         media: uploaded.map((item) => item.upload_path),
       });
       if (!sent) throw new Error("消息未发送，WebSocket 已断开");
+      const submittedAt = new Date().toISOString();
+      // 新会话的首轮可能长期运行或排队，发送成功后先放入目录，最终再由服务端标题覆盖。
+      setSessions((current) => current.some((session) => session.key === chat.sessionId)
+        ? current
+        : [{
+            key: chat.sessionId,
+            title: "新对话",
+            created_at: submittedAt,
+            updated_at: submittedAt,
+            message_count: 0,
+            first_message_content: "",
+          }, ...current]);
       setInput("");
       setFiles([]);
     } catch (error) {
