@@ -11,6 +11,7 @@ ActivityLevel = Literal["restrained", "balanced", "active"]
 QuietPolicy = Literal["delay", "send", "skip"]
 ScheduleTier = Literal["instant", "soft"]
 ScheduleTrigger = Literal["at", "after", "every"]
+NotificationStatus = Literal["pending", "delivered", "seen"]
 
 
 @dataclass(slots=True)
@@ -67,6 +68,23 @@ class ProactiveState:
     recent_messages: list[str] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class ProactiveNotification:
+    """不进入 Session 的提醒通知，由 Web 消息层独立展示和补发。"""
+
+    session_key: str
+    source: Literal["scheduled_reminder", "scheduled_soft"]
+    source_id: str
+    content: str
+    scheduled_at: datetime
+    recurring: bool = False
+    status: NotificationStatus = "pending"
+    generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    delivered_at: datetime | None = None
+    seen_at: datetime | None = None
+    id: str = field(default_factory=lambda: uuid4().hex)
+
+
 @dataclass(frozen=True, slots=True)
 class DeliveryResult:
     """主动消息提交结果；重复 delivery_key 不会再次写入 Session。"""
@@ -80,6 +98,8 @@ class DeliveryResult:
 __all__ = [
     "ActivityLevel",
     "DeliveryResult",
+    "NotificationStatus",
+    "ProactiveNotification",
     "ProactiveState",
     "QuietPolicy",
     "ScheduledJob",

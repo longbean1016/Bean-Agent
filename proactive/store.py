@@ -9,7 +9,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from proactive.models import ProactiveState, ScheduledJob, SessionProactiveSettings
+from proactive.models import ProactiveNotification, ProactiveState, ScheduledJob, SessionProactiveSettings
 
 
 class ProactiveStore:
@@ -59,6 +59,23 @@ class ProactiveStore:
                     message_id TEXT NOT NULL,
                     delivered_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS proactive_notifications (
+                    id TEXT PRIMARY KEY,
+                    session_key TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    scheduled_at TEXT NOT NULL,
+                    generated_at TEXT NOT NULL,
+                    delivered_at TEXT,
+                    seen_at TEXT,
+                    recurring INTEGER NOT NULL,
+                    status TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_proactive_notifications_session
+                    ON proactive_notifications(session_key, generated_at, id);
+                CREATE INDEX IF NOT EXISTS idx_proactive_notifications_pending
+                    ON proactive_notifications(session_key, status, generated_at);
                 """
             )
             self._conn.commit()
@@ -226,6 +243,69 @@ class ProactiveStore:
             )
             self._conn.commit()
 
+    def enqueue_notification(self, notification: ProactiveNotification) -> ProactiveNotification:
+        """保存待投递通知；同一周期任务只覆盖尚未投递的最新一条。
+
+        周期合并不能覆盖已经送达的记录，否则用户刷新页面后会看到旧消息内容
+        被悄悄改写。一次性任务始终插入独立记录，保证不同提醒互不吞并。
+        """
+
+        item = _validated_notification(notification)
+        with self._lock:
+            self._ensure_open()
+            existing = None
+            if item.recurring:
+                existing = self._conn.execute(
+                    "SELECT id FROM proactive_notifications WHERE session_key=? AND source_id=? AND status='pending' ORDER BY generated_at DESC LIMIT 1",
+                    (item.session_key, item.source_id),
+                ).fetchone()
+            if existing is not None:
+                item.id = str(existing["id"])
+                self._conn.execute(
+                    "UPDATE proactive_notifications SET source=?, content=?, scheduled_at=?, generated_at=?, recurring=1 WHERE id=?",
+                    (item.source, item.content, item.scheduled_at.astimezone(timezone.utc).isoformat(), item.generated_at.astimezone(timezone.utc).isoformat(), item.id),
+                )
+            else:
+                self._conn.execute(
+                    """INSERT INTO proactive_notifications(
+                        id, session_key, source, source_id, content, scheduled_at,
+                        generated_at, delivered_at, seen_at, recurring, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 'pending')""",
+                    (item.id, item.session_key, item.source, item.source_id, item.content, item.scheduled_at.astimezone(timezone.utc).isoformat(), item.generated_at.astimezone(timezone.utc).isoformat(), int(item.recurring)),
+                )
+            self._conn.commit()
+        return item
+
+    def list_notifications(self, session_key: str, *, pending_only: bool = False, limit: int = 500) -> list[ProactiveNotification]:
+        """按生成时间返回独立通知；API 必须用 session_key 隔离会话。"""
+
+        key = _session_key(session_key)
+        safe_limit = max(1, min(int(limit), 500))
+        status_clause = " AND status = 'pending'" if pending_only else ""
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                f"SELECT * FROM proactive_notifications WHERE session_key=?{status_clause} ORDER BY generated_at DESC, id DESC LIMIT ?",
+                (key, safe_limit),
+            ).fetchall()
+        return [_notification_from_row(row) for row in reversed(rows)]
+
+    def mark_notification_delivered(self, notification_id: str, *, seen: bool = False) -> bool:
+        """记录浏览器已收到通知；重复确认不会改变首次投递时间。"""
+
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._ensure_open()
+            cursor = self._conn.execute(
+                """UPDATE proactive_notifications
+                SET status=?, delivered_at=COALESCE(delivered_at, ?),
+                    seen_at=CASE WHEN ? THEN COALESCE(seen_at, ?) ELSE seen_at END
+                WHERE id=?""",
+                ("seen" if seen else "delivered", now, int(seen), now, str(notification_id)),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
     def close(self) -> None:
         """幂等关闭数据库连接。"""
 
@@ -290,6 +370,30 @@ def _job_from_payload(payload: dict[str, object]) -> ScheduledJob:
     data["fire_at"] = datetime.fromisoformat(str(data["fire_at"]))
     data["created_at"] = datetime.fromisoformat(str(data["created_at"]))
     return ScheduledJob(**data)  # type: ignore[arg-type]
+
+
+def _validated_notification(notification: ProactiveNotification) -> ProactiveNotification:
+    notification.session_key = _session_key(notification.session_key)
+    notification.content = str(notification.content).strip()
+    if not notification.content:
+        raise ValueError("通知内容不能为空")
+    if notification.source not in {"scheduled_reminder", "scheduled_soft"}:
+        raise ValueError("通知来源无效")
+    if notification.scheduled_at.tzinfo is None or notification.generated_at.tzinfo is None:
+        raise ValueError("通知时间必须包含时区")
+    return notification
+
+
+def _notification_from_row(row: sqlite3.Row) -> ProactiveNotification:
+    return ProactiveNotification(
+        id=str(row["id"]), session_key=str(row["session_key"]),
+        source=str(row["source"]), source_id=str(row["source_id"]),  # type: ignore[arg-type]
+        content=str(row["content"]), scheduled_at=datetime.fromisoformat(str(row["scheduled_at"])),
+        generated_at=datetime.fromisoformat(str(row["generated_at"])),
+        delivered_at=datetime.fromisoformat(str(row["delivered_at"])) if row["delivered_at"] else None,
+        seen_at=datetime.fromisoformat(str(row["seen_at"])) if row["seen_at"] else None,
+        recurring=bool(row["recurring"]), status=str(row["status"]),  # type: ignore[arg-type]
+    )
 
 
 __all__ = ["ProactiveStore"]
