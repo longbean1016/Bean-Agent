@@ -34,8 +34,8 @@ class Provider:
 
 
 class Extractor:
-    async def extract(self, messages, previous_recent_context):
-        return ConsolidationDraft(history_entries=[{"summary": "完成项目", "emotional_weight": 1}], pending_items=[{"tag": "identity", "content": "用户是开发者"}], recent_context="# Recent Context\n- 项目开发")
+    async def extract(self, messages, previous_recent_context, *, recent_turns="", current_memory=""):
+        return ConsolidationDraft(history_entries=[{"summary": "\u5b8c\u6210\u9879\u76ee", "emotional_weight": 1}], pending_items=[{"tag": "identity", "content": "\u7528\u6237\u662f\u5f00\u53d1\u8005"}], recent_context="# Recent Context\n- \u9879\u76ee\u5f00\u53d1")
 
 
 @pytest.mark.asyncio
@@ -498,7 +498,7 @@ async def test_turn_committed_only_enqueues_background_memory_work(tmp_path: Pat
     import asyncio
 
     class SlowExtractor:
-        async def extract(self, messages, previous_recent_context):
+        async def extract(self, messages, previous_recent_context, *, recent_turns="", current_memory=""):
             await asyncio.sleep(0.05)
             return ConsolidationDraft()
 

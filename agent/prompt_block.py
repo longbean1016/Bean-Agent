@@ -30,6 +30,7 @@ class TurnContext:
     active_tool_names: list[str] = field(default_factory=list)
     skills: SkillsPromptApi | None = None
     active_skill_names: list[str] = field(default_factory=list)
+    deferred_tools_hint: str = ""
 
 
 class PromptBlock(Protocol):
@@ -149,6 +150,14 @@ class ActiveToolsPromptBlock(_Block):
         return f"当前活跃工具: {', '.join(ctx.active_tool_names)}" if ctx.active_tool_names else None
 
 
+class DeferredToolsHintBlock(_Block):
+    """注入未加载工具目录，让模型在调用 tool_search 前知道有哪些工具可用。"""
+
+    priority, label = 48, "deferred_tools_hint"
+    def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
+        return ctx.deferred_tools_hint.strip() or None
+
+
 class ActiveSkillsPromptBlock(_Block):
     priority, label = 52, "active_skills"
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
@@ -197,7 +206,7 @@ class SystemPromptBuilder:
 
 
 def default_prompt_blocks() -> list[PromptBlock]:
-    return [IdentityPromptBlock(), BehaviorRulesPromptBlock(), SkillsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), RecentContextPromptBlock(), ActiveToolsPromptBlock(), ActiveSkillsPromptBlock(), RetrievedMemoryPromptBlock()]
+    return [IdentityPromptBlock(), BehaviorRulesPromptBlock(), SkillsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), RecentContextPromptBlock(), DeferredToolsHintBlock(), ActiveToolsPromptBlock(), ActiveSkillsPromptBlock(), RetrievedMemoryPromptBlock()]
 
 
-__all__ = ["PromptSectionMeta", "PromptSectionRender", "SectionCache", "SystemPromptBuilder", "TurnContext", "default_prompt_blocks"]
+__all__ = ["DeferredToolsHintBlock", "PromptSectionMeta", "PromptSectionRender", "SectionCache", "SystemPromptBuilder", "TurnContext", "default_prompt_blocks"]

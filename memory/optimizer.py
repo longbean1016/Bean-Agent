@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any, Protocol
 
 from memory.md_store import MarkdownMemoryStore
@@ -18,6 +19,178 @@ class LLMApi(Protocol):
 
 class MemoryOptimizerBusy(RuntimeError):
     """同一 Workspace 的 Markdown 记忆正在整理。"""
+
+
+# ── MEMORY 合并提示词（对齐 Akashic）─────────────────────────────────
+
+_MERGE_SYSTEM = (
+    "你是一个用户长期记忆整理器。"
+    "你的工作不是概括对话，而是从记忆中剔除噪音，"
+    "只保留对未来每次对话都产生底色影响的长期记忆。"
+)
+
+_MERGE_PROMPT = """\
+今日日期：{today}
+
+你的任务是将「现有用户档案」重新整理为一份精炼的长期记忆，同时合并「待合并事实」中的新内容。
+但更重要的是：**你必须剔除那些不应该存在于用户档案中的内容。**
+
+## 核心判断标准：缺席成本测试
+
+对每一条内容，问自己：
+> 在 6 个月后的一次全新对话中，如果这条信息没有被注入，agent 是否会在某个回复中出现方向性失误？
+
+是 → 保留。否 → 删除。
+
+## 三种应保留的内容
+
+- 「用户事实」：关于用户稳定身份的信息——他是谁、他有什么、他身上不可改变或长期稳定的事实；**当前正在进行的社会角色（就读学校/专业、实习公司+部门+岗位、在职单位+职位）也属于用户事实，必须保留具体细节和现在时态，不得转化为过去时或抽象化**
+- 「用户偏好」：用户在对话中持续的审美取向、交互禁忌和根本价值判断——不是具体的爱好列表，而是定义了他是什么样的人的方向性偏好
+- 「用户明确要求长期记住的关键内容」：用户亲口说"记住""写进长期记忆"的内容，保持原文连贯性，不删减
+
+待合并事实来自 PENDING.md，采用带 tag 的 bullet 格式：
+- [identity] ...
+- [preference] ...
+- [key_info] ...
+- [health_long_term] ...
+- [requested_memory] ...
+- [correction] ...
+
+tag 含义：
+- identity：基础信息、稳定背景、长期技术方向、经历、长期设备、长期维护项目
+- preference：稳定偏好、禁忌、审美、游戏口味、价值取向
+- key_info：允许长期保存的 key / token / id / 账号信息
+- health_long_term：长期健康状态的一阶事实，不展开动态指标
+- requested_memory：用户明确要求长期记住的关键内容；允许比普通事实更连贯、更完整
+- correction：对已有 MEMORY.md 内容的显式修正
+- agent_context：助手操作用户环境所需的工具性配置，如服务端口、环境变量名、工具分工、常用登录站点；具体参数（端口号、变量名）必须完整保留，不得抽象化或删除
+
+## 什么必须剔除
+
+### 网络运维细节
+内网 IP、路由模式（如"CGNAT""桥接模式""NAT"）、运营商名称、MAC 地址等网络层配置。
+→ 这些是瞬时运维信息，不是用户画像。项目路径、配置文件名、环境变量名等与用户开发环境直接相关的信息可以保留。
+
+### 时效性数字和瞬时情绪
+具体数字的动态指标（如 Star 数、增长率）、版本变更叙事（"V4 发布后切换"）、瞬时情绪（"失落""失望"）。
+→ 保留背后的价值观（如"高度认可某模型"），删除数字和事件过程。
+
+### 临时状态描述
+描述当前正在进行、随时会结束的状态（如"最近加班频繁""这周在赶项目""目前在等 offer"）。
+→ 与规律性习惯区分：每周/每天持续的行为模式（如"每周去健身房""喜欢手冲咖啡"）可以保留；带"最近""这周""目前"等时间限定词的瞬时状态必须删除。
+→ **例外：就读、实习、在职三类社会角色不在此限**，它们定义用户当前的身份位置，应完整保留机构、部门、岗位名称。删除的是角色内部发生的活动描述，而不是角色本身。
+
+### Agent 执行规则伪装成用户偏好
+以"偏好"开头但实际描述 agent 应如何执行（如检索维度划分策略、元数据标注规范等）。
+→ 这些是 procedure，不是用户身份，删除。
+
+## 示例
+
+<example id="drop_network_ops_not_project">
+输入：
+- 开发环境：项目位于 /home/user/project，配置文件 config.toml，需要设置 DB_PASSWORD
+- 家庭网络：电信宽带，桥接模式，内网 IP 192.168.1.x
+
+→ 保留开发环境信息（项目路径和配置是用户的开发画像），删除家庭网络（内网 IP 和路由模式是瞬时运维细节）。
+</example>
+
+<example id="drop_timed_metrics">
+输入：
+- GitHub 仓库截至 3 月已有 200 Star；用户对增长放缓感到焦虑
+
+→ 全部删除。Star 数会过期，情绪是瞬时的——三个月后这条就是谎言。
+</example>
+
+<example id="drop_transient_keep_habit">
+输入：
+- 用户每周去健身房，主要做力量训练
+- 用户最近加班频繁，每天靠咖啡撑着
+
+→ 保留"每周去健身房"（规律性习惯）。删除"最近加班频繁，靠咖啡撑着"（带"最近"的瞬时状态）。
+</example>
+
+<example id="drop_meta_rule">
+输入：
+- 信息检索偏好：偏好按多维度分类搜索，能用标签组合过滤，拒绝单一关键词匹配
+
+→ 全部删除。语义上描述的是 agent 应怎么执行检索任务（procedure），不是用户自身的身份或偏好。
+</example>
+
+## 整理原则
+- 合并同类、上收方向**只适用于偏好类内容**：把多条表达同一方向偏好的内容合并为一条方向性陈述
+- **身份事实（机构名称、部门、具体岗位、学校/专业）不做上收**：同一机构的多条描述可合并为一条，但不得丢失具体信息，不得抽象化
+- 同类重复只保留最终版本
+- correction 要直接反映到最终内容中，不要保留"旧值 → 新值"痕迹
+- 不要生成 agent 执行规则、SOP、工具调用规范
+- 不要保留短期状态、时效性事件
+- 普通事实保持简洁；requested_memory 允许保留更完整的连贯描述
+
+## agent_context 特殊规则
+- agent_context 条目**必须完整保留**，包括端口号、变量名、URL 等具体参数；不得以"助手可访问某服务"之类的模糊描述替代
+- agent_context 内容归入第四节 `## 助手操作上下文`，不与用户事实混合
+
+## 输出格式
+- 标题 `# 用户长期记忆`
+- 四个大分类：`## 用户事实`、`## 用户偏好`、`## 用户明确要求长期记住的关键内容`、`## 助手操作上下文`
+- 每个分类内用 bullet 列表，每条 1-2 行
+- `## 助手操作上下文` 若无内容则省略该节
+- 直接输出完整档案，不要 JSON，不要代码块，不要任何解释
+
+---
+
+现有用户档案：
+{memory}
+
+待合并事实（若有新内容则合并进去，若为空则忽略）：
+{pending}
+"""
+
+
+# ── SELF 更新提示词（对齐 Akashic，Akashic → BeanAgent）───────────
+
+_SELF_SYSTEM = (
+    "你是 BeanAgent，只能更新 SELF.md 中现有的三个 section，不得新增其他 section。"
+)
+
+_SELF_PROMPT = """\
+你的任务是根据当前 SELF.md 和本轮待合并事实，整理一份新的 SELF.md。
+
+## 目标
+- 只输出完整的 SELF.md
+- 只允许保留以下三个 section：
+  - `## 人格与形象`
+  - `## 我对当前用户的理解`
+  - `## 我们关系的定义`
+- 绝对禁止新增任何其他 section，尤其禁止出现 `## 关系演进记录`
+
+## 更新原则
+- 当前 SELF.md 是主文本，优先保留其已有的自我认知、语气和关系定义；不要把待合并事实机械改写进 SELF
+- 待合并事实只是辅助证据，只能在它们确实帮助澄清以下内容时少量吸收：
+  - BeanAgent 的定位、说话风格、交互边界
+  - BeanAgent 对当前用户的稳定理解
+  - BeanAgent 与当前用户关系的长期定义
+- 大多数待合并事实其实与 SELF.md 无关；无关时直接忽略，不要为了"有输入"而强行改写
+- 尤其不要把以下内容写进 SELF.md：
+  - 用户资料清单、账号、key、设备参数
+  - 健康状态、动态指标、短期计划、近期事件
+  - 工具规范、SOP、调用规则、执行流程
+  - 对话事件复盘、事件流水账、阶段性经历总结
+- 如果没有足够高价值的新信息，宁可输出与当前 SELF.md 基本一致的版本
+- 保持语气稳定、简洁、有立场；它是自我认知，不是用户档案，也不是工作日志
+
+## 输出约束
+- 输出必须以 `# BeanAgent 的自我认知` 开头
+- 只能包含标题和 bullet 列表
+- 不要代码块，不要解释，不要额外说明
+
+---
+
+当前 SELF.md：
+{self_content}
+
+待合并事实：
+{pending}
+"""
 
 
 class MemoryOptimizer:
@@ -36,8 +209,6 @@ class MemoryOptimizer:
     async def optimize(self) -> dict[str, int]:
         if self._lock.locked():
             raise MemoryOptimizerBusy("memory optimizer 正在运行")
-        # 锁必须覆盖 snapshot、两次 LLM 调用和文件提交；否则并发任务会把处理中
-        # 的临时空 PENDING 误判为没有工作，并破坏快照事务的单写者约束。
         async with self._lock:
             return await self._optimize()
 
@@ -52,10 +223,18 @@ class MemoryOptimizer:
                 "self_chars": len(self._store.read_self()),
             }
 
+        today = datetime.now().strftime("%Y-%m-%d")
+        merge_prompt = _MERGE_PROMPT.format(
+            today=today,
+            memory=current_memory or "（空）",
+            pending=pending or "（无新内容）",
+        )
         try:
-            merged = await self._complete(
-                "合并长期记忆。只保留会在未来新对话中影响回答方向的稳定事实、偏好、明确要求和助手操作上下文。\n"
-                f"当前 MEMORY:\n{current_memory}\n\nPENDING:\n{pending}"
+            merged = await self._chat(
+                messages=[
+                    {"role": "system", "content": _MERGE_SYSTEM},
+                    {"role": "user", "content": merge_prompt},
+                ]
             )
             if self._store.has_long_term_memory():
                 self._store.backup_long_term()
@@ -68,8 +247,6 @@ class MemoryOptimizer:
                 len(pending),
             )
         except Exception:
-            # MEMORY 是 Pending 的归档目标；只有该阶段失败才回滚快照，保证候选
-            # 事实仍能在后续周期重试。
             self._store.rollback_pending_snapshot()
             logger.exception("长期记忆合并失败，Pending 快照已回滚")
             raise
@@ -82,18 +259,21 @@ class MemoryOptimizer:
             logger.info("SELF.md 为空，跳过自我认知更新")
             return {"pending_chars": len(pending), "memory_chars": len(merged), "self_chars": 0}
 
+        self_prompt = _SELF_PROMPT.format(
+            self_content=current_self,
+            pending=pending or "（无新内容）",
+        )
         try:
-            updated_self = await self._complete(
-                "更新 SELF，只允许人格与形象、我对当前用户的理解、我们关系的定义三个 section；"
-                "不要写入工具规范或用户隐私清单。\n"
-                f"当前 SELF:\n{current_self}\n\nPENDING 证据:\n{pending}"
+            updated_self = await self._chat(
+                messages=[
+                    {"role": "system", "content": _SELF_SYSTEM},
+                    {"role": "user", "content": self_prompt},
+                ]
             )
             self._store.write_self(updated_self)
             logger.info("SELF.md 已更新")
             self_chars = len(updated_self)
         except Exception:
-            # MEMORY 已经安全提交，SELF 的独立失败不能重新放回 Pending，否则同一批
-            # 用户事实会在下一周期重复合并。
             logger.exception("SELF.md 更新失败，保留现有内容")
             self_chars = len(current_self)
 
@@ -103,8 +283,9 @@ class MemoryOptimizer:
             "self_chars": self_chars,
         }
 
-    async def _complete(self, prompt: str) -> str:
-        response = await self._provider.complete([{"role": "user", "content": prompt}], tools=[])
+    async def _chat(self, *, messages: list[dict[str, str]]) -> str:
+        """发送 system+user 消息并返回文本内容。"""
+        response = await self._provider.complete(messages, tools=[])
         content = str(getattr(response, "content", response) or "").strip()
         if not content:
             raise ValueError("Optimizer LLM 返回空内容")

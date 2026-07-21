@@ -633,10 +633,10 @@ class _LLMConsolidationExtractor:
     def __init__(self, provider: Any) -> None:
         self._provider = provider
 
-    async def extract(self, messages: list[dict[str, object]], previous_recent_context: str) -> ConsolidationDraft:
+    async def extract(self, messages: list[dict[str, object]], previous_recent_context: str, *, recent_turns: str = "", current_memory: str = "") -> ConsolidationDraft:
         conversation = render_consolidation_conversation(messages)
-        event_data = await self._complete_json(_event_extraction_prompt(conversation, previous_recent_context))
-        recent_data = await self._complete_json(_recent_context_prompt(conversation, previous_recent_context))
+        event_data = await self._complete_json(_event_extraction_prompt(conversation, previous_recent_context, current_memory=current_memory))
+        recent_data = await self._complete_json(_recent_context_prompt(conversation, previous_recent_context, recent_turns=recent_turns))
         history_entries = []
         for item in event_data.get("history_entries") or []:
             if not isinstance(item, dict) or not str(item.get("summary") or "").strip():
@@ -670,46 +670,180 @@ class _LLMConsolidationExtractor:
         return data
 
 
-def _event_extraction_prompt(conversation: str, recent_context: str) -> str:
-    return f"""你是记忆提取代理。从对话中精确提取 history_entries 和 pending_items，只返回合法 JSON。
+def _event_extraction_prompt(conversation: str, recent_context: str, *, current_memory: str = "") -> str:
+    memory_section = ""
+    if current_memory.strip():
+        memory_section = f"""当前用户档案（用于查重）：
+{current_memory}
 
-history_entries：每个独立主题一条，summary 用第三人称并以 [YYYY-MM-DD HH:MM] 开头，emotional_weight 为 0-10。
-- 日期和时间只能取自对应 USER 消息前的 Session 时间戳；不得使用模型知识、当前时间或写入时间推测。
-- 时间戳为 unknown，或无法确定哪条 USER 消息是事件证据时，不输出该 history_entry；没有消息时间证据时不得猜测或补写具体日期。
-- 只写 USER 明确表达的行动、经历、计划和状态；ASSISTANT 的建议、解释和推荐不作证据。
-- 保留地点、人名、数量、价格、型号等细节，不复制 USER:/ASSISTANT: 标记。
-- 若 USER 展示外部聊天记录或 transcript，默认 speaker 身份不明确，只允许一条“用户展示了一段聊天记录”的高层 event；禁止把材料中的人物事实归给当前用户。
+"""
+    return f"""你是记忆提取代理（Memory Extraction Agent）。从对话中精确提取结构化信息，返回 JSON。
 
-pending_items：只保存跨对话有价值的长期候选，格式为 {{"tag":"...","content":"..."}}。合法 tag：identity、preference、key_info、health_long_term、requested_memory、correction、agent_context。
-- 不写 agent SOP、工具顺序、输出规范；这些属于 procedure。
-- 不写最近/这周/目前等临时状态、日程、动态健康指标、Star 数、增长率和瞬时情绪。
-- requested_memory 仅在 USER 明确要求长期记住时使用。
-- agent_context 只保存已部署、当前有效且明确授权助手使用的配置；架构方案、网络诊断、内网 IP、路由模式和假设端口不提取。
-- 工程路径、配置文件名、环境变量名可在明确长期有效时提取。
+## 字段说明
 
-当前 RECENT_CONTEXT 只用于理解话题延续，不能作为身份、关系或事实归属证据；发生冲突时以当前窗口 USER 原文为准。
+### 1. "history_entries" → 记忆事件条目（数组，每条对应一个独立主题）
+按主题拆分，每个独立话题写一条对象，格式为 {{"summary":"...", "emotional_weight":0}}。
+summary 要求 1-2 句，以 [YYYY-MM-DD HH:MM] 开头，保留足够细节便于后续向量写入和回源判断。
+不同主题必须拆成独立条目，不得合并。若整段对话只有一个主题，返回只含一条的数组。
+
+history_entries.emotional_weight 规则：
+- 范围 0-10
+- 普通技术讨论、普通事务记录、无明显情绪色彩 → 0
+- 用户明确表达强烈喜欢/厌恶、明显受挫、关系冲突、情绪波动时按强度给 3-9
+- 不确定时保守输出 0
+
+**history_entries 提取规则（严格遵守）**：
+1. 只提取 USER 明确表达的行动、经历、计划和状态；ASSISTANT 的建议、推荐、解释一律不写入，即使其中提到了地名、店名或活动。
+2. 每条必须是简洁的第三人称摘要句，绝对不能包含 "USER:" 或 "ASSISTANT:" 等原始对话标记，不得复制粘贴原始对话文本。
+3. 商家名称、地点、人名、数量、价格、型号等具体细节必须保留，不得用"某商店""某地方"概括。
+4. 先判断当前 USER 内容的材料类型：是"用户此刻直接自述"，还是"用户正在展示一段外部聊天记录、截图 OCR、转贴 transcript 给助手看"。
+5. 若 USER 内容属于外部聊天记录 / transcript，必须先做层级理解：
+   - 外层：当前 USER 正在把一段材料发给助手看。
+   - 内层：材料中可能有多个 speaker；这些 speaker 不自动等于当前 USER。
+   - 只有当材料中某个 speaker 与当前 USER 的映射在当前会话里被明确确认时，才允许把该 speaker 的事实写入摘要。
+6. 对 transcript 场景，默认认为 speaker 映射不明确；除非当前会话中有非常明确的显式说明，否则不要尝试判断材料里的某个昵称/说话人就是用户或对方。
+7. 若 speaker 映射不明确，history_entries 只允许写 1 条高层 event，例如"用户向助手展示了一段与某人的聊天记录，内容涉及求职、学校、兴趣等话题"。
+8. 对 transcript 场景，禁止输出任何未确认关系的句子，例如：
+   - "用户向对方透露……"
+   - "对方是……"
+   - "双方确认……"
+   - 把聊天记录里的具体事实直接写成用户个人经历
+9. transcript 场景下，默认最多输出 1 条高层 history_entry；不要下钻成人物小传，不要替材料里的 speaker 自动补全身份关系。
+
+**transcript 场景示例（严格遵守）**：
+- 错误：用户贴出一段聊天记录，speaker 归属未确认，却写成"用户向对方透露自己正在找暑期实习"。
+- 错误：用户贴出一段聊天记录，直接写成"对方位于北京大兴区，就读于二外 MPAcc 专业"。
+- 错误：用户贴出一段聊天记录，直接写成"对方昵称为'一只快乐的小奶龙'"。
+- 错误：用户贴出一段聊天记录，直接写成"用户曾为打 FGO 日服选修日语"。
+- 正确：用户向助手展示了一段与匹配对象的聊天记录，聊天内容涉及学校背景、兴趣爱好和求职话题。
+
+### 2. "pending_items" → PENDING.md 候选缓冲
+只写用户的长期记忆候选，返回对象数组。每个对象格式：
+{{"tag": "<tag>", "content": "<string>"}}
+
+允许的 tag 只有 7 个：
+- "identity"：稳定背景事实，如身份、学校/专业、长期技术方向、实习/工作经历、长期设备、长期维护项目
+- "preference"：稳定偏好、禁忌、审美、游戏口味、价值取向
+- "key_info"：用户明确允许保存的 key / token / id / 账号信息
+- "health_long_term"：长期健康状态的一阶事实，只写长期状态，不写动态指标、基线、最近波动
+- "requested_memory"：用户明确要求"长期记住"的关键内容，可比普通事实更连贯
+- "correction"：对当前 MEMORY.md 现有事实的明确纠正
+- "agent_context"：助手操作用户环境所需的工具性配置，如已部署服务的端口、环境变量名、工具分工约定、常用登录站点列表；不是用户画像，但对助手执行操作有长期价值；具体参数（端口号、变量名）必须完整保留。**硬规则：只有当对话明确表明该配置当前有效且助手已被授权使用时才提取；方案讨论、架构设计、网络诊断中出现的端口和地址一律不提取**
+
+必须遵守：
+- 只写跨对话仍有长期价值的内容
+- 不写 agent 执行规则、SOP、工具调用顺序、流程规范
+- 不写短期状态、近期计划、日程、课表、一次性操作
+- 不写动态健康数据、实时指标、最近状态
+- 不写对话过程总结
+- 不写 self_insights、行为规律总结、关系演进感悟
+- "requested_memory" 只能在用户明确表达"记住这个 / 写进长期记忆 / 以后要能聊到 / 希望你记住"时使用
+
+进阶过滤（四条硬规则，任一触发即不提取）：
+
+1. **网络运维细节不提取**
+内网 IP、路由模式（如"CGNAT""桥接模式""NAT"）、运营商名称、MAC 地址等网络层配置属于瞬时运维信息，不提取。项目路径、配置文件名、环境变量名等与用户开发环境直接相关的信息可以提取。
+✗ "家庭网络是联通宽带，光猫路由模式，内网 IP 192.168.1.x" → 不提取（网络层瞬时配置）
+✓ "项目位于 /home/user/project，配置文件 config.toml" → 可提取（开发环境画像）
+
+2. **临时状态不提取，规律习惯可提取**
+带"最近""这周""目前""正在"等时间限定词的瞬时状态不提取。每周/每天持续的规律性行为模式可以提取为偏好或习惯标识。
+✗ "用户最近加班频繁，靠咖啡撑着" → 不提取（瞬时状态，随时会变）
+✓ "用户每周去健身房，主要做力量训练" → 可提取（规律性习惯，是长期生活方式）
+
+3. **时效性数字和瞬时情绪不提取**
+带有具体数值的动态指标（如 Star 数、增长率、评分）、瞬时情绪描述（如"失落""焦虑"）、正在进行中的短期状态。保留背后的价值判断，不提取数字和情绪本身。
+✗ "项目刚突破 500 Star，但增速降到每天 2 个，用户为此很焦虑" → 不提取（数字过期、情绪瞬时）
+✓ "用户长期维护某开源项目并重视社区增长" → 可提取（稳定身份信息）
+
+4. **Agent 执行规则不放入 pending_items**
+以"偏好"开头但语义上描述 agent 应如何执行的内容（如检索策略、元数据标注规范、输出格式要求等），属于 procedure，应由隐式提取路径写入向量库。
+✗ "偏好搜索结果按来源可信度分层展示" → 不提取为 pending_item（agent 输出规范）
+✗ "希望以后推荐前先查最新评测和社区反馈" → 不提取为 pending_item（agent 执行规则）
+
+5. **agent_context 只提取已部署的配置，不提取方案讨论**
+判断标准：对话中是否明确表明该服务/工具**当前已在运行**，且助手**已被告知可以使用**。
+对话中提出的架构方案、网络诊断信息、假设性配置，即使出现了具体端口、地址或变量名，也不提取。
+
+{memory_section}当前 RECENT_CONTEXT 只用于理解话题延续，不能作为身份、关系或事实归属证据；发生冲突时以当前窗口 USER 原文为准。
 {recent_context or '（空）'}
 
 待处理对话：
 {conversation}
 
-返回：{{"history_entries": [], "pending_items": []}}"""
+只返回合法 JSON，不要 markdown 代码块。"""
 
 
-def _recent_context_prompt(conversation: str, old_context: str) -> str:
-    return f"""你是近期语境压缩代理，只返回合法 JSON，不自由总结。
-只依据 USER 明确表达，提取 active_topics、user_preferences、follow_ups、avoidances、ongoing_threads，每项最多 3 条。
-- user_preferences 必须能找到“喜欢/偏好/希望”等明确锚点；技术方案讨论、为什么不、能不能不算稳定偏好。
-- avoidances 必须能找到“不要/别/避免/不想”等明确否定；ASSISTANT 建议不算。
-- ongoing_threads 只保存持续影响生活、情绪、工作、学习、关系或健康的重要现实线索；普通技术讨论和一次性提问不进入。
-- 话题已切换时，不把较早技术方案升级为偏好或避免事项。
-- 宁可数组为空，也不要脑补。
+def _recent_context_prompt(conversation: str, old_context: str, *, recent_turns: str = "") -> str:
+    return f"""你是近期语境压缩代理。你的任务不是自由总结，而是为后续上下文中保守地抽取近期语境。
 
-上一版：
+目标：
+1. 提取用户最近持续关注的话题
+2. 提取最近新暴露、但尚未沉淀为长期记忆的显式偏好
+3. 提取最近适合自然续接的话题
+4. 提取最近应避免打扰、应避免推荐、或明显不想聊的方向
+5. 提取跨窗口持续存在的重要现实线索（ongoing_threads）
+
+规则：
+- 只允许依据 USER 明确表达过的内容输出；ASSISTANT 的建议、解释、命名、延伸，一律不得当作证据
+- recent_topics 可以总结“用户最近在讨论什么”，但必须贴近 USER 原话，不得升级成长期偏好
+- active_topics 和 follow_ups 要优先写“话题层级”的概括，不要写 JSON Schema、函数名、字段名、具体术语翻译这类实现细节，除非用户明确把该细节当作核心关注点反复强调
+- user_preferences 只允许在 USER 出现明确偏好/要求/禁忌表达时输出，例如：喜欢、偏好、希望、别、不要、避免、不想
+- 不要把技术方案讨论、架构设想、问题求证、头脑风暴自动写成“用户偏好”
+- 对技术讨论场景，只有当 USER 明确表达“以后都这样做 / 我就是偏好这种方式 / 我不要另一种方式 / 以后统一按这个来”时，才允许写 user_preferences；否则一律视为 active_topics 或 follow_ups
+- 用户用“为什么不……”“能不能……”“是不是可以……”“只要不是最后一轮就……”这类方式提出方案设想或追问时，默认视为设计提议，不视为稳定偏好
+- avoidances 只允许在 USER 明确表达“不要/别/避免/不想”时输出；没有明确否定表达就留空
+- 如果最新 recent turns 显示话题已经明显切换，不要把较早窗口的技术讨论升级成当前偏好或避免事项
+- 只保留未来几轮仍会影响辅助决策的信息
+- 不要记录工具细节、推理过程、普通寒暄
+- 每个字段最多 3 条，每条尽量 1 句
+- 没有把握就留空；宁可漏掉，也不要脑补
+
+ongoing_threads 严格限制：
+- 只记录用户正在经历、推进或承受的重要事情
+- 必须是对用户当前生活、情绪、工作、学习、关系或健康有持续影响的线索
+- 普通提问、技术讨论、方案脑暴、一次性 ask、知识求证，一律不得写入 ongoing_threads
+- 若旧的 ongoing_threads 中已有某条重要线索，而当前窗口没有明确终结它，默认保留
+- 只有当用户明确表示这件事已解决、结束、过去了、不再关心，才允许删除
+- ongoing_threads 的写入门槛高于 active_topics；宁可少写，也不要把普通话题升级进去
+
+专项禁令：
+- 用户讨论“某个设计有没有依据/有没有实践/是否可行/为什么不这样做”，这是方案讨论，不是偏好；默认只能进入 active_topics 或 follow_ups，不能进入 user_preferences
+- 用户说“为什么不让前台……只要不是最后一轮就……”是在提出一种实现设想，不等于“用户偏好以后统一这样做”
+- 用户说“这样也不会引入额外延迟”“有没有这样的设计”，这是在分析方案目标，不等于稳定偏好
+- 用户讨论“零延迟”“预加载”“流式预取”“前瞻性检索”这类设计目标时，默认视为当前方案讨论，不得直接提炼成 user_preferences
+- 对方案讨论里的具体实现细节，优先上收一层概括，例如写“下一轮检索规划”“流式预取方案”，不要写“JSON Schema”“结构化预取指令”这类细碎实现点
+- 用户说“睡觉了”“头有点疼”“身体不适”，这只是当前状态；除非用户明确说“别再聊这个”“不要继续”“我不想讨论”，否则不得生成 avoidances
+- assistant 说“今晚先别想架构和代码了”“先休息”，这是 assistant 建议，不是用户 avoidances
+- 如果较早窗口是技术方案讨论，而最新 recent turns 已切到睡眠/头痛/身体状态，则 user_preferences 和 avoidances 默认应为空；技术方案最多保留在 active_topics / follow_ups
+- “最近在讨论前瞻性检索/流式预取方案”只能进入 active_topics / follow_ups，不能进入 ongoing_threads
+- “用户最近几天反复因面试失败而情绪低落”“用户近期持续受睡眠紊乱影响”这类重要现实线索，才允许进入 ongoing_threads
+
+反例：
+- 错误：把“在 React 过程中同时输出下一轮检索内容”写成“用户偏好在对话中实时生成下一轮检索指令”
+- 错误：把“这样也不会引入额外延迟”写成“用户偏好零延迟预加载”
+- 错误：把“为什么不让前台在进行时同时输出自己想要什么”写成“用户偏好实时生成下一轮检索指令”
+- 错误：把“睡觉了，吃了褪黑素头有点疼”写成“避免在身体不适时继续讨论技术架构”
+- 错误：把“最近在讨论 React / 流式预取方案”写成 ongoing_threads
+- 正确：active_topics 可写“用户最近在讨论前瞻性检索/流式预取方案”
+- 正确：ongoing_threads 可写“用户最近几天反复提到面试受挫，持续影响情绪”
+- 正确：如果用户没有明确说“希望/不要/避免/不想”，user_preferences 和 avoidances 可以为空
+
+输出前自检：
+1. 检查 user_preferences 中每一条，是否都能在 USER 原话里找到明确偏好/要求词（如“希望/不要/避免/不想/偏好/喜欢”）
+2. 若找不到明确偏好/要求词，删除该条
+3. 检查 avoidances 中每一条，是否都能在 USER 原话里找到明确否定/回避表达
+4. 若找不到明确否定/回避表达，删除该条
+5. 如果删除后为空，返回空数组，不要为了“信息完整”硬填
+
+【上一版 recent context（仅供延续，不要机械复述）】
 {old_context or '（空）'}
 
-待压缩窗口：
-{conversation}
+【较早窗口（本次待压缩）】
+{conversation or '（空）'}
+
+【最新 recent turns（只用于判断是否已切话题，不可把 assistant 内容当证据）】
+{recent_turns or '（空）'}
 
 返回：{{"active_topics": [], "user_preferences": [], "follow_ups": [], "avoidances": [], "ongoing_threads": []}}"""
 

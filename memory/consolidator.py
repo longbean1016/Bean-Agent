@@ -26,7 +26,7 @@ class ConsolidationResult:
 
 
 class ConsolidationExtractor(Protocol):
-    async def extract(self, messages: list[dict[str, object]], previous_recent_context: str) -> ConsolidationDraft: ...
+    async def extract(self, messages: list[dict[str, object]], previous_recent_context: str, *, recent_turns: str = "", current_memory: str = "") -> ConsolidationDraft: ...
 
 
 def render_consolidation_conversation(messages: list[dict[str, object]]) -> str:
@@ -43,6 +43,27 @@ def render_consolidation_conversation(messages: list[dict[str, object]]) -> str:
     )
 
 
+def _format_recent_turns_for_prompt(messages: list[dict[str, object]]) -> str:
+    """将热历史消息转为 recent context prompt 可读的简短格式。
+
+    只取 user 和 assistant 角色，assistant 只保留短预览，不暴露完整回复。
+    """
+
+    lines: list[str] = []
+    for item in messages:
+        role = str(item.get("role") or "").lower()
+        content = str(item.get("content") or "").strip()
+        if not content or role not in {"user", "assistant"}:
+            continue
+        if role == "assistant" and item.get("proactive"):
+            continue
+        if role == "assistant":
+            lines.append(f"[a-preview] {content[:60]}")
+        else:
+            lines.append(f"[user] {content}")
+    return "\n".join(lines).strip()
+
+
 class Consolidator:
     def __init__(self, sessions: SessionStore, markdown: MarkdownMemoryStore, extractor: ConsolidationExtractor, *, keep_count: int = 20, threshold: int | None = None) -> None:
         self._sessions = sessions
@@ -56,14 +77,16 @@ class Consolidator:
         cursor = self._sessions.get_cursor(session_key)
         end = max(cursor, len(messages) - self._keep_count)
         window = messages[cursor:end]
+        recent = messages[-self._keep_count:] if self._keep_count else messages
         if len(window) < self._threshold:
             # 未达到归档阈值时不消耗 LLM，只刷新最近对话的可读窗口；cursor 保持不变，
             # 后续消息累计到阈值后仍从同一位置进入 Consolidation。
-            recent = messages[-self._keep_count:] if self._keep_count else messages
             self._markdown.refresh_recent_turns(recent)
             return None
 
-        draft = await self._extractor.extract(window, self._markdown.read_recent_context())
+        recent_turns = _format_recent_turns_for_prompt(recent)
+        current_memory = self._markdown.read_long_term().strip()
+        draft = await self._extractor.extract(window, self._markdown.read_recent_context(), recent_turns=recent_turns, current_memory=current_memory)
         source_ref = f"{session_key}@{cursor}-{end - 1}"
         pending_lines = [
             f"- [{str(item.get('tag') or 'key_info')}] {str(item.get('content') or '').strip()}"
@@ -86,4 +109,5 @@ __all__ = [
     "ConsolidationResult",
     "Consolidator",
     "render_consolidation_conversation",
+    "_format_recent_turns_for_prompt",
 ]

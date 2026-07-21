@@ -34,6 +34,16 @@ HistoryLoader = Callable[[str, int], Awaitable[list[dict[str, Any]]]]
 logger = logging.getLogger(__name__)
 
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+_SUMMARY_MAX_TOKENS = 512
+_INCOMPLETE_SUMMARY_PROMPT = """当前任务需要先暂停继续调用工具，请直接输出给用户看的中文阶段性回复。
+必须基于已有上下文，不要编造结果。
+必须包含四点：
+1) 已经使用了哪些工具或操作，以及拿到了什么关键信息；
+2) 当前已经做到哪一步；
+3) 还缺什么信息或步骤；
+4) 如果继续，下一步会怎么做。
+可以提到工具名称和关键结果，但不要暴露 tool_call_id、schema、内部 prompt 或原始参数 JSON。
+禁止输出"已达到最大迭代次数"这类模板句；不要输出 JSON。"""
 
 
 class Pipeline:
@@ -119,6 +129,7 @@ class Pipeline:
             else []
         )
         active_skills = collect_skill_mentions(message.content, available_skills)
+        deferred_hint = _build_deferred_tools_hint(self._tools, tool_view.visible_names)
         context = TurnContext(
             workspace=self._workspace,
             channel=message.channel,
@@ -128,6 +139,7 @@ class Pipeline:
             active_tool_names=names,
             skills=self._skills,
             active_skill_names=active_skills,
+            deferred_tools_hint=deferred_hint,
         )
         current_content = await build_current_user_content(
             message.content,
@@ -146,6 +158,7 @@ class Pipeline:
         react_messages: list[dict[str, Any]] = []
         tool_chain: list[dict[str, Any]] = []
         tools_used: list[str] = []
+        last_base_messages: list[dict[str, Any]] = []
 
         async def on_delta(delta: dict[str, str]) -> None:
             snapshot = self._interrupt_snapshots[turn_id]
@@ -161,7 +174,7 @@ class Pipeline:
             ))
 
         async def chat_with_context_retry() -> LLMResponse:
-            nonlocal retry_plan_index
+            nonlocal retry_plan_index, last_base_messages
             while True:
                 plan = DEFAULT_CONTEXT_RETRY_PLANS[retry_plan_index]
                 history_for_attempt = slice_complete_turns(history, plan.history_ratio)
@@ -183,6 +196,7 @@ class Pipeline:
                 # ReAct 后缀可能包含已经执行过的工具结果。超限重试只重建基础
                 # Prompt，原样保留该后缀，避免重复执行有副作用的工具。
                 model_messages = [*assembled.messages, *react_messages]
+                last_base_messages = assembled.messages
                 try:
                     response = await self._provider.chat(
                         model_messages,
@@ -233,8 +247,32 @@ class Pipeline:
                         error,
                     )
             if not response.tool_calls:
+                # 模型只输出了 thinking 但没有正文时，重试一次催出正式回复。
+                content = str(response.content or "").strip()
+                thinking = str(response.thinking or "")
+                if not content and thinking:
+                    logger.warning(
+                        "空回复重试: session=%s iteration=%d content 为空但 thinking 非空",
+                        message.session_key,
+                        iteration,
+                    )
+                    react_messages.append({"role": "assistant", "content": ""})
+                    react_messages.append({
+                        "role": "user",
+                        "content": "你刚才只输出了思考过程，没有给出正式回复。请直接回复用户，不要重复思考。",
+                    })
+                    retry = await self._provider.chat(
+                        [*last_base_messages, *react_messages],
+                        tools=[],
+                        tool_choice="none",
+                    )
+                    if retry.content:
+                        response = retry
+                        content = str(retry.content or "").strip()
+                    else:
+                        logger.warning("空回复重试仍为空: session=%s", message.session_key)
                 return PipelineResult(
-                    content=str(response.content or ""),
+                    content=str(content or ""),
                     thinking=str(response.thinking or ""),
                     tool_chain=tool_chain,
                     tools_used=list(dict.fromkeys(tools_used)),
@@ -301,7 +339,26 @@ class Pipeline:
                 snapshot["tools_used"] = list(dict.fromkeys(tools_used))
                 snapshot["tool_chain_partial"] = deepcopy([*tool_chain, group])
             tool_chain.append(group)
-        raise RuntimeError(f"ReAct 超过最大迭代次数: {self._max_iterations}")
+        # 达到最大迭代次数后生成阶段性进度总结，不直接崩溃。
+        logger.warning(
+            "ReAct 达到最大迭代次数: session=%s iteration=%d tools=%s",
+            message.session_key,
+            self._max_iterations,
+            ", ".join(tools_used) if tools_used else "无",
+        )
+        summary = await self._summarize_incomplete_progress(
+            last_base_messages, react_messages,
+            reason="max_iterations",
+            iteration=self._max_iterations,
+            tools_used=tools_used,
+        )
+        return PipelineResult(
+            content=summary,
+            thinking="",
+            tool_chain=tool_chain,
+            tools_used=list(dict.fromkeys(tools_used)),
+            context_retry=context_retry,
+        )
 
     def snapshot_interrupt_state(self, turn_id: str) -> dict[str, Any]:
         """返回当前 Turn 的隔离副本，避免取消后的清理影响中断状态。"""
@@ -312,6 +369,44 @@ class Pipeline:
         """Turn 结束后幂等释放纯内存快照。"""
 
         self._interrupt_snapshots.pop(turn_id, None)
+
+    async def _summarize_incomplete_progress(
+        self,
+        base_messages: list[dict[str, Any]],
+        react_messages: list[dict[str, Any]],
+        *,
+        reason: str,
+        iteration: int,
+        tools_used: list[str],
+    ) -> str:
+        """ReAct 达到上限时调 LLM 生成用户可读的阶段性进度总结。"""
+
+        summary_prompt = (
+            f"[收尾原因] {reason}\n"
+            f"[已执行轮次] {iteration}\n"
+            f"[已调用工具] {', '.join(tools_used[-8:]) if tools_used else '无'}\n\n"
+            + _INCOMPLETE_SUMMARY_PROMPT
+        )
+        try:
+            response = await self._provider.chat(
+                [*base_messages, *react_messages,
+                 {"role": "user", "content": summary_prompt}],
+                tools=[],
+                max_tokens=_SUMMARY_MAX_TOKENS,
+                tool_choice="none",
+            )
+            text = str(response.content or "").strip()
+            if text:
+                return text
+        except Exception as error:
+            logger.warning("生成进度收尾总结失败: %s", error)
+        # 模型收尾失败时返回固定兜底文案。
+        tool_text = "、".join(tools_used[-8:]) if tools_used else "无"
+        done = f"已尝试 {iteration} 轮，调用工具 {len(tools_used)} 次（{tool_text}）。"
+        return (
+            f"这次任务还没完全收束。{done}"
+            "我先停在当前进度，后续会继续基于已有工具结果补齐缺失信息并给你最终结论。"
+        )
 
 
 def _log_prompt_cache_usage(
@@ -334,6 +429,39 @@ def _log_prompt_cache_usage(
         prompt_tokens,
         rate,
     )
+
+
+def _build_deferred_tools_hint(tools: Any, visible: set[str] | None = None) -> str:
+    """构建未加载工具目录，让模型在调用 tool_search 前知道有哪些工具可用。
+
+    对齐 Akashic 的 build_deferred_tools_hint() 行为：列出当前 Turn 不可见
+    但已注册的工具名，并说明通过 tool_search 的加载方式。
+    """
+
+    if tools is None:
+        return ""
+    try:
+        registered = getattr(tools, "get_registered_names", None)
+        if callable(registered):
+            all_names = set(registered())
+        else:
+            all_names = set(getattr(tools, "_tools", {}).keys())
+    except Exception:
+        return ""
+    if not all_names:
+        return ""
+    visible_set = visible or set()
+    deferred = [name for name in sorted(all_names) if name not in visible_set]
+    if not deferred:
+        return ""
+    lines = ["【未加载工具目录（知道名字但 schema 未暴露）】"]
+    lines.append(f"内置: {', '.join(deferred)}")
+    lines.append(
+        f"\n共 {len(deferred)} 个。加载方式：\n"
+        "- 已知工具名 → tool_search(query=\"select:工具名\")，支持逗号分隔多个\n"
+        "- 描述功能   → tool_search(query=\"关键词\") 搜索匹配"
+    )
+    return "\n".join(lines) + "\n\n"
 
 
 __all__ = ["Pipeline"]

@@ -74,7 +74,7 @@ class Extractor:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
 
-    async def extract(self, messages, previous_recent_context):
+    async def extract(self, messages, previous_recent_context, *, recent_turns="", current_memory=""):
         if self.fail:
             raise RuntimeError("LLM failed")
         return ConsolidationDraft(
