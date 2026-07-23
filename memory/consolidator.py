@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from memory.md_store import MarkdownMemoryStore
+from memory.md_store import MarkdownMemoryStore, format_assistant_preview
 from session.store import SessionStore
 
 
@@ -58,10 +58,33 @@ def _format_recent_turns_for_prompt(messages: list[dict[str, object]]) -> str:
         if role == "assistant" and item.get("proactive"):
             continue
         if role == "assistant":
-            lines.append(f"[a-preview] {content[:60]}")
+            preview = format_assistant_preview(content)
+            if preview:
+                lines.append(f"[a-preview] {preview}")
         else:
             lines.append(f"[user] {content}")
     return "\n".join(lines).strip()
+
+
+def _stable_recent_context(content: str) -> str:
+    """剥离易变预览，避免旧 Recent Turns 与当前 Session 热历史重复入模。"""
+
+    return str(content or "").partition("## Recent Turns")[0].rstrip()
+
+
+def _with_compression_until(content: str, timestamp: object) -> str:
+    """在标准 Compression 区块记录已归档原文的确定边界。"""
+
+    text = str(content or "").strip()
+    marker = "## Compression"
+    if not text or marker not in text:
+        return text
+    boundary = str(timestamp or "unknown").strip() or "unknown"
+    prefix, suffix = text.split(marker, 1)
+    body = suffix.lstrip("\n")
+    if body.startswith("until:"):
+        _, _, body = body.partition("\n")
+    return f"{prefix}{marker}\nuntil: {boundary}\n{body}".rstrip() + "\n"
 
 
 class Consolidator:
@@ -77,7 +100,9 @@ class Consolidator:
         cursor = self._sessions.get_cursor(session_key)
         end = max(cursor, len(messages) - self._keep_count)
         window = messages[cursor:end]
-        recent = messages[-self._keep_count:] if self._keep_count else messages
+        tail = messages[-self._keep_count:] if self._keep_count else messages
+        recent_count = max(1, self._keep_count // 2) if self._keep_count else len(tail)
+        recent = tail[-recent_count:] if recent_count else []
         if len(window) < self._threshold:
             # 未达到归档阈值时不消耗 LLM，只刷新最近对话的可读窗口；cursor 保持不变，
             # 后续消息累计到阈值后仍从同一位置进入 Consolidation。
@@ -86,7 +111,15 @@ class Consolidator:
 
         recent_turns = _format_recent_turns_for_prompt(recent)
         current_memory = self._markdown.read_long_term().strip()
-        draft = await self._extractor.extract(window, self._markdown.read_recent_context(), recent_turns=recent_turns, current_memory=current_memory)
+        previous_recent_context = _stable_recent_context(
+            self._markdown.read_recent_context()
+        )
+        draft = await self._extractor.extract(
+            window,
+            previous_recent_context,
+            recent_turns=recent_turns,
+            current_memory=current_memory,
+        )
         source_ref = f"{session_key}@{cursor}-{end - 1}"
         pending_lines = [
             f"- [{str(item.get('tag') or 'key_info')}] {str(item.get('content') or '').strip()}"
@@ -97,7 +130,12 @@ class Consolidator:
         if pending_lines:
             self._markdown.append_pending_once("\n".join(pending_lines), source_ref=source_ref)
         if draft.recent_context.strip():
-            self._markdown.write_recent_context(draft.recent_context)
+            self._markdown.write_recent_context(
+                _with_compression_until(
+                    draft.recent_context,
+                    window[-1].get("timestamp") if window else None,
+                )
+            )
         conversation = render_consolidation_conversation(window)
         # 此处只返回候选 cursor。MemoryEngine 必须先持久化 outbox 再推进它，
         # 否则进程在两步之间失败会让原文退出模型历史却没有可恢复的派生任务。

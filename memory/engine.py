@@ -842,7 +842,11 @@ ongoing_threads 严格限制：
 【较早窗口（本次待压缩）】
 {conversation or '（空）'}
 
-【最新 recent turns（只用于判断是否已切话题，不可把 assistant 内容当证据）】
+【最新 Recent Turns（仅用于判断话题是否切换）】
+- `[user]` 表示近期用户消息，只用于判断近期正在讨论什么，以及话题是否已经切换
+- `[a-preview]` 表示 ASSISTANT 回复的截断预览，内容可能不完整，也不代表用户立场
+- Recent Turns 中的任何内容都不能替代待压缩窗口中的 USER 原文
+- 严禁将 `[a-preview]` 作为用户身份、事实、偏好、关系、回避事项或 ongoing thread 的证据
 {recent_turns or '（空）'}
 
 返回：{{"active_topics": [], "user_preferences": [], "follow_ups": [], "avoidances": [], "ongoing_threads": []}}"""

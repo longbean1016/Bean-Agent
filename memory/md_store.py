@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -20,6 +21,31 @@ DEFAULT_SELF_MD = """# BeanAgent 的自我认知
 ## 我们关系的定义
 - 我们以透明、尊重边界和持续协作为基础。
 """
+
+_ASSISTANT_PREVIEW_LIMIT = 60
+
+
+def format_assistant_preview(content: object) -> str:
+    """生成不会破坏 Markdown 结构的单行回复预览。"""
+
+    text = str(content or "")
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    cleaned_lines: list[str] = []
+    for line in text.splitlines():
+        value = line.strip()
+        if re.fullmatch(r"(?:[-*_]\s*){3,}", value):
+            continue
+        value = re.sub(r"^#{1,6}\s+", "", value)
+        value = re.sub(r"^>+\s*", "", value)
+        value = re.sub(r"^(?:[-+*]|\d+[.)])\s+", "", value)
+        cleaned_lines.append(value)
+    text = " ".join(cleaned_lines)
+    text = re.sub(r"[`*_~]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= _ASSISTANT_PREVIEW_LIMIT:
+        return text
+    return text[:_ASSISTANT_PREVIEW_LIMIT].rstrip() + "…（已截断）"
 
 
 class MarkdownMemoryStore:
@@ -73,7 +99,9 @@ class MarkdownMemoryStore:
                 lines.append(f"[user] {content}")
             elif role == "assistant" and not item.get("proactive"):
                 # Recent Turns 只保存助手短预览，避免公共 Markdown 重复完整回复或工具输出。
-                lines.append(f"[a-preview] {content[:60]}")
+                preview = format_assistant_preview(content)
+                if preview:
+                    lines.append(f"[a-preview] {preview}")
         if not lines:
             return
         with self._lock:
@@ -82,7 +110,10 @@ class MarkdownMemoryStore:
             # 同一个 Turn 因任务重试被重复写入，同时不破坏前面的 Compression/Ongoing Threads。
             stable, marker, _ = current.partition("## Recent Turns")
             prefix = stable.rstrip() if marker else current
-            content = f"{prefix}\n\n## Recent Turns\n".lstrip() + "\n".join(lines) + "\n"
+            content = (
+                f"{prefix}\n\n## Recent Turns\n"
+                "<!-- [a-preview] = assistant reply preview only; not evidence -->\n"
+            ).lstrip() + "\n".join(lines) + "\n"
             self._atomic_write(self.recent_context_file, content)
 
     def get_memory_context(self) -> str:

@@ -73,8 +73,12 @@ def test_append_pending_once_is_idempotent(tmp_path: Path) -> None:
 class Extractor:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
+        self.previous_recent_context = ""
+        self.recent_turns = ""
 
     async def extract(self, messages, previous_recent_context, *, recent_turns="", current_memory=""):
+        self.previous_recent_context = previous_recent_context
+        self.recent_turns = recent_turns
         if self.fail:
             raise RuntimeError("LLM failed")
         return ConsolidationDraft(
@@ -156,6 +160,92 @@ async def test_below_threshold_refreshes_recent_turns_without_llm(tmp_path: Path
     assert "[assistant]" not in recent
     assert "工具原文" not in recent
     assert "长" * 61 not in recent
+
+
+def test_recent_turn_preview_is_single_line_plain_text_with_truncation_marker(tmp_path: Path) -> None:
+    markdown = MarkdownMemoryStore(tmp_path)
+    try:
+        markdown.refresh_recent_turns([
+            {"role": "user", "content": "问题"},
+            {
+                "role": "assistant",
+                "content": "**标题**\n---\n## 详情\n" + "内容" * 50,
+            },
+        ])
+        recent = markdown.read_recent_context()
+    finally:
+        markdown.close()
+
+    preview = next(
+        line.removeprefix("[a-preview] ")
+        for line in recent.splitlines()
+        if line.startswith("[a-preview] ")
+    )
+    assert "\n" not in preview
+    assert "**" not in preview
+    assert "##" not in preview
+    assert "---" not in preview
+    assert preview.endswith("…（已截断）")
+
+
+@pytest.mark.asyncio
+async def test_recent_turn_refresh_keeps_only_last_ten_messages(tmp_path: Path) -> None:
+    class ForbiddenExtractor:
+        async def extract(self, messages, previous_recent_context):
+            raise AssertionError("未达到阈值时不应调用归档 LLM")
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    markdown = MarkdownMemoryStore(tmp_path)
+    try:
+        for index in range(20):
+            sessions.add_message(NewMessage(
+                session_key="web:c",
+                role="user",
+                content=f"问题 {index}",
+            ))
+        consolidator = Consolidator(
+            sessions,
+            markdown,
+            ForbiddenExtractor(),
+            keep_count=20,
+            threshold=5,
+        )
+        await consolidator.consolidate("web:c")
+        recent = markdown.read_recent_context()
+    finally:
+        sessions.close()
+        markdown.close()
+
+    assert "问题 9" not in recent
+    assert "问题 10" in recent
+    assert "问题 19" in recent
+
+
+@pytest.mark.asyncio
+async def test_consolidation_passes_only_stable_context_and_adds_until(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    markdown = MarkdownMemoryStore(tmp_path)
+    extractor = Extractor()
+    try:
+        for index in range(6):
+            sessions.add_message(NewMessage(
+                session_key="web:c",
+                role="user" if index % 2 == 0 else "assistant",
+                content=f"消息 {index}",
+                timestamp=f"2026-07-16T10:0{index}:00+08:00",
+            ))
+        markdown.write_recent_context(
+            "# Recent Context\n\n## Compression\n- 项目\n\n## Recent Turns\n[user] 旧话题\n"
+        )
+        consolidator = Consolidator(sessions, markdown, extractor, keep_count=2, threshold=4)
+        result = await consolidator.consolidate("web:c")
+    finally:
+        sessions.close()
+        markdown.close()
+
+    assert result is not None
+    assert "旧话题" not in extractor.previous_recent_context
+    assert "until: 2026-07-16T10:03:00+08:00" in markdown.read_recent_context()
 
 
 class OptimizerLLM:
