@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from abc import abstractmethod
 from datetime import timezone
 from typing import Any
 
@@ -11,64 +12,31 @@ from proactive.store import ProactiveStore
 from tools.base import Tool
 
 
-class ScheduleTool(Tool):
-    name = "schedule"
-    description = (
-        "为当前会话创建定时任务。能够在创建时确定最终提醒文本的任务必须使用 instant，"
-        "并将到期后原样发送的文本写入 message。只有到期后需要查询实时信息、调用工具、"
-        "检查状态或动态判断时才能使用 soft；soft 的 prompt 是未来执行的独立任务指令，"
-        "不是直接发给用户的最终提醒话术。创建 soft 时只定义未来任务，不得提前执行。"
-        "时间或执行方式存在歧义时必须先询问用户，不得猜测。"
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "tier": {"type": "string", "enum": ["instant", "soft"]},
-            "trigger": {"type": "string", "enum": ["at", "after", "every"]},
-            "when": {"type": "string", "description": "ISO/HH:MM、30m/2h，或每日 Cron"},
-            "message": {
-                "type": "string",
-                "description": "仅供 instant 使用；到期后原样发送给用户的最终提醒文本。",
-            },
-            "prompt": {
-                "type": "string",
-                "description": (
-                    "仅供 soft 使用；描述到期后需要执行的任务，不是最终提醒话术。"
-                    "使用客观指令口吻，写明任务目标、结果接收者、必要背景、需要调用的工具或"
-                    "判断条件以及失败处理。不要在创建任务时提前执行查询或检查；只有取得实际"
-                    "工具结果后才能声称已经完成，无法执行时如实说明，不得编造。"
-                ),
-            },
-            "timezone": {"type": "string", "description": "IANA 时区，默认 Asia/Shanghai"},
-            "name": {"type": "string", "description": "便于查询和取消的名称"},
-        },
-        "required": ["tier", "trigger", "when"],
-    }
+_COMMON_PROPERTIES = {
+    "trigger": {"type": "string", "enum": ["at", "after", "every"]},
+    "when": {"type": "string", "description": "ISO/HH:MM、30m/2h，或每日 Cron"},
+    "timezone": {"type": "string", "description": "IANA 时区，默认 Asia/Shanghai"},
+    "name": {"type": "string", "description": "便于查询和取消的名称"},
+}
 
-    def __init__(self, store: ProactiveStore) -> None:
-        self._store = store
+
+class _ScheduleCreateTool(Tool):
+    """复用时间解析和持久化，但不向模型暴露 tier 选择。"""
+
+    @abstractmethod
+    def _job_kind(self) -> tuple[str, str]:
+        """返回内部固定的 tier 与唯一内容字段。"""
 
     async def execute(self, **kwargs: Any) -> str:
         session_key = str(kwargs.get("session_key") or "").strip()
         if not session_key:
             return "错误：当前会话身份缺失"
-        tier = str(kwargs.get("tier") or "")
         trigger = str(kwargs.get("trigger") or "")
         timezone_name = str(kwargs.get("timezone") or "Asia/Shanghai")
-        message_text = str(kwargs.get("message") or "").strip()
-        prompt_text = str(kwargs.get("prompt") or "").strip()
-        # tier 决定内容是在创建时定稿还是到期后执行；禁止交叉字段可避免
-        # 固定提醒误走 LLM，也避免 soft 执行器收到含糊的最终话术。
-        if tier == "instant":
-            if not message_text:
-                return "错误：instant 必须提供最终提醒文本 message"
-            if prompt_text:
-                return "错误：instant 不应提供 prompt，请将最终提醒内容放入 message"
-        if tier == "soft":
-            if not prompt_text:
-                return "错误：soft 必须提供可独立执行的任务指令 prompt"
-            if message_text:
-                return "错误：soft 不应提供 message，请将未来任务定义写入 prompt"
+        tier, content_field = self._job_kind()
+        content = str(kwargs.get(content_field) or "").strip()
+        if not content:
+            return f"错误：{self.name} 必须提供 {content_field}"
         try:
             fire_at, interval_seconds, cron_expr = compute_fire_at(
                 trigger,
@@ -83,15 +51,76 @@ class ScheduleTool(Tool):
                 fire_at=fire_at.astimezone(timezone.utc),
                 interval_seconds=interval_seconds,
                 cron_expr=cron_expr,
-                message=message_text,
-                prompt=prompt_text,
+                message=content if tier == "instant" else "",
+                prompt=content if tier == "soft" else "",
                 name=str(kwargs.get("name") or ""),
                 timezone=timezone_name,
             )
             self._store.add_job(job)
         except (TypeError, ValueError) as error:
             return f"错误：{error}"
-        return f"已创建{('固定提醒' if tier == 'instant' else 'AI 定时任务')}「{job.name or job.id[:8]}」，首次触发时间：{fire_at.astimezone().isoformat()}"
+        label = "固定提醒" if tier == "instant" else "AI 定时任务"
+        return f"已创建{label}「{job.name or job.id[:8]}」，首次触发时间：{fire_at.astimezone().isoformat()}"
+
+    def __init__(self, store: ProactiveStore) -> None:
+        self._store = store
+
+
+class ScheduleReminderTool(_ScheduleCreateTool):
+    """创建到期后原样投递的固定提醒。"""
+
+    name = "schedule_reminder"
+    description = (
+        "创建固定提醒。只要到期内容现在就能确定，例如喝水、关电脑、午休、买东西，"
+        "必须使用本工具；最终提醒话术写入 message。时间存在歧义时先询问用户。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            **_COMMON_PROPERTIES,
+            "message": {
+                "type": "string",
+                "description": "到期后原样发送给用户的最终提醒文本。",
+            },
+        },
+        "required": ["trigger", "when", "message"],
+    }
+
+    def _job_kind(self) -> tuple[str, str]:
+        return "instant", "message"
+
+
+class ScheduleTaskTool(_ScheduleCreateTool):
+    """创建到期后由隔离 Agent 动态执行的任务。"""
+
+    name = "schedule_task"
+    description = (
+        "创建到期后才执行的动态任务。仅当到期后需要查询实时信息、读取文件、调用工具、"
+        "检查状态或动态判断时使用；普通固定提醒不得使用本工具。创建时只定义未来任务，"
+        "不得提前执行，也不要写入预计执行时间；真实时间由到期执行环境提供。"
+        "时间或任务目标存在歧义时先询问用户。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            **_COMMON_PROPERTIES,
+            "prompt": {
+                "type": "string",
+                "description": (
+                    "描述到期后需要执行的独立任务，不是最终提醒话术。"
+                    "使用客观指令口吻，写明任务目标、结果接收者、必要背景、需要调用的工具或"
+                    "判断条件以及失败处理。不要写入预计日期、时间或‘现在是几点’，需要表达"
+                    "时间时使用‘执行时刻’，到期环境会提供真实当前时间。不要在创建任务时提前"
+                    "执行查询或检查；只有取得实际工具结果后才能声称已经完成，无法执行时如实"
+                    "说明，不得编造。"
+                ),
+            },
+        },
+        "required": ["trigger", "when", "prompt"],
+    }
+
+    def _job_kind(self) -> tuple[str, str]:
+        return "soft", "prompt"
 
 
 class ListSchedulesTool(Tool):
@@ -141,4 +170,9 @@ class CancelScheduleTool(Tool):
         return f"已取消 {len(matches)} 个定时任务" if matches else "未找到匹配的定时任务"
 
 
-__all__ = ["CancelScheduleTool", "ListSchedulesTool", "ScheduleTool"]
+__all__ = [
+    "CancelScheduleTool",
+    "ListSchedulesTool",
+    "ScheduleReminderTool",
+    "ScheduleTaskTool",
+]

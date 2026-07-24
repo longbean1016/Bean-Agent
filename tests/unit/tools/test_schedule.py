@@ -1,55 +1,75 @@
-"""定时任务工具的 tier 选择契约与字段边界测试。"""
+"""固定提醒与动态定时任务的独立工具契约测试。"""
 
 from __future__ import annotations
 
 import pytest
 
 from proactive.store import ProactiveStore
-from tools.schedule import ScheduleTool
+from tools.schedule import ScheduleReminderTool, ScheduleTaskTool
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("tier", "message", "prompt", "expected"),
-    [
-        ("instant", "", "提醒用户午休", "instant 必须提供最终提醒文本 message"),
-        ("instant", "午休时间到了", "提醒用户午休", "instant 不应提供 prompt"),
-        ("soft", "", "", "soft 必须提供可独立执行的任务指令 prompt"),
-        ("soft", "天气提醒", "查询实时天气", "soft 不应提供 message"),
-    ],
-)
-async def test_schedule_rejects_cross_tier_content_fields(
-    tmp_path,
-    tier: str,
-    message: str,
-    prompt: str,
-    expected: str,
-) -> None:
+def test_schedule_tools_expose_disjoint_content_schemas(tmp_path) -> None:
     store = ProactiveStore(tmp_path / "proactive.db")
-    tool = ScheduleTool(store)
+    reminder = ScheduleReminderTool(store)
+    task = ScheduleTaskTool(store)
 
-    result = await tool.execute(
-        session_key="web:a",
-        tier=tier,
-        trigger="after",
-        when="10m",
-        message=message,
-        prompt=prompt,
-        request_time="2026-07-24T12:00:00+08:00",
-    )
-
-    assert expected in result
-    assert store.list_jobs("web:a") == []
+    reminder_properties = reminder.parameters["properties"]
+    task_properties = task.parameters["properties"]
+    assert reminder.name == "schedule_reminder"
+    assert set(reminder_properties) == {"trigger", "when", "message", "timezone", "name"}
+    assert reminder.parameters["required"] == ["trigger", "when", "message"]
+    assert "固定提醒" in reminder.description
+    assert task.name == "schedule_task"
+    assert set(task_properties) == {"trigger", "when", "prompt", "timezone", "name"}
+    assert task.parameters["required"] == ["trigger", "when", "prompt"]
+    assert "到期后" in task.description
+    assert "不要写入预计执行时间" in task.description
+    assert "不得编造" in task_properties["prompt"]["description"]
+    assert "真实当前时间" in task_properties["prompt"]["description"]
     store.close()
 
 
-def test_schedule_schema_explains_creation_and_execution_boundaries(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_schedule_reminder_persists_instant_message(tmp_path) -> None:
     store = ProactiveStore(tmp_path / "proactive.db")
-    tool = ScheduleTool(store)
+    tool = ScheduleReminderTool(store)
 
-    assert "最终提醒文本" in tool.description
-    assert "到期后" in tool.description
-    prompt_description = tool.parameters["properties"]["prompt"]["description"]
-    assert "不要在创建任务时提前执行" in prompt_description
-    assert "不得编造" in prompt_description
+    result = await tool.execute(
+        session_key="web:a",
+        trigger="after",
+        when="30m",
+        message="30分钟到了，请关电脑。",
+        name="关电脑提醒",
+        request_time="2026-07-24T12:00:00+08:00",
+    )
+
+    jobs = store.list_jobs("web:a")
+    assert "已创建固定提醒" in result
+    assert len(jobs) == 1
+    assert jobs[0].tier == "instant"
+    assert jobs[0].message == "30分钟到了，请关电脑。"
+    assert jobs[0].prompt == ""
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_schedule_task_persists_soft_prompt(tmp_path) -> None:
+    store = ProactiveStore(tmp_path / "proactive.db")
+    tool = ScheduleTaskTool(store)
+
+    result = await tool.execute(
+        session_key="web:a",
+        trigger="at",
+        when="09:05",
+        prompt="到期后查询用户的 GitHub 仓库实时状态并生成报告。",
+        name="查看GitHub仓库",
+        request_time="2026-07-24T12:00:00+08:00",
+    )
+
+    jobs = store.list_jobs("web:a")
+    assert "已创建AI 定时任务" in result
+    assert len(jobs) == 1
+    assert jobs[0].tier == "soft"
+    assert jobs[0].message == ""
+    assert jobs[0].prompt == "到期后查询用户的 GitHub 仓库实时状态并生成报告。"
     store.close()

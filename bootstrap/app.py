@@ -44,7 +44,12 @@ from proactive.store import ProactiveStore
 from proactive.turn_service import ProactiveTurnService
 from session.manager import SessionManager
 from tools import ToolRegistry, register_all
-from tools.schedule import CancelScheduleTool, ListSchedulesTool, ScheduleTool
+from tools.schedule import (
+    CancelScheduleTool,
+    ListSchedulesTool,
+    ScheduleReminderTool,
+    ScheduleTaskTool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +286,8 @@ def build_core_runtime(
     )
     # 提醒工具从当前 Turn 的系统执行上下文取得 session_key，模型不需要也不能
     # 选择其他 Web 会话作为目标。
-    tools.register(ScheduleTool(proactive_store), risk="write", always_on=True)
+    tools.register(ScheduleReminderTool(proactive_store), risk="write", always_on=True)
+    tools.register(ScheduleTaskTool(proactive_store), risk="write", always_on=True)
     tools.register(ListSchedulesTool(proactive_store), risk="read-only", always_on=True)
     tools.register(CancelScheduleTool(proactive_store), risk="write", always_on=True)
     mcp_registry = McpServerRegistry(root / "mcp_servers.json", tools)

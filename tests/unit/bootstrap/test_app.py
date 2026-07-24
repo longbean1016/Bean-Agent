@@ -52,6 +52,10 @@ def test_build_core_runtime_wires_singletons_and_all_tools(tmp_path: Path) -> No
     ).resolve()
     assert runtime.sessions.store is runtime.memory._sessions
     assert "load_skill" in runtime.tools.get_registered_names()
+    assert {
+        "schedule_reminder", "schedule_task", "list_schedules", "cancel_schedule",
+    } <= runtime.tools.get_registered_names()
+    assert "schedule" not in runtime.tools.get_registered_names()
     assert runtime.mcp_registry is not None
     assert {"mcp_add", "mcp_remove", "mcp_list"} <= runtime.tools.get_registered_names()
     assert runtime.tools.get_metadata("mcp_add").always_on is True
