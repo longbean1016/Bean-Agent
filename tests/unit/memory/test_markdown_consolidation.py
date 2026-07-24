@@ -248,6 +248,79 @@ async def test_consolidation_passes_only_stable_context_and_adds_until(tmp_path:
     assert "until: 2026-07-16T10:03:00+08:00" in markdown.read_recent_context()
 
 
+@pytest.mark.asyncio
+async def test_consolidation_snapshot_rereads_recent_turns_without_expanding_cursor(
+    tmp_path: Path,
+) -> None:
+    class BlockingExtractor:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def extract(
+            self,
+            messages,
+            previous_recent_context,
+            *,
+            recent_turns="",
+            current_memory="",
+        ):
+            self.started.set()
+            await self.release.wait()
+            return ConsolidationDraft(
+                recent_context=(
+                    "# Recent Context\n\n"
+                    "## Compression\n- 新摘要\n\n"
+                    "## Ongoing Threads\n- none\n"
+                )
+            )
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    markdown = MarkdownMemoryStore(tmp_path)
+    extractor = BlockingExtractor()
+    try:
+        for index in range(6):
+            sessions.add_message(NewMessage(
+                session_key="web:c",
+                role="user" if index % 2 == 0 else "assistant",
+                content=f"消息 {index}",
+                timestamp=f"2026-07-16T10:0{index}:00+08:00",
+            ))
+        consolidator = Consolidator(
+            sessions,
+            markdown,
+            extractor,
+            keep_count=2,
+            threshold=4,
+        )
+        task = asyncio.create_task(consolidator.consolidate("web:c"))
+        await extractor.started.wait()
+        sessions.add_message(NewMessage(
+            session_key="web:c",
+            role="user",
+            content="并发新问题",
+            timestamp="2026-07-16T10:06:00+08:00",
+        ))
+        sessions.add_message(NewMessage(
+            session_key="web:c",
+            role="assistant",
+            content="**并发新回答**",
+            timestamp="2026-07-16T10:07:00+08:00",
+        ))
+        extractor.release.set()
+        result = await task
+        recent_context = markdown.read_recent_context()
+    finally:
+        sessions.close()
+        markdown.close()
+
+    assert result is not None
+    assert result.cursor == 4
+    assert "until: 2026-07-16T10:03:00+08:00" in recent_context
+    assert "## Recent Turns" in recent_context
+    assert "[a-preview] 并发新回答" in recent_context
+
+
 class OptimizerLLM:
     def __init__(self, *, fail_first: bool = False, fail_second: bool = False) -> None:
         self.calls = 0

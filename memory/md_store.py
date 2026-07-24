@@ -89,6 +89,29 @@ class MarkdownMemoryStore:
     def refresh_recent_turns(self, messages: Sequence[dict[str, object]]) -> None:
         """不调用 LLM，只用最新持久化消息替换 Recent Turns 区块。"""
 
+        with self._lock:
+            self._write_recent_context_snapshot(
+                self.read_recent_context(),
+                messages,
+            )
+
+    def write_recent_context_snapshot(
+        self,
+        stable_content: str,
+        messages: Sequence[dict[str, object]],
+    ) -> None:
+        """原子写入稳定摘要和提交时刻的最新热历史预览。"""
+
+        with self._lock:
+            self._write_recent_context_snapshot(stable_content, messages)
+
+    def _write_recent_context_snapshot(
+        self,
+        stable_content: str,
+        messages: Sequence[dict[str, object]],
+    ) -> None:
+        """调用方持锁时构造完整快照，避免三个区块分两次落盘。"""
+
         lines: list[str] = []
         for item in messages:
             role = str(item.get("role") or "").strip().lower()
@@ -102,19 +125,18 @@ class MarkdownMemoryStore:
                 preview = format_assistant_preview(content)
                 if preview:
                     lines.append(f"[a-preview] {preview}")
-        if not lines:
-            return
-        with self._lock:
-            current = self.read_recent_context().rstrip()
-            # Recent Turns 始终是文件末尾的易变区块。每轮整体替换而不是追加，可以避免
-            # 同一个 Turn 因任务重试被重复写入，同时不破坏前面的 Compression/Ongoing Threads。
-            stable, marker, _ = current.partition("## Recent Turns")
-            prefix = stable.rstrip() if marker else current
-            content = (
-                f"{prefix}\n\n## Recent Turns\n"
-                "<!-- [a-preview] = assistant reply preview only; not evidence -->\n"
-            ).lstrip() + "\n".join(lines) + "\n"
-            self._atomic_write(self.recent_context_file, content)
+        # Recent Turns 始终是文件末尾的易变区块。整体替换可避免任务重试重复写入，
+        # 正式压缩也能把新摘要与提交时刻的热历史作为一个原子快照落盘。
+        current = str(stable_content or "").rstrip()
+        stable, marker, _ = current.partition("## Recent Turns")
+        prefix = stable.rstrip() if marker else current
+        recent_turns = "\n".join(lines) if lines else "- none"
+        content = (
+            f"{prefix}\n\n## Recent Turns\n"
+            "<!-- [a-preview] = assistant reply preview only; not evidence -->\n"
+            f"{recent_turns}\n"
+        ).lstrip()
+        self._atomic_write(self.recent_context_file, content)
 
     def get_memory_context(self) -> str:
         value = self.read_long_term().strip()

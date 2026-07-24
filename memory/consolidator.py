@@ -95,14 +95,22 @@ class Consolidator:
         self._keep_count = max(0, int(keep_count))
         self._threshold = max(1, int(threshold if threshold is not None else max(5, self._keep_count // 2)))
 
+    def _select_recent_messages(
+        self,
+        messages: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """按 Akashic 派生规则选择用于预览的最新热历史。"""
+
+        tail = messages[-self._keep_count:] if self._keep_count else messages
+        recent_count = max(1, self._keep_count // 2) if self._keep_count else len(tail)
+        return tail[-recent_count:] if recent_count else []
+
     async def consolidate(self, session_key: str) -> ConsolidationResult | None:
         messages = self._sessions.fetch_session_messages(session_key)
         cursor = self._sessions.get_cursor(session_key)
         end = max(cursor, len(messages) - self._keep_count)
         window = messages[cursor:end]
-        tail = messages[-self._keep_count:] if self._keep_count else messages
-        recent_count = max(1, self._keep_count // 2) if self._keep_count else len(tail)
-        recent = tail[-recent_count:] if recent_count else []
+        recent = self._select_recent_messages(messages)
         if len(window) < self._threshold:
             # 未达到归档阈值时不消耗 LLM，只刷新最近对话的可读窗口；cursor 保持不变，
             # 后续消息累计到阈值后仍从同一位置进入 Consolidation。
@@ -130,11 +138,16 @@ class Consolidator:
         if pending_lines:
             self._markdown.append_pending_once("\n".join(pending_lines), source_ref=source_ref)
         if draft.recent_context.strip():
-            self._markdown.write_recent_context(
+            # LLM 运行期间可能提交新 Turn；这里只重读热历史用于展示，不扩大本次
+            # 归档窗口，也不改变候选 cursor=end。
+            latest_messages = self._sessions.fetch_session_messages(session_key)
+            latest_recent = self._select_recent_messages(latest_messages)
+            self._markdown.write_recent_context_snapshot(
                 _with_compression_until(
                     draft.recent_context,
                     window[-1].get("timestamp") if window else None,
-                )
+                ),
+                latest_recent,
             )
         conversation = render_consolidation_conversation(window)
         # 此处只返回候选 cursor。MemoryEngine 必须先持久化 outbox 再推进它，
