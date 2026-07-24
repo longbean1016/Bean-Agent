@@ -10,6 +10,33 @@ export interface TurnNavigationEntry {
   preview: string;
 }
 
+export function activeTurnAtViewportTop(
+  turns: TurnNavigationEntry[],
+  anchorTops: ReadonlyMap<string, number>,
+  viewportTop: number,
+  atConversationEnd = false,
+): string {
+  if (atConversationEnd) return turns.at(-1)?.id ?? "";
+  let current = turns[0]?.id ?? "";
+  for (const turn of turns) {
+    const anchorTop = anchorTops.get(turn.id);
+    if (anchorTop !== undefined && anchorTop <= viewportTop) current = turn.id;
+  }
+  return current;
+}
+
+export function scrollTopToRevealItem(
+  scrollTop: number,
+  clientHeight: number,
+  itemTop: number,
+  itemHeight: number,
+): number {
+  if (itemTop < scrollTop) return itemTop;
+  const itemBottom = itemTop + itemHeight;
+  if (itemBottom > scrollTop + clientHeight) return itemBottom - clientHeight;
+  return scrollTop;
+}
+
 export function turnsFromMessages(
   messages: ChatMessage[],
   previewLength = DEFAULT_PREVIEW_LENGTH,
@@ -68,13 +95,17 @@ export function TurnNavigator({ sessionId, turns }: {
     if (!scroller || turns.length === 0) return;
     const updateActiveTurn = () => {
       const scrollerRect = scroller.getBoundingClientRect();
-      const probe = scrollerRect.top + Math.min(scroller.clientHeight * 0.28, 180);
-      let current = turns[0].id;
-      for (const turn of turns) {
+      const anchorTops = new Map(turns.flatMap((turn) => {
         const anchor = findAnchor(turn.id);
-        if (anchor && anchor.getBoundingClientRect().top <= probe) current = turn.id;
-      }
-      setActiveTurnId(current);
+        return anchor ? [[turn.id, anchor.getBoundingClientRect().top] as const] : [];
+      }));
+      const atConversationEnd = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop <= 1;
+      setActiveTurnId(activeTurnAtViewportTop(
+        turns,
+        anchorTops,
+        scrollerRect.top,
+        atConversationEnd,
+      ));
     };
     updateActiveTurn();
     scroller.addEventListener("scroll", updateActiveTurn, { passive: true });
@@ -86,11 +117,20 @@ export function TurnNavigator({ sessionId, turns }: {
   }, [findAnchor, findScroller, sessionId, turns]);
 
   useEffect(() => {
-    const activeItem = navRef.current?.querySelector<HTMLElement>(
-      `[data-turn-nav-item="${activeTurnId}"]`,
-    );
-    if (activeItem && typeof activeItem.scrollIntoView === "function") {
-      activeItem.scrollIntoView({ block: "nearest" });
+    const reveal = (selector: string) => {
+      const item = navRef.current?.querySelector<HTMLElement>(selector);
+      const container = item?.parentElement;
+      if (!item || !container) return;
+      container.scrollTop = scrollTopToRevealItem(
+        container.scrollTop,
+        container.clientHeight,
+        item.offsetTop,
+        item.offsetHeight,
+      );
+    };
+    if (activeTurnId) {
+      reveal(`[data-turn-marker="${activeTurnId}"]`);
+      reveal(`[data-turn-nav-item="${activeTurnId}"]`);
     }
   }, [activeTurnId]);
 
@@ -106,6 +146,7 @@ export function TurnNavigator({ sessionId, turns }: {
             className={`turn-marker ${activeTurnId === turn.id ? "active" : ""}`}
             aria-label={`跳转到：${turn.preview}`}
             aria-current={activeTurnId === turn.id ? "true" : undefined}
+            data-turn-marker={turn.id}
             onClick={() => jumpToTurn(turn.id)}
           />
         ))}
