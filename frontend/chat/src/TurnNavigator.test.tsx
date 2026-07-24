@@ -2,7 +2,8 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  activeTurnAtViewportTop,
+  activeTurnFromVisibleRegions,
+  messagesWithNavigationTurns,
   scrollTopToRevealItem,
   TurnNavigator,
   turnsFromMessages,
@@ -14,34 +15,43 @@ function message(id: string, role: "user" | "assistant", content: string): ChatM
 }
 
 describe("TurnNavigator", () => {
-  it("keeps the current turn active until the next user anchor crosses the viewport top", () => {
+  it("keeps the current turn active while any part of its assistant response remains visible", () => {
     const turns = [
       { id: "u1", question: "第一问", preview: "第一问" },
       { id: "u2", question: "第二问", preview: "第二问" },
       { id: "u3", question: "第三问", preview: "第三问" },
     ];
 
-    expect(activeTurnAtViewportTop(turns, new Map([
-      ["u1", -500],
-      ["u2", 1],
-      ["u3", 700],
-    ]), 0)).toBe("u1");
-    expect(activeTurnAtViewportTop(turns, new Map([
-      ["u1", -540],
-      ["u2", -1],
-      ["u3", 660],
-    ]), 0)).toBe("u2");
-    expect(activeTurnAtViewportTop(turns, new Map([
-      ["u1", -900],
-      ["u2", -360],
-      ["u3", 280],
-    ]), 0, true)).toBe("u3");
+    expect(activeTurnFromVisibleRegions(turns, new Map([
+      ["u1", [{ top: -300, bottom: 80 }]],
+      ["u2", [{ top: 100, bottom: 420 }]],
+      ["u3", [{ top: 450, bottom: 700 }]],
+    ]), 0, 600)).toBe("u1");
+    expect(activeTurnFromVisibleRegions(turns, new Map([
+      ["u1", [{ top: -340, bottom: -1 }]],
+      ["u2", [{ top: 1, bottom: 380 }]],
+      ["u3", [{ top: 410, bottom: 680 }]],
+    ]), 0, 600)).toBe("u2");
+    expect(activeTurnFromVisibleRegions(turns, new Map([
+      ["u1", [{ top: -900, bottom: -500 }]],
+      ["u2", [{ top: -360, bottom: -20 }]],
+      ["u3", [{ top: 280, bottom: 500 }]],
+    ]), 0, 600, true)).toBe("u3");
   });
 
-  it("calculates the smallest internal scroll needed to reveal an active navigation item", () => {
-    expect(scrollTopToRevealItem(0, 120, 240, 20)).toBe(140);
-    expect(scrollTopToRevealItem(180, 120, 80, 20)).toBe(80);
-    expect(scrollTopToRevealItem(100, 120, 140, 20)).toBe(100);
+  it("assigns each assistant response to the preceding user turn", () => {
+    expect(messagesWithNavigationTurns([
+      message("u1", "user", "第一问"),
+      message("a1", "assistant", "第一答"),
+      message("u2", "user", "第二问"),
+      message("a2", "assistant", "第二答"),
+    ]).map((item) => item.navigationTurnId)).toEqual(["u1", "u1", "u2", "u2"]);
+  });
+
+  it("uses actual rectangles to reveal an active navigation item inside its rail", () => {
+    expect(scrollTopToRevealItem(0, 0, 100, 220, 240)).toBe(140);
+    expect(scrollTopToRevealItem(180, 100, 220, 80, 100)).toBe(160);
+    expect(scrollTopToRevealItem(100, 100, 220, 140, 160)).toBe(100);
   });
 
   it("builds one entry per user turn and truncates long questions", () => {

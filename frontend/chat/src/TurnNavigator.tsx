@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type { ChatMessage } from "./types";
 
@@ -10,31 +10,51 @@ export interface TurnNavigationEntry {
   preview: string;
 }
 
-export function activeTurnAtViewportTop(
+interface VerticalRegion {
+  top: number;
+  bottom: number;
+}
+
+export interface NavigationMessage {
+  message: ChatMessage;
+  navigationTurnId: string;
+}
+
+export function activeTurnFromVisibleRegions(
   turns: TurnNavigationEntry[],
-  anchorTops: ReadonlyMap<string, number>,
+  regions: ReadonlyMap<string, VerticalRegion[]>,
   viewportTop: number,
+  viewportBottom: number,
   atConversationEnd = false,
 ): string {
   if (atConversationEnd) return turns.at(-1)?.id ?? "";
-  let current = turns[0]?.id ?? "";
   for (const turn of turns) {
-    const anchorTop = anchorTops.get(turn.id);
-    if (anchorTop !== undefined && anchorTop <= viewportTop) current = turn.id;
+    if (regions.get(turn.id)?.some((region) => (
+      region.bottom > viewportTop && region.top < viewportBottom
+    ))) return turn.id;
   }
-  return current;
+  return turns[0]?.id ?? "";
 }
 
 export function scrollTopToRevealItem(
   scrollTop: number,
-  clientHeight: number,
+  containerTop: number,
+  containerBottom: number,
   itemTop: number,
-  itemHeight: number,
+  itemBottom: number,
 ): number {
-  if (itemTop < scrollTop) return itemTop;
-  const itemBottom = itemTop + itemHeight;
-  if (itemBottom > scrollTop + clientHeight) return itemBottom - clientHeight;
+  if (itemTop < containerTop) return scrollTop - (containerTop - itemTop);
+  if (itemBottom > containerBottom) return scrollTop + (itemBottom - containerBottom);
   return scrollTop;
+}
+
+export function messagesWithNavigationTurns(messages: ChatMessage[]): NavigationMessage[] {
+  let navigationTurnId = "";
+  return messages.map((message) => {
+    if (message.role === "user") navigationTurnId = message.turnId || message.id;
+    if (message.proactive) navigationTurnId = "";
+    return { message, navigationTurnId };
+  });
 }
 
 export function turnsFromMessages(
@@ -95,15 +115,19 @@ export function TurnNavigator({ sessionId, turns }: {
     if (!scroller || turns.length === 0) return;
     const updateActiveTurn = () => {
       const scrollerRect = scroller.getBoundingClientRect();
-      const anchorTops = new Map(turns.flatMap((turn) => {
-        const anchor = findAnchor(turn.id);
-        return anchor ? [[turn.id, anchor.getBoundingClientRect().top] as const] : [];
-      }));
+      const regions = new Map<string, VerticalRegion[]>();
+      for (const element of scroller.querySelectorAll<HTMLElement>("[data-turn-region]")) {
+        const id = element.dataset.turnRegion;
+        if (!id) continue;
+        const rect = element.getBoundingClientRect();
+        regions.set(id, [...(regions.get(id) ?? []), { top: rect.top, bottom: rect.bottom }]);
+      }
       const atConversationEnd = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop <= 1;
-      setActiveTurnId(activeTurnAtViewportTop(
+      setActiveTurnId(activeTurnFromVisibleRegions(
         turns,
-        anchorTops,
+        regions,
         scrollerRect.top,
+        scrollerRect.bottom,
         atConversationEnd,
       ));
     };
@@ -116,16 +140,19 @@ export function TurnNavigator({ sessionId, turns }: {
     };
   }, [findAnchor, findScroller, sessionId, turns]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const reveal = (selector: string) => {
       const item = navRef.current?.querySelector<HTMLElement>(selector);
       const container = item?.parentElement;
       if (!item || !container) return;
+      const containerRect = container.getBoundingClientRect();
+      const itemRect = item.getBoundingClientRect();
       container.scrollTop = scrollTopToRevealItem(
         container.scrollTop,
-        container.clientHeight,
-        item.offsetTop,
-        item.offsetHeight,
+        containerRect.top,
+        containerRect.bottom,
+        itemRect.top,
+        itemRect.bottom,
       );
     };
     if (activeTurnId) {
