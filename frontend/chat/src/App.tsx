@@ -40,6 +40,7 @@ import { MermaidBlock } from "./MermaidBlock";
 import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupSessionsByUpdatedAt } from "./sessionGroups";
 import type { ChatFrame, ChatMessage, ConnectionStatus, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity } from "./types";
+import { TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
 
 const SESSION_STORAGE_KEY = "beanagent.session_id";
@@ -160,6 +161,7 @@ export function App() {
   routeSessionRef.current = routeSession;
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
   const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running";
+  const conversationTurns = useMemo(() => turnsFromMessages(chat.messages), [chat.messages]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -488,6 +490,7 @@ export function App() {
               <MessageView key={message.id} message={message} />
             ))}
           </StickToBottom.Content>
+          <TurnNavigator sessionId={chat.sessionId} turns={conversationTurns} />
           <ConversationAutoScroll sessionId={chat.sessionId} messages={chat.messages} active={currentTurn.status === "running"} />
           <ConversationScrollButton />
         </StickToBottom>
@@ -910,7 +913,10 @@ function MessageView({ message }: { message: ChatMessage }) {
   const markdownAnimating = Boolean(message.streaming && !containsClosedMermaidFence(message.content));
 
   return (
-    <article className={`message ${isUser ? "user-message" : "assistant-message"}`}>
+    <article
+      className={`message ${isUser ? "user-message" : "assistant-message"}`}
+      data-turn-anchor={isUser ? (message.turnId || message.id) : undefined}
+    >
       <div className="message-label">{isUser ? "你" : "BeanAgent"}</div>
       <div className="message-body">
         {!isUser && message.source ? <MessageSourceBadge message={message} /> : null}

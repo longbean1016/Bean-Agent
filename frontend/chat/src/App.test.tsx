@@ -118,7 +118,7 @@ it("首次连接创建 Session 并发送用户消息", async () => {
 
   await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send" && frame.text === "组件测试消息")).toBe(true));
   expect(window.location.pathname).toBe("/chat/component");
-  expect(screen.getByText("组件测试消息")).toBeVisible();
+  expect(screen.getByText("组件测试消息", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
 });
 
@@ -247,7 +247,7 @@ it("切回后台运行会话时恢复用户问题流式内容和工具状态", a
   }) } as MessageEvent);
 
   fireEvent.click(screen.getByRole("button", { name: "新对话" }));
-  expect(await screen.findByText("分析当前项目")).toBeVisible();
+  expect(await screen.findByText("分析当前项目", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByText("阶段结果")).toBeVisible();
   expect(screen.getByText("list_dir")).toBeVisible();
   expect(screen.queryByText("排队中 · 即将开始")).not.toBeInTheDocument();
