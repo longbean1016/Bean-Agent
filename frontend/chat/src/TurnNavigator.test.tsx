@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   activeTurnFromVisibleRegions,
+  groupMessagesIntoNavigationTurns,
   messagesWithNavigationTurns,
   scrollTopToRevealItem,
   TurnNavigator,
@@ -26,7 +27,12 @@ describe("TurnNavigator", () => {
       ["u1", [{ top: -300, bottom: 80 }]],
       ["u2", [{ top: 100, bottom: 420 }]],
       ["u3", [{ top: 450, bottom: 700 }]],
-    ]), 0, 600)).toBe("u1");
+    ]), 0, 600, false, "down")).toBe("u1");
+    expect(activeTurnFromVisibleRegions(turns, new Map([
+      ["u1", [{ top: -300, bottom: 80 }]],
+      ["u2", [{ top: 100, bottom: 420 }]],
+      ["u3", [{ top: 450, bottom: 700 }]],
+    ]), 0, 600, false, "up")).toBe("u3");
     expect(activeTurnFromVisibleRegions(turns, new Map([
       ["u1", [{ top: -340, bottom: -1 }]],
       ["u2", [{ top: 1, bottom: 380 }]],
@@ -46,6 +52,23 @@ describe("TurnNavigator", () => {
       message("u2", "user", "第二问"),
       message("a2", "assistant", "第二答"),
     ]).map((item) => item.navigationTurnId)).toEqual(["u1", "u1", "u2", "u2"]);
+  });
+
+  it("groups each user message and its assistant response into one render section", () => {
+    const groups = groupMessagesIntoNavigationTurns([
+      message("u1", "user", "第一问"),
+      message("a1", "assistant", "第一答"),
+      message("u2", "user", "第二问"),
+      message("a2", "assistant", "第二答"),
+    ]);
+
+    expect(groups.map((group) => ({
+      id: group.navigationTurnId,
+      messages: group.messages.map((item) => item.id),
+    }))).toEqual([
+      { id: "u1", messages: ["u1", "a1"] },
+      { id: "u2", messages: ["u2", "a2"] },
+    ]);
   });
 
   it("uses actual rectangles to reveal an active navigation item inside its rail", () => {

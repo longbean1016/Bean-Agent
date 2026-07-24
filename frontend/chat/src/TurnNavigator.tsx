@@ -20,15 +20,22 @@ export interface NavigationMessage {
   navigationTurnId: string;
 }
 
+export interface NavigationTurnGroup {
+  navigationTurnId: string;
+  messages: ChatMessage[];
+}
+
 export function activeTurnFromVisibleRegions(
   turns: TurnNavigationEntry[],
   regions: ReadonlyMap<string, VerticalRegion[]>,
   viewportTop: number,
   viewportBottom: number,
   atConversationEnd = false,
+  direction: "up" | "down" = "down",
 ): string {
   if (atConversationEnd) return turns.at(-1)?.id ?? "";
-  for (const turn of turns) {
+  const orderedTurns = direction === "up" ? [...turns].reverse() : turns;
+  for (const turn of orderedTurns) {
     if (regions.get(turn.id)?.some((region) => (
       region.bottom > viewportTop && region.top < viewportBottom
     ))) return turn.id;
@@ -57,6 +64,19 @@ export function messagesWithNavigationTurns(messages: ChatMessage[]): Navigation
   });
 }
 
+export function groupMessagesIntoNavigationTurns(messages: ChatMessage[]): NavigationTurnGroup[] {
+  const groups: NavigationTurnGroup[] = [];
+  for (const item of messagesWithNavigationTurns(messages)) {
+    const current = groups.at(-1);
+    if (current && current.navigationTurnId === item.navigationTurnId) {
+      current.messages.push(item.message);
+    } else {
+      groups.push({ navigationTurnId: item.navigationTurnId, messages: [item.message] });
+    }
+  }
+  return groups;
+}
+
 export function turnsFromMessages(
   messages: ChatMessage[],
   previewLength = DEFAULT_PREVIEW_LENGTH,
@@ -81,6 +101,8 @@ export function TurnNavigator({ sessionId, turns }: {
   turns: TurnNavigationEntry[];
 }) {
   const navRef = useRef<HTMLElement>(null);
+  const previousScrollTopRef = useRef(0);
+  const scrollDirectionRef = useRef<"up" | "down">("down");
   const [activeTurnId, setActiveTurnId] = useState(() => turns.at(-1)?.id ?? "");
 
   const findScroller = useCallback(() => (
@@ -113,7 +135,11 @@ export function TurnNavigator({ sessionId, turns }: {
   useEffect(() => {
     const scroller = findScroller();
     if (!scroller || turns.length === 0) return;
+    previousScrollTopRef.current = scroller.scrollTop;
     const updateActiveTurn = () => {
+      if (scroller.scrollTop < previousScrollTopRef.current) scrollDirectionRef.current = "up";
+      if (scroller.scrollTop > previousScrollTopRef.current) scrollDirectionRef.current = "down";
+      previousScrollTopRef.current = scroller.scrollTop;
       const scrollerRect = scroller.getBoundingClientRect();
       const regions = new Map<string, VerticalRegion[]>();
       for (const element of scroller.querySelectorAll<HTMLElement>("[data-turn-region]")) {
@@ -129,6 +155,7 @@ export function TurnNavigator({ sessionId, turns }: {
         scrollerRect.top,
         scrollerRect.bottom,
         atConversationEnd,
+        scrollDirectionRef.current,
       ));
     };
     updateActiveTurn();

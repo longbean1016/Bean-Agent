@@ -40,7 +40,7 @@ import { MermaidBlock } from "./MermaidBlock";
 import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupSessionsByUpdatedAt } from "./sessionGroups";
 import type { ChatFrame, ChatMessage, ConnectionStatus, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity } from "./types";
-import { messagesWithNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
+import { groupMessagesIntoNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
 
 const SESSION_STORAGE_KEY = "beanagent.session_id";
@@ -162,7 +162,7 @@ export function App() {
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
   const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running";
   const conversationTurns = useMemo(() => turnsFromMessages(chat.messages), [chat.messages]);
-  const conversationMessages = useMemo(() => messagesWithNavigationTurns(chat.messages), [chat.messages]);
+  const conversationTurnGroups = useMemo(() => groupMessagesIntoNavigationTurns(chat.messages), [chat.messages]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -487,8 +487,16 @@ export function App() {
 
         <StickToBottom className="conversation" initial="instant" resize="smooth" role="log">
           <StickToBottom.Content className="conversation-content" scrollClassName="conversation-scroll">
-            {chat.messages.length === 0 ? <EmptyConversation /> : conversationMessages.map(({ message, navigationTurnId }) => (
-              <MessageView key={message.id} message={message} navigationTurnId={navigationTurnId} />
+            {chat.messages.length === 0 ? <EmptyConversation /> : conversationTurnGroups.map((group) => (
+              <section
+                key={group.messages[0].id}
+                className="turn-section"
+                data-turn-region={group.navigationTurnId || undefined}
+              >
+                {group.messages.map((message) => (
+                  <MessageView key={message.id} message={message} navigationTurnId={group.navigationTurnId} />
+                ))}
+              </section>
             ))}
           </StickToBottom.Content>
           <TurnNavigator sessionId={chat.sessionId} turns={conversationTurns} />
@@ -917,7 +925,6 @@ function MessageView({ message, navigationTurnId }: { message: ChatMessage; navi
     <article
       className={`message ${isUser ? "user-message" : "assistant-message"}`}
       data-turn-anchor={isUser ? navigationTurnId : undefined}
-      data-turn-region={navigationTurnId || undefined}
     >
       <div className="message-label">{isUser ? "你" : "BeanAgent"}</div>
       <div className="message-body">
