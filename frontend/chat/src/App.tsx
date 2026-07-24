@@ -40,6 +40,7 @@ import { MermaidBlock } from "./MermaidBlock";
 import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupSessionsByUpdatedAt } from "./sessionGroups";
 import type { ChatFrame, ChatMessage, ConnectionStatus, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity } from "./types";
+import { groupMessagesIntoNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
 
 const SESSION_STORAGE_KEY = "beanagent.session_id";
@@ -160,6 +161,8 @@ export function App() {
   routeSessionRef.current = routeSession;
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
   const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running";
+  const conversationTurns = useMemo(() => turnsFromMessages(chat.messages), [chat.messages]);
+  const conversationTurnGroups = useMemo(() => groupMessagesIntoNavigationTurns(chat.messages), [chat.messages]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -484,10 +487,19 @@ export function App() {
 
         <StickToBottom className="conversation" initial="instant" resize="smooth" role="log">
           <StickToBottom.Content className="conversation-content" scrollClassName="conversation-scroll">
-            {chat.messages.length === 0 ? <EmptyConversation /> : chat.messages.map((message) => (
-              <MessageView key={message.id} message={message} />
+            {chat.messages.length === 0 ? <EmptyConversation /> : conversationTurnGroups.map((group) => (
+              <section
+                key={group.messages[0].id}
+                className="turn-section"
+                data-turn-region={group.navigationTurnId || undefined}
+              >
+                {group.messages.map((message) => (
+                  <MessageView key={message.id} message={message} navigationTurnId={group.navigationTurnId} />
+                ))}
+              </section>
             ))}
           </StickToBottom.Content>
+          <TurnNavigator sessionId={chat.sessionId} turns={conversationTurns} />
           <ConversationAutoScroll sessionId={chat.sessionId} messages={chat.messages} active={currentTurn.status === "running"} />
           <ConversationScrollButton />
         </StickToBottom>
@@ -902,7 +914,7 @@ function ThemeControl({ value, onChange }: { value: ThemePreference; onChange: (
   );
 }
 
-function MessageView({ message }: { message: ChatMessage }) {
+function MessageView({ message, navigationTurnId }: { message: ChatMessage; navigationTurnId: string }) {
   const isUser = message.role === "user";
   const parsed = useMemo(() => parseMemoryCitations(message.content), [message.content]);
   // Streamdown 在 isAnimating 期间会禁用复制和全屏按钮。Mermaid fence 一旦
@@ -910,7 +922,10 @@ function MessageView({ message }: { message: ChatMessage }) {
   const markdownAnimating = Boolean(message.streaming && !containsClosedMermaidFence(message.content));
 
   return (
-    <article className={`message ${isUser ? "user-message" : "assistant-message"}`}>
+    <article
+      className={`message ${isUser ? "user-message" : "assistant-message"}`}
+      data-turn-anchor={isUser ? navigationTurnId : undefined}
+    >
       <div className="message-label">{isUser ? "你" : "BeanAgent"}</div>
       <div className="message-body">
         {!isUser && message.source ? <MessageSourceBadge message={message} /> : null}
