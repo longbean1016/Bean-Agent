@@ -99,14 +99,15 @@ describe("TurnNavigator", () => {
     const { container } = render(
       <div className="conversation">
         <div className="conversation-scroll">
-          <article data-turn-anchor="u1" />
-          <article data-turn-anchor="u2" />
+          <section data-turn-region="u1"><article data-turn-anchor="u1" /></section>
+          <section data-turn-region="u2"><article data-turn-anchor="u2" /></section>
         </div>
         <TurnNavigator sessionId="web:test" turns={turns} />
       </div>,
     );
     const scroller = container.querySelector<HTMLElement>(".conversation-scroll")!;
     const anchors = Array.from(container.querySelectorAll<HTMLElement>("[data-turn-anchor]"));
+    const regions = Array.from(container.querySelectorAll<HTMLElement>("[data-turn-region]"));
     Object.defineProperties(scroller, {
       clientHeight: { configurable: true, value: 600 },
       scrollHeight: { configurable: true, value: 1200 },
@@ -116,12 +117,19 @@ describe("TurnNavigator", () => {
     scroller.getBoundingClientRect = () => ({ top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600, x: 0, y: 0, toJSON: () => ({}) });
     anchors[0].getBoundingClientRect = () => ({ top: 40, bottom: 80, left: 0, right: 0, width: 0, height: 40, x: 0, y: 40, toJSON: () => ({}) });
     anchors[1].getBoundingClientRect = () => ({ top: 640, bottom: 680, left: 0, right: 0, width: 0, height: 40, x: 0, y: 640, toJSON: () => ({}) });
+    regions[0].getBoundingClientRect = () => ({ top: -400, bottom: -100, left: 0, right: 800, width: 800, height: 300, x: 0, y: -400, toJSON: () => ({}) });
+    regions[1].getBoundingClientRect = () => ({ top: 0, bottom: 500, left: 0, right: 800, width: 800, height: 500, x: 0, y: 0, toJSON: () => ({}) });
 
     expect(screen.getAllByRole("button", { name: /跳转到/ })).toHaveLength(2);
     expect(screen.getByRole("button", { name: "02第二个问题" })).toHaveAttribute("aria-current", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "01第一个问题" }));
     expect(scrollTo).toHaveBeenCalledWith({ top: 16, behavior: "smooth" });
-    expect(screen.getByRole("button", { name: "01第一个问题" })).toHaveAttribute("aria-current", "true");
+    const firstTurnButton = screen.getByRole("button", { name: "01第一个问题" });
+    expect(firstTurnButton).toHaveAttribute("aria-current", "true");
+
+    scroller.scrollTop = 100;
+    fireEvent.scroll(scroller);
+    expect(firstTurnButton).toHaveAttribute("aria-current", "true");
   });
 });

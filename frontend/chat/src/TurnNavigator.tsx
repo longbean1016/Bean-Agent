@@ -103,7 +103,17 @@ export function TurnNavigator({ sessionId, turns }: {
   const navRef = useRef<HTMLElement>(null);
   const previousScrollTopRef = useRef(0);
   const scrollDirectionRef = useRef<"up" | "down">("down");
+  const navigationLockRef = useRef("");
+  const navigationUnlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [activeTurnId, setActiveTurnId] = useState(() => turns.at(-1)?.id ?? "");
+
+  const scheduleNavigationUnlock = useCallback((delay: number) => {
+    if (navigationUnlockTimerRef.current) clearTimeout(navigationUnlockTimerRef.current);
+    navigationUnlockTimerRef.current = setTimeout(() => {
+      navigationLockRef.current = "";
+      navigationUnlockTimerRef.current = null;
+    }, delay);
+  }, []);
 
   const findScroller = useCallback(() => (
     navRef.current?.closest(".conversation")?.querySelector<HTMLElement>(".conversation-scroll") ?? null
@@ -124,9 +134,15 @@ export function TurnNavigator({ sessionId, turns }: {
       + anchor.getBoundingClientRect().top
       - scroller.getBoundingClientRect().top
       - 24;
+    navigationLockRef.current = id;
+    scheduleNavigationUnlock(1200);
     scroller.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
     setActiveTurnId(id);
-  }, [findAnchor, findScroller]);
+  }, [findAnchor, findScroller, scheduleNavigationUnlock]);
+
+  useEffect(() => () => {
+    if (navigationUnlockTimerRef.current) clearTimeout(navigationUnlockTimerRef.current);
+  }, []);
 
   useEffect(() => {
     setActiveTurnId(turns.at(-1)?.id ?? "");
@@ -137,6 +153,12 @@ export function TurnNavigator({ sessionId, turns }: {
     if (!scroller || turns.length === 0) return;
     previousScrollTopRef.current = scroller.scrollTop;
     const updateActiveTurn = () => {
+      if (navigationLockRef.current) {
+        previousScrollTopRef.current = scroller.scrollTop;
+        setActiveTurnId(navigationLockRef.current);
+        scheduleNavigationUnlock(180);
+        return;
+      }
       if (scroller.scrollTop < previousScrollTopRef.current) scrollDirectionRef.current = "up";
       if (scroller.scrollTop > previousScrollTopRef.current) scrollDirectionRef.current = "down";
       previousScrollTopRef.current = scroller.scrollTop;
@@ -165,7 +187,7 @@ export function TurnNavigator({ sessionId, turns }: {
       scroller.removeEventListener("scroll", updateActiveTurn);
       window.removeEventListener("resize", updateActiveTurn);
     };
-  }, [findAnchor, findScroller, sessionId, turns]);
+  }, [findAnchor, findScroller, scheduleNavigationUnlock, sessionId, turns]);
 
   useLayoutEffect(() => {
     const reveal = (selector: string) => {
