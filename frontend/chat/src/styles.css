@@ -219,7 +219,7 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .turn-marker:hover, .turn-marker:focus-visible { width: 20px; outline: none; background: var(--primary-border); }
 .turn-marker.active { width: 22px; background: var(--primary); box-shadow: 0 0 0 2px var(--primary-tint); }
 .turn-directory { position: absolute; top: 50%; right: 25px; width: min(220px, calc(100vw - 74px)); max-height: min(62vh, 480px); padding: 4px; overflow: hidden; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); box-shadow: var(--shadow-lg); opacity: 0; pointer-events: none; transform: translate(8px, -50%); transform-origin: right center; transition: opacity .15s ease, transform .15s ease; }
-.turn-navigator:hover .turn-directory, .turn-navigator:focus-within .turn-directory { opacity: 1; pointer-events: auto; transform: translate(0, -50%); }
+.turn-navigator:hover .turn-directory, .turn-navigator:has(.turn-marker:focus-visible) .turn-directory, .turn-navigator:has(.turn-directory-item:focus-visible) .turn-directory { opacity: 1; pointer-events: auto; transform: translate(0, -50%); }
 .turn-directory-list { display: flex; max-height: calc(min(62vh, 480px) - 8px); flex-direction: column; gap: 1px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; }
 .turn-directory-list::-webkit-scrollbar { display: none; }
 .turn-directory-item { display: grid; grid-template-columns: 21px minmax(0, 1fr); min-height: 30px; align-items: center; gap: 5px; padding: 4px 7px 4px 5px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: var(--text-muted); cursor: pointer; text-align: left; }
