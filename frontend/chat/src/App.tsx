@@ -834,7 +834,7 @@ function ProactiveSettingsDialog({ target, onClose }: { target: SessionSummary |
               </SettingsSection>
 
               <SettingsSection title="主动聊天" enabled={settings.conversation_enabled} onEnabled={(value) => update("conversation_enabled", value)}>
-                <SettingRow label="主动程度" helpId="activity" help={help} onHelp={setHelp} helpText="算法倾向：克制更少尝试，均衡适合日常，积极更愿意延续明确未完成的话题；仍受间隔、次数和勿扰限制。">
+                <SettingRow label="主动程度" helpId="activity" help={help} onHelp={setHelp} helpText="算法倾向：克制更少尝试，均衡适合日常，积极更愿意延续明确未完成的话题；所有档位仍受间隔、次数和勿扰限制。">
                   <select value={settings.activity_level} onChange={(event) => update("activity_level", event.target.value as ProactiveSettings["activity_level"])}>
                     <option value="restrained">克制</option><option value="balanced">均衡</option><option value="active">积极</option>
                   </select>

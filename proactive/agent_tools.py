@@ -78,6 +78,10 @@ class ProactiveToolSession:
     def decision(self) -> ProactiveToolDecision | None:
         return self._decision
 
+    @property
+    def has_draft(self) -> bool:
+        return bool(self._draft)
+
     def schemas(self) -> list[dict[str, Any]]:
         """只返回主动判断所需工具；共享注册表中的其它能力保持不可见。"""
 
@@ -149,11 +153,12 @@ class ProactiveToolSession:
                 "content": str(row.get("content") or ""),
                 "timestamp": str(row.get("timestamp") or ""),
             }
-            if bool(row.get("proactive")) or bool(
+            is_proactive = bool(row.get("proactive")) or bool(
                 (row.get("metadata") or {}).get("proactive")
                 if isinstance(row.get("metadata"), dict)
                 else False
-            ):
+            )
+            if is_proactive:
                 proactive.append(item)
             else:
                 passive.append(item)
@@ -162,7 +167,13 @@ class ProactiveToolSession:
         proactive = proactive[-limit:]
         self._recent_chat_read = True
         return json.dumps(
-            {"recent_chat": passive, "recent_proactive": proactive},
+            {
+                "recent_chat": passive,
+                "recent_proactive": proactive,
+                "conversation_state": {
+                    "waiting_for_proactive_reply": waiting_for_proactive_reply(chat),
+                },
+            },
             ensure_ascii=False,
         )
 
@@ -261,6 +272,28 @@ def _recent_rows(session_store: Any, session_key: str) -> list[dict[str, Any]]:
     return rows
 
 
+def waiting_for_proactive_reply(rows: list[dict[str, Any]]) -> bool:
+    """按会话消息顺序判断最新主动消息后是否尚无用户回复。"""
+
+    latest_user_index: int | None = None
+    latest_proactive_index: int | None = None
+    for index, row in enumerate(rows):
+        if row.get("role") == "user":
+            latest_user_index = index
+        elif row.get("role") == "assistant" and (
+            bool(row.get("proactive"))
+            or bool(
+                (row.get("metadata") or {}).get("proactive")
+                if isinstance(row.get("metadata"), dict)
+                else False
+            )
+        ):
+            latest_proactive_index = index
+    return latest_proactive_index is not None and (
+        latest_user_index is None or latest_proactive_index > latest_user_index
+    )
+
+
 _GET_RECENT_CHAT_SCHEMA = {
     "type": "function",
     "function": {
@@ -325,4 +358,5 @@ __all__ = [
     "ProactiveToolError",
     "ProactiveToolFactory",
     "ProactiveToolSession",
+    "waiting_for_proactive_reply",
 ]

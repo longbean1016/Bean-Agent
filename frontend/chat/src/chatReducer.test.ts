@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame } from "./chatReducer";
+import { initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
 
 describe("reduceChatFrame", () => {
   it("提交确认后会从提交中切换到排队状态", () => {
@@ -279,5 +279,18 @@ describe("reduceChatFrame", () => {
 
     expect(timeline.map((message) => message.id)).toEqual(["user-1", "notice-1"]);
     expect(timeline[1]).toMatchObject({ source: "scheduled_reminder", scheduledAt: "2026-07-20T09:00:00+08:00" });
+  });
+  it("主动历史消息只展示最终正文，不暴露持久化工具链", () => {
+    const [message] = rowsToMessages([{
+      id: "proactive-1",
+      role: "assistant",
+      content: "给你一道关于记忆去重的面试题。",
+      proactive: true,
+      reasoning_content: "不应展示",
+      tool_chain: [{ calls: [{ call_id: "call-1", name: "recall_memory", arguments: {}, result: "偏好", status: "ok" }] }],
+    }]);
+
+    expect(message.thinking).toBe("");
+    expect(message.tools).toEqual([]);
   });
 });
