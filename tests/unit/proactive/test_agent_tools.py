@@ -26,6 +26,15 @@ class _Sessions:
         ], 3)
 
 
+class _SessionRows:
+    def __init__(self, rows_by_session: dict[str, list[dict[str, object]]]) -> None:
+        self._rows_by_session = rows_by_session
+
+    def list_chat_messages(self, session_key: str, *, limit: int, offset: int):
+        rows = self._rows_by_session.get(session_key, [])
+        return rows[offset:offset + limit], len(rows)
+
+
 class _Memory:
     request = None
 
@@ -80,6 +89,70 @@ async def test_proactive_tools_expose_only_allowlist_and_read_interest_memory() 
     assert memory.request.limit == 2
     with pytest.raises(ProactiveToolError, match="白名单"):
         await tools.execute("shell", {"command": "echo no"})
+
+
+@pytest.mark.asyncio
+async def test_recent_chat_reports_not_waiting_without_proactive_message() -> None:
+    sessions = _SessionRows({"web:a": [
+        {"seq": 1, "role": "user", "content": "准备面试"},
+        {"seq": 2, "role": "assistant", "content": "先整理知识点"},
+    ]})
+    tools = ProactiveToolFactory(sessions, None, ToolRegistry()).create("web:a")
+
+    recent = json.loads(await tools.execute("get_recent_chat", {}))
+
+    assert recent["conversation_state"]["waiting_for_proactive_reply"] is False
+
+
+@pytest.mark.asyncio
+async def test_recent_chat_reports_waiting_when_proactive_message_is_latest() -> None:
+    sessions = _SessionRows({"web:a": [
+        {"seq": 1, "role": "user", "content": "准备面试"},
+        {"seq": 2, "role": "assistant", "content": "给你一道实操题", "proactive": True},
+    ]})
+    tools = ProactiveToolFactory(sessions, None, ToolRegistry()).create("web:a")
+
+    recent = json.loads(await tools.execute("get_recent_chat", {}))
+
+    assert recent["conversation_state"]["waiting_for_proactive_reply"] is True
+
+
+@pytest.mark.asyncio
+async def test_recent_chat_reports_not_waiting_after_user_replies() -> None:
+    sessions = _SessionRows({"web:a": [
+        {"seq": 1, "role": "assistant", "content": "给你一道实操题", "proactive": True},
+        {"seq": 2, "role": "user", "content": "我来试试"},
+        {"seq": 3, "role": "assistant", "content": "可以从冲突策略开始"},
+    ]})
+    tools = ProactiveToolFactory(sessions, None, ToolRegistry()).create("web:a")
+
+    recent = json.loads(await tools.execute("get_recent_chat", {}))
+
+    assert recent["conversation_state"]["waiting_for_proactive_reply"] is False
+
+
+@pytest.mark.asyncio
+async def test_recent_chat_waiting_state_is_isolated_by_session() -> None:
+    sessions = _SessionRows({
+        "web:a": [
+            {"seq": 1, "role": "user", "content": "会话 A"},
+            {"seq": 2, "role": "assistant", "content": "主动跟进 A", "proactive": True},
+        ],
+        "web:b": [
+            {"seq": 1, "role": "assistant", "content": "主动跟进 B", "proactive": True},
+            {"seq": 2, "role": "user", "content": "已回复 B"},
+        ],
+    })
+
+    recent_a = json.loads(await ProactiveToolFactory(
+        sessions, None, ToolRegistry()
+    ).create("web:a").execute("get_recent_chat", {}))
+    recent_b = json.loads(await ProactiveToolFactory(
+        sessions, None, ToolRegistry()
+    ).create("web:b").execute("get_recent_chat", {}))
+
+    assert recent_a["conversation_state"]["waiting_for_proactive_reply"] is True
+    assert recent_b["conversation_state"]["waiting_for_proactive_reply"] is False
 
 
 @pytest.mark.asyncio

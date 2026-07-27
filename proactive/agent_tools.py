@@ -147,26 +147,41 @@ class ProactiveToolSession:
         chat = [row for row in rows if row.get("role") in {"user", "assistant"}]
         passive: list[dict[str, object]] = []
         proactive: list[dict[str, object]] = []
-        for row in chat:
+        latest_user_index: int | None = None
+        latest_proactive_index: int | None = None
+        for index, row in enumerate(chat):
             item = {
                 "role": str(row.get("role") or ""),
                 "content": str(row.get("content") or ""),
                 "timestamp": str(row.get("timestamp") or ""),
             }
-            if bool(row.get("proactive")) or bool(
+            is_proactive = bool(row.get("proactive")) or bool(
                 (row.get("metadata") or {}).get("proactive")
                 if isinstance(row.get("metadata"), dict)
                 else False
-            ):
+            )
+            if is_proactive:
+                latest_proactive_index = index
                 proactive.append(item)
             else:
+                if row.get("role") == "user":
+                    latest_user_index = index
                 passive.append(item)
         passive = passive[-limit:]
         # 主动历史只用于避免重复打扰，不与普通聊天争夺 20 条上下文预算。
         proactive = proactive[-limit:]
+        waiting_for_proactive_reply = latest_proactive_index is not None and (
+            latest_user_index is None or latest_proactive_index > latest_user_index
+        )
         self._recent_chat_read = True
         return json.dumps(
-            {"recent_chat": passive, "recent_proactive": proactive},
+            {
+                "recent_chat": passive,
+                "recent_proactive": proactive,
+                "conversation_state": {
+                    "waiting_for_proactive_reply": waiting_for_proactive_reply,
+                },
+            },
             ensure_ascii=False,
         )
 
