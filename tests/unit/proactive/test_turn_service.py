@@ -16,6 +16,7 @@ async def test_delivery_persists_filtered_tool_chain_on_assistant_message(tmp_pa
     sessions = SessionManager(tmp_path)
     service = ProactiveTurnService(store, sessions, MessageBus())
     tool_chain = [{
+        "iteration": 1,
         "text": "",
         "calls": [{
             "call_id": "call-memory",
@@ -33,11 +34,14 @@ async def test_delivery_persists_filtered_tool_chain_on_assistant_message(tmp_pa
         delivery_key="conversation:test",
         source_id="test",
         tool_chain=tool_chain,
+        tools_used=["recall_memory"],
     )
 
     rows, total = sessions.store.list_chat_messages("web:test")
     assert result.delivered is True
     assert total == 1
     assert rows[0]["tool_chain"] == tool_chain
+    assert rows[0]["tools_used"] == ["recall_memory"]
+    assert "message_id" not in rows[0]["metadata"]
     await sessions.close()
     store.close()

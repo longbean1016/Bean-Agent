@@ -43,6 +43,7 @@ class ProactiveDeliveryApi(Protocol):
         delivery_key: str,
         source_id: str,
         tool_chain: list[dict[str, Any]] | None = None,
+        tools_used: list[str] | None = None,
     ) -> object: ...
 
 
@@ -203,6 +204,7 @@ class ProactiveChatLoop:
             delivery_key=f"conversation:{fingerprint}",
             source_id=fingerprint,
             tool_chain=list(verdict.get("tool_chain") or []),
+            tools_used=list(verdict.get("tools_used") or []),
         )
         if diagnostics:
             logger.info(
@@ -302,7 +304,11 @@ class ProactiveChatLoop:
                     if tool_session.decision is not None:
                         if call_index != len(calls) - 1:
                             return _skip("calls_after_finish", _iteration + 1)
-                        _append_tool_chain_group(tool_chain, response, trace_calls)
+                        _append_tool_chain_group(
+                            tool_chain,
+                            iteration=_iteration + 1,
+                            calls=trace_calls,
+                        )
                         decision = tool_session.decision
                         return {
                             "action": decision.decision,
@@ -311,8 +317,13 @@ class ProactiveChatLoop:
                             "reason": decision.reason,
                             "iterations": _iteration + 1,
                             "tool_chain": tool_chain,
+                            "tools_used": _tool_names(tool_chain),
                         }
-                _append_tool_chain_group(tool_chain, response, trace_calls)
+                _append_tool_chain_group(
+                    tool_chain,
+                    iteration=_iteration + 1,
+                    calls=trace_calls,
+                )
             except ProactiveToolError as error:
                 logger.info("主动 Agent 工具协议拒绝: session=%s error=%s", session_key, error)
                 return _skip("tool_protocol_error", _iteration + 1)
@@ -352,6 +363,7 @@ class ProactiveChatLoop:
                             "reason": decision.reason,
                             "iterations": iterations,
                             "tool_chain": tool_chain,
+                            "tools_used": _tool_names(tool_chain),
                         }
                 except ProactiveToolError as error:
                     logger.info("主动 Agent 终止纠偏失败: session=%s error=%s", session_key, error)
@@ -416,14 +428,25 @@ def _skip(reason: str, iterations: int = 0) -> dict[str, Any]:
 
 def _append_tool_chain_group(
     tool_chain: list[dict[str, Any]],
-    response: Any,
+    *,
+    iteration: int,
     calls: list[dict[str, Any]],
 ) -> None:
     if calls:
         tool_chain.append({
-            "text": str(getattr(response, "content", "") or ""),
+            "iteration": iteration,
+            "text": "",
             "calls": calls,
         })
+
+
+def _tool_names(tool_chain: list[dict[str, Any]]) -> list[str]:
+    return list(dict.fromkeys(
+        str(call.get("name") or "")
+        for group in tool_chain
+        for call in group.get("calls", [])
+        if str(call.get("name") or "")
+    ))
 
 
 def _recent_rows(session_store: Any, session_key: str) -> list[dict[str, Any]]:

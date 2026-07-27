@@ -29,6 +29,7 @@ class ProactiveTurnService:
         delivery_key: str,
         source_id: str,
         tool_chain: list[dict[str, Any]] | None = None,
+        tools_used: list[str] | None = None,
     ) -> DeliveryResult:
         """按 delivery_key 幂等提交；离线 Web 不影响已落库消息。"""
 
@@ -52,7 +53,6 @@ class ProactiveTurnService:
             "source": source,
             "source_id": source_id,
             "delivery_key": delivery_key,
-            "message_id": message_id,
         }
         try:
             session = await self._sessions.get_or_create(session_key)
@@ -62,6 +62,7 @@ class ProactiveTurnService:
                 proactive=True,
                 metadata=metadata,
                 tool_chain=list(tool_chain or []),
+                tools_used=list(tools_used or []),
                 status="ok",
             )
             await self._sessions.append_messages(session, [message])
