@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from uuid import uuid4
 
 from agent.message_bus import MessageBus, OutboundMessage
@@ -27,6 +28,7 @@ class ProactiveTurnService:
         source: str,
         delivery_key: str,
         source_id: str,
+        tool_chain: list[dict[str, Any]] | None = None,
     ) -> DeliveryResult:
         """按 delivery_key 幂等提交；离线 Web 不影响已落库消息。"""
 
@@ -59,6 +61,7 @@ class ProactiveTurnService:
                 text,
                 proactive=True,
                 metadata=metadata,
+                tool_chain=list(tool_chain or []),
                 status="ok",
             )
             await self._sessions.append_messages(session, [message])

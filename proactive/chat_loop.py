@@ -19,13 +19,31 @@ from proactive.store import ProactiveStore
 
 logger = logging.getLogger(__name__)
 
+_AUDIT_TOOL_NAMES = frozenset({
+    "recall_memory",
+    "web_search",
+    "web_fetch",
+    "read_file",
+    "list_dir",
+    "load_skill",
+})
+
 
 class CompletionProvider(Protocol):
     async def complete(self, messages: list[dict[str, Any]], tools: object = None, **kwargs: Any) -> Any: ...
 
 
 class ProactiveDeliveryApi(Protocol):
-    async def deliver(self, *, session_key: str, content: str, source: str, delivery_key: str, source_id: str) -> object: ...
+    async def deliver(
+        self,
+        *,
+        session_key: str,
+        content: str,
+        source: str,
+        delivery_key: str,
+        source_id: str,
+        tool_chain: list[dict[str, Any]] | None = None,
+    ) -> object: ...
 
 
 class ProactiveChatLoop:
@@ -184,6 +202,7 @@ class ProactiveChatLoop:
             source="proactive_conversation",
             delivery_key=f"conversation:{fingerprint}",
             source_id=fingerprint,
+            tool_chain=list(verdict.get("tool_chain") or []),
         )
         if diagnostics:
             logger.info(
@@ -228,6 +247,7 @@ class ProactiveChatLoop:
         schemas = tool_session.schemas()
         previous_calls = ""
         repeated_calls = 0
+        tool_chain: list[dict[str, Any]] = []
         for _iteration in range(self._max_iterations):
             try:
                 response = await self._complete_with_argument_retry(session_key, messages, schemas)
@@ -263,6 +283,7 @@ class ProactiveChatLoop:
                     **dict(getattr(response, "provider_fields", {}) or {}),
                 }
                 messages.append(assistant_message)
+                trace_calls: list[dict[str, Any]] = []
                 for call_index, call in enumerate(calls):
                     result = await tool_session.execute(call.name, dict(call.arguments))
                     messages.append({
@@ -270,9 +291,18 @@ class ProactiveChatLoop:
                         "tool_call_id": call.id,
                         "content": result,
                     })
+                    if call.name in _AUDIT_TOOL_NAMES:
+                        trace_calls.append({
+                            "call_id": call.id,
+                            "name": call.name,
+                            "arguments": dict(call.arguments),
+                            "result": result,
+                            "status": "ok",
+                        })
                     if tool_session.decision is not None:
                         if call_index != len(calls) - 1:
                             return _skip("calls_after_finish", _iteration + 1)
+                        _append_tool_chain_group(tool_chain, response, trace_calls)
                         decision = tool_session.decision
                         return {
                             "action": decision.decision,
@@ -280,7 +310,9 @@ class ProactiveChatLoop:
                             "message": decision.message,
                             "reason": decision.reason,
                             "iterations": _iteration + 1,
+                            "tool_chain": tool_chain,
                         }
+                _append_tool_chain_group(tool_chain, response, trace_calls)
             except ProactiveToolError as error:
                 logger.info("主动 Agent 工具协议拒绝: session=%s error=%s", session_key, error)
                 return _skip("tool_protocol_error", _iteration + 1)
@@ -319,6 +351,7 @@ class ProactiveChatLoop:
                             "message": decision.message,
                             "reason": decision.reason,
                             "iterations": iterations,
+                            "tool_chain": tool_chain,
                         }
                 except ProactiveToolError as error:
                     logger.info("主动 Agent 终止纠偏失败: session=%s error=%s", session_key, error)
@@ -379,6 +412,18 @@ def _skip(reason: str, iterations: int = 0) -> dict[str, Any]:
         "reason": reason,
         "iterations": iterations,
     }
+
+
+def _append_tool_chain_group(
+    tool_chain: list[dict[str, Any]],
+    response: Any,
+    calls: list[dict[str, Any]],
+) -> None:
+    if calls:
+        tool_chain.append({
+            "text": str(getattr(response, "content", "") or ""),
+            "calls": calls,
+        })
 
 
 def _recent_rows(session_store: Any, session_key: str) -> list[dict[str, Any]]:

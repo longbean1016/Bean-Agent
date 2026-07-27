@@ -161,6 +161,11 @@ async def test_proactive_agent_uses_read_only_tools_and_explicit_reply_finish(
     assert provider.calls == 3
     assert delivery.items[0]["content"] == "周末想不想去走走？"
     assert delivery.items[0]["source"] == "proactive_conversation"
+    assert [
+        call["name"]
+        for group in delivery.items[0]["tool_chain"]
+        for call in group["calls"]
+    ] == ["recall_memory"]
     assert store.get_state("web:a").last_skip_reason == ""
     await loop.close()
     store.close()
