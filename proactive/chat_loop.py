@@ -12,7 +12,11 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
-from proactive.agent_tools import ProactiveToolError, ProactiveToolFactory
+from proactive.agent_tools import (
+    ProactiveToolError,
+    ProactiveToolFactory,
+    waiting_for_proactive_reply,
+)
 from proactive.models import ProactiveState
 from proactive.policy import admission_probability, check_conversation_gate, next_tick_seconds, resolve_policy
 from proactive.store import ProactiveStore
@@ -113,9 +117,6 @@ class ProactiveChatLoop:
         settings = await asyncio.to_thread(self._store.get_settings, session_key)
         state = await asyncio.to_thread(self._store.get_state, session_key)
         now = self._now_fn().astimezone(timezone.utc)
-        diagnostics = settings.activity_level == "dev_verify"
-        if diagnostics:
-            logger.info("主动 Agent 开发验证: session=%s stage=consider", session_key)
         decision = check_conversation_gate(
             settings,
             state,
@@ -123,78 +124,43 @@ class ProactiveChatLoop:
             passive_busy=self._is_session_busy(session_key),
         )
         if not decision.allowed:
-            if diagnostics:
-                logger.info(
-                    "主动 Agent 开发验证: session=%s stage=gate reason=%s",
-                    session_key,
-                    decision.reason,
-                )
             await self._record_skip(state, now, decision.reason)
             return
         meta = await asyncio.to_thread(self._sessions.get_session_meta, session_key)
         if meta is None:
-            if diagnostics:
-                logger.info(
-                    "主动 Agent 开发验证: session=%s stage=precondition reason=missing_session",
-                    session_key,
-                )
             await self._record_skip(state, now, "missing_session")
             return
         updated = datetime.fromisoformat(str(meta["updated_at"]))
         if updated.tzinfo is None:
             updated = updated.replace(tzinfo=timezone.utc)
         idle_minutes = max(0.0, (now - updated.astimezone(timezone.utc)).total_seconds() / 60)
-        policy = resolve_policy(settings)
-        probability = admission_probability(policy, idle_minutes)
-        draw = self._rng.random()
-        if diagnostics:
-            logger.info(
-                "主动 Agent 开发验证: session=%s stage=probability probability=%.4f draw=%.4f allowed=%s",
-                session_key,
-                probability,
-                draw,
-                draw <= probability,
-            )
-        if draw > probability:
-            await self._record_skip(state, now, "probability")
-            return
         rows = await asyncio.to_thread(_recent_rows, self._sessions, session_key)
+        if waiting_for_proactive_reply(rows):
+            await self._record_skip(state, now, "waiting_for_reply")
+            return
         passive = [
             row for row in rows
             if row.get("role") in {"user", "assistant"} and not _is_proactive(row)
         ]
         if not passive or passive[-1].get("role") != "assistant":
             # 用户尚在等待普通回复时绝不把它包装成主动消息。
-            if diagnostics:
-                logger.info(
-                    "主动 Agent 开发验证: session=%s stage=precondition reason=unfinished_passive_turn",
-                    session_key,
-                )
             await self._record_skip(state, now, "unfinished_passive_turn")
+            return
+        policy = resolve_policy(settings)
+        probability = admission_probability(policy, idle_minutes)
+        if self._rng.random() > probability:
+            await self._record_skip(state, now, "probability")
             return
         verdict = await self._judge(
             session_key,
             policy.judge_send_threshold,
             idle_minutes=idle_minutes,
         )
-        if diagnostics:
-            logger.info(
-                "主动 Agent 开发验证: session=%s stage=judge action=%s iterations=%s reason=%s",
-                session_key,
-                verdict.get("action", "skip"),
-                verdict.get("iterations", 0),
-                verdict.get("reason") or "none",
-            )
         if verdict["action"] != "reply" or not verdict["message"]:
             await self._record_skip(state, now, str(verdict.get("reason") or "llm_skip"))
             return
         fingerprint = hashlib.sha256(f"{session_key}\n{verdict['topic']}\n{verdict['message']}".encode()).hexdigest()[:24]
         if fingerprint in state.recent_messages:
-            if diagnostics:
-                logger.info(
-                    "主动 Agent 开发验证: session=%s stage=dedupe reason=duplicate_topic",
-                    session_key,
-                )
             await self._record_skip(state, now, "duplicate_topic")
             return
         await self._delivery.deliver(
@@ -206,11 +172,6 @@ class ProactiveChatLoop:
             tool_chain=list(verdict.get("tool_chain") or []),
             tools_used=list(verdict.get("tools_used") or []),
         )
-        if diagnostics:
-            logger.info(
-                "主动 Agent 开发验证: session=%s stage=delivery status=success",
-                session_key,
-            )
         local_date = now.astimezone(ZoneInfo(settings.timezone)).date().isoformat()
         state.last_checked_at = now.isoformat()
         state.last_delivered_at = now.isoformat()
@@ -236,8 +197,6 @@ class ProactiveChatLoop:
             "计划、兴趣、困难点或明确希望后续跟进的事项，可结合近期对话与长期记忆主动跟进，"
             "不因上一轮已有回复就默认话题结束。主动消息应包含与用户近况或持续目标相关的具体内容，"
             "并可自然提出相关问题延续交流；不得只发送“需要帮助吗”“要继续吗”等空泛询问。"
-            "get_recent_chat 返回的 conversation_state.waiting_for_proactive_reply 是代码计算的权威状态；"
-            "值为 true 时不得围绕同一主题连续追问，值为 false 时不得声称仍在等待用户回复。"
             "用户近期消息明确表达正在忙、稍后再聊、暂不需要或拒绝继续时，应 skip。"
             "需要核实稳定兴趣时用 recall_memory。涉及新闻、版本变化、近期事件等时效性信息，或需要补充、"
             "核实外部资料时，应调用 web_search，必要时使用 web_fetch 核实来源，不得依赖模型记忆编造最新事实。"

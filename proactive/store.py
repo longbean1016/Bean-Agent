@@ -335,7 +335,7 @@ def _session_key(value: str) -> str:
 def _validated_settings(settings: SessionProactiveSettings) -> SessionProactiveSettings:
     data = asdict(settings)
     data["session_key"] = _session_key(settings.session_key)
-    if settings.activity_level not in {"restrained", "balanced", "active", "dev_verify"}:
+    if settings.activity_level not in {"restrained", "balanced", "active"}:
         raise ValueError("主动程度无效")
     if settings.reminder_quiet_policy not in {"delay", "send", "skip"}:
         raise ValueError("提醒勿扰策略无效")

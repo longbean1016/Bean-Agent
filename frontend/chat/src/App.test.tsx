@@ -349,47 +349,6 @@ it("点击会话菜单外部会关闭菜单", async () => {
   expect(screen.queryByRole("menu")).not.toBeInTheDocument();
 });
 
-it("主动设置提供开发验证活动档位", async () => {
-  window.history.replaceState({}, "", "/chat/dev-verify");
-  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
-    const url = String(input);
-    if (url.endsWith("/proactive")) {
-      return { ok: true, json: async () => ({ settings: {
-          session_key: "web:dev-verify",
-          reminders_enabled: false,
-          reminder_quiet_policy: "delay",
-          conversation_enabled: true,
-          activity_level: "active",
-          min_conversation_interval_hours: 1,
-          daily_conversation_limit: 2,
-          quiet_hours_enabled: false,
-          quiet_start: "23:00",
-          quiet_end: "08:00",
-          timezone: "Asia/Shanghai",
-        } }) } as Response;
-    }
-    if (url.includes("/messages") || url.includes("/notifications") || url.includes("/reminders")) {
-      return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
-    }
-    return { ok: true, json: async () => ({
-      items: [{
-        key: "web:dev-verify",
-        first_message_content: "开发验证会话",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      }],
-      total: 1,
-    }) } as Response;
-  }));
-
-  render(<App />);
-  await screen.findByText("开发验证会话", { selector: ".session-row-select span" });
-  fireEvent.click(screen.getByRole("button", { name: /打开会话.*开发验证会话.*菜单/ }));
-  fireEvent.click(screen.getByRole("menuitem", { name: "主动设置" }));
-
-  expect(await screen.findByRole("option", { name: "开发验证" })).toHaveValue("dev_verify");
-});
-
 it("重命名失焦后保存并收起输入框", async () => {
   let renamed = false;
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

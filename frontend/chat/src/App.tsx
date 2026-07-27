@@ -834,9 +834,9 @@ function ProactiveSettingsDialog({ target, onClose }: { target: SessionSummary |
               </SettingsSection>
 
               <SettingsSection title="主动聊天" enabled={settings.conversation_enabled} onEnabled={(value) => update("conversation_enabled", value)}>
-                <SettingRow label="主动程度" helpId="activity" help={help} onHelp={setHelp} helpText="算法倾向：克制更少尝试，均衡适合日常，积极更愿意延续明确未完成的话题，开发验证用于缩短真实链路测试等待；所有档位仍受间隔、次数和勿扰限制。">
+                <SettingRow label="主动程度" helpId="activity" help={help} onHelp={setHelp} helpText="算法倾向：克制更少尝试，均衡适合日常，积极更愿意延续明确未完成的话题；所有档位仍受间隔、次数和勿扰限制。">
                   <select value={settings.activity_level} onChange={(event) => update("activity_level", event.target.value as ProactiveSettings["activity_level"])}>
-                    <option value="restrained">克制</option><option value="balanced">均衡</option><option value="active">积极</option><option value="dev_verify">开发验证</option>
+                    <option value="restrained">克制</option><option value="balanced">均衡</option><option value="active">积极</option>
                   </select>
                 </SettingRow>
                 <SettingRow label="最短间隔" helpId="interval" help={help} onHelp={setHelp} helpText="一次主动聊天后，至少等待这么久再尝试。这是明确的频率边界，主动程度不会越过它。">

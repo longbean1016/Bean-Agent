@@ -76,7 +76,7 @@ export interface ProactiveSettings {
   reminders_enabled: boolean;
   reminder_quiet_policy: "delay" | "send" | "skip";
   conversation_enabled: boolean;
-  activity_level: "restrained" | "balanced" | "active" | "dev_verify";
+  activity_level: "restrained" | "balanced" | "active";
   min_conversation_interval_hours: number;
   daily_conversation_limit: number;
   quiet_hours_enabled: boolean;

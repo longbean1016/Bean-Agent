@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
-ActivityLevel = Literal["restrained", "balanced", "active", "dev_verify"]
+ActivityLevel = Literal["restrained", "balanced", "active"]
 QuietPolicy = Literal["delay", "send", "skip"]
 ScheduleTier = Literal["instant", "soft"]
 ScheduleTrigger = Literal["at", "after", "every"]
