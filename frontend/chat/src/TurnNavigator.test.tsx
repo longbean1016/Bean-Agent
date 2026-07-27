@@ -54,6 +54,40 @@ describe("TurnNavigator", () => {
     ]).map((item) => item.navigationTurnId)).toEqual(["u1", "u1", "u2", "u2"]);
   });
 
+  it("assigns a proactive message to the nearest preceding user turn", () => {
+    const proactive = {
+      ...message("p1", "assistant", "proactive follow-up"),
+      proactive: true,
+      turnId: "",
+    };
+
+    expect(messagesWithNavigationTurns([
+      message("u1", "user", "first question"),
+      message("a1", "assistant", "first answer"),
+      proactive,
+    ]).map((item) => item.navigationTurnId)).toEqual(["u1", "u1", "u1"]);
+
+    expect(groupMessagesIntoNavigationTurns([
+      message("u1", "user", "first question"),
+      message("a1", "assistant", "first answer"),
+      proactive,
+    ])).toMatchObject([{
+      navigationTurnId: "u1",
+      messages: [{ id: "u1" }, { id: "a1" }, { id: "p1" }],
+    }]);
+  });
+
+  it("does not invent a navigation turn for proactive-only history", () => {
+    const proactive = {
+      ...message("p1", "assistant", "proactive follow-up"),
+      proactive: true,
+      turnId: "",
+    };
+
+    expect(messagesWithNavigationTurns([proactive])[0].navigationTurnId).toBe("");
+    expect(turnsFromMessages([proactive])).toEqual([]);
+  });
+
   it("groups each user message and its assistant response into one render section", () => {
     const groups = groupMessagesIntoNavigationTurns([
       message("u1", "user", "第一问"),

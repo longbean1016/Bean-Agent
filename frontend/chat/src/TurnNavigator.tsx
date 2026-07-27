@@ -59,7 +59,6 @@ export function messagesWithNavigationTurns(messages: ChatMessage[]): Navigation
   let navigationTurnId = "";
   return messages.map((message) => {
     if (message.role === "user") navigationTurnId = message.turnId || message.id;
-    if (message.proactive) navigationTurnId = "";
     return { message, navigationTurnId };
   });
 }
