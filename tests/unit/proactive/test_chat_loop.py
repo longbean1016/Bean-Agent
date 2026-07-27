@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -321,5 +322,75 @@ async def test_repeated_identical_tool_call_stops_early(tmp_path) -> None:
 
     assert verdict["reason"] == "repeated_tool_call"
     assert provider.calls == 3
+    await loop.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_dev_verify_logs_gate_reason_without_chat_content(tmp_path, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="proactive.chat_loop")
+    store = ProactiveStore(tmp_path / "proactive.db")
+    store.upsert_settings(SessionProactiveSettings(
+        session_key="web:a",
+        conversation_enabled=True,
+        activity_level="dev_verify",
+        quiet_hours_enabled=True,
+        quiet_start="23:00",
+        quiet_end="08:00",
+        timezone="UTC",
+    ))
+    loop = ProactiveChatLoop(
+        store,
+        _SessionStore(),
+        _NeverProvider(),
+        _NeverDelivery(),
+        _NeverTools(),  # type: ignore[arg-type]
+        is_session_busy=lambda _key: False,
+        now_fn=lambda: datetime(2026, 7, 20, 23, 30, tzinfo=timezone.utc),
+        rng=_AlwaysAdmit(),  # type: ignore[arg-type]
+    )
+
+    await loop.run_once()
+
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "stage=consider" in logs
+    assert "stage=gate reason=quiet_hours" in logs
+    assert "请继续处理这个普通请求" not in logs
+    await loop.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_dev_verify_logs_probability_judge_and_delivery_without_draft(tmp_path, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="proactive.chat_loop")
+    store = ProactiveStore(tmp_path / "proactive.db")
+    store.upsert_settings(SessionProactiveSettings(
+        session_key="web:a",
+        conversation_enabled=True,
+        activity_level="dev_verify",
+        quiet_hours_enabled=False,
+        min_conversation_interval_hours=1,
+    ))
+    sessions = _CompletedSessionStore()
+    provider = _ToolProvider()
+    delivery = _Delivery()
+    loop = ProactiveChatLoop(
+        store,
+        sessions,
+        provider,
+        delivery,
+        ProactiveToolFactory(sessions, _Memory(), ToolRegistry()),
+        is_session_busy=lambda _key: False,
+        now_fn=lambda: datetime(2026, 7, 20, 12, tzinfo=timezone.utc),
+        rng=_AlwaysAdmit(),  # type: ignore[arg-type]
+    )
+
+    await loop.run_once()
+
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "stage=probability" in logs
+    assert "stage=judge action=reply iterations=3" in logs
+    assert "stage=delivery status=success" in logs
+    assert delivery.items[0]["content"] not in logs
     await loop.close()
     store.close()

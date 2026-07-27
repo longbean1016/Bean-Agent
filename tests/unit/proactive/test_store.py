@@ -26,6 +26,20 @@ def test_settings_round_trip_and_isolation(tmp_path) -> None:
     store.close()
 
 
+def test_dev_verify_activity_level_round_trip(tmp_path) -> None:
+    store = ProactiveStore(tmp_path / "proactive.db")
+
+    saved = store.upsert_settings(SessionProactiveSettings(
+        session_key="web:a",
+        conversation_enabled=True,
+        activity_level="dev_verify",
+    ))
+
+    assert saved.activity_level == "dev_verify"
+    assert store.get_settings("web:a").activity_level == "dev_verify"
+    store.close()
+
+
 def test_settings_reject_invalid_ranges(tmp_path) -> None:
     store = ProactiveStore(tmp_path / "proactive.db")
     with pytest.raises(ValueError, match="1-168"):

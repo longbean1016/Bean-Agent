@@ -35,6 +35,7 @@ _POLICIES = {
     "restrained": ProactivePolicy(1800, 900, .30, .75, .05, .30, 120, .03, 24),
     "balanced": ProactivePolicy(900, 450, .25, .65, .10, .50, 60, .08, 12),
     "active": ProactivePolicy(480, 240, .20, .55, .20, .70, 30, .15, 6),
+    "dev_verify": ProactivePolicy(60, 30, .0, .28, .75, .98, 15, .15, 6),
 }
 
 

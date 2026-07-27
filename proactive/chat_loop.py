@@ -94,6 +94,9 @@ class ProactiveChatLoop:
         settings = await asyncio.to_thread(self._store.get_settings, session_key)
         state = await asyncio.to_thread(self._store.get_state, session_key)
         now = self._now_fn().astimezone(timezone.utc)
+        diagnostics = settings.activity_level == "dev_verify"
+        if diagnostics:
+            logger.info("主动 Agent 开发验证: session=%s stage=consider", session_key)
         decision = check_conversation_gate(
             settings,
             state,
@@ -101,10 +104,21 @@ class ProactiveChatLoop:
             passive_busy=self._is_session_busy(session_key),
         )
         if not decision.allowed:
+            if diagnostics:
+                logger.info(
+                    "主动 Agent 开发验证: session=%s stage=gate reason=%s",
+                    session_key,
+                    decision.reason,
+                )
             await self._record_skip(state, now, decision.reason)
             return
         meta = await asyncio.to_thread(self._sessions.get_session_meta, session_key)
         if meta is None:
+            if diagnostics:
+                logger.info(
+                    "主动 Agent 开发验证: session=%s stage=precondition reason=missing_session",
+                    session_key,
+                )
             await self._record_skip(state, now, "missing_session")
             return
         updated = datetime.fromisoformat(str(meta["updated_at"]))
@@ -112,7 +126,17 @@ class ProactiveChatLoop:
             updated = updated.replace(tzinfo=timezone.utc)
         idle_minutes = max(0.0, (now - updated.astimezone(timezone.utc)).total_seconds() / 60)
         policy = resolve_policy(settings)
-        if self._rng.random() > admission_probability(policy, idle_minutes):
+        probability = admission_probability(policy, idle_minutes)
+        draw = self._rng.random()
+        if diagnostics:
+            logger.info(
+                "主动 Agent 开发验证: session=%s stage=probability probability=%.4f draw=%.4f allowed=%s",
+                session_key,
+                probability,
+                draw,
+                draw <= probability,
+            )
+        if draw > probability:
             await self._record_skip(state, now, "probability")
             return
         rows = await asyncio.to_thread(_recent_rows, self._sessions, session_key)
@@ -122,14 +146,32 @@ class ProactiveChatLoop:
         ]
         if not passive or passive[-1].get("role") != "assistant":
             # 用户尚在等待普通回复时绝不把它包装成主动消息。
+            if diagnostics:
+                logger.info(
+                    "主动 Agent 开发验证: session=%s stage=precondition reason=unfinished_passive_turn",
+                    session_key,
+                )
             await self._record_skip(state, now, "unfinished_passive_turn")
             return
         verdict = await self._judge(session_key, policy.judge_send_threshold)
+        if diagnostics:
+            logger.info(
+                "主动 Agent 开发验证: session=%s stage=judge action=%s iterations=%s reason=%s",
+                session_key,
+                verdict.get("action", "skip"),
+                verdict.get("iterations", 0),
+                verdict.get("reason") or "none",
+            )
         if verdict["action"] != "reply" or not verdict["message"]:
             await self._record_skip(state, now, str(verdict.get("reason") or "llm_skip"))
             return
         fingerprint = hashlib.sha256(f"{session_key}\n{verdict['topic']}\n{verdict['message']}".encode()).hexdigest()[:24]
         if fingerprint in state.recent_messages:
+            if diagnostics:
+                logger.info(
+                    "主动 Agent 开发验证: session=%s stage=dedupe reason=duplicate_topic",
+                    session_key,
+                )
             await self._record_skip(state, now, "duplicate_topic")
             return
         await self._delivery.deliver(
@@ -139,6 +181,11 @@ class ProactiveChatLoop:
             delivery_key=f"conversation:{fingerprint}",
             source_id=fingerprint,
         )
+        if diagnostics:
+            logger.info(
+                "主动 Agent 开发验证: session=%s stage=delivery status=success",
+                session_key,
+            )
         local_date = now.astimezone(ZoneInfo(settings.timezone)).date().isoformat()
         state.last_checked_at = now.isoformat()
         state.last_delivered_at = now.isoformat()
@@ -148,7 +195,7 @@ class ProactiveChatLoop:
         state.recent_messages = [*state.recent_messages[-19:], fingerprint]
         await asyncio.to_thread(self._store.put_state, state)
 
-    async def _judge(self, session_key: str, threshold: float) -> dict[str, str]:
+    async def _judge(self, session_key: str, threshold: float) -> dict[str, Any]:
         """运行受限工具循环；任何不完整终态都按 skip 处理，避免意外打扰。"""
 
         tool_session = self._tools.create(session_key)
@@ -169,10 +216,10 @@ class ProactiveChatLoop:
             try:
                 response = await self._complete_with_argument_retry(session_key, messages, schemas)
                 if response is None:
-                    return _skip("invalid_tool_arguments")
+                    return _skip("invalid_tool_arguments", _iteration + 1)
                 calls = list(getattr(response, "tool_calls", ()) or ())
                 if not calls:
-                    return _skip("missing_terminal_tool")
+                    return _skip("missing_terminal_tool", _iteration + 1)
                 call_signature = json.dumps(
                     [(call.name, call.arguments) for call in calls],
                     ensure_ascii=False,
@@ -182,7 +229,7 @@ class ProactiveChatLoop:
                 previous_calls = call_signature
                 if repeated_calls >= 3:
                     logger.warning("主动 Agent 连续重复工具调用: session=%s", session_key)
-                    return _skip("repeated_tool_call")
+                    return _skip("repeated_tool_call", _iteration + 1)
                 assistant_message: dict[str, Any] = {
                     "role": "assistant",
                     "content": str(getattr(response, "content", "") or ""),
@@ -209,20 +256,21 @@ class ProactiveChatLoop:
                     })
                     if tool_session.decision is not None:
                         if call_index != len(calls) - 1:
-                            return _skip("calls_after_finish")
+                            return _skip("calls_after_finish", _iteration + 1)
                         decision = tool_session.decision
                         return {
                             "action": decision.decision,
                             "topic": decision.topic,
                             "message": decision.message,
                             "reason": decision.reason,
+                            "iterations": _iteration + 1,
                         }
             except ProactiveToolError as error:
                 logger.info("主动 Agent 工具协议拒绝: session=%s error=%s", session_key, error)
-                return _skip("tool_protocol_error")
+                return _skip("tool_protocol_error", _iteration + 1)
             except Exception:
                 logger.exception("主动 Agent 单次判断失败: session=%s", session_key)
-                return _skip("agent_error")
+                return _skip("agent_error", _iteration + 1)
         if tool_session.has_draft:
             messages.append({
                 "role": "user",
@@ -233,6 +281,7 @@ class ProactiveChatLoop:
                 if schema.get("function", {}).get("name") == "finish_turn"
             ]
             for _attempt in range(3):
+                iterations = self._max_iterations + _attempt + 1
                 try:
                     response = await self._complete_with_argument_retry(
                         session_key,
@@ -240,10 +289,10 @@ class ProactiveChatLoop:
                         finish_schemas,
                     )
                     if response is None:
-                        return _skip("invalid_tool_arguments")
+                        return _skip("invalid_tool_arguments", iterations)
                     calls = list(getattr(response, "tool_calls", ()) or ())
                     if len(calls) != 1 or calls[0].name != "finish_turn":
-                        return _skip("terminal_correction_failed")
+                        return _skip("terminal_correction_failed", iterations)
                     call = calls[0]
                     await tool_session.execute(call.name, dict(call.arguments))
                     decision = tool_session.decision
@@ -253,15 +302,16 @@ class ProactiveChatLoop:
                             "topic": decision.topic,
                             "message": decision.message,
                             "reason": decision.reason,
+                            "iterations": iterations,
                         }
                 except ProactiveToolError as error:
                     logger.info("主动 Agent 终止纠偏失败: session=%s error=%s", session_key, error)
-                    return _skip("terminal_correction_failed")
+                    return _skip("terminal_correction_failed", iterations)
                 except Exception:
                     logger.exception("主动 Agent 终止纠偏异常: session=%s", session_key)
-                    return _skip("agent_error")
-            return _skip("terminal_correction_failed")
-        return _skip("max_iterations")
+                    return _skip("agent_error", iterations)
+            return _skip("terminal_correction_failed", self._max_iterations + 3)
+        return _skip("max_iterations", self._max_iterations)
 
     async def _complete_with_argument_retry(
         self,
@@ -305,8 +355,14 @@ class ProactiveChatLoop:
             await asyncio.gather(self._task, return_exceptions=True)
 
 
-def _skip(reason: str) -> dict[str, str]:
-    return {"action": "skip", "topic": "", "message": "", "reason": reason}
+def _skip(reason: str, iterations: int = 0) -> dict[str, Any]:
+    return {
+        "action": "skip",
+        "topic": "",
+        "message": "",
+        "reason": reason,
+        "iterations": iterations,
+    }
 
 
 def _recent_rows(session_store: Any, session_key: str) -> list[dict[str, Any]]:
