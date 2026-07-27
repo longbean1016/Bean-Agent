@@ -331,8 +331,15 @@ async def test_judge_prompt_allows_value_first_followup_for_ongoing_goal(tmp_pat
 
     prompt = provider.received_messages[0][0]["content"]
     assert "持续目标" in prompt
-    assert "先提供具体价值" in prompt
-    assert "不能只询问用户是否需要" in prompt
+    assert "不因上一轮已有回复就默认话题结束" in prompt
+    assert "具体内容" in prompt
+    assert "空泛询问" in prompt
+    assert "web_search" in prompt
+    assert "web_fetch" in prompt
+    assert "不得依赖模型记忆编造最新事实" in prompt
+    assert "正在忙" in prompt
+    assert "应 skip" in prompt
+    assert "waiting_for_proactive_reply" in prompt
     assert "已空闲 180 分钟" in prompt
     await loop.close()
     store.close()
