@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -195,5 +196,130 @@ async def test_proactive_agent_without_finish_tool_defaults_to_skip(tmp_path) ->
 
     assert delivery.items == []
     assert store.get_state("web:a").last_skip_reason == "missing_terminal_tool"
+    await loop.close()
+    store.close()
+
+
+class _InvalidArgumentsProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        raise json.JSONDecodeError("missing comma", '{"message":"broken"', 12)
+
+
+class _CountingProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        if self.calls % 2:
+            call = ToolCall(f"c{self.calls}", "get_recent_chat", {"limit": self.calls})
+        else:
+            call = ToolCall(
+                f"c{self.calls}",
+                "recall_memory",
+                {"query": f"topic-{self.calls}", "limit": 1},
+            )
+        return LLMResponse(None, tool_calls=[call])
+
+
+class _DraftWithoutFinishProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.received_messages: list[list[dict]] = []
+
+    async def complete(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        self.received_messages.append(list(messages))
+        if self.calls == 1:
+            calls = [ToolCall("c1", "get_recent_chat", {"limit": 20})]
+        elif self.calls == 2:
+            calls = [ToolCall("c2", "message_push", {
+                "message": "A useful follow-up",
+                "topic": "interview",
+            })]
+        else:
+            calls = [ToolCall("c3", "finish_turn", {"decision": "reply"})]
+        return LLMResponse(None, tool_calls=calls)
+
+
+class _RepeatedCallProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        return LLMResponse(None, tool_calls=[
+            ToolCall(f"c{self.calls}", "get_recent_chat", {"limit": 20}),
+        ])
+
+
+def _judge_loop(tmp_path, provider, *, max_iterations: int = 16) -> tuple[ProactiveChatLoop, ProactiveStore]:
+    store = ProactiveStore(tmp_path / "proactive.db")
+    sessions = _CompletedSessionStore()
+    return ProactiveChatLoop(
+        store,
+        sessions,
+        provider,
+        _Delivery(),
+        ProactiveToolFactory(sessions, _Memory(), ToolRegistry()),
+        is_session_busy=lambda _key: False,
+        max_iterations=max_iterations,
+    ), store
+
+
+@pytest.mark.asyncio
+async def test_invalid_tool_arguments_retry_once_without_traceback(tmp_path, caplog) -> None:
+    provider = _InvalidArgumentsProvider()
+    loop, store = _judge_loop(tmp_path, provider)
+
+    verdict = await loop._judge("web:a", 0.5)
+
+    assert verdict["reason"] == "invalid_tool_arguments"
+    assert provider.calls == 2
+    assert not [record for record in caplog.records if record.exc_info]
+    await loop.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_judge_defaults_to_sixteen_tool_steps(tmp_path) -> None:
+    provider = _CountingProvider()
+    loop, store = _judge_loop(tmp_path, provider)
+
+    verdict = await loop._judge("web:a", 0.5)
+
+    assert verdict["reason"] == "max_iterations"
+    assert provider.calls == 16
+    await loop.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_drafted_message_gets_terminal_correction_after_step_limit(tmp_path) -> None:
+    provider = _DraftWithoutFinishProvider()
+    loop, store = _judge_loop(tmp_path, provider, max_iterations=2)
+
+    verdict = await loop._judge("web:a", 0.5)
+
+    assert verdict["action"] == "reply"
+    assert provider.calls == 3
+    assert "finish_turn" in provider.received_messages[2][-1]["content"]
+    await loop.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_identical_tool_call_stops_early(tmp_path) -> None:
+    provider = _RepeatedCallProvider()
+    loop, store = _judge_loop(tmp_path, provider)
+
+    verdict = await loop._judge("web:a", 0.5)
+
+    assert verdict["reason"] == "repeated_tool_call"
+    assert provider.calls == 3
     await loop.close()
     store.close()

@@ -42,6 +42,7 @@ class ProactiveChatLoop:
         is_session_busy: Callable[[str], bool],
         now_fn: Callable[[], datetime] | None = None,
         rng: random.Random | None = None,
+        max_iterations: int = 16,
     ) -> None:
         self._store = store
         self._sessions = session_store
@@ -51,6 +52,7 @@ class ProactiveChatLoop:
         self._is_session_busy = is_session_busy
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._rng = rng or random.Random()
+        self._max_iterations = max(1, int(max_iterations))
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -161,17 +163,26 @@ class ProactiveChatLoop:
         )
         messages: list[dict[str, Any]] = [{"role": "system", "content": prompt}]
         schemas = tool_session.schemas()
-        for _iteration in range(6):
+        previous_calls = ""
+        repeated_calls = 0
+        for _iteration in range(self._max_iterations):
             try:
-                response = await self._provider.complete(
-                    messages,
-                    tools=schemas,
-                    max_tokens=800,
-                    disable_thinking=True,
-                )
+                response = await self._complete_with_argument_retry(session_key, messages, schemas)
+                if response is None:
+                    return _skip("invalid_tool_arguments")
                 calls = list(getattr(response, "tool_calls", ()) or ())
                 if not calls:
                     return _skip("missing_terminal_tool")
+                call_signature = json.dumps(
+                    [(call.name, call.arguments) for call in calls],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                repeated_calls = repeated_calls + 1 if call_signature == previous_calls else 1
+                previous_calls = call_signature
+                if repeated_calls >= 3:
+                    logger.warning("主动 Agent 连续重复工具调用: session=%s", session_key)
+                    return _skip("repeated_tool_call")
                 assistant_message: dict[str, Any] = {
                     "role": "assistant",
                     "content": str(getattr(response, "content", "") or ""),
@@ -212,7 +223,71 @@ class ProactiveChatLoop:
             except Exception:
                 logger.exception("主动 Agent 单次判断失败: session=%s", session_key)
                 return _skip("agent_error")
+        if tool_session.has_draft:
+            messages.append({
+                "role": "user",
+                "content": "你已经生成了主动消息草稿。现在只能调用 finish_turn(decision=reply) 完成本轮。",
+            })
+            finish_schemas = [
+                schema for schema in schemas
+                if schema.get("function", {}).get("name") == "finish_turn"
+            ]
+            for _attempt in range(3):
+                try:
+                    response = await self._complete_with_argument_retry(
+                        session_key,
+                        messages,
+                        finish_schemas,
+                    )
+                    if response is None:
+                        return _skip("invalid_tool_arguments")
+                    calls = list(getattr(response, "tool_calls", ()) or ())
+                    if len(calls) != 1 or calls[0].name != "finish_turn":
+                        return _skip("terminal_correction_failed")
+                    call = calls[0]
+                    await tool_session.execute(call.name, dict(call.arguments))
+                    decision = tool_session.decision
+                    if decision is not None:
+                        return {
+                            "action": decision.decision,
+                            "topic": decision.topic,
+                            "message": decision.message,
+                            "reason": decision.reason,
+                        }
+                except ProactiveToolError as error:
+                    logger.info("主动 Agent 终止纠偏失败: session=%s error=%s", session_key, error)
+                    return _skip("terminal_correction_failed")
+                except Exception:
+                    logger.exception("主动 Agent 终止纠偏异常: session=%s", session_key)
+                    return _skip("agent_error")
+            return _skip("terminal_correction_failed")
         return _skip("max_iterations")
+
+    async def _complete_with_argument_retry(
+        self,
+        session_key: str,
+        messages: list[dict[str, Any]],
+        schemas: object,
+    ) -> Any | None:
+        for attempt in range(1, 3):
+            try:
+                return await self._provider.complete(
+                    messages,
+                    tools=schemas,
+                    max_tokens=800,
+                    disable_thinking=True,
+                )
+            except json.JSONDecodeError:
+                logger.warning(
+                    "主动 Agent 工具参数解析失败: session=%s attempt=%d/2",
+                    session_key,
+                    attempt,
+                )
+        logger.warning(
+            "主动 Agent 本轮结束: session=%s reason=invalid_tool_arguments",
+            session_key,
+        )
+        return None
 
     async def _record_skip(self, state: ProactiveState, now: datetime, reason: str) -> None:
         state.last_checked_at = now.isoformat()

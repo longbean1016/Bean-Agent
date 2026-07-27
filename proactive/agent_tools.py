@@ -78,6 +78,10 @@ class ProactiveToolSession:
     def decision(self) -> ProactiveToolDecision | None:
         return self._decision
 
+    @property
+    def has_draft(self) -> bool:
+        return bool(self._draft)
+
     def schemas(self) -> list[dict[str, Any]]:
         """只返回主动判断所需工具；共享注册表中的其它能力保持不可见。"""
 
