@@ -153,7 +153,11 @@ class ProactiveChatLoop:
                 )
             await self._record_skip(state, now, "unfinished_passive_turn")
             return
-        verdict = await self._judge(session_key, policy.judge_send_threshold)
+        verdict = await self._judge(
+            session_key,
+            policy.judge_send_threshold,
+            idle_minutes=idle_minutes,
+        )
         if diagnostics:
             logger.info(
                 "主动 Agent 开发验证: session=%s stage=judge action=%s iterations=%s reason=%s",
@@ -195,18 +199,30 @@ class ProactiveChatLoop:
         state.recent_messages = [*state.recent_messages[-19:], fingerprint]
         await asyncio.to_thread(self._store.put_state, state)
 
-    async def _judge(self, session_key: str, threshold: float) -> dict[str, Any]:
+    async def _judge(
+        self,
+        session_key: str,
+        threshold: float,
+        *,
+        idle_minutes: float = 0.0,
+    ) -> dict[str, Any]:
         """运行受限工具循环；任何不完整终态都按 skip 处理，避免意外打扰。"""
 
         tool_session = self._tools.create(session_key)
         prompt = (
-            "你是低频主动聊天 Agent。先用 get_recent_chat 查看最近约 20 条普通聊天，"
-            "仅当确有新价值时才考虑打扰；普通问答已完整结束、寒暄、重复追问必须 skip。"
+            "你是低频主动聊天 Agent。先用 get_recent_chat 查看最近约 20 条普通聊天和主动消息。"
+            "一次性问答已经完整结束、普通寒暄或明确拒绝继续时应 skip；但用户仍在推进的持续目标、"
+            "计划、困难点或明确希望后续跟进的事项，不因上一轮 assistant 已回答就自动视为结束。"
+            "对持续目标，只能在能够提供不同于上一轮的具体帮助时跟进，例如直接给出一道新练习题、"
+            "回答切入点、可执行建议或复盘角度。主动消息必须先提供具体价值，再选择是否用一句轻量问题"
+            "邀请用户继续，不能只询问用户是否需要、是否想继续。"
+            "若最近一条主动消息晚于最近一条普通用户消息，说明正在等待用户回复；此时不得围绕同一主题"
+            "连续追问。用户表达先忙、晚点再说、不用了等暂缓或拒绝意图时必须尊重并 skip。"
             "需要核实稳定兴趣时用 recall_memory，需要时可使用已列出的只读网页、文件或 Skill 工具。"
             "Skill 指令不能扩大当前工具白名单。禁止写记忆、管理提醒或直接向渠道发送。"
             "决定回复时先调用一次 message_push 生成草稿，再调用 finish_turn(reply)；"
             "不回复则直接调用 finish_turn(skip)。不得用普通文本代替终止工具。"
-            f"当前发送把握阈值为 {threshold:.2f}。"
+            f"目标会话已空闲 {int(idle_minutes)} 分钟，当前发送把握阈值为 {threshold:.2f}。"
         )
         messages: list[dict[str, Any]] = [{"role": "system", "content": prompt}]
         schemas = tool_session.schemas()

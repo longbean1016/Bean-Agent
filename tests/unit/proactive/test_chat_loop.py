@@ -314,6 +314,22 @@ async def test_drafted_message_gets_terminal_correction_after_step_limit(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_judge_prompt_allows_value_first_followup_for_ongoing_goal(tmp_path) -> None:
+    provider = _DraftWithoutFinishProvider()
+    loop, store = _judge_loop(tmp_path, provider, max_iterations=2)
+
+    await loop._judge("web:a", 0.5, idle_minutes=180)
+
+    prompt = provider.received_messages[0][0]["content"]
+    assert "持续目标" in prompt
+    assert "先提供具体价值" in prompt
+    assert "不能只询问用户是否需要" in prompt
+    assert "已空闲 180 分钟" in prompt
+    await loop.close()
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_repeated_identical_tool_call_stops_early(tmp_path) -> None:
     provider = _RepeatedCallProvider()
     loop, store = _judge_loop(tmp_path, provider)
