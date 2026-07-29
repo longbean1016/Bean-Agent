@@ -88,6 +88,7 @@ class Pipeline:
         self._interrupt_snapshots[turn_id] = {
             "partial_reply": "",
             "partial_thinking": "",
+            "tools": [],
             "tools_used": [],
             "tool_chain_partial": [],
         }
@@ -299,6 +300,15 @@ class Pipeline:
                     group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "status": "error"})
                     continue
                 if not suppress_stream:
+                    # 先写入运行中快照，再发实时事件；刷新重连正好发生在事件前后时，订阅端都能恢复工具图标。
+                    self._upsert_interrupt_tool(
+                        turn_id,
+                        call_id=call.id,
+                        name=call.name,
+                        arguments=dict(call.arguments),
+                        status="running",
+                        result_preview="",
+                    )
                     await self._events.emit(ToolCallStarted(message.session_key, turn_id, call.id, call.name, dict(call.arguments)))
                 execution_context: dict[str, Any] = tool_view.context
                 execution_context.update({
@@ -331,7 +341,17 @@ class Pipeline:
                 status = "error" if result.text.startswith("工具执行出错:") or result.text.startswith("工具 '") else "ok"
                 append_tool_result(react_messages, tool_call_id=call.id, content=result, tool_name=call.name)
                 if not suppress_stream:
-                    await self._events.emit(ToolCallCompleted(message.session_key, turn_id, call.id, call.name, status, result.preview()[:500]))
+                    preview = result.preview()[:500]
+                    # 完成态同样先落快照再发事件，避免刷新窗口里看到旧的 running 状态。
+                    self._upsert_interrupt_tool(
+                        turn_id,
+                        call_id=call.id,
+                        name=call.name,
+                        arguments=dict(call.arguments),
+                        status="error" if status == "error" else "completed",
+                        result_preview=preview,
+                    )
+                    await self._events.emit(ToolCallCompleted(message.session_key, turn_id, call.id, call.name, status, preview))
                 group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "status": status})
                 tools_used.append(call.name)
                 # 一组内后续工具也可能阻塞或被取消；每完成一个调用就刷新快照，避免丢失已完成结果。
@@ -364,6 +384,35 @@ class Pipeline:
         """返回当前 Turn 的隔离副本，避免取消后的清理影响中断状态。"""
 
         return deepcopy(self._interrupt_snapshots.get(turn_id, {}))
+
+    def _upsert_interrupt_tool(
+        self,
+        turn_id: str,
+        *,
+        call_id: str,
+        name: str,
+        arguments: dict[str, Any],
+        status: str,
+        result_preview: str,
+    ) -> None:
+        """维护当前进程内 running turn 的工具快照，供刷新/重连后补发 UI 状态。"""
+
+        snapshot = self._interrupt_snapshots.get(turn_id)
+        if snapshot is None:
+            return
+        tools = snapshot.setdefault("tools", [])
+        item = {
+            "call_id": call_id,
+            "name": name,
+            "arguments": deepcopy(arguments),
+            "status": status,
+            "result_preview": result_preview,
+        }
+        for index, existing in enumerate(tools):
+            if existing.get("call_id") == call_id:
+                tools[index] = item
+                return
+        tools.append(item)
 
     def discard_interrupt_snapshot(self, turn_id: str) -> None:
         """Turn 结束后幂等释放纯内存快照。"""

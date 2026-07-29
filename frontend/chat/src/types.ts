@@ -112,6 +112,7 @@ export interface ProactiveNotificationRow {
 export type ChatFrame =
   | { type: "session.created"; request_id: string; session_id: string }
   | { type: "session.subscribed"; request_id: string; session_id: string }
+  | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message: string; user_media: string[]; content: string; thinking: string; tools: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments: unknown; result_preview: string }>; status: "running" }
   | { type: "turn.queued"; request_id: string; session_id: string; position: number }
   | { type: "turn.started"; request_id?: string; session_id: string; turn_id: string }
   | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }

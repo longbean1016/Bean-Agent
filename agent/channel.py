@@ -100,6 +100,8 @@ class WebChannel:
                 "request_id": request_id,
                 "session_id": session_key,
             })
+            # 订阅确认后只给当前连接补发运行中快照，用于刷新/重连恢复流式草稿。
+            await self._send_active_turn_snapshot(session_key, websocket)
             await self._replay_pending_notifications(session_key, websocket)
             return
         if frame_type == "message.send":
@@ -191,6 +193,17 @@ class WebChannel:
             except Exception:
                 return
             await asyncio.to_thread(self._proactive_store.mark_notification_delivered, item.id)
+
+    async def _send_active_turn_snapshot(self, session_key: str, websocket: WebSocketApi) -> None:
+        """从 AgentLoop 读取纯内存 running turn 快照，避免刷新后前端丢失正在生成的内容。"""
+
+        snapshotter = getattr(self._interrupt, "get_active_turn_snapshot", None)
+        if not callable(snapshotter):
+            return
+        snapshot = snapshotter(session_key)
+        if not snapshot:
+            return
+        await self._send_json(websocket, {"type": "turn.snapshot", **dict(snapshot)})
 
     async def _on_turn_started(self, event: TurnStarted) -> None:
         await self._broadcast(event.session_key, {"type": "turn.started", "request_id": event.request_id, "session_id": event.session_key, "turn_id": event.turn_id})

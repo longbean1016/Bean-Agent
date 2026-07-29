@@ -32,6 +32,30 @@ class EchoTool(Tool):
     async def execute(self, text: str, **kwargs): return f"echo:{text}:{kwargs['session_key']}"
 
 
+class BlockingEchoTool(Tool):
+    name = "blocking_echo"
+    description = "blocking echo"
+    parameters = {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+
+    async def execute(self, text: str, **kwargs):
+        await self.release.wait()
+        return f"blocked:{text}:{kwargs['session_key']}"
+
+
+class BlockingProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResponse(None, [ToolCall("call-1", "blocking_echo", {"text": "hi"})])
+        return LLMResponse("done")
+
+
 class Provider:
     def __init__(self) -> None:
         self.calls = 0
@@ -356,6 +380,54 @@ async def test_pipeline_runs_tool_loop_and_emits_lifecycle_events() -> None:
     assert any(isinstance(event, ToolCallCompleted) for event in seen)
     assert any(isinstance(event, StreamDeltaReady) for event in seen)
     assert provider.messages[1][-1]["role"] == "tool"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_snapshot_tracks_running_and_completed_tool_state() -> None:
+    tool = BlockingEchoTool()
+    tools = ToolRegistry()
+    tools.register(tool)
+    events = EventBus()
+    pipeline = Pipeline(
+        BlockingProvider(),
+        tools,
+        events,
+        PromptAssembler(SystemPromptBuilder(default_prompt_blocks(), SectionCache()), MessageEnvelopeBuilder()),
+        workspace="D:/workspace",
+    )
+    started_snapshot: list[dict] = []
+    completed_snapshot: list[dict] = []
+
+    async def on_started(event: ToolCallStarted) -> None:
+        started_snapshot.extend(pipeline.snapshot_interrupt_state("turn-running-tool").get("tools", []))
+        tool.release.set()
+
+    async def on_completed(event: ToolCallCompleted) -> None:
+        completed_snapshot.extend(pipeline.snapshot_interrupt_state("turn-running-tool").get("tools", []))
+
+    events.on(ToolCallStarted, on_started)
+    events.on(ToolCallCompleted, on_completed)
+
+    result = await pipeline.process(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="run"),
+        turn_id="turn-running-tool",
+    )
+
+    assert result.content == "done"
+    assert started_snapshot == [{
+        "call_id": "call-1",
+        "name": "blocking_echo",
+        "arguments": {"text": "hi"},
+        "status": "running",
+        "result_preview": "",
+    }]
+    assert completed_snapshot == [{
+        "call_id": "call-1",
+        "name": "blocking_echo",
+        "arguments": {"text": "hi"},
+        "status": "completed",
+        "result_preview": "blocked:hi:web:c",
+    }]
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,23 @@ class Interrupt:
         return InterruptResult("idle", "")
 
 
+class SnapshotInterrupt(Interrupt):
+    def get_active_turn_snapshot(self, session_key: str) -> dict | None:
+        if session_key != "web:chat":
+            return None
+        return {
+            "session_id": "web:chat",
+            "turn_id": "turn-1",
+            "request_id": "r1",
+            "user_message": "read it",
+            "user_media": [],
+            "content": "partial",
+            "thinking": "thinking",
+            "tools": [],
+            "status": "running",
+        }
+
+
 class Socket:
     def __init__(self) -> None:
         self.frames: list[dict] = []
@@ -51,6 +68,38 @@ async def test_web_channel_rejects_media_outside_upload_root(tmp_path: Path) -> 
 
     assert socket.frames[-1]["code"] == "invalid_media"
     assert bus._inbound.empty()
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_session_subscribe_replays_active_turn_snapshot() -> None:
+    bus = MessageBus()
+    channel = WebChannel(bus, EventBus(), SnapshotInterrupt())
+    socket = Socket()
+
+    await channel.handle_frame(socket, {
+        "type": "session.subscribe",
+        "request_id": "subscribe",
+        "session_id": "web:chat",
+    })
+
+    assert socket.frames[0] == {
+        "type": "session.subscribed",
+        "request_id": "subscribe",
+        "session_id": "web:chat",
+    }
+    assert socket.frames[1] == {
+        "type": "turn.snapshot",
+        "session_id": "web:chat",
+        "turn_id": "turn-1",
+        "request_id": "r1",
+        "user_message": "read it",
+        "user_media": [],
+        "content": "partial",
+        "thinking": "thinking",
+        "tools": [],
+        "status": "running",
+    }
     await channel.close()
 
 

@@ -262,6 +262,70 @@ async def test_interrupt_defers_persistence_until_next_message_and_preserves_too
 
 
 @pytest.mark.asyncio
+async def test_active_turn_snapshot_exports_running_state_for_resubscribe(tmp_path: Path) -> None:
+    class BlockingPipeline:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def process(self, message, *, turn_id):
+            self.started.set()
+            await asyncio.Event().wait()
+
+        def snapshot_interrupt_state(self, turn_id: str):
+            return {
+                "partial_reply": "partial answer",
+                "partial_thinking": "partial thinking",
+                "tools": [
+                    {
+                        "call_id": "call-1",
+                        "name": "read_file",
+                        "arguments": {"path": "README.md"},
+                        "status": "completed",
+                        "result_preview": "project docs",
+                    }
+                ],
+            }
+
+        def discard_interrupt_snapshot(self, turn_id: str) -> None:
+            pass
+
+    bus = MessageBus()
+    sessions = SessionManager(tmp_path)
+    pipeline = BlockingPipeline()
+    loop = AgentLoop(bus, EventBus(), pipeline, sessions)
+    await bus.publish_inbound(
+        InboundMessage(
+            channel="web",
+            sender="u",
+            chat_id="c",
+            content="read it",
+            media=["D:/tmp/a.png"],
+            metadata={"request_id": "r1"},
+        )
+    )
+    running = asyncio.create_task(loop.run_once())
+    await pipeline.started.wait()
+
+    try:
+        snapshot = loop.get_active_turn_snapshot("web:c")
+        assert snapshot is not None
+        assert snapshot["session_id"] == "web:c"
+        assert snapshot["turn_id"]
+        assert snapshot["request_id"] == "r1"
+        assert snapshot["user_message"] == "read it"
+        assert snapshot["user_media"] == ["D:/tmp/a.png"]
+        assert snapshot["content"] == "partial answer"
+        assert snapshot["thinking"] == "partial thinking"
+        assert snapshot["tools"][0]["status"] == "completed"
+        assert snapshot["status"] == "running"
+    finally:
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        await sessions.close()
+
+
+@pytest.mark.asyncio
 async def test_expired_interrupt_state_is_discarded_without_marker(tmp_path: Path) -> None:
     bus = MessageBus()
     sessions = SessionManager(tmp_path)

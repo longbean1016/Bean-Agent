@@ -154,6 +154,66 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       messages: sessionMessages,
     };
   }
+  if (action.type === "turn.snapshot") {
+    const current = action.session_id === state.sessionId;
+    const turnStates = setTurnState(state, action.session_id, {
+      status: "running",
+      queuePosition: null,
+      turnId: action.turn_id,
+      requestId: action.request_id ?? "",
+    });
+    const source = getSessionMessages(state, action.session_id);
+    const userId = action.request_id ? `user-${action.request_id}` : `user-${action.turn_id}`;
+    const user: ChatMessage = {
+      id: userId,
+      role: "user",
+      content: action.user_message,
+      thinking: "",
+      media: action.user_media ?? [],
+      tools: [],
+      turnId: action.turn_id,
+      streaming: false,
+    };
+    const incomingTools = action.tools.map((tool) => ({
+      callId: tool.call_id,
+      name: tool.name,
+      status: tool.status === "error" ? "error" as const : tool.status === "running" ? "running" as const : "completed" as const,
+      arguments: tool.arguments,
+      resultPreview: tool.result_preview,
+    }));
+    const existingUser = source.find((message) => (
+      message.role === "user" && (message.turnId === action.turn_id || message.id === userId)
+    ));
+    const existingAssistant = source.find((message) => message.role === "assistant" && message.turnId === action.turn_id);
+    const assistant: ChatMessage = {
+      ...(existingAssistant ?? createDraft(action.turn_id)),
+      id: action.turn_id,
+      turnId: action.turn_id,
+      role: "assistant",
+      content: longestText(existingAssistant?.content ?? "", action.content ?? ""),
+      thinking: longestText(existingAssistant?.thinking ?? "", action.thinking ?? ""),
+      media: existingAssistant?.media ?? [],
+      tools: mergeTools(existingAssistant?.tools ?? [], incomingTools),
+      streaming: true,
+    };
+    const withoutTurn = source.filter((message) => message.turnId !== action.turn_id && message.id !== userId);
+    const restoredUser = existingUser ? {
+      ...existingUser,
+      content: existingUser.content || user.content,
+      media: existingUser.media.length ? existingUser.media : user.media,
+      turnId: action.turn_id,
+      streaming: false,
+    } : user;
+    const messages = [...withoutTurn, restoredUser, assistant];
+    return {
+      ...state,
+      activeTurnId: current ? action.turn_id : state.activeTurnId,
+      turnStates,
+      messages: current ? messages : state.messages,
+      sessionMessages: setSessionMessages(state, action.session_id, messages),
+      error: current ? "" : state.error,
+    };
+  }
   if (action.type === "answer.delta") {
     return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
       ...message,
@@ -171,23 +231,25 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
   if (action.type === "react.tool.started") {
     return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
       ...message,
-      tools: [...message.tools, {
+      tools: mergeTools(message.tools, [{
         callId: action.call_id,
         name: action.tool_name,
         status: "running",
         arguments: action.arguments,
         resultPreview: "",
-      }],
+      }]),
     }));
   }
   if (action.type === "react.tool.completed") {
     return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
       ...message,
-      tools: message.tools.map((tool) => tool.callId === action.call_id ? {
-        ...tool,
+      tools: mergeTools(message.tools, [{
+        callId: action.call_id,
+        name: action.tool_name,
         status: action.status === "error" ? "error" : "completed",
+        arguments: undefined,
         resultPreview: action.result_preview,
-      } : tool),
+      }]),
     }));
   }
   if (action.type === "message.final") {
@@ -269,6 +331,32 @@ function setSessionMessages(
   return { ...state.sessionMessages, [sessionId]: messages };
 }
 
+function longestText(current: string, incoming: string): string {
+  return current.length > incoming.length ? current : incoming;
+}
+
+function mergeTools(current: ToolActivity[], incoming: ToolActivity[]): ToolActivity[] {
+  const merged = [...current];
+  for (const tool of incoming) {
+    const index = merged.findIndex((item) => item.callId === tool.callId);
+    if (index < 0) {
+      merged.push(tool);
+      continue;
+    }
+    const existing = merged[index];
+    if ((existing.status === "completed" || existing.status === "error") && tool.status === "running") {
+      continue;
+    }
+    merged[index] = {
+      ...existing,
+      ...tool,
+      arguments: tool.arguments === undefined ? existing.arguments : tool.arguments,
+      resultPreview: tool.resultPreview || existing.resultPreview,
+    };
+  }
+  return merged;
+}
+
 function updateSessionTurn(
   state: ChatState,
   sessionId: string,
@@ -276,7 +364,7 @@ function updateSessionTurn(
   updater: (message: ChatMessage) => ChatMessage,
 ): ChatState {
   const source = getSessionMessages(state, sessionId);
-  const index = source.findIndex((message) => message.turnId === turnId);
+  const index = source.findIndex((message) => message.role === "assistant" && message.turnId === turnId);
   if (index < 0) return state;
   const messages = [...source];
   messages[index] = updater(messages[index]);

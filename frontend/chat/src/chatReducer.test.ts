@@ -77,6 +77,140 @@ describe("reduceChatFrame", () => {
     });
   });
 
+  it("turn snapshot 在刷新后重建用户消息和流式草稿", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "ui.session.select",
+      sessionId: "web:one",
+      messages: [],
+    });
+
+    state = reduceChatFrame(state, {
+      type: "turn.snapshot",
+      session_id: "web:one",
+      turn_id: "turn-1",
+      request_id: "r1",
+      user_message: "读取项目",
+      user_media: ["D:/tmp/a.png"],
+      content: "已经读到",
+      thinking: "正在分析",
+      tools: [{
+        call_id: "call-1",
+        name: "read_file",
+        status: "completed",
+        arguments: { path: "README.md" },
+        result_preview: "project docs",
+      }],
+      status: "running",
+    });
+    state = reduceChatFrame(state, {
+      type: "answer.delta",
+      session_id: "web:one",
+      turn_id: "turn-1",
+      delta: "更多",
+    });
+
+    expect(state.activeTurnId).toBe("turn-1");
+    expect(state.turnStates["web:one"]).toMatchObject({ status: "running", turnId: "turn-1", requestId: "r1" });
+    expect(state.messages).toHaveLength(2);
+    expect(state.messages[0]).toMatchObject({
+      id: "user-r1",
+      role: "user",
+      content: "读取项目",
+      media: ["D:/tmp/a.png"],
+      turnId: "turn-1",
+    });
+    expect(state.messages[1]).toMatchObject({
+      id: "turn-1",
+      role: "assistant",
+      content: "已经读到更多",
+      thinking: "正在分析",
+      streaming: true,
+      tools: [{ callId: "call-1", status: "completed", resultPreview: "project docs" }],
+    });
+  });
+
+  it("turn snapshot 会复用已有乐观用户消息", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "ui.user.append",
+      message: {
+        id: "user-r1",
+        role: "user",
+        content: "读取项目",
+        thinking: "",
+        media: [],
+        tools: [],
+      },
+    });
+
+    state = reduceChatFrame(state, {
+      type: "turn.snapshot",
+      session_id: "web:one",
+      turn_id: "turn-1",
+      request_id: "r1",
+      user_message: "读取项目",
+      user_media: [],
+      content: "已经读到",
+      thinking: "",
+      tools: [],
+      status: "running",
+    });
+
+    expect(state.messages.filter((message) => message.role === "user")).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({ id: "user-r1", turnId: "turn-1" });
+  });
+
+  it("turn snapshot 不会把已完成工具降级为运行中", () => {
+    let state = reduceChatFrame(initialChatState, {
+      type: "turn.started",
+      request_id: "r1",
+      session_id: "web:one",
+      turn_id: "turn-1",
+    });
+    state = reduceChatFrame(state, {
+      type: "react.tool.started",
+      session_id: "web:one",
+      turn_id: "turn-1",
+      call_id: "call-1",
+      tool_name: "read_file",
+      arguments: { path: "README.md" },
+    });
+    state = reduceChatFrame(state, {
+      type: "react.tool.completed",
+      session_id: "web:one",
+      turn_id: "turn-1",
+      call_id: "call-1",
+      tool_name: "read_file",
+      status: "ok",
+      result_preview: "done",
+    });
+
+    state = reduceChatFrame(state, {
+      type: "turn.snapshot",
+      session_id: "web:one",
+      turn_id: "turn-1",
+      request_id: "r1",
+      user_message: "读取",
+      user_media: [],
+      content: "",
+      thinking: "",
+      tools: [{
+        call_id: "call-1",
+        name: "read_file",
+        status: "running",
+        arguments: { path: "README.md" },
+        result_preview: "",
+      }],
+      status: "running",
+    });
+
+    const assistant = state.messages.find((message) => message.role === "assistant");
+    expect(assistant?.tools[0]).toMatchObject({
+      callId: "call-1",
+      status: "completed",
+      resultPreview: "done",
+    });
+  });
+
   it("按 session 保存排队位置并在切换会话后保留", () => {
     const current = { ...initialChatState, sessionId: "web:current" };
     const queued = reduceChatFrame(current, {

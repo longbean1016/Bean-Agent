@@ -46,6 +46,7 @@ class TurnInterruptState:
 
     session_key: str
     original_user_message: str
+    original_media: list[str] = field(default_factory=list)
     original_metadata: dict[str, Any] = field(default_factory=dict)
     partial_reply: str = ""
     partial_thinking: str | None = None
@@ -129,6 +130,7 @@ class AgentLoop:
         self._active_turn_states[message.session_key] = TurnInterruptState(
             session_key=message.session_key,
             original_user_message=message.content,
+            original_media=list(message.media),
             original_metadata=dict(message.metadata),
         )
         self._active_tasks[message.session_key] = task
@@ -283,6 +285,7 @@ class AgentLoop:
             self.interrupt_states[session_key] = TurnInterruptState(
                 session_key=session_key,
                 original_user_message=state.original_user_message,
+                original_media=list(state.original_media),
                 original_metadata=dict(state.original_metadata),
                 partial_reply=str(snapshot.get("partial_reply") or ""),
                 partial_thinking=str(snapshot.get("partial_thinking") or "") or None,
@@ -291,6 +294,39 @@ class AgentLoop:
             )
         result = await self._scheduler.cancel(session_key)
         return InterruptResult(result.status, session_key, turn_id)
+
+    def get_active_turn_snapshot(self, session_key: str) -> dict[str, Any] | None:
+        """导出正在运行的 Turn 快照，供 WebSocket 刷新/重连后按 session 补发。"""
+
+        task = self._active_tasks.get(session_key)
+        turn_id = self._active_turn_ids.get(session_key, "")
+        state = self._active_turn_states.get(session_key)
+        if task is None or task.done() or state is None or not turn_id:
+            return None
+        snapshotter = getattr(self._pipeline, "snapshot_interrupt_state", None)
+        snapshot = snapshotter(turn_id) if callable(snapshotter) else {}
+        tools = [
+            {
+                "call_id": str(tool.get("call_id") or ""),
+                "name": str(tool.get("name") or "tool"),
+                "arguments": dict(tool.get("arguments") or {}),
+                "status": _normalize_snapshot_tool_status(tool.get("status")),
+                "result_preview": str(tool.get("result_preview") or ""),
+            }
+            for tool in snapshot.get("tools") or []
+            if isinstance(tool, dict)
+        ]
+        return {
+            "session_id": session_key,
+            "turn_id": turn_id,
+            "request_id": str(state.original_metadata.get("request_id") or ""),
+            "user_message": state.original_user_message,
+            "user_media": list(state.original_media),
+            "content": str(snapshot.get("partial_reply") or ""),
+            "thinking": str(snapshot.get("partial_thinking") or ""),
+            "tools": tools,
+            "status": "running",
+        }
 
     def stop(self) -> None:
         self._running = False
@@ -306,6 +342,15 @@ class AgentLoop:
         discarded = await self._bus.discard_pending_inbound()
         for message in discarded:
             self._finish_waiter(message)
+
+
+def _normalize_snapshot_tool_status(value: object) -> str:
+    text = str(value or "").strip()
+    if text == "error":
+        return "error"
+    if text == "running":
+        return "running"
+    return "completed"
 
 
 __all__ = ["AgentLoop", "InterruptResult", "TurnInterruptState"]
