@@ -379,6 +379,24 @@ class SessionStore:
         total = int((count_row["count"] if count_row else 0) or 0)
         return [self._row_to_message(row) for row in rows], total
 
+    def get_last_chat_message_timestamp(self, session_key: str) -> str | None:
+        """Return the last user/assistant message timestamp for proactive idle checks."""
+
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                """
+                SELECT ts
+                FROM messages
+                WHERE session_key = ? AND role IN ('user', 'assistant')
+                ORDER BY seq DESC
+                LIMIT 1
+                """,
+                (key,),
+            ).fetchone()
+        return str(row["ts"]) if row is not None else None
+
     def set_cursor(self, session_key: str, value: int) -> None:
         """设置该会话已完成记忆归档的消息序号。"""
 

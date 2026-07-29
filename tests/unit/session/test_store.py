@@ -513,6 +513,23 @@ def test_list_chat_messages_returns_persisted_frontend_fields(
     assert items[0]["media"] == ["D:/workspace/uploads/image.png"]
 
 
+def test_last_chat_message_timestamp_uses_messages_not_session_updated_at(
+    store: SessionStore,
+) -> None:
+    first = store.add_message(
+        NewMessage(session_key="web:chat-1", role="user", content="first")
+    )
+    second = store.add_message(
+        NewMessage(session_key="web:chat-1", role="assistant", content="second")
+    )
+
+    store.set_cursor("web:chat-1", 99)
+
+    assert store.get_last_chat_message_timestamp("web:chat-1") == second["timestamp"]
+    assert store.get_last_chat_message_timestamp("web:missing") is None
+    assert first["timestamp"] != second["timestamp"] or second["timestamp"]
+
+
 @pytest.mark.asyncio
 async def test_add_message_rejects_invalid_role(store: SessionStore) -> None:
     with pytest.raises(ValueError, match="role"):

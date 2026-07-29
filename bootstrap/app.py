@@ -332,7 +332,7 @@ def build_core_runtime(
     )
     proactive_turns = ProactiveTurnService(proactive_store, sessions, messages)
     proactive_notifications = NotificationService(proactive_store, messages)
-    proactive_tools = ProactiveToolFactory(sessions.store, memory, tools)
+    proactive_tools = ProactiveToolFactory(sessions.store, memory, tools, skills, workspace=str(root))
     soft_executor = SoftTaskExecutor(pipeline)
     scheduler = SchedulerService(
         proactive_store,

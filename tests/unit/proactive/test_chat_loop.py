@@ -123,6 +123,9 @@ class _CompletedSessionStore:
     def get_session_meta(self, session_key: str):
         return {"key": session_key, "updated_at": "2026-07-20T00:00:00+00:00"}
 
+    def get_last_chat_message_timestamp(self, session_key: str):
+        return "2026-07-20T09:00:00+00:00"
+
     def list_chat_messages(self, session_key: str, *, limit: int, offset: int):
         return self.rows[offset:offset + limit], len(self.rows)
 
@@ -138,21 +141,30 @@ class _Memory:
 class _ToolProvider:
     def __init__(self) -> None:
         self.calls = 0
+        self.received_messages: list[list[dict]] = []
 
     async def complete(self, messages, tools=None, **kwargs):
         self.calls += 1
+        self.received_messages.append(list(messages))
         if self.calls == 1:
-            calls = [ToolCall("c1", "get_recent_chat", {"limit": 20})]
+            calls = [
+                ToolCall("c1", "finish_turn", {
+                    "decision": "reply",
+                    "message": "周末想不想去走走？",
+                    "topic": "徒步",
+                    "reason": "用户近期表达了兴趣",
+                })
+            ]
         elif self.calls == 2:
             calls = [ToolCall("c2", "recall_memory", {"query": "徒步兴趣", "limit": 2})]
         else:
             calls = [
-                ToolCall("c3", "message_push", {
+                ToolCall("c3", "finish_turn", {
+                    "decision": "reply",
                     "message": "周末想不想去走走？",
                     "topic": "徒步",
                     "reason": "用户近期表达了兴趣",
                 }),
-                ToolCall("c4", "finish_turn", {"decision": "reply"}),
             ]
         return LLMResponse(None, tool_calls=calls)
 
@@ -194,18 +206,14 @@ async def test_proactive_agent_uses_read_only_tools_and_explicit_reply_finish(
 
     await loop.run_once()
 
-    assert provider.calls == 3
+    assert provider.calls == 1
     assert delivery.items[0]["content"] == "周末想不想去走走？"
     assert delivery.items[0]["source"] == "proactive_conversation"
-    assert [
-        call["name"]
-        for group in delivery.items[0]["tool_chain"]
-        for call in group["calls"]
-    ] == ["recall_memory"]
-    assert delivery.items[0]["tool_chain"][0]["iteration"] == 2
-    assert delivery.items[0]["tool_chain"][0]["text"] == ""
-    assert "provider_fields" not in delivery.items[0]["tool_chain"][0]
-    assert delivery.items[0]["tools_used"] == ["recall_memory"]
+    assert delivery.items[0]["tool_chain"] == []
+    assert delivery.items[0]["tools_used"] == []
+    assert "get_recent_chat" not in str(provider.received_messages[0])
+    assert "message_push" not in str(provider.received_messages[0])
+    assert "最近想去徒步" in str(provider.received_messages[0])
     assert store.get_state("web:a").last_skip_reason == ""
     await loop.close()
     store.close()
@@ -261,18 +269,15 @@ class _CountingProvider:
 
     async def complete(self, messages, tools=None, **kwargs):
         self.calls += 1
-        if self.calls % 2:
-            call = ToolCall(f"c{self.calls}", "get_recent_chat", {"limit": self.calls})
-        else:
-            call = ToolCall(
-                f"c{self.calls}",
-                "recall_memory",
-                {"query": f"topic-{self.calls}", "limit": 1},
-            )
+        call = ToolCall(
+            f"c{self.calls}",
+            "recall_memory",
+            {"query": f"topic-{self.calls}", "limit": 1},
+        )
         return LLMResponse(None, tool_calls=[call])
 
 
-class _DraftWithoutFinishProvider:
+class _ToolThenFinishProvider:
     def __init__(self) -> None:
         self.calls = 0
         self.received_messages: list[list[dict]] = []
@@ -281,14 +286,14 @@ class _DraftWithoutFinishProvider:
         self.calls += 1
         self.received_messages.append(list(messages))
         if self.calls == 1:
-            calls = [ToolCall("c1", "get_recent_chat", {"limit": 20})]
-        elif self.calls == 2:
-            calls = [ToolCall("c2", "message_push", {
-                "message": "A useful follow-up",
-                "topic": "interview",
-            })]
+            calls = [ToolCall("c1", "recall_memory", {"query": "面试计划", "limit": 1})]
         else:
-            calls = [ToolCall("c3", "finish_turn", {"decision": "reply"})]
+            calls = [ToolCall("c2", "finish_turn", {
+                "decision": "reply",
+                "message": "今天要不要把面试复盘里最薄弱的一项先拆出来？",
+                "topic": "面试复盘",
+                "reason": "用户近期持续推进面试准备",
+            })]
         return LLMResponse(None, tool_calls=calls)
 
 
@@ -299,7 +304,7 @@ class _RepeatedCallProvider:
     async def complete(self, messages, tools=None, **kwargs):
         self.calls += 1
         return LLMResponse(None, tool_calls=[
-            ToolCall(f"c{self.calls}", "get_recent_chat", {"limit": 20}),
+            ToolCall(f"c{self.calls}", "recall_memory", {"query": "same", "limit": 1}),
         ])
 
 
@@ -345,25 +350,25 @@ async def test_proactive_judge_defaults_to_sixteen_tool_steps(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_drafted_message_gets_terminal_correction_after_step_limit(tmp_path) -> None:
-    provider = _DraftWithoutFinishProvider()
-    loop, store = _judge_loop(tmp_path, provider, max_iterations=2)
+async def test_tool_use_can_be_followed_by_single_reply_finish(tmp_path) -> None:
+    provider = _ToolThenFinishProvider()
+    loop, store = _judge_loop(tmp_path, provider, max_iterations=3)
 
     verdict = await loop._judge("web:a", 0.5)
 
     assert verdict["action"] == "reply"
-    assert provider.calls == 3
-    assert "finish_turn" in provider.received_messages[2][-1]["content"]
+    assert provider.calls == 2
+    assert verdict["tools_used"] == ["recall_memory"]
     await loop.close()
     store.close()
 
 
 @pytest.mark.asyncio
 async def test_judge_prompt_allows_value_first_followup_for_ongoing_goal(tmp_path) -> None:
-    provider = _DraftWithoutFinishProvider()
+    provider = _ToolThenFinishProvider()
     loop, store = _judge_loop(tmp_path, provider, max_iterations=2)
 
-    await loop._judge("web:a", 0.5, idle_minutes=180)
+    await loop._judge("web:a", 0.5)
 
     prompt = provider.received_messages[0][0]["content"]
     assert "持续目标" in prompt
@@ -376,7 +381,8 @@ async def test_judge_prompt_allows_value_first_followup_for_ongoing_goal(tmp_pat
     assert "正在忙" in prompt
     assert "应 skip" in prompt
     assert "waiting_for_proactive_reply" not in prompt
-    assert "已空闲 180 分钟" in prompt
+    assert "已空闲" not in prompt
+    assert "发送把握阈值" not in prompt
     await loop.close()
     store.close()
 

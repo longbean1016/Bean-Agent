@@ -1,4 +1,4 @@
-"""主动 Agent 工具白名单、只读上下文与草稿终态协议测试。"""
+"""主动 Agent 工具白名单、只读上下文与终态协议测试。"""
 
 from __future__ import annotations
 
@@ -73,17 +73,14 @@ async def test_proactive_tools_expose_only_allowlist_and_read_interest_memory() 
     tools = ProactiveToolFactory(_Sessions(), memory, registry).create("web:a")
 
     names = {schema["function"]["name"] for schema in tools.schemas()}
-    recent = json.loads(await tools.execute("get_recent_chat", {"limit": 20}))
     recalled = json.loads(await tools.execute(
         "recall_memory", {"query": "徒步兴趣", "limit": 2}
     ))
 
     assert names == {
-        "get_recent_chat", "recall_memory", "read_file", "message_push", "finish_turn"
+        "recall_memory", "read_file", "finish_turn"
     }
     assert "shell" not in names
-    assert len(recent["recent_chat"]) == 2
-    assert len(recent["recent_proactive"]) == 1
     assert recalled["items"][0]["memory_type"] == "preference"
     assert memory.request.intent == "interest"
     assert memory.request.limit == 2
@@ -92,86 +89,36 @@ async def test_proactive_tools_expose_only_allowlist_and_read_interest_memory() 
 
 
 @pytest.mark.asyncio
-async def test_recent_chat_reports_not_waiting_without_proactive_message() -> None:
-    sessions = _SessionRows({"web:a": [
-        {"seq": 1, "role": "user", "content": "准备面试"},
-        {"seq": 2, "role": "assistant", "content": "先整理知识点"},
-    ]})
-    tools = ProactiveToolFactory(sessions, None, ToolRegistry()).create("web:a")
-
-    recent = json.loads(await tools.execute("get_recent_chat", {}))
-
-    assert recent["conversation_state"]["waiting_for_proactive_reply"] is False
-
-
-@pytest.mark.asyncio
-async def test_recent_chat_reports_waiting_when_proactive_message_is_latest() -> None:
-    sessions = _SessionRows({"web:a": [
-        {"seq": 1, "role": "user", "content": "准备面试"},
-        {"seq": 2, "role": "assistant", "content": "给你一道实操题", "proactive": True},
-    ]})
-    tools = ProactiveToolFactory(sessions, None, ToolRegistry()).create("web:a")
-
-    recent = json.loads(await tools.execute("get_recent_chat", {}))
-
-    assert recent["conversation_state"]["waiting_for_proactive_reply"] is True
-
-
-@pytest.mark.asyncio
-async def test_recent_chat_reports_not_waiting_after_user_replies() -> None:
-    sessions = _SessionRows({"web:a": [
-        {"seq": 1, "role": "assistant", "content": "给你一道实操题", "proactive": True},
-        {"seq": 2, "role": "user", "content": "我来试试"},
-        {"seq": 3, "role": "assistant", "content": "可以从冲突策略开始"},
-    ]})
-    tools = ProactiveToolFactory(sessions, None, ToolRegistry()).create("web:a")
-
-    recent = json.loads(await tools.execute("get_recent_chat", {}))
-
-    assert recent["conversation_state"]["waiting_for_proactive_reply"] is False
-
-
-@pytest.mark.asyncio
-async def test_recent_chat_waiting_state_is_isolated_by_session() -> None:
-    sessions = _SessionRows({
-        "web:a": [
-            {"seq": 1, "role": "user", "content": "会话 A"},
-            {"seq": 2, "role": "assistant", "content": "主动跟进 A", "proactive": True},
-        ],
-        "web:b": [
-            {"seq": 1, "role": "assistant", "content": "主动跟进 B", "proactive": True},
-            {"seq": 2, "role": "user", "content": "已回复 B"},
-        ],
-    })
-
-    recent_a = json.loads(await ProactiveToolFactory(
-        sessions, None, ToolRegistry()
-    ).create("web:a").execute("get_recent_chat", {}))
-    recent_b = json.loads(await ProactiveToolFactory(
-        sessions, None, ToolRegistry()
-    ).create("web:b").execute("get_recent_chat", {}))
-
-    assert recent_a["conversation_state"]["waiting_for_proactive_reply"] is True
-    assert recent_b["conversation_state"]["waiting_for_proactive_reply"] is False
-
-
-@pytest.mark.asyncio
-async def test_message_push_requires_single_draft_then_reply_finish() -> None:
+async def test_finish_turn_reply_carries_message_topic_and_reason() -> None:
     tools = ProactiveToolFactory(_Sessions(), None, ToolRegistry()).create("web:a")
 
-    await tools.execute("get_recent_chat", {"limit": 20})
-    await tools.execute("message_push", {
+    result = json.loads(await tools.execute("finish_turn", {
+        "decision": "reply",
         "message": "周末想不想去走走？",
         "topic": "徒步",
         "reason": "用户近期表达了兴趣",
-    })
-    with pytest.raises(ProactiveToolError, match="最多生成一条"):
-        await tools.execute("message_push", {"message": "第二条", "topic": "重复"})
-    with pytest.raises(ProactiveToolError, match="不能再改为 skip"):
-        await tools.execute("finish_turn", {"decision": "skip"})
-    await tools.execute("finish_turn", {"decision": "reply"})
+    }))
 
+    assert result == {"finished": True, "decision": "reply"}
     assert tools.decision is not None
     assert tools.decision.decision == "reply"
     assert tools.decision.message == "周末想不想去走走？"
     assert tools.decision.topic == "徒步"
+    assert tools.decision.reason == "用户近期表达了兴趣"
+
+
+@pytest.mark.asyncio
+async def test_finish_turn_validates_reply_and_skip_shapes() -> None:
+    tools = ProactiveToolFactory(_Sessions(), None, ToolRegistry()).create("web:a")
+
+    with pytest.raises(ProactiveToolError, match="reply 必须包含非空 message、topic 和 reason"):
+        await tools.execute("finish_turn", {"decision": "reply", "message": "hi", "topic": "t"})
+
+    with pytest.raises(ProactiveToolError, match="skip 不允许包含待发送消息"):
+        await tools.execute("finish_turn", {"decision": "skip", "message": "hi", "reason": "no"})
+
+    await tools.execute("finish_turn", {"decision": "skip", "reason": "没有合适话题"})
+
+    assert tools.decision is not None
+    assert tools.decision.decision == "skip"
+    assert tools.decision.reason == "没有合适话题"
