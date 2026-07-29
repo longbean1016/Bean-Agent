@@ -203,22 +203,90 @@ class MemoryStore2:
         return [self.vector_search(vector, **kwargs) for vector in vectors]
 
     def keyword_search_summary(self, terms: list[str], memory_types: list[str] | None = None, limit: int = 20, time_start: datetime | None = None, time_end: datetime | None = None, scope_channel: str | None = None, scope_chat_id: str | None = None, require_scope_match: bool = False) -> list[dict[str, object]]:
+        """使用 SQLite OR-LIKE 检索摘要，并按关键词覆盖率排序。"""
+
         clean_terms = [str(term).strip() for term in terms if len(str(term).strip()) >= 2]
         if not clean_terms:
             return []
-        hits: list[dict[str, object]] = []
-        for row in self._active_rows(memory_types):
-            item = self._row_to_item(row)
-            if not _scope_matches(item, scope_channel, scope_chat_id, require_scope_match) or not _time_matches(item, time_start, time_end):
-                continue
-            summary = str(item["summary"]).lower()
-            count = sum(term.lower() in summary for term in clean_terms)
-            if count:
-                item.pop("embedding", None)
-                item["keyword_score"] = count / len(clean_terms)
-                hits.append(item)
-        hits.sort(key=lambda value: (-float(value["keyword_score"]), -int(value["reinforcement"]), str(value["id"])))
-        return hits[: max(1, int(limit))]
+        actual_limit = max(1, int(limit))
+
+        type_filter = ""
+        type_params: list[object] = []
+        if memory_types:
+            placeholders = ",".join("?" for _ in memory_types)
+            type_filter = f" AND memory_type IN ({placeholders})"
+            type_params.extend(memory_types)
+
+        scope_filter = ""
+        scope_params: list[object] = []
+        if require_scope_match:
+            scope_filter = (
+                " AND COALESCE(TRIM(json_extract(extra_json, '$.scope_channel')), '') = ?"
+                " AND COALESCE(TRIM(json_extract(extra_json, '$.scope_chat_id')), '') = ?"
+            )
+            scope_params.extend([
+                str(scope_channel or "").strip(),
+                str(scope_chat_id or "").strip(),
+            ])
+
+        conditions = " OR ".join("summary LIKE ?" for _ in clean_terms)
+        score_expression = " + ".join(
+            "(CASE WHEN summary LIKE ? THEN 1 ELSE 0 END)"
+            for _ in clean_terms
+        )
+        like_values = [f"%{term}%" for term in clean_terms]
+        has_time_filter = time_start is not None or time_end is not None
+        batch_size = max(actual_limit, 1000) if has_time_filter else actual_limit
+        sql = (
+            "SELECT id,memory_type,summary,reinforcement,emotional_weight,"
+            "extra_json,source_ref,happened_at,status,created_at,updated_at,"
+            f"({score_expression}) AS keyword_hits "
+            "FROM memory_items "
+            f"WHERE status='active' AND ({conditions}){type_filter}{scope_filter} "
+            "ORDER BY keyword_hits DESC,reinforcement DESC,id ASC "
+            "LIMIT ? OFFSET ?"
+        )
+
+        results: list[dict[str, object]] = []
+        offset = 0
+        with self._lock:
+            self._ensure_open()
+            while True:
+                params: list[object] = [
+                    *like_values,
+                    *like_values,
+                    *type_params,
+                    *scope_params,
+                    batch_size,
+                    offset,
+                ]
+                rows = self._db.execute(sql, params).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    item: dict[str, object] = {
+                        "id": str(row["id"]),
+                        "memory_type": str(row["memory_type"]),
+                        "summary": str(row["summary"]),
+                        "reinforcement": int(row["reinforcement"]),
+                        "emotional_weight": int(row["emotional_weight"]),
+                        "extra_json": json.loads(row["extra_json"] or "{}"),
+                        "source_ref": str(row["source_ref"] or ""),
+                        "happened_at": str(row["happened_at"] or ""),
+                        "status": str(row["status"]),
+                        "created_at": str(row["created_at"]),
+                        "updated_at": str(row["updated_at"]),
+                        "keyword_score": float(row["keyword_hits"]) / len(clean_terms),
+                    }
+                    if not _time_matches(item, time_start, time_end):
+                        continue
+                    results.append(item)
+                    if len(results) >= actual_limit:
+                        return results
+                if not has_time_filter or len(rows) < batch_size:
+                    break
+                offset += batch_size
+        return results
 
     def list_events_by_time_range(
         self,

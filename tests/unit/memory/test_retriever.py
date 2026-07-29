@@ -82,5 +82,24 @@ async def test_business_timeout_returns_available_keyword_results() -> None:
     assert {item["id"] for item in items} == {"both", "keyword"}
 
 
-def test_extract_query_terms_contains_cjk_bigrams_and_ascii_tokens() -> None:
-    assert extract_query_terms("上海 Python asyncio") == ["上海", "Python", "asyncio"]
+def test_extract_query_terms_matches_default_memory_tokenization() -> None:
+    assert extract_query_terms(
+        "准备面试 长期记忆检索 Python Charge-6 用户"
+    ) == [
+        "Python",
+        "Charge-6",
+        "准备面试",
+        "长期",
+        "期记",
+        "记忆",
+        "忆检",
+        "检索",
+    ]
+
+
+def test_extract_query_terms_deduplicates_and_limits_results() -> None:
+    query = " ".join(["token0", "token0", *(f"token{index}" for index in range(1, 25))])
+
+    terms = extract_query_terms(query)
+
+    assert terms == [f"token{index}" for index in range(20)]

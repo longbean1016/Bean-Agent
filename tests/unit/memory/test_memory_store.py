@@ -38,6 +38,50 @@ def test_vector_and_keyword_search_enforce_scope(store: MemoryStore2) -> None:
     assert [item["source_ref"] for item in keyword] == ["web:b:0"]
 
 
+def test_keyword_search_filters_and_scores_in_sql(
+    store: MemoryStore2,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stronger = store.upsert_item(
+        "profile",
+        "用户使用 Fitbit Charge-6 跑步",
+        [1.0, 0.0, 0.0],
+        "web:a:0",
+        extra={"scope_channel": "web", "scope_chat_id": "a"},
+    ).split(":", 1)[1]
+    weaker = store.upsert_item(
+        "profile",
+        "用户使用 Fitbit 记录运动",
+        [0.0, 1.0, 0.0],
+        "web:a:1",
+        extra={"scope_channel": "web", "scope_chat_id": "a"},
+    ).split(":", 1)[1]
+    store.upsert_item(
+        "event",
+        "购买 Fitbit Charge-6",
+        [0.0, 0.0, 1.0],
+        "web:a:2",
+        extra={"scope_channel": "web", "scope_chat_id": "a"},
+    )
+
+    def fail_full_scan(*args: object, **kwargs: object) -> list[object]:
+        raise AssertionError("关键词查询不应加载全部 active rows")
+
+    monkeypatch.setattr(store, "_active_rows", fail_full_scan)
+
+    items = store.keyword_search_summary(
+        ["Fitbit", "Charge-6"],
+        memory_types=["profile"],
+        scope_channel="web",
+        scope_chat_id="a",
+        require_scope_match=True,
+    )
+
+    assert [item["id"] for item in items] == [stronger, weaker]
+    assert [item["keyword_score"] for item in items] == [1.0, 0.5]
+    assert items[0]["extra_json"]["scope_chat_id"] == "a"
+
+
 def test_soft_delete_removes_item_from_search_but_keeps_audit_row(store: MemoryStore2) -> None:
     result = store.upsert_item("profile", "用户是开发者", [0.0, 1.0, 0.0], "web:c:2")
     item_id = result.split(":", 1)[1]

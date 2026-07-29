@@ -12,9 +12,15 @@ from memory.store import MemoryStore2
 
 logger = logging.getLogger(__name__)
 
-_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff]+")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff]{2,}")
 _ASCII_RE = re.compile(r"[a-zA-Z0-9_\-.]{2,}")
-_STOPWORDS = {"这个", "那个", "我们", "你们", "他们", "什么", "怎么"}
+_STOPWORDS = {
+    "用户", "助手", "我们", "他们", "这个", "那个", "什么", "如何", "是否",
+    "有没", "没有", "有过", "做过", "进行", "完成", "包括", "通过", "实现",
+    "行为", "内容", "相关", "情况", "问题", "方式", "时候", "时间", "目前",
+    "当前", "最近", "之前", "以前", "后来", "然后", "因为", "所以", "但是",
+    "用户在", "用户对", "的行为吗", "进行了",
+}
 
 
 class EmbeddingApi(Protocol):
@@ -120,14 +126,21 @@ class Retriever:
 
 
 def extract_query_terms(query: str) -> list[str]:
-    """提取 CJK bigram 与 ASCII token，并按首次出现顺序去重。"""
+    """提取短 CJK 片段、长片段 bigram 与 ASCII token。"""
 
-    values: list[str] = []
+    values = _ASCII_RE.findall(str(query))
     for match in _CJK_RE.finditer(str(query)):
         sequence = match.group()
-        values.extend(sequence[index:index + 2] for index in range(len(sequence) - 1))
-    values.extend(_ASCII_RE.findall(str(query)))
-    return [value for value in _dedupe(values) if value not in _STOPWORDS]
+        if len(sequence) <= 4:
+            if sequence not in _STOPWORDS:
+                values.append(sequence)
+            continue
+        values.extend(
+            sequence[index:index + 2]
+            for index in range(len(sequence) - 1)
+            if sequence[index:index + 2] not in _STOPWORDS
+        )
+    return _dedupe(values)[:20]
 
 
 def rrf_merge(vector_hits: list[dict[str, object]], keyword_hits: list[dict[str, object]], *, top_n: int = 8, k: int = 60, keyword_weight: float = 0.5) -> list[dict[str, object]]:
