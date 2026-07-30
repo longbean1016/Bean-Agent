@@ -49,6 +49,49 @@ class Socket:
 
 
 @pytest.mark.asyncio
+async def test_message_send_publishes_session_title_update_before_turn_runs() -> None:
+    bus = MessageBus()
+    titles: list[tuple[str, str, list[str]]] = []
+
+    async def ensure_title(session_key: str, content: str, media: list[str]) -> dict:
+        titles.append((session_key, content, media))
+        return {
+            "key": session_key,
+            "title": "first question title",
+            "first_message_content": "",
+            "message_count": 0,
+            "created_at": "2026-07-30T12:00:00+08:00",
+            "updated_at": "2026-07-30T12:00:00+08:00",
+        }
+
+    channel = WebChannel(bus, EventBus(), Interrupt(), ensure_session_title=ensure_title)
+    socket = Socket()
+
+    await channel.handle_frame(socket, {
+        "type": "message.send",
+        "request_id": "r-title",
+        "session_id": "web:chat",
+        "text": "first question title",
+        "media": [],
+    })
+
+    assert titles == [("web:chat", "first question title", [])]
+    assert socket.frames[-1] == {
+        "type": "session.updated",
+        "session": {
+            "key": "web:chat",
+            "title": "first question title",
+            "first_message_content": "",
+            "message_count": 0,
+            "created_at": "2026-07-30T12:00:00+08:00",
+            "updated_at": "2026-07-30T12:00:00+08:00",
+        },
+    }
+    assert not bus._inbound.empty()
+    await channel.close()
+
+
+@pytest.mark.asyncio
 async def test_web_channel_rejects_media_outside_upload_root(tmp_path: Path) -> None:
     upload_root = tmp_path / "uploads"
     upload_root.mkdir()

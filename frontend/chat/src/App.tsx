@@ -39,14 +39,11 @@ import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
 import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupSessionsByUpdatedAt } from "./sessionGroups";
-import type { ChatFrame, ChatMessage, ConnectionStatus, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity, TurnRuntimeState } from "./types";
+import type { ChatFrame, ChatMessage, ConnectionStatus, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity } from "./types";
 import { groupMessagesIntoNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
 
 const SESSION_STORAGE_KEY = "beanagent.session_id";
-const RUNNING_DRAFT_PREFIX = "beanagent.running_draft:";
-const RUNNING_DRAFT_VERSION = 1;
-const RUNNING_DRAFT_TTL_MS = 6 * 60 * 60 * 1000;
 const THEME_STORAGE_KEY = "beanagent.theme";
 const MAX_ATTACHMENTS = 8;
 const MAX_TEXT_ATTACHMENT_SIZE = 2 * 1024 * 1024;
@@ -66,14 +63,6 @@ const ATTACHMENT_ACCEPT = [
   ...TEXT_SUFFIXES,
 ].join(",");
 type ThemePreference = "light" | "system" | "dark";
-interface RunningDraftCache {
-  version: number;
-  sessionId: string;
-  activeTurnId: string;
-  messages: ChatMessage[];
-  turnState: TurnRuntimeState;
-  savedAt: number;
-}
 const markdownPlugins = { code, renderers: [{ language: "mermaid", component: MermaidBlock }] };
 const markdownComponents = { inlineCode: MemoryInlineCode };
 const markdownControls = {
@@ -149,18 +138,14 @@ function containsClosedMermaidFence(markdown: string): boolean {
 export function App() {
   const initialRouteSession = sessionFromPath(window.location.pathname);
   const initialSession = initialRouteSession || readStoredSession();
-  const initialDraft = initialSession ? readRunningDraft(initialSession) : null;
   const [chat, dispatch] = useReducer(reduceChatFrame, {
     ...initialChatState,
     sessionId: initialSession,
-    activeTurnId: initialDraft?.activeTurnId ?? "",
-    messages: initialDraft?.messages ?? [],
-    sessionMessages: initialDraft ? { [initialSession]: initialDraft.messages } : {},
-    turnStates: initialDraft ? { [initialSession]: initialDraft.turnState } : {},
   });
   const [routeSession, setRouteSession] = useState(initialSession);
   const [connection, setConnection] = useState<ConnectionStatus>("connecting");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [loadingSessionId, setLoadingSessionId] = useState(initialSession);
   const [input, setInput] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [textDrafts, setTextDrafts] = useState<Record<string, string>>({});
@@ -178,6 +163,7 @@ export function App() {
   routeSessionRef.current = routeSession;
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
   const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running";
+  const restoringSession = Boolean(chat.sessionId && loadingSessionId === chat.sessionId && chat.messages.length === 0);
   const conversationTurns = useMemo(() => turnsFromMessages(chat.messages), [chat.messages]);
   const conversationTurnGroups = useMemo(() => groupMessagesIntoNavigationTurns(chat.messages), [chat.messages]);
 
@@ -227,8 +213,8 @@ export function App() {
     if (frame.type === "session.created") {
       localStorage.setItem(SESSION_STORAGE_KEY, frame.session_id);
     }
-    if (frame.type === "message.final" || frame.type === "turn.interrupted") {
-      clearRunningDraft(frame.session_id);
+    if (frame.type === "session.updated") {
+      setSessions((current) => upsertSessionSummary(current, frame.session));
     }
     if (frame.type === "turn.started") {
       // 收到后端接收确认后立即提升已有会话；最终提交后再通过列表接口校准持久化时间。
@@ -241,20 +227,6 @@ export function App() {
     }
     if (frame.type === "message.final") void refreshSessions();
   }, [refreshSessions]);
-
-  useEffect(() => {
-    if (!chat.sessionId) return;
-    const turn = chat.turnStates[chat.sessionId] ?? idleTurnState;
-    const messages = chat.sessionMessages[chat.sessionId] ?? chat.messages;
-    const active = turn.status === "submitting" || turn.status === "queued" || turn.status === "running";
-    if (active && messages.length > 0) {
-      writeRunningDraft(chat.sessionId, chat.activeTurnId, messages, turn);
-      return;
-    }
-    if (!messages.some((message) => message.streaming)) {
-      clearRunningDraft(chat.sessionId);
-    }
-  }, [chat]);
 
   useEffect(() => {
     const client = new BeanWebSocketClient({
@@ -285,6 +257,7 @@ export function App() {
   }, [chat.sessionId]);
 
   const loadSession = async (sessionId: string, closeSidebar = true) => {
+    setLoadingSessionId(sessionId);
     try {
       const [rows, notifications] = await Promise.all([fetchMessages(sessionId), fetchNotifications(sessionId)]);
       const messages = mergeTimeline(rowsToMessages(rows), notificationRowsToMessages(notifications));
@@ -293,12 +266,14 @@ export function App() {
       if (closeSidebar) setSidebarOpen(false);
     } catch (error) {
       dispatch(errorFrame(error));
+    } finally {
+      setLoadingSessionId((current) => current === sessionId ? "" : current);
     }
   };
 
   const createSession = () => {
     if (connection !== "connected") return;
-    if (chat.sessionId) clearRunningDraft(chat.sessionId);
+    setLoadingSessionId("");
     localStorage.removeItem(SESSION_STORAGE_KEY);
     window.history.pushState({}, "", "/");
     setRouteSession("");
@@ -530,7 +505,7 @@ export function App() {
 
         <StickToBottom className="conversation" initial="instant" resize="smooth" role="log">
           <StickToBottom.Content className="conversation-content" scrollClassName="conversation-scroll">
-            {chat.messages.length === 0 ? <EmptyConversation restoring={Boolean(chat.sessionId && routeSession)} /> : conversationTurnGroups.map((group) => (
+            {restoringSession ? <ConversationSkeleton /> : chat.messages.length === 0 ? <EmptyConversation /> : conversationTurnGroups.map((group) => (
               <section
                 key={group.messages[0].id}
                 className="turn-section"
@@ -1224,11 +1199,21 @@ function Composer(props: {
   );
 }
 
-function EmptyConversation({ restoring = false }: { restoring?: boolean }) {
+function EmptyConversation() {
   return (
     <div className="empty-conversation">
       <span className="empty-mark">B</span>
-      <h1>{restoring ? "正在恢复会话" : "从一个具体问题开始对话"}</h1>
+      <h1>从一个具体问题开始对话</h1>
+    </div>
+  );
+}
+
+function ConversationSkeleton() {
+  return (
+    <div className="conversation-skeleton" aria-hidden="true">
+      <div className="skeleton-line short" />
+      <div className="skeleton-block" />
+      <div className="skeleton-line" />
     </div>
   );
 }
@@ -1250,119 +1235,12 @@ function readStoredSession(): string {
   return "";
 }
 
-function runningDraftKey(sessionId: string): string {
-  return `${RUNNING_DRAFT_PREFIX}${sessionId}`;
-}
-
-function readRunningDraft(sessionId: string): RunningDraftCache | null {
-  try {
-    const raw = sessionStorage.getItem(runningDraftKey(sessionId));
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<RunningDraftCache>;
-    if (parsed.version !== RUNNING_DRAFT_VERSION || parsed.sessionId !== sessionId) return null;
-    if (!parsed.savedAt || Date.now() - parsed.savedAt > RUNNING_DRAFT_TTL_MS) {
-      clearRunningDraft(sessionId);
-      return null;
-    }
-    const turnState = normalizeCachedTurnState(parsed.turnState);
-    const messages = normalizeCachedMessages(parsed.messages);
-    if (!turnState || messages.length === 0) return null;
-    return {
-      version: RUNNING_DRAFT_VERSION,
-      sessionId,
-      activeTurnId: String(parsed.activeTurnId || turnState.turnId || ""),
-      messages,
-      turnState,
-      savedAt: Number(parsed.savedAt),
-    };
-  } catch {
-    clearRunningDraft(sessionId);
-    return null;
-  }
-}
-
-function writeRunningDraft(
-  sessionId: string,
-  activeTurnId: string,
-  messages: ChatMessage[],
-  turnState: TurnRuntimeState,
-): void {
-  const payload: RunningDraftCache = {
-    version: RUNNING_DRAFT_VERSION,
-    sessionId,
-    activeTurnId,
-    messages,
-    turnState,
-    savedAt: Date.now(),
-  };
-  try {
-    sessionStorage.setItem(runningDraftKey(sessionId), JSON.stringify(payload));
-  } catch {
-    // 浏览器存储可能被禁用或配额已满，失败时退化为后端 snapshot 恢复。
-  }
-}
-
-function clearRunningDraft(sessionId: string): void {
-  try {
-    sessionStorage.removeItem(runningDraftKey(sessionId));
-  } catch {
-    return;
-  }
-}
-
-function normalizeCachedTurnState(value: unknown): TurnRuntimeState | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  const status = record.status;
-  if (status !== "submitting" && status !== "queued" && status !== "running") return null;
-  const queuePosition = typeof record.queuePosition === "number" ? record.queuePosition : null;
-  return {
-    status,
-    queuePosition,
-    turnId: String(record.turnId || ""),
-    requestId: String(record.requestId || ""),
-  };
-}
-
-function normalizeCachedMessages(value: unknown): ChatMessage[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item): ChatMessage[] => {
-    if (!item || typeof item !== "object") return [];
-    const record = item as Record<string, unknown>;
-    const role = record.role === "user" || record.role === "assistant" ? record.role : null;
-    if (!role) return [];
-    return [{
-      id: String(record.id || crypto.randomUUID()),
-      role,
-      content: String(record.content || ""),
-      thinking: String(record.thinking || ""),
-      media: Array.isArray(record.media) ? record.media.filter((entry): entry is string => typeof entry === "string") : [],
-      tools: normalizeCachedTools(record.tools),
-      turnId: typeof record.turnId === "string" ? record.turnId : undefined,
-      streaming: Boolean(record.streaming),
-      status: typeof record.status === "string" ? record.status : undefined,
-      timestamp: typeof record.timestamp === "string" ? record.timestamp : undefined,
-      proactive: Boolean(record.proactive),
-      source: record.source === "scheduled_reminder" || record.source === "scheduled_soft" || record.source === "proactive_conversation" ? record.source : undefined,
-      scheduledAt: typeof record.scheduledAt === "string" ? record.scheduledAt : undefined,
-    }];
-  });
-}
-
-function normalizeCachedTools(value: unknown): ToolActivity[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item): ToolActivity[] => {
-    if (!item || typeof item !== "object") return [];
-    const record = item as Record<string, unknown>;
-    const status = record.status === "error" ? "error" : record.status === "completed" ? "completed" : "running";
-    return [{
-      callId: String(record.callId || ""),
-      name: String(record.name || "tool"),
-      status,
-      arguments: record.arguments,
-      resultPreview: String(record.resultPreview || ""),
-    }];
-  });
+function upsertSessionSummary(current: SessionSummary[], incoming: SessionSummary): SessionSummary[] {
+  const index = current.findIndex((session) => session.key === incoming.key);
+  if (index < 0) return [incoming, ...current];
+  const next = [...current];
+  next[index] = { ...current[index], ...incoming };
+  return next;
 }
 
 function shortSession(sessionId: string): string { return sessionId ? `会话 ${sessionId.slice(-8)}` : "正在创建会话"; }

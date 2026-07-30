@@ -394,6 +394,12 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .empty-conversation { display: flex; flex-direction: column; align-items: center; max-width: 620px; margin: 15vh auto 0; }
 .empty-mark { width: 52px; height: 52px; margin-bottom: 16px; font-size: 22px; box-shadow: 0 4px 14px rgba(17, 111, 104, .22); }
 .empty-conversation h1 { margin: 0; font-family: Georgia, "Microsoft YaHei UI", serif; font-size: 28px; font-weight: 500; letter-spacing: -0.01em; text-align: center; }
+.conversation-skeleton { display: grid; gap: 20px; width: min(560px, 72vw); margin: 8px 0 0; }
+.skeleton-line, .skeleton-block { border-radius: 6px; background: #edf1f0; }
+.skeleton-line { width: min(360px, 48vw); height: 38px; }
+.skeleton-line.short { width: min(150px, 26vw); height: 24px; }
+.skeleton-block { width: min(520px, 70vw); height: 34px; }
+:root[data-theme="dark"] .skeleton-line, :root[data-theme="dark"] .skeleton-block { background: #25302c; }
 
 .composer-wrap { grid-area: composer; position: relative; z-index: 2; align-self: end; min-width: 0; width: 100%; padding: 0 max(24px, calc((100% - 880px) / 2)) 18px; background: var(--surface-raised); }
 .composer { border: 1px solid var(--border-input); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow-md); transition: border-color .15s ease, box-shadow .15s ease; }

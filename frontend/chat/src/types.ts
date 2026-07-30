@@ -64,6 +64,13 @@ export interface MessageRow {
   metadata?: Record<string, unknown>;
 }
 
+export interface MessagePage {
+  items: MessageRow[];
+  total?: number;
+  has_more?: boolean;
+  next_before_seq?: number | null;
+}
+
 export interface UploadedFile {
   filename: string;
   upload_path: string;
@@ -111,6 +118,7 @@ export interface ProactiveNotificationRow {
 
 export type ChatFrame =
   | { type: "session.created"; request_id: string; session_id: string }
+  | { type: "session.updated"; session: SessionSummary }
   | { type: "session.subscribed"; request_id: string; session_id: string }
   | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message: string; user_media: string[]; content: string; thinking: string; tools: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments: unknown; result_preview: string }>; status: "running" }
   | { type: "turn.queued"; request_id: string; session_id: string; position: number }

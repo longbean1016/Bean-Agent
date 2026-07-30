@@ -384,7 +384,7 @@ export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {
     media: Array.isArray(row.media) ? row.media : [],
     tools: row.proactive ? [] : toolChainToActivities(row.tool_chain),
     turnId: row.turn_id,
-    streaming: false,
+    streaming: Boolean(row.metadata?.running) && row.role === "assistant",
     status: row.status,
     timestamp: row.timestamp,
     proactive: Boolean(row.proactive),
@@ -425,7 +425,7 @@ function toolChainToActivities(chain: MessageRow["tool_chain"]): ToolActivity[] 
   return (chain ?? []).flatMap((group) => (group.calls ?? []).map((call) => ({
     callId: String(call.call_id ?? ""),
     name: String(call.name ?? "tool"),
-    status: call.status === "error" ? "error" : "completed",
+    status: call.status === "error" ? "error" : call.status === "running" ? "running" : "completed",
     arguments: call.arguments,
     resultPreview: String(call.result ?? ""),
   })));

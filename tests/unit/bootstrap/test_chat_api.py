@@ -55,6 +55,85 @@ def test_chat_api_lists_sessions_and_messages(tmp_path: Path) -> None:
     assert [item["content"] for item in messages["items"]] == ["第一问", "第一答"]
 
 
+def test_chat_api_lists_titled_running_session_without_messages(tmp_path: Path) -> None:
+    client, runtime = _client(tmp_path)
+    runtime.sessions.store.ensure_default_chat_session_title(
+        "web:running",
+        "running title from first user message",
+        [],
+    )
+
+    with client:
+        sessions = client.get("/api/chat/sessions").json()
+
+    assert sessions["total"] == 1
+    assert sessions["items"][0]["key"] == "web:running"
+    assert sessions["items"][0]["title"] == "running title from first user message"
+    assert sessions["items"][0]["message_count"] == 0
+
+
+def test_chat_api_messages_returns_latest_page_and_older_page(tmp_path: Path) -> None:
+    client, runtime = _client(tmp_path)
+    for index in range(85):
+        runtime.sessions.store.add_message(
+            NewMessage(session_key="web:paged", role="user", content=f"m-{index:02d}")
+        )
+
+    with client:
+        latest = client.get("/api/chat/sessions/web:paged/messages").json()
+        older = client.get(
+            f"/api/chat/sessions/web:paged/messages/older?before_seq={latest['next_before_seq']}&limit=10"
+        ).json()
+
+    assert len(latest["items"]) == 80
+    assert latest["items"][0]["content"] == "m-05"
+    assert latest["items"][-1]["content"] == "m-84"
+    assert latest["has_more"] is True
+    assert latest["next_before_seq"] == 5
+    assert [item["content"] for item in older["items"]] == [f"m-{index:02d}" for index in range(0, 5)]
+    assert older["has_more"] is False
+
+
+def test_chat_api_messages_appends_running_snapshot_without_persisting(tmp_path: Path) -> None:
+    client, runtime = _client(tmp_path)
+    runtime.sessions.store.create_session("web:running")
+
+    def snapshot(session_key: str) -> dict[str, object] | None:
+        if session_key != "web:running":
+            return None
+        return {
+            "session_id": "web:running",
+            "turn_id": "turn-live",
+            "request_id": "request-live",
+            "user_message": "live question",
+            "user_media": [],
+            "content": "partial answer",
+            "thinking": "partial thinking",
+            "tools": [{
+                "call_id": "call-1",
+                "name": "read_file",
+                "status": "running",
+                "arguments": {"path": "README.md"},
+                "result_preview": "",
+            }],
+            "status": "running",
+        }
+
+    runtime.agent_loop.get_active_turn_snapshot = snapshot  # type: ignore[method-assign]
+
+    with client:
+        messages = client.get("/api/chat/sessions/web:running/messages").json()
+        persisted = runtime.sessions.store.fetch_session_messages("web:running")
+
+    assert [item["role"] for item in messages["items"]] == ["user", "assistant"]
+    assert messages["items"][0]["id"] == "running:user:turn-live"
+    assert messages["items"][1]["id"] == "running:assistant:turn-live"
+    assert messages["items"][1]["content"] == "partial answer"
+    assert messages["items"][1]["reasoning_content"] == "partial thinking"
+    assert messages["items"][1]["metadata"]["running"] is True
+    assert persisted == []
+
+
 def test_chat_api_renames_session_and_validates_title(tmp_path: Path) -> None:
     client, runtime = _client(tmp_path)
     runtime.sessions.store.add_message(

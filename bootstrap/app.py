@@ -141,6 +141,7 @@ class AppRuntime:
             media_root=core.workspace / "uploads",
             proactive_store=core.proactive_store,
             ensure_session=core.sessions.get_or_create,
+            ensure_session_title=core.sessions.ensure_default_title,
         )
         self.maintenance = (
             MemoryMaintenanceLoop(
@@ -431,15 +432,36 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
     @app.get("/api/chat/sessions/{session_key:path}/messages")
     def list_messages(
         session_key: str,
-        page: int = Query(1, ge=1),
-        page_size: int = Query(100, ge=1, le=500),
+        limit: int = Query(80, ge=1, le=200),
     ) -> dict[str, Any]:
-        items, total = application.core.sessions.store.list_chat_messages(
+        items, total, has_more, next_before_seq = application.core.sessions.store.list_latest_chat_messages(
             session_key,
-            limit=page_size,
-            offset=(page - 1) * page_size,
+            limit=limit,
         )
-        return {"items": items, "total": total}
+        items = _append_running_snapshot(items, application.core.agent_loop.get_active_turn_snapshot(session_key))
+        return {
+            "items": items,
+            "total": total,
+            "has_more": has_more,
+            "next_before_seq": next_before_seq,
+        }
+
+    @app.get("/api/chat/sessions/{session_key:path}/messages/older")
+    def list_older_messages(
+        session_key: str,
+        before_seq: int = Query(..., ge=0),
+        limit: int = Query(80, ge=1, le=200),
+    ) -> dict[str, Any]:
+        items, has_more, next_before_seq = application.core.sessions.store.list_chat_messages_before(
+            session_key,
+            before_seq=before_seq,
+            limit=limit,
+        )
+        return {
+            "items": items,
+            "has_more": has_more,
+            "next_before_seq": next_before_seq,
+        }
 
     def require_web_session(session_key: str) -> None:
         """主动设置只属于当前 Web channel，禁止借 path 参数访问其他渠道。"""
@@ -629,6 +651,68 @@ def _scheduled_job_payload(job: Any) -> dict[str, Any]:
         "run_count": job.run_count,
         "last_error": job.last_error,
     }
+
+
+def _append_running_snapshot(
+    items: list[dict[str, Any]],
+    snapshot: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """把运行中 Turn 的内存快照追加为虚拟消息；不改变 SQLite 历史。"""
+
+    if not snapshot:
+        return items
+    turn_id = str(snapshot.get("turn_id") or "")
+    if not turn_id:
+        return items
+    if any(str(item.get("turn_id") or "") == turn_id for item in items):
+        return items
+    now = datetime.now().astimezone().isoformat()
+    metadata = {
+        "running": True,
+        "request_id": str(snapshot.get("request_id") or ""),
+    }
+    tools = []
+    for tool in snapshot.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        tools.append({
+            "call_id": str(tool.get("call_id") or ""),
+            "name": str(tool.get("name") or "tool"),
+            "arguments": tool.get("arguments") if isinstance(tool.get("arguments"), dict) else {},
+            "result": str(tool.get("result_preview") or ""),
+            "status": str(tool.get("status") or "running"),
+        })
+    return [
+        *items,
+        {
+            "id": f"running:user:{turn_id}",
+            "session_key": str(snapshot.get("session_id") or ""),
+            "seq": -2,
+            "role": "user",
+            "content": str(snapshot.get("user_message") or ""),
+            "tool_chain": [],
+            "timestamp": now,
+            "turn_id": turn_id,
+            "reasoning_content": "",
+            "status": "running",
+            "metadata": metadata,
+            "media": list(snapshot.get("user_media") or []),
+        },
+        {
+            "id": f"running:assistant:{turn_id}",
+            "session_key": str(snapshot.get("session_id") or ""),
+            "seq": -1,
+            "role": "assistant",
+            "content": str(snapshot.get("content") or ""),
+            "tool_chain": [{"calls": tools}] if tools else [],
+            "timestamp": now,
+            "turn_id": turn_id,
+            "reasoning_content": str(snapshot.get("thinking") or ""),
+            "status": "running",
+            "metadata": metadata,
+            "media": [],
+        },
+    ]
 
 
 def _notification_payload(item: Any) -> dict[str, Any]:

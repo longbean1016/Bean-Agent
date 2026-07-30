@@ -391,6 +391,29 @@ class SessionManager:
                 cached.metadata["title"] = str(title).strip()
             return updated
 
+    async def ensure_default_title(
+        self,
+        session_key: str,
+        content: str,
+        media: list[str],
+    ) -> dict[str, Any] | None:
+        """首条用户消息推理期间提前生成目录标题，不提前写入消息历史。"""
+
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            updated = await asyncio.to_thread(
+                self._store.ensure_default_chat_session_title,
+                key,
+                content,
+                list(media),
+            )
+            if updated is None:
+                return None
+            cached = self._cache.get(key)
+            if cached is not None and not str(cached.metadata.get("title") or "").strip():
+                cached.metadata["title"] = str(updated.get("title") or "")
+            return updated
+
     async def delete(self, session_key: str) -> bool:
         """删除会话并封锁旧对象的后续回写；长期记忆由独立组件持有，不参与删除。"""
 

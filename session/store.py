@@ -253,24 +253,13 @@ class SessionStore:
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
-        """按第一次用户提问时间列出已有消息的聊天会话。"""
+        """按第一次用户提问时间列出聊天会话，并包含运行中但尚未落消息的标题会话。"""
 
         safe_limit = max(1, min(int(limit), 200))
         safe_offset = max(0, int(offset))
         prefix = f"{str(channel).strip()}:%"
         with self._lock:
             self._ensure_open()
-            count_row = self._conn.execute(
-                """
-                SELECT COUNT(1) AS count
-                FROM sessions s
-                WHERE s.key LIKE ?
-                  AND EXISTS (
-                      SELECT 1 FROM messages m WHERE m.session_key = s.key
-                  )
-                """,
-                (prefix,),
-            ).fetchone()
             rows = self._conn.execute(
                 """
                 SELECT s.key,
@@ -294,23 +283,83 @@ class SessionStore:
                            LIMIT 1
                        ), '') AS first_message_content
                 FROM sessions s
-                JOIN messages m ON m.session_key = s.key
+                LEFT JOIN messages m ON m.session_key = s.key
                 WHERE s.key LIKE ?
                  GROUP BY s.key, s.created_at, s.updated_at, s.metadata
-                -- 列表时间和排序使用同一份首次提问时间；后续消息不能改变会话位置。
                 ORDER BY created_at DESC, s.key DESC
-                LIMIT ? OFFSET ?
                 """,
-                (prefix, safe_limit, safe_offset),
+                (prefix,),
             ).fetchall()
-        total = int((count_row["count"] if count_row else 0) or 0)
         items = []
         for row in rows:
             item = dict(row)
             metadata = _load_json_object(item.pop("metadata", "{}"))
             item["title"] = str(metadata.get("title") or "")
+            if int(item.get("message_count") or 0) <= 0 and not item["title"].strip():
+                continue
             items.append(item)
-        return items, total
+        total = len(items)
+        return items[safe_offset:safe_offset + safe_limit], total
+
+    def ensure_default_chat_session_title(
+        self,
+        session_key: str,
+        content: str,
+        media: object,
+    ) -> dict[str, Any] | None:
+        """在首条消息最终落库前写入稳定标题，供运行中会话目录恢复使用。"""
+
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            now = _now_iso()
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO sessions (
+                    key, created_at, updated_at, last_consolidated, next_seq, metadata
+                ) VALUES (?, ?, ?, 0, 0, '{}')
+                """,
+                (key, now, now),
+            )
+            row = self._conn.execute(
+                "SELECT metadata FROM sessions WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                return None
+            metadata = _load_json_object(row["metadata"])
+            if not str(metadata.get("title") or "").strip():
+                metadata["title"] = _default_session_title(content, media)
+                self._conn.execute(
+                    "UPDATE sessions SET metadata = ?, updated_at = ? WHERE key = ?",
+                    (json.dumps(metadata, ensure_ascii=False), now, key),
+                )
+            self._conn.commit()
+            summary = self._conn.execute(
+                """
+                SELECT s.key, s.created_at, s.updated_at, s.metadata,
+                       COUNT(m.id) AS message_count,
+                       COALESCE((
+                           SELECT first.content
+                           FROM messages first
+                           WHERE first.session_key = s.key
+                             AND first.role = 'user'
+                           ORDER BY first.seq ASC
+                           LIMIT 1
+                       ), '') AS first_message_content
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_key = s.key
+                WHERE s.key = ?
+                GROUP BY s.key, s.created_at, s.updated_at, s.metadata
+                """,
+                (key,),
+            ).fetchone()
+        if summary is None:
+            return None
+        item = dict(summary)
+        metadata = _load_json_object(item.pop("metadata", "{}"))
+        item["title"] = str(metadata.get("title") or "")
+        return item
 
     def update_chat_session_title(self, session_key: str, title: str) -> dict[str, Any] | None:
         """只更新会话展示标题，不改写首条消息或会话创建时间。"""
@@ -378,6 +427,72 @@ class SessionStore:
             ).fetchall()
         total = int((count_row["count"] if count_row else 0) or 0)
         return [self._row_to_message(row) for row in rows], total
+
+    def list_latest_chat_messages(
+        self,
+        session_key: str,
+        *,
+        limit: int = 80,
+    ) -> tuple[list[dict[str, Any]], int, bool, int | None]:
+        """返回最新一页聊天消息，结果仍按 seq 升序供前端直接渲染。"""
+
+        key = self._validate_session_key(session_key)
+        safe_limit = max(1, min(int(limit), 200))
+        with self._lock:
+            self._ensure_open()
+            count_row = self._conn.execute(
+                "SELECT COUNT(1) AS count FROM messages WHERE session_key = ?",
+                (key,),
+            ).fetchone()
+            rows = self._conn.execute(
+                f"""
+                SELECT {_MESSAGE_COLUMNS}
+                FROM messages
+                WHERE session_key = ?
+                ORDER BY seq DESC
+                LIMIT ?
+                """,
+                (key, safe_limit),
+            ).fetchall()
+        total = int((count_row["count"] if count_row else 0) or 0)
+        items = [self._row_to_message(row) for row in reversed(rows)]
+        has_more = total > len(items)
+        next_before_seq = int(items[0]["seq"]) if has_more and items else None
+        return items, total, has_more, next_before_seq
+
+    def list_chat_messages_before(
+        self,
+        session_key: str,
+        *,
+        before_seq: int,
+        limit: int = 80,
+    ) -> tuple[list[dict[str, Any]], bool, int | None]:
+        """按 seq 游标向前读取更早消息，避免首屏加载超大历史。"""
+
+        key = self._validate_session_key(session_key)
+        safe_before = max(0, int(before_seq))
+        safe_limit = max(1, min(int(limit), 200))
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                f"""
+                SELECT {_MESSAGE_COLUMNS}
+                FROM messages
+                WHERE session_key = ? AND seq < ?
+                ORDER BY seq DESC
+                LIMIT ?
+                """,
+                (key, safe_before, safe_limit),
+            ).fetchall()
+            more_before = int(rows[-1]["seq"]) if rows else safe_before
+            more_row = self._conn.execute(
+                "SELECT 1 FROM messages WHERE session_key = ? AND seq < ? LIMIT 1",
+                (key, more_before),
+            ).fetchone()
+        items = [self._row_to_message(row) for row in reversed(rows)]
+        has_more = more_row is not None
+        next_before_seq = int(items[0]["seq"]) if has_more and items else None
+        return items, has_more, next_before_seq
 
     def get_last_chat_message_timestamp(self, session_key: str) -> str | None:
         """Return the last user/assistant message timestamp for proactive idle checks."""

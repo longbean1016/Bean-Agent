@@ -1,4 +1,4 @@
-import type { MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, UploadedFile } from "./types";
+import type { MessagePage, MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, UploadedFile } from "./types";
 
 export async function fetchSessions(): Promise<SessionSummary[]> {
   const response = await fetch("/api/chat/sessions?page=1&page_size=100");
@@ -8,10 +8,16 @@ export async function fetchSessions(): Promise<SessionSummary[]> {
 }
 
 export async function fetchMessages(sessionId: string): Promise<MessageRow[]> {
-  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages?page=1&page_size=500`);
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`);
   if (!response.ok) throw new Error("无法加载会话历史");
-  const payload = await response.json() as { items?: MessageRow[] };
+  const payload = await response.json() as MessagePage;
   return payload.items ?? [];
+}
+
+export async function fetchOlderMessages(sessionId: string, beforeSeq: number, limit = 80): Promise<MessagePage> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages/older?before_seq=${encodeURIComponent(String(beforeSeq))}&limit=${encodeURIComponent(String(limit))}`);
+  if (!response.ok) throw new Error("无法加载更早会话历史");
+  return response.json() as Promise<MessagePage>;
 }
 
 export async function fetchNotifications(sessionId: string): Promise<ProactiveNotificationRow[]> {

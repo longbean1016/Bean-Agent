@@ -49,6 +49,7 @@ class WebChannel:
         media_root: Path | None = None,
         proactive_store: ProactiveStore | None = None,
         ensure_session: Callable[[str], Awaitable[object]] | None = None,
+        ensure_session_title: Callable[[str, str, list[str]], Awaitable[dict[str, Any] | None]] | None = None,
     ) -> None:
         self._bus = bus
         self._events = event_bus
@@ -56,6 +57,7 @@ class WebChannel:
         self._media_root = media_root.resolve() if media_root is not None else None
         self._proactive_store = proactive_store
         self._ensure_session = ensure_session
+        self._ensure_session_title = ensure_session_title
         self._connections: dict[str, set[WebSocketApi]] = {}
         self._socket_send_locks: weakref.WeakKeyDictionary[WebSocketApi, asyncio.Lock] = (
             weakref.WeakKeyDictionary()
@@ -120,6 +122,13 @@ class WebChannel:
                 await self._error(websocket, request_id, "invalid_media", "附件路径无效或不属于当前 workspace")
                 return
             await self._register(session_key, websocket)
+            if self._ensure_session_title is not None:
+                session = await self._ensure_session_title(session_key, text, list(media))
+                if session is not None:
+                    await self._broadcast(session_key, {
+                        "type": "session.updated",
+                        "session": dict(session),
+                    })
             chat_id = session_key.split(":", 1)[1]
             await self._bus.publish_inbound(InboundMessage(self.name, "web", chat_id, text, list(media), {"request_id": request_id}))
             return
