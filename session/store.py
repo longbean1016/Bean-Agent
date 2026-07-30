@@ -591,6 +591,22 @@ class SessionStore:
 
         return self._get_cursor_sync(session_key)
 
+    def get_recent_context(self, session_key: str) -> str:
+        """读取当前会话的近期压缩上下文；未生成时返回空字符串。"""
+
+        return self._get_recent_context_sync(session_key)
+
+    def set_recent_context(
+        self,
+        session_key: str,
+        content: str,
+        *,
+        source_ref: str = "",
+    ) -> None:
+        """写入当前会话的近期压缩上下文，与消息 cursor 使用同一个 Session DB。"""
+
+        self._set_recent_context_sync(session_key, content, source_ref=source_ref)
+
     def close(self) -> None:
         """幂等关闭 SQLite 连接。"""
 
@@ -627,6 +643,15 @@ class SessionStore:
 
                 CREATE INDEX IF NOT EXISTS idx_messages_session_seq
                     ON messages(session_key, seq);
+
+                CREATE TABLE IF NOT EXISTS session_recent_context (
+                    session_key TEXT PRIMARY KEY,
+                    content     TEXT NOT NULL DEFAULT '',
+                    source_ref  TEXT NOT NULL DEFAULT '',
+                    updated_at  TEXT NOT NULL,
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
                 """
             )
             try:
@@ -1169,6 +1194,53 @@ class SessionStore:
                 (key,),
             ).fetchone()
         return int((row["last_consolidated"] if row else 0) or 0)
+
+    def _get_recent_context_sync(self, session_key: str) -> str:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT content FROM session_recent_context WHERE session_key = ?",
+                (key,),
+            ).fetchone()
+        return str(row["content"] or "") if row else ""
+
+    def _set_recent_context_sync(
+        self,
+        session_key: str,
+        content: str,
+        *,
+        source_ref: str = "",
+    ) -> None:
+        key = self._validate_session_key(session_key)
+        now = _now_iso()
+        with self._lock:
+            self._ensure_open()
+            # recent context 是会话 cursor 的伴生状态；缺失会话先幂等创建，避免孤儿摘要。
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO sessions(
+                    key, created_at, updated_at, last_consolidated,
+                    next_seq, metadata
+                )
+                VALUES (?, ?, ?, 0, 0, '{}')
+                """,
+                (key, now, now),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO session_recent_context(
+                    session_key, content, source_ref, updated_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    content = excluded.content,
+                    source_ref = excluded.source_ref,
+                    updated_at = excluded.updated_at
+                """,
+                (key, str(content), str(source_ref or ""), now),
+            )
+            self._conn.commit()
 
     def _close_sync(self) -> None:
         with self._lock:

@@ -530,6 +530,40 @@ def test_last_chat_message_timestamp_uses_messages_not_session_updated_at(
     assert first["timestamp"] != second["timestamp"] or second["timestamp"]
 
 
+def test_session_recent_context_is_scoped_by_session(store: SessionStore) -> None:
+    store.create_session("web:chat-1")
+    store.create_session("web:chat-2")
+
+    assert store.get_recent_context("web:chat-1") == ""
+
+    store.set_recent_context(
+        "web:chat-1",
+        "# Recent Context\n\n## Compression\n- 最近持续关注：项目\n",
+        source_ref="web:chat-1@0-3",
+    )
+    store.set_recent_context(
+        "web:chat-2",
+        "# Recent Context\n\n## Compression\n- 最近持续关注：生活\n",
+        source_ref="web:chat-2@0-3",
+    )
+
+    assert "项目" in store.get_recent_context("web:chat-1")
+    assert "生活" not in store.get_recent_context("web:chat-1")
+    assert "生活" in store.get_recent_context("web:chat-2")
+
+
+def test_session_recent_context_is_deleted_with_session(store: SessionStore) -> None:
+    store.set_recent_context(
+        "web:delete",
+        "# Recent Context\n\n## Compression\n- 最近持续关注：待删除\n",
+        source_ref="web:delete@0-1",
+    )
+
+    assert store.get_recent_context("web:delete")
+    assert store.delete_chat_session("web:delete") is True
+    assert store.get_recent_context("web:delete") == ""
+
+
 @pytest.mark.asyncio
 async def test_add_message_rejects_invalid_role(store: SessionStore) -> None:
     with pytest.raises(ValueError, match="role"):
