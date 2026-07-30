@@ -112,15 +112,13 @@ class Consolidator:
         window = messages[cursor:end]
         recent = self._select_recent_messages(messages)
         if len(window) < self._threshold:
-            # 未达到归档阈值时不消耗 LLM，只刷新最近对话的可读窗口；cursor 保持不变，
-            # 后续消息累计到阈值后仍从同一位置进入 Consolidation。
-            self._markdown.refresh_recent_turns(recent)
+            # 未达到归档阈值时不调用 LLM，也不再持久化 Recent Turns；cursor 保持不变。
             return None
 
         recent_turns = _format_recent_turns_for_prompt(recent)
         current_memory = self._markdown.read_long_term().strip()
         previous_recent_context = _stable_recent_context(
-            self._markdown.read_recent_context()
+            self._sessions.get_recent_context(session_key)
         )
         draft = await self._extractor.extract(
             window,
@@ -138,16 +136,14 @@ class Consolidator:
         if pending_lines:
             self._markdown.append_pending_once("\n".join(pending_lines), source_ref=source_ref)
         if draft.recent_context.strip():
-            # LLM 运行期间可能提交新 Turn；这里只重读热历史用于展示，不扩大本次
-            # 归档窗口，也不改变候选 cursor=end。
-            latest_messages = self._sessions.fetch_session_messages(session_key)
-            latest_recent = self._select_recent_messages(latest_messages)
-            self._markdown.write_recent_context_snapshot(
+            # recent context 是会话级稳定摘要，写入 Session DB 后由 cursor 提交边界保护。
+            self._sessions.set_recent_context(
+                session_key,
                 _with_compression_until(
                     draft.recent_context,
                     window[-1].get("timestamp") if window else None,
                 ),
-                latest_recent,
+                source_ref=source_ref,
             )
         conversation = render_consolidation_conversation(window)
         # 此处只返回候选 cursor。MemoryEngine 必须先持久化 outbox 再推进它，

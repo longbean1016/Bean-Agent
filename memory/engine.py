@@ -635,7 +635,7 @@ class _LLMConsolidationExtractor:
 
     async def extract(self, messages: list[dict[str, object]], previous_recent_context: str, *, recent_turns: str = "", current_memory: str = "") -> ConsolidationDraft:
         conversation = render_consolidation_conversation(messages)
-        event_data = await self._complete_json(_event_extraction_prompt(conversation, previous_recent_context, current_memory=current_memory))
+        event_data = await self._complete_json(_event_extraction_prompt(conversation, current_memory=current_memory))
         recent_data = await self._complete_json(_recent_context_prompt(conversation, previous_recent_context, recent_turns=recent_turns))
         history_entries = []
         for item in event_data.get("history_entries") or []:
@@ -670,7 +670,7 @@ class _LLMConsolidationExtractor:
         return data
 
 
-def _event_extraction_prompt(conversation: str, recent_context: str, *, current_memory: str = "") -> str:
+def _event_extraction_prompt(conversation: str, *, current_memory: str = "") -> str:
     memory_section = ""
     if current_memory.strip():
         memory_section = f"""当前用户档案（用于查重）：
@@ -765,10 +765,7 @@ history_entries.emotional_weight 规则：
 判断标准：对话中是否明确表明该服务/工具**当前已在运行**，且助手**已被告知可以使用**。
 对话中提出的架构方案、网络诊断信息、假设性配置，即使出现了具体端口、地址或变量名，也不提取。
 
-{memory_section}当前 RECENT_CONTEXT 只用于理解话题延续，不能作为身份、关系或事实归属证据；发生冲突时以当前窗口 USER 原文为准。
-{recent_context or '（空）'}
-
-待处理对话：
+{memory_section}待处理对话：
 {conversation}
 
 只返回合法 JSON，不要 markdown 代码块。"""
@@ -783,6 +780,7 @@ def _recent_context_prompt(conversation: str, old_context: str, *, recent_turns:
 3. 提取最近适合自然续接的话题
 4. 提取最近应避免打扰、应避免推荐、或明显不想聊的方向
 5. 提取跨窗口持续存在的重要现实线索（ongoing_threads）
+6. 提取已经离开最新主线但仍可能被用户回头追问的会话内旧话题（dormant_threads）
 
 规则：
 - 只允许依据 USER 明确表达过的内容输出；ASSISTANT 的建议、解释、命名、延伸，一律不得当作证据
@@ -796,7 +794,8 @@ def _recent_context_prompt(conversation: str, old_context: str, *, recent_turns:
 - 如果最新 recent turns 显示话题已经明显切换，不要把较早窗口的技术讨论升级成当前偏好或避免事项
 - 只保留未来几轮仍会影响辅助决策的信息
 - 不要记录工具细节、推理过程、普通寒暄
-- 每个字段最多 3 条，每条尽量 1 句
+- active_topics、user_preferences、follow_ups、avoidances 和 ongoing_threads 最多 3 条，每条尽量 1 句
+- dormant_threads 最多 5 条；最新话题切换时，旧的普通会话话题优先降级到 dormant_threads，而不是直接删除
 - 没有把握就留空；宁可漏掉，也不要脑补
 
 ongoing_threads 严格限制：
@@ -849,7 +848,7 @@ ongoing_threads 严格限制：
 - 严禁将 `[a-preview]` 作为用户身份、事实、偏好、关系、回避事项或 ongoing thread 的证据
 {recent_turns or '（空）'}
 
-返回：{{"active_topics": [], "user_preferences": [], "follow_ups": [], "avoidances": [], "ongoing_threads": []}}"""
+返回：{{"active_topics": [], "user_preferences": [], "follow_ups": [], "avoidances": [], "dormant_threads": [], "ongoing_threads": []}}"""
 
 
 def _render_recent_context(data: dict[str, object]) -> str:
@@ -864,6 +863,12 @@ def _render_recent_context(data: dict[str, object]) -> str:
         values = data.get(key)
         items = [str(item).strip() for item in values if str(item).strip()][:3] if isinstance(values, list) else []
         lines.append(f"- {label}：{'；'.join(items) if items else 'none'}")
+    lines.extend(["", "## Dormant Threads"])
+    dormant = data.get("dormant_threads")
+    items = [str(item).strip() for item in dormant if str(item).strip()][:5] if isinstance(dormant, list) else []
+    lines.extend(f"- {item}" for item in items)
+    if not items:
+        lines.append("- none")
     lines.extend(["", "## Ongoing Threads"])
     ongoing = data.get("ongoing_threads")
     items = [str(item).strip() for item in ongoing if str(item).strip()][:3] if isinstance(ongoing, list) else []
