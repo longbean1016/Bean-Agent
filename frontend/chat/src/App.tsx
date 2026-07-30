@@ -14,6 +14,7 @@ import {
   Image as ImageIcon,
   Menu,
   MessageSquarePlus,
+  Mic,
   MoreHorizontal,
   Monitor,
   Moon,
@@ -28,6 +29,7 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { ComponentPropsWithoutRef, ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
@@ -84,6 +86,29 @@ const markdownTranslations = {
 const markdownLinkSafety = {
   enabled: false,
 };
+
+type BrowserSpeechRecognition = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onstart: (() => void) | null;
+  onend: (() => void) | null;
+  onerror: ((event: { error?: string }) => void) | null;
+  onresult: ((event: { resultIndex: number; results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }> }) => void) | null;
+  abort: () => void;
+  start: () => void;
+  stop: () => void;
+};
+
+type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
+
+function getSpeechRecognitionConstructor(): BrowserSpeechRecognitionConstructor | null {
+  const speechWindow = window as Window & {
+    SpeechRecognition?: BrowserSpeechRecognitionConstructor;
+    webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
+  };
+  return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
+}
 
 function prepareMessageMarkdown(markdown: string): string {
   let fenced = false;
@@ -669,6 +694,7 @@ export function App() {
           connected={connection === "connected"}
           files={files}
           input={input}
+          sessionId={chat.sessionId}
           sending={sending}
           onFiles={(next) => {
             setFiles(next);
@@ -925,11 +951,15 @@ function ProactiveSettingsDialog({ target, onClose }: { target: SessionSummary |
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [help, setHelp] = useState("");
+  const [confirmReminderId, setConfirmReminderId] = useState("");
+  const [deletingReminderId, setDeletingReminderId] = useState("");
 
   useEffect(() => {
     if (!target) return;
     setLoading(true);
     setError("");
+    setConfirmReminderId("");
+    setDeletingReminderId("");
     Promise.all([fetchProactiveSettings(target.key), fetchReminders(target.key)])
       .then(([nextSettings, nextReminders]) => { setSettings(nextSettings); setReminders(nextReminders); })
       .catch((reason) => setError(reason instanceof Error ? reason.message : "加载失败"))
@@ -962,6 +992,20 @@ function ProactiveSettingsDialog({ target, onClose }: { target: SessionSummary |
   const refreshReminderList = async () => {
     if (target) setReminders(await fetchReminders(target.key));
   };
+  const removeReminder = async (item: ScheduledReminder) => {
+    if (!target || deletingReminderId) return;
+    setDeletingReminderId(item.id);
+    setError("");
+    try {
+      await deleteReminder(target.key, item.id);
+      setConfirmReminderId("");
+      await refreshReminderList();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setDeletingReminderId("");
+    }
+  };
 
   return (
     <Dialog.Root open={target !== null} onOpenChange={(open) => { if (!open && !saving) onClose(); }}>
@@ -983,9 +1027,16 @@ function ProactiveSettingsDialog({ target, onClose }: { target: SessionSummary |
                 <div className="reminder-list">
                   <div className="reminder-list-title"><span>已创建的提醒</span><small>通过对话创建</small></div>
                   {reminders.length === 0 ? <p className="reminder-empty">暂无提醒</p> : reminders.map((item) => (
-                    <div className="reminder-item" key={item.id}>
+                    <div className={`reminder-item${confirmReminderId === item.id ? " confirming" : ""}`} key={item.id}>
                       <div><strong>{item.name || (item.tier === "instant" ? "固定提醒" : "AI 定时任务")}</strong><small>{item.trigger === "every" ? "周期 · " : ""}{new Date(item.fire_at).toLocaleString()} · {item.tier === "instant" ? "固定文本" : "到期执行 prompt"}{item.status === "failed" ? ` · 失败：${item.last_error}` : ""}</small></div>
-                      <button className="icon-button danger" aria-label="删除提醒" onClick={() => { if (!target) return; void deleteReminder(target.key, item.id).then(refreshReminderList).catch((reason) => setError(String(reason))); }}><Trash2 size={15} /></button>
+                      {confirmReminderId === item.id ? (
+                        <span className="reminder-confirm-actions">
+                          <button type="button" disabled={deletingReminderId === item.id} onClick={() => setConfirmReminderId("")}>取消</button>
+                          <button type="button" className="confirm-delete" disabled={deletingReminderId === item.id} onClick={() => void removeReminder(item)}>{deletingReminderId === item.id ? "删除中" : "确认删除"}</button>
+                        </span>
+                      ) : (
+                        <button className="icon-button danger" aria-label="删除提醒" onClick={() => setConfirmReminderId(item.id)}><Trash2 size={15} /></button>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -1221,13 +1272,75 @@ function AttachmentGallery({ paths }: { paths: string[] }) {
 }
 
 function Composer(props: {
-  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running"; queuePosition: number | null; connected: boolean; sending: boolean;
+  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running"; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string;
   onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
   const [dragging, setDragging] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [speechToast, setSpeechToast] = useState("");
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const speechActiveRef = useRef(false);
+  const speechHadTextRef = useRef(false);
+  const speechRestartTimerRef = useRef<number | null>(null);
+  const speechToastTimerRef = useRef<number | null>(null);
+  const speechUpdatingRef = useRef(false);
+  const speechBaseTextRef = useRef("");
+  const speechFinalTextRef = useRef("");
+  const onInputRef = useRef(props.onInput);
   const previews = useMemo(() => props.files.map((file) => ({ file, url: file.type.startsWith("image/") ? URL.createObjectURL(file) : "" })), [props.files]);
+  const speechSupported = typeof window !== "undefined" && getSpeechRecognitionConstructor() !== null;
   useEffect(() => () => previews.forEach((item) => item.url && URL.revokeObjectURL(item.url)), [previews]);
+  useEffect(() => { onInputRef.current = props.onInput; }, [props.onInput]);
+
+  const showSpeechToast = useCallback((message: string) => {
+    setSpeechToast(message);
+    if (speechToastTimerRef.current !== null) window.clearTimeout(speechToastTimerRef.current);
+    speechToastTimerRef.current = window.setTimeout(() => {
+      speechToastTimerRef.current = null;
+      setSpeechToast("");
+    }, 2400);
+  }, []);
+
+  const stopSpeechInput = useCallback((abort = false, notifyNoText = false) => {
+    const shouldNotifyNoText = notifyNoText && !speechHadTextRef.current;
+    speechActiveRef.current = false;
+    if (speechRestartTimerRef.current !== null) {
+      window.clearTimeout(speechRestartTimerRef.current);
+      speechRestartTimerRef.current = null;
+    }
+    const recognition = recognitionRef.current;
+    recognitionRef.current = null;
+    setListening(false);
+    speechFinalTextRef.current = "";
+    speechHadTextRef.current = false;
+    if (shouldNotifyNoText) showSpeechToast("未识别到文字");
+    if (!recognition) return;
+    recognition.onstart = null;
+    recognition.onend = null;
+    recognition.onerror = null;
+    recognition.onresult = null;
+    try {
+      if (abort) recognition.abort();
+      else recognition.stop();
+    } catch {
+      // 浏览器语音识别对象可能已经结束；这里保持输入框状态收敛即可。
+    }
+  }, [showSpeechToast]);
+
+  useEffect(() => () => {
+    stopSpeechInput(true);
+    if (speechToastTimerRef.current !== null) window.clearTimeout(speechToastTimerRef.current);
+  }, [stopSpeechInput]);
+  useEffect(() => {
+    setSpeechToast("");
+    if (!speechActiveRef.current) return;
+    // 切换会话不关闭浏览器语音识别，只清空当前输入框并让后续转写从新会话重新拼接。
+    speechBaseTextRef.current = "";
+    speechFinalTextRef.current = "";
+    speechHadTextRef.current = false;
+    onInputRef.current("");
+  }, [props.sessionId]);
 
   const addFiles = useCallback((incoming: File[]) => {
     // 选择、拖拽和粘贴共用同一入口；这里只负责即时反馈，服务端仍执行最终内容校验。
@@ -1282,8 +1395,124 @@ function Composer(props: {
     };
   }, [addFiles]);
 
+  const toggleSpeechInput = useCallback(() => {
+    if (!props.connected) return;
+    if (listening || speechActiveRef.current) {
+      stopSpeechInput(false, true);
+      return;
+    }
+    const Recognition = getSpeechRecognitionConstructor();
+    if (!Recognition) {
+      showSpeechToast("当前浏览器不支持语音输入");
+      return;
+    }
+    const recognition = new Recognition();
+    recognition.lang = "zh-CN";
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    speechBaseTextRef.current = props.input;
+    speechFinalTextRef.current = "";
+    speechHadTextRef.current = false;
+    speechActiveRef.current = true;
+    recognitionRef.current = recognition;
+    setSpeechToast("");
+    recognition.onstart = () => {
+      setListening(true);
+    };
+    recognition.onresult = (event) => {
+      let newlyFinalText = "";
+      let interimText = "";
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        const text = result[0]?.transcript ?? "";
+        if (result.isFinal) newlyFinalText += text;
+        else interimText += text;
+      }
+      speechFinalTextRef.current += newlyFinalText;
+      const originalText = speechBaseTextRef.current;
+      speechUpdatingRef.current = true;
+      const transcript = `${speechFinalTextRef.current}${interimText}`;
+      const separator = originalText.trim() && transcript.trim() ? " " : "";
+      if (transcript.trim()) speechHadTextRef.current = true;
+      onInputRef.current(`${originalText}${separator}${transcript}`.trimStart());
+      queueMicrotask(() => { speechUpdatingRef.current = false; });
+    };
+    recognition.onerror = (event) => {
+      const error = event.error ?? "";
+      if (error === "aborted") return;
+      if (error === "no-speech") {
+        return;
+      } else if (error === "not-allowed" || error === "service-not-allowed") {
+        speechActiveRef.current = false;
+        showSpeechToast("浏览器没有麦克风权限");
+      } else if (error === "audio-capture") {
+        speechActiveRef.current = false;
+        showSpeechToast("没有检测到可用麦克风");
+      } else if (error === "network") {
+        speechActiveRef.current = false;
+        showSpeechToast("浏览器语音服务网络不可用");
+      } else {
+        speechActiveRef.current = false;
+        showSpeechToast(`语音输入暂时不可用${error ? `：${error}` : ""}`);
+      }
+    };
+    recognition.onend = () => {
+      setListening(false);
+      if (!speechActiveRef.current) {
+        recognitionRef.current = null;
+        return;
+      }
+      if (speechRestartTimerRef.current !== null) window.clearTimeout(speechRestartTimerRef.current);
+      speechRestartTimerRef.current = window.setTimeout(() => {
+        speechRestartTimerRef.current = null;
+        if (!speechActiveRef.current || recognitionRef.current !== recognition) return;
+        try {
+          recognition.start();
+        } catch {
+          speechActiveRef.current = false;
+          recognitionRef.current = null;
+          setListening(false);
+          showSpeechToast("语音输入重启失败");
+        }
+      }, 250);
+    };
+    try {
+      recognition.start();
+    } catch {
+      speechActiveRef.current = false;
+      setListening(false);
+      recognitionRef.current = null;
+      showSpeechToast("语音输入启动失败");
+    }
+  }, [listening, props.connected, props.input, showSpeechToast, stopSpeechInput]);
+
+  const handleInputChange = useCallback((value: string) => {
+    if ((listening || speechActiveRef.current) && !speechUpdatingRef.current) {
+      speechBaseTextRef.current = value;
+      speechFinalTextRef.current = "";
+      speechHadTextRef.current = false;
+    }
+    props.onInput(value);
+  }, [listening, props.onInput]);
+
+  const handleSend = useCallback(() => {
+    stopSpeechInput();
+    props.onSend();
+  }, [props.onSend, stopSpeechInput]);
+
+  const handleStop = useCallback(() => {
+    props.onStop();
+  }, [props.onStop]);
+  const speechRunning = listening || speechActiveRef.current;
+
   return (
-    <footer className="composer-wrap">
+    <>
+      {speechToast && typeof document !== "undefined" ? createPortal((
+        <div className="speech-toast" role="status">
+          <AlertCircle size={20} /><span>{speechToast}</span>
+        </div>
+      ), document.body) : null}
+      <footer className="composer-wrap">
       <div
         className={`composer${dragging ? " dragging" : ""}`}
         onPaste={(event) => {
@@ -1308,20 +1537,34 @@ function Composer(props: {
         {attachmentError ? <div className="attachment-error" role="alert">{attachmentError}</div> : null}
         <textarea
           value={props.input}
-          onChange={(event) => props.onInput(event.target.value)}
+          onChange={(event) => handleInputChange(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); props.onSend(); }
+            if (event.key === "Enter" && !event.shiftKey && !props.active) { event.preventDefault(); handleSend(); }
           }}
           placeholder={props.connected ? "输入消息，或附加文本与图片" : "等待连接恢复"}
-          disabled={!props.connected || props.active}
-          rows={3}
+          disabled={!props.connected}
+          rows={2}
         />
         <div className="composer-actions">
-          <label className="icon-button attach-button" title="添加文本或图片">
+          <label className="icon-button composer-tool-button attach-button" title="添加文本或图片">
             <Paperclip size={18} /><span className="sr-only">添加附件</span>
             <input type="file" multiple accept={ATTACHMENT_ACCEPT} onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />
           </label>
-          <span className="composer-hint">Enter 发送 · Shift+Enter 换行</span>
+          <button
+            type="button"
+            className={`icon-button composer-tool-button voice-button${speechRunning ? " listening" : ""}`}
+            title={speechSupported ? (speechRunning ? "停止语音输入" : "语音输入") : "当前浏览器不支持语音输入"}
+            aria-label={speechRunning ? "停止语音输入" : "语音输入"}
+            aria-pressed={speechRunning}
+            disabled={!speechSupported || (!props.connected && !speechRunning)}
+            onClick={toggleSpeechInput}
+          >
+            {speechRunning ? (
+              <span className="voice-levels" aria-hidden="true">
+                <span /><span /><span /><span />
+              </span>
+            ) : <Mic size={19} />}
+          </button>
           {props.turnStatus === "queued" ? (
             <span className="queue-status" role="status">
               {props.queuePosition === 1 ? "排队中 · 即将开始" : `排队中 · 前面还有 ${(props.queuePosition ?? 1) - 1} 个会话`}
@@ -1329,13 +1572,14 @@ function Composer(props: {
           ) : null}
           {props.turnStatus === "submitting" ? <span className="queue-status" role="status">正在提交...</span> : null}
           {props.active ? (
-            <button className="send-button stop" aria-label="停止" onClick={props.onStop}><CircleStop size={18} /><span>停止</span></button>
+            <button className="send-button stop" aria-label="停止" onClick={handleStop}><CircleStop size={18} /><span>停止</span></button>
           ) : (
-            <button className="send-button" aria-label="发送" onClick={props.onSend} disabled={props.sending || (!props.input.trim() && props.files.length === 0)}><SendHorizontal size={18} /><span>发送</span></button>
+            <button className="send-button" aria-label="发送" onClick={handleSend} disabled={props.sending || (!props.input.trim() && props.files.length === 0)}><SendHorizontal size={18} /><span>发送</span></button>
           )}
         </div>
       </div>
-    </footer>
+      </footer>
+    </>
   );
 }
 
