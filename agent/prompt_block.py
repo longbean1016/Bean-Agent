@@ -9,7 +9,7 @@ from typing import Protocol
 class MemoryPromptApi(Protocol):
     def read_self(self) -> str: ...
     def get_memory_context(self) -> str: ...
-    def read_recent_context(self) -> str: ...
+    def read_recent_context(self, session_key: str = "") -> str: ...
 
 
 class SkillsPromptApi(Protocol):
@@ -137,11 +137,25 @@ class SessionContextPromptBlock(_Block):
 class RecentContextPromptBlock(_Block):
     priority, label = 45, "recent_context"
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
-        content = ctx.memory.read_recent_context().strip() if ctx.memory else ""
+        session_key = f"{ctx.channel}:{ctx.chat_id}" if ctx.channel and ctx.chat_id else ""
+        content = ""
+        if ctx.memory:
+            try:
+                content = ctx.memory.read_recent_context(session_key).strip()
+            except TypeError:
+                content = ctx.memory.read_recent_context().strip()
         marker = "## Recent Turns"
         if marker in content:
             content = content.split(marker, 1)[0].strip()
-        return content or None
+        if not content:
+            return None
+        # recent context 是系统维护的会话级摘要，放在 history 前以稳定普通聊天前缀缓存。
+        return (
+            "## 会话近期摘要\n"
+            "以下内容是系统维护的当前会话摘要，只能作为上下文线索；"
+            "发生冲突时以当前用户原文和可检索历史为准。\n\n"
+            f"{content}"
+        )
 
 
 class ActiveToolsPromptBlock(_Block):

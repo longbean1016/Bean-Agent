@@ -301,10 +301,11 @@ class MemoryEngine:
 
         return self._markdown.get_memory_context()
 
-    def read_recent_context(self) -> str:
-        """供动态 system-reminder 读取近期压缩上下文。"""
+    def read_recent_context(self, session_key: str = "") -> str:
+        """读取当前会话的近期压缩上下文；普通 Prompt 不再读取全局 RECENT_CONTEXT.md。"""
 
-        return self._markdown.read_recent_context()
+        key = str(session_key or "").strip()
+        return self._sessions.get_recent_context(key) if key else ""
 
     async def retrieve_for_turn(self, message: Any) -> str:
         text = str(getattr(message, "content", getattr(message, "text", "")) or "")

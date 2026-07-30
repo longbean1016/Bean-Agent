@@ -11,7 +11,8 @@ from agent.prompt_block import SectionCache, SystemPromptBuilder, TurnContext, d
 class Memory:
     def read_self(self) -> str: return "保持直接"
     def get_memory_context(self) -> str: return "用户是开发者"
-    def read_recent_context(self) -> str:
+    def read_recent_context(self, session_key: str = "") -> str:
+        assert session_key in {"", "web:c", "web:other"}
         return "## Compression\n- 项目开发\n\n## Recent Turns\n- [user] 重复消息"
 
 
@@ -41,13 +42,16 @@ def test_static_prefix_cache_and_dynamic_context_frame_are_separated() -> None:
 
     assert first.messages[0]["role"] == "system"
     assert first.messages[0]["content"] == second.messages[0]["content"]
+    assert "会话近期摘要" in str(first.messages[0]["content"])
+    assert "项目开发" in str(first.messages[0]["content"])
+    assert "重复消息" not in str(first.messages[0]["content"])
     assert {item.name for item in second.debug_breakdown if item.cache_hit} == {
         "identity", "behavior_rules"
     }
     reminder = first.messages[-2]["content"]
     assert reminder.startswith('<system-reminder data-system-context-frame="true">')
     assert "用户偏好中文" in reminder
-    assert "项目开发" in reminder
+    assert "项目开发" not in reminder
     assert "重复消息" not in reminder
 
 
@@ -100,6 +104,28 @@ def test_envelope_order_is_system_history_reminder_current_message() -> None:
         "[语言要求: 默认用简体中文完成最终回复和可见思考过程；用户明确要求其他语言时遵循用户要求。]\n"
         "当前问题"
     )
+
+
+def test_recent_context_is_in_system_before_history() -> None:
+    assembler = PromptAssembler(
+        SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
+        MessageEnvelopeBuilder(),
+    )
+    result = assembler.assemble(
+        turn_ctx=TurnContext(
+            workspace="D:/workspace",
+            channel="web",
+            chat_id="c",
+            memory=Memory(),
+        ),
+        history=[{"role": "assistant", "content": "旧回答"}],
+        current_message="当前问题",
+    )
+
+    assert result.messages[0]["role"] == "system"
+    assert "会话近期摘要" in str(result.messages[0]["content"])
+    assert "项目开发" in str(result.messages[0]["content"])
+    assert result.messages[1] == {"role": "assistant", "content": "旧回答"}
 
 
 def test_stable_behavior_rules_request_chinese_answer_and_reasoning() -> None:
