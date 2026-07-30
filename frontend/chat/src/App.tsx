@@ -32,14 +32,14 @@ import type { ComponentPropsWithoutRef, ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
-import { deleteReminder, deleteSession, fetchMessages, fetchNotifications, fetchProactiveSettings, fetchReminders, fetchSessions, mediaUrl, renameSession, saveProactiveSettings, uploadAttachment } from "./api";
+import { deleteReminder, deleteSession, fetchMessagePage, fetchMessagesAroundPage, fetchNotifications, fetchOlderMessages, fetchProactiveSettings, fetchReminders, fetchSessions, fetchTurns, mediaUrl, renameSession, saveProactiveSettings, uploadAttachment } from "./api";
 import { idleTurnState, initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
 import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupSessionsByUpdatedAt } from "./sessionGroups";
-import type { ChatFrame, ChatMessage, ConnectionStatus, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity } from "./types";
+import type { ChatFrame, ChatMessage, ConnectionStatus, MessageRow, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity, TurnNavigationEntry } from "./types";
 import { groupMessagesIntoNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
 
@@ -63,6 +63,7 @@ const ATTACHMENT_ACCEPT = [
   ...TEXT_SUFFIXES,
 ].join(",");
 type ThemePreference = "light" | "system" | "dark";
+type MessageWindowState = { hasMoreBefore: boolean; nextBeforeSeq: number | null };
 const markdownPlugins = { code, renderers: [{ language: "mermaid", component: MermaidBlock }] };
 const markdownComponents = { inlineCode: MemoryInlineCode };
 const markdownControls = {
@@ -145,6 +146,10 @@ export function App() {
   const [routeSession, setRouteSession] = useState(initialSession);
   const [connection, setConnection] = useState<ConnectionStatus>("connecting");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [turnsBySession, setTurnsBySession] = useState<Record<string, TurnNavigationEntry[]>>({});
+  const [notificationsBySession, setNotificationsBySession] = useState<Record<string, ChatMessage[]>>({});
+  const [messageWindows, setMessageWindows] = useState<Record<string, MessageWindowState>>({});
+  const [loadingOlderSessionId, setLoadingOlderSessionId] = useState("");
   const [loadingSessionId, setLoadingSessionId] = useState(initialSession);
   const [input, setInput] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -158,13 +163,22 @@ export function App() {
   const [titleDraft, setTitleDraft] = useState("");
   const clientRef = useRef<BeanWebSocketClient | null>(null);
   const chatRef = useRef(chat);
+  const messageWindowsRef = useRef(messageWindows);
+  const notificationsBySessionRef = useRef(notificationsBySession);
+  const loadingOlderSessionIdRef = useRef(loadingOlderSessionId);
   const routeSessionRef = useRef(routeSession);
   chatRef.current = chat;
+  messageWindowsRef.current = messageWindows;
+  notificationsBySessionRef.current = notificationsBySession;
+  loadingOlderSessionIdRef.current = loadingOlderSessionId;
   routeSessionRef.current = routeSession;
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
   const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running";
   const restoringSession = Boolean(chat.sessionId && loadingSessionId === chat.sessionId && chat.messages.length === 0);
-  const conversationTurns = useMemo(() => turnsFromMessages(chat.messages), [chat.messages]);
+  const messageTurns = useMemo(() => turnsFromMessages(chat.messages), [chat.messages]);
+  const conversationTurns = useMemo(() => (
+    mergeNavigationTurns(turnsBySession[chat.sessionId] ?? [], messageTurns)
+  ), [chat.sessionId, messageTurns, turnsBySession]);
   const conversationTurnGroups = useMemo(() => groupMessagesIntoNavigationTurns(chat.messages), [chat.messages]);
 
   useEffect(() => {
@@ -208,7 +222,40 @@ export function App() {
     }
   }, []);
 
+  const refreshTurnPreviews = useCallback(async (sessionId: string) => {
+    if (!sessionId) return;
+    try {
+      const turns = await fetchTurns(sessionId);
+      setTurnsBySession((current) => ({ ...current, [sessionId]: turns }));
+    } catch (error) {
+      dispatch(errorFrame(error));
+    }
+  }, []);
+
+  const handleNotificationFrame = useCallback((frame: ChatFrame) => {
+    if (!isNotificationFinalFrame(frame)) return false;
+    const notification = notificationFrameToMessage(frame);
+    if (!notification) return true;
+    const sessionId = frame.session_id;
+    const currentNotifications = notificationsBySessionRef.current[sessionId] ?? [];
+    const nextNotifications = upsertMessage(currentNotifications, notification);
+    setNotificationsBySession((current) => ({
+      ...current,
+      [sessionId]: upsertMessage(current[sessionId] ?? [], notification),
+    }));
+    if (sessionId === chatRef.current.sessionId) {
+      const persistedMessages = chatRef.current.messages.filter((message) => !isStandaloneNotification(message));
+      dispatch({
+        type: "ui.session.select",
+        sessionId,
+        messages: mergeMessageWindow(persistedMessages, nextNotifications),
+      });
+    }
+    return true;
+  }, []);
+
   const handleFrame = useCallback((frame: ChatFrame) => {
+    if (handleNotificationFrame(frame)) return;
     dispatch(frame);
     if (frame.type === "session.created") {
       localStorage.setItem(SESSION_STORAGE_KEY, frame.session_id);
@@ -225,8 +272,11 @@ export function App() {
           : session
       )));
     }
-    if (frame.type === "message.final") void refreshSessions();
-  }, [refreshSessions]);
+    if (frame.type === "message.final") {
+      void refreshSessions();
+      void refreshTurnPreviews(frame.session_id);
+    }
+  }, [handleNotificationFrame, refreshSessions, refreshTurnPreviews]);
 
   useEffect(() => {
     const client = new BeanWebSocketClient({
@@ -259,8 +309,23 @@ export function App() {
   const loadSession = async (sessionId: string, closeSidebar = true) => {
     setLoadingSessionId(sessionId);
     try {
-      const [rows, notifications] = await Promise.all([fetchMessages(sessionId), fetchNotifications(sessionId)]);
-      const messages = mergeTimeline(rowsToMessages(rows), notificationRowsToMessages(notifications));
+      const [page, notifications, turns] = await Promise.all([
+        fetchMessagePage(sessionId),
+        fetchNotifications(sessionId),
+        fetchTurns(sessionId),
+      ]);
+      const rows = page.items ?? [];
+      const notificationMessages = notificationRowsToMessages(notifications);
+      const messages = mergeMessageWindow(rowsToMessages(rows), notificationMessages);
+      setMessageWindows((current) => ({
+        ...current,
+        [sessionId]: {
+          hasMoreBefore: Boolean(page.has_more),
+          nextBeforeSeq: page.next_before_seq ?? firstSeqFromRows(rows),
+        },
+      }));
+      setNotificationsBySession((current) => ({ ...current, [sessionId]: notificationMessages }));
+      setTurnsBySession((current) => ({ ...current, [sessionId]: turns }));
       localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
       dispatch({ type: "ui.session.select", sessionId, messages });
       if (closeSidebar) setSidebarOpen(false);
@@ -294,6 +359,81 @@ export function App() {
     setFiles(fileDrafts[routeKey(sessionId)] ?? []);
     void loadSession(sessionId);
   };
+
+  const handleTurnRequest = useCallback(async (turn: TurnNavigationEntry) => {
+    const sessionId = chatRef.current.sessionId;
+    if (!sessionId || typeof turn.seq !== "number") return;
+    const loaded = chatRef.current.messages.some((message) => (
+      message.role === "user"
+      && (message.turnId === turn.id || message.id === turn.id || message.seq === turn.seq)
+    ));
+    if (loaded) return;
+    try {
+      const [page, notifications] = await Promise.all([
+        fetchMessagesAroundPage(sessionId, turn.seq),
+        fetchNotifications(sessionId),
+      ]);
+      const rows = page.items ?? [];
+      const notificationMessages = notificationRowsToMessages(notifications);
+      const messages = mergeMessageWindow(rowsToMessages(rows), notificationMessages);
+      setMessageWindows((current) => ({
+        ...current,
+        [sessionId]: {
+          hasMoreBefore: Boolean(page.has_before),
+          nextBeforeSeq: page.next_before_seq ?? firstSeqFromRows(rows),
+        },
+      }));
+      setNotificationsBySession((current) => ({ ...current, [sessionId]: notificationMessages }));
+      dispatch({ type: "ui.session.select", sessionId, messages });
+    } catch (error) {
+      dispatch(errorFrame(error));
+    }
+  }, []);
+
+  const loadOlderMessages = useCallback(async (scroller: HTMLElement) => {
+    const sessionId = chatRef.current.sessionId;
+    const windowState = messageWindowsRef.current[sessionId];
+    if (!sessionId || !windowState?.hasMoreBefore || typeof windowState.nextBeforeSeq !== "number") return;
+    if (loadingOlderSessionIdRef.current === sessionId) return;
+    const previousHeight = scroller.scrollHeight;
+    const previousTop = scroller.scrollTop;
+    setLoadingOlderSessionId(sessionId);
+    try {
+      const page = await fetchOlderMessages(sessionId, windowState.nextBeforeSeq);
+      const olderMessages = rowsToMessages(page.items ?? []);
+      const currentMessages = chatRef.current.messages.filter((message) => !isStandaloneNotification(message));
+      const persistedMessages = dedupeMessages(mergeTimeline(olderMessages, currentMessages));
+      const messages = mergeMessageWindow(persistedMessages, notificationsBySessionRef.current[sessionId] ?? []);
+      dispatch({ type: "ui.session.select", sessionId, messages });
+      setMessageWindows((current) => ({
+        ...current,
+        [sessionId]: {
+          hasMoreBefore: Boolean(page.has_more),
+          nextBeforeSeq: page.next_before_seq ?? firstSeqFromRows(page.items ?? []),
+        },
+      }));
+      requestAnimationFrame(() => {
+        const delta = scroller.scrollHeight - previousHeight;
+        scroller.scrollTop = Math.max(0, previousTop + delta);
+      });
+    } catch (error) {
+      dispatch(errorFrame(error));
+    } finally {
+      setLoadingOlderSessionId((current) => current === sessionId ? "" : current);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!chat.sessionId) return;
+    const scroller = document.querySelector<HTMLElement>(".conversation-scroll");
+    if (!scroller) return;
+    const handleScroll = () => {
+      if (scroller.scrollTop > 48) return;
+      void loadOlderMessages(scroller);
+    };
+    scroller.addEventListener("scroll", handleScroll, { passive: true });
+    return () => scroller.removeEventListener("scroll", handleScroll);
+  }, [chat.sessionId, loadOlderMessages]);
 
   useEffect(() => {
     const handlePopState = () => {
@@ -517,7 +657,7 @@ export function App() {
               </section>
             ))}
           </StickToBottom.Content>
-          <TurnNavigator sessionId={chat.sessionId} turns={conversationTurns} />
+          <TurnNavigator sessionId={chat.sessionId} turns={conversationTurns} onTurnRequest={handleTurnRequest} />
           <ConversationAutoScroll sessionId={chat.sessionId} messages={chat.messages} active={currentTurn.status === "running"} />
           <ConversationScrollButton />
         </StickToBottom>
@@ -1241,6 +1381,97 @@ function upsertSessionSummary(current: SessionSummary[], incoming: SessionSummar
   const next = [...current];
   next[index] = { ...current[index], ...incoming };
   return next;
+}
+
+function mergeNavigationTurns(globalTurns: TurnNavigationEntry[], messageTurns: TurnNavigationEntry[]): TurnNavigationEntry[] {
+  if (!globalTurns.length) {
+    return messageTurns.map((turn, index) => ({ ...turn, turnIndex: turn.turnIndex ?? index + 1 }));
+  }
+  const usedIds = new Set(globalTurns.map((turn) => turn.id));
+  const usedSeqs = new Set(globalTurns.map((turn) => turn.seq).filter((seq): seq is number => typeof seq === "number"));
+  const usedQuestions = new Set(globalTurns.map((turn) => turn.question.trim()).filter(Boolean));
+  const next = [...globalTurns];
+  for (const turn of messageTurns) {
+    if (usedIds.has(turn.id) || (typeof turn.seq === "number" && usedSeqs.has(turn.seq))) continue;
+    if (typeof turn.seq !== "number" && usedQuestions.has(turn.question.trim())) continue;
+    next.push({ ...turn, turnIndex: turn.turnIndex ?? next.length + 1 });
+  }
+  return next;
+}
+
+function dedupeMessages(messages: ChatMessage[]): ChatMessage[] {
+  const seen = new Set<string>();
+  const next: ChatMessage[] = [];
+  for (const message of messages) {
+    if (seen.has(message.id)) continue;
+    seen.add(message.id);
+    next.push(message);
+  }
+  return next;
+}
+
+function upsertMessage(messages: ChatMessage[], incoming: ChatMessage): ChatMessage[] {
+  const index = messages.findIndex((message) => message.id === incoming.id);
+  if (index < 0) return [...messages, incoming];
+  const next = [...messages];
+  next[index] = { ...next[index], ...incoming };
+  return next;
+}
+
+function mergeMessageWindow(persistedMessages: ChatMessage[], notifications: ChatMessage[]): ChatMessage[] {
+  return dedupeMessages(mergeTimeline(
+    persistedMessages,
+    notificationsForMessageWindow(persistedMessages, notifications),
+  ));
+}
+
+function notificationsForMessageWindow(persistedMessages: ChatMessage[], notifications: ChatMessage[]): ChatMessage[] {
+  const times = persistedMessages
+    .map((message) => Date.parse(message.timestamp || ""))
+    .filter((time) => !Number.isNaN(time));
+  if (!times.length) return [];
+  const start = Math.min(...times);
+  const end = Math.max(...times);
+  return notifications.filter((message) => {
+    if (!isStandaloneNotification(message)) return false;
+    const time = Date.parse(message.timestamp || "");
+    return !Number.isNaN(time) && time >= start && time <= end;
+  });
+}
+
+function isStandaloneNotification(message: ChatMessage): boolean {
+  return typeof message.seq !== "number"
+    && (message.source === "scheduled_reminder" || message.source === "scheduled_soft");
+}
+
+function isNotificationFinalFrame(frame: ChatFrame): frame is Extract<ChatFrame, { type: "message.final" }> {
+  return frame.type === "message.final" && Boolean(frame.metadata?.notification);
+}
+
+function notificationFrameToMessage(frame: Extract<ChatFrame, { type: "message.final" }>): ChatMessage | null {
+  const metadata = frame.metadata ?? {};
+  const source = String(metadata.source || "");
+  if (source !== "scheduled_reminder" && source !== "scheduled_soft") return null;
+  const id = frame.message_id
+    || String(metadata.notification_id || metadata.message_id || "");
+  if (!id) return null;
+  return {
+    id,
+    role: "assistant",
+    content: frame.content,
+    thinking: frame.thinking ?? "",
+    media: frame.media ?? [],
+    tools: [],
+    streaming: false,
+    source,
+    scheduledAt: String(metadata.scheduled_at || "") || undefined,
+    timestamp: String(metadata.generated_at || "") || undefined,
+  };
+}
+
+function firstSeqFromRows(rows: MessageRow[]): number | null {
+  const first = rows.find((row) => typeof row.seq === "number");
+  return typeof first?.seq === "number" ? first.seq : null;
 }
 
 function shortSession(sessionId: string): string { return sessionId ? `会话 ${sessionId.slice(-8)}` : "正在创建会话"; }

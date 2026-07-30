@@ -432,7 +432,7 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
     @app.get("/api/chat/sessions/{session_key:path}/messages")
     def list_messages(
         session_key: str,
-        limit: int = Query(80, ge=1, le=200),
+        limit: int = Query(60, ge=1, le=200),
     ) -> dict[str, Any]:
         items, total, has_more, next_before_seq = application.core.sessions.store.list_latest_chat_messages(
             session_key,
@@ -450,7 +450,7 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
     def list_older_messages(
         session_key: str,
         before_seq: int = Query(..., ge=0),
-        limit: int = Query(80, ge=1, le=200),
+        limit: int = Query(60, ge=1, le=200),
     ) -> dict[str, Any]:
         items, has_more, next_before_seq = application.core.sessions.store.list_chat_messages_before(
             session_key,
@@ -462,6 +462,28 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             "has_more": has_more,
             "next_before_seq": next_before_seq,
         }
+
+    @app.get("/api/chat/sessions/{session_key:path}/messages/around")
+    def list_messages_around(
+        session_key: str,
+        anchor_seq: int = Query(..., ge=0),
+        limit: int = Query(60, ge=1, le=200),
+    ) -> dict[str, Any]:
+        items, has_before, has_after, next_before_seq = application.core.sessions.store.list_chat_messages_from(
+            session_key,
+            anchor_seq=anchor_seq,
+            limit=limit,
+        )
+        return {
+            "items": items,
+            "has_before": has_before,
+            "has_after": has_after,
+            "next_before_seq": next_before_seq,
+        }
+
+    @app.get("/api/chat/sessions/{session_key:path}/turns")
+    def list_turns(session_key: str) -> dict[str, Any]:
+        return {"items": application.core.sessions.store.list_chat_turns(session_key)}
 
     def require_web_session(session_key: str) -> None:
         """主动设置只属于当前 Web channel，禁止借 path 参数访问其他渠道。"""

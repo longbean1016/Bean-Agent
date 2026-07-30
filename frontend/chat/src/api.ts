@@ -1,4 +1,6 @@
-import type { MessagePage, MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, UploadedFile } from "./types";
+import type { MessagePage, MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile } from "./types";
+
+const MESSAGE_WINDOW_LIMIT = 60;
 
 export async function fetchSessions(): Promise<SessionSummary[]> {
   const response = await fetch("/api/chat/sessions?page=1&page_size=100");
@@ -8,16 +10,44 @@ export async function fetchSessions(): Promise<SessionSummary[]> {
 }
 
 export async function fetchMessages(sessionId: string): Promise<MessageRow[]> {
-  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`);
-  if (!response.ok) throw new Error("无法加载会话历史");
-  const payload = await response.json() as MessagePage;
+  const payload = await fetchMessagePage(sessionId);
   return payload.items ?? [];
 }
 
-export async function fetchOlderMessages(sessionId: string, beforeSeq: number, limit = 80): Promise<MessagePage> {
+export async function fetchMessagePage(sessionId: string): Promise<MessagePage> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`);
+  if (!response.ok) throw new Error("无法加载会话历史");
+  return response.json() as Promise<MessagePage>;
+}
+
+export async function fetchOlderMessages(sessionId: string, beforeSeq: number, limit = MESSAGE_WINDOW_LIMIT): Promise<MessagePage> {
   const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages/older?before_seq=${encodeURIComponent(String(beforeSeq))}&limit=${encodeURIComponent(String(limit))}`);
   if (!response.ok) throw new Error("无法加载更早会话历史");
   return response.json() as Promise<MessagePage>;
+}
+
+export async function fetchMessagesAround(sessionId: string, anchorSeq: number, limit = MESSAGE_WINDOW_LIMIT): Promise<MessageRow[]> {
+  const payload = await fetchMessagesAroundPage(sessionId, anchorSeq, limit);
+  return payload.items ?? [];
+}
+
+export async function fetchMessagesAroundPage(sessionId: string, anchorSeq: number, limit = MESSAGE_WINDOW_LIMIT): Promise<MessagePage> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages/around?anchor_seq=${encodeURIComponent(String(anchorSeq))}&limit=${encodeURIComponent(String(limit))}`);
+  if (!response.ok) throw new Error("无法定位会话轮次");
+  return response.json() as Promise<MessagePage>;
+}
+
+export async function fetchTurns(sessionId: string): Promise<TurnNavigationEntry[]> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/turns`);
+  if (!response.ok) throw new Error("无法加载会话导航");
+  const payload = await response.json() as { items?: Array<{ id?: string; seq?: number; turn_index?: number; question?: string; preview?: string }> };
+  return (payload.items ?? []).filter((item) => typeof item.id === "string").map((item) => ({
+    id: String(item.id),
+    seq: typeof item.seq === "number" ? item.seq : undefined,
+    turnIndex: typeof item.turn_index === "number" ? item.turn_index : undefined,
+    question: String(item.question ?? item.preview ?? ""),
+    preview: String(item.preview ?? item.question ?? ""),
+  }));
 }
 
 export async function fetchNotifications(sessionId: string): Promise<ProactiveNotificationRow[]> {

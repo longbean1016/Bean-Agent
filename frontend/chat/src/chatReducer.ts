@@ -378,6 +378,7 @@ function updateSessionTurn(
 export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {
   return rows.filter((row) => row.role === "user" || row.role === "assistant").map((row) => ({
     id: row.id,
+    seq: typeof row.seq === "number" ? row.seq : undefined,
     role: row.role === "user" ? "user" : "assistant",
     content: row.content,
     thinking: row.proactive ? "" : (row.reasoning_content ?? ""),

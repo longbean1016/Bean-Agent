@@ -74,7 +74,7 @@ def test_chat_api_lists_titled_running_session_without_messages(tmp_path: Path) 
 
 def test_chat_api_messages_returns_latest_page_and_older_page(tmp_path: Path) -> None:
     client, runtime = _client(tmp_path)
-    for index in range(85):
+    for index in range(65):
         runtime.sessions.store.add_message(
             NewMessage(session_key="web:paged", role="user", content=f"m-{index:02d}")
         )
@@ -85,13 +85,55 @@ def test_chat_api_messages_returns_latest_page_and_older_page(tmp_path: Path) ->
             f"/api/chat/sessions/web:paged/messages/older?before_seq={latest['next_before_seq']}&limit=10"
         ).json()
 
-    assert len(latest["items"]) == 80
+    assert len(latest["items"]) == 60
     assert latest["items"][0]["content"] == "m-05"
-    assert latest["items"][-1]["content"] == "m-84"
+    assert latest["items"][-1]["content"] == "m-64"
     assert latest["has_more"] is True
     assert latest["next_before_seq"] == 5
     assert [item["content"] for item in older["items"]] == [f"m-{index:02d}" for index in range(0, 5)]
     assert older["has_more"] is False
+
+
+def test_chat_api_lists_global_user_turn_navigation(tmp_path: Path) -> None:
+    client, runtime = _client(tmp_path)
+    runtime.sessions.store.add_message(
+        NewMessage(session_key="web:turns", role="user", content="第一问", turn_id="turn-1")
+    )
+    runtime.sessions.store.add_message(
+        NewMessage(session_key="web:turns", role="assistant", content="第一答", turn_id="turn-1")
+    )
+    runtime.sessions.store.add_message(
+        NewMessage(session_key="web:turns", role="assistant", content="主动消息")
+    )
+    runtime.sessions.store.add_message(
+        NewMessage(session_key="web:turns", role="user", content="第二问", turn_id="turn-2")
+    )
+
+    with client:
+        turns = client.get("/api/chat/sessions/web:turns/turns").json()
+
+    assert [item["turn_index"] for item in turns["items"]] == [1, 2]
+    assert [item["seq"] for item in turns["items"]] == [0, 3]
+    assert [item["id"] for item in turns["items"]] == ["turn-1", "turn-2"]
+    assert [item["preview"] for item in turns["items"]] == ["第一问", "第二问"]
+
+
+def test_chat_api_messages_around_returns_window_from_anchor(tmp_path: Path) -> None:
+    client, runtime = _client(tmp_path)
+    for index in range(70):
+        runtime.sessions.store.add_message(
+            NewMessage(session_key="web:around", role="user", content=f"m-{index:02d}")
+        )
+
+    with client:
+        page = client.get("/api/chat/sessions/web:around/messages/around?anchor_seq=8").json()
+
+    assert len(page["items"]) == 60
+    assert page["items"][0]["seq"] == 8
+    assert page["items"][-1]["seq"] == 67
+    assert page["has_before"] is True
+    assert page["has_after"] is True
+    assert page["next_before_seq"] == 8
 
 
 def test_chat_api_messages_appends_running_snapshot_without_persisting(tmp_path: Path) -> None:

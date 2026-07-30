@@ -432,7 +432,7 @@ class SessionStore:
         self,
         session_key: str,
         *,
-        limit: int = 80,
+        limit: int = 60,
     ) -> tuple[list[dict[str, Any]], int, bool, int | None]:
         """返回最新一页聊天消息，结果仍按 seq 升序供前端直接渲染。"""
 
@@ -465,7 +465,7 @@ class SessionStore:
         session_key: str,
         *,
         before_seq: int,
-        limit: int = 80,
+        limit: int = 60,
     ) -> tuple[list[dict[str, Any]], bool, int | None]:
         """按 seq 游标向前读取更早消息，避免首屏加载超大历史。"""
 
@@ -493,6 +493,75 @@ class SessionStore:
         has_more = more_row is not None
         next_before_seq = int(items[0]["seq"]) if has_more and items else None
         return items, has_more, next_before_seq
+
+    def list_chat_messages_from(
+        self,
+        session_key: str,
+        *,
+        anchor_seq: int,
+        limit: int = 60,
+    ) -> tuple[list[dict[str, Any]], bool, bool, int | None]:
+        """从指定 seq 往后读取一个正文窗口，用于右侧全局导航跳转。"""
+
+        key = self._validate_session_key(session_key)
+        safe_anchor = max(0, int(anchor_seq))
+        safe_limit = max(1, min(int(limit), 200))
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                f"""
+                SELECT {_MESSAGE_COLUMNS}
+                FROM messages
+                WHERE session_key = ? AND seq >= ?
+                ORDER BY seq ASC
+                LIMIT ?
+                """,
+                (key, safe_anchor, safe_limit),
+            ).fetchall()
+            first_seq = int(rows[0]["seq"]) if rows else safe_anchor
+            last_seq = int(rows[-1]["seq"]) if rows else safe_anchor
+            before_row = self._conn.execute(
+                "SELECT 1 FROM messages WHERE session_key = ? AND seq < ? LIMIT 1",
+                (key, first_seq),
+            ).fetchone()
+            after_row = self._conn.execute(
+                "SELECT 1 FROM messages WHERE session_key = ? AND seq > ? LIMIT 1",
+                (key, last_seq),
+            ).fetchone()
+        items = [self._row_to_message(row) for row in rows]
+        next_before_seq = int(items[0]["seq"]) if before_row is not None and items else None
+        return items, before_row is not None, after_row is not None, next_before_seq
+
+    def list_chat_turns(self, session_key: str) -> list[dict[str, Any]]:
+        """返回全局普通对话导航，只统计 user 消息，主动 assistant 不参与编号。"""
+
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                f"""
+                SELECT {_MESSAGE_COLUMNS}
+                FROM messages
+                WHERE session_key = ? AND role = 'user'
+                ORDER BY seq ASC
+                """,
+                (key,),
+            ).fetchall()
+        turns: list[dict[str, Any]] = []
+        for index, row in enumerate(rows, start=1):
+            message = self._row_to_message(row)
+            question = " ".join(str(message.get("content") or "").split()) or "附件消息"
+            preview = question[:80].rstrip()
+            turns.append({
+                "id": str(message.get("turn_id") or message["id"]),
+                "message_id": message["id"],
+                "seq": int(message["seq"]),
+                "turn_index": index,
+                "question": question[:240].rstrip(),
+                "preview": preview,
+                "timestamp": message["timestamp"],
+            })
+        return turns
 
     def get_last_chat_message_timestamp(self, session_key: str) -> str | None:
         """Return the last user/assistant message timestamp for proactive idle checks."""

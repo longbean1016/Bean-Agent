@@ -1,14 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
-import type { ChatMessage } from "./types";
+import type { ChatMessage, TurnNavigationEntry } from "./types";
 
 const DEFAULT_PREVIEW_LENGTH = 34;
-
-export interface TurnNavigationEntry {
-  id: string;
-  question: string;
-  preview: string;
-}
 
 interface VerticalRegion {
   top: number;
@@ -89,15 +83,17 @@ export function turnsFromMessages(
         : question;
       return {
         id: message.turnId || message.id,
+        seq: message.seq,
         question,
         preview,
       };
     });
 }
 
-export function TurnNavigator({ sessionId, turns }: {
+export function TurnNavigator({ sessionId, turns, onTurnRequest }: {
   sessionId: string;
   turns: TurnNavigationEntry[];
+  onTurnRequest?: (turn: TurnNavigationEntry) => Promise<void> | void;
 }) {
   const navRef = useRef<HTMLElement>(null);
   const previousScrollTopRef = useRef(0);
@@ -125,10 +121,10 @@ export function TurnNavigator({ sessionId, turns }: {
       .find((element) => element.dataset.turnAnchor === id) ?? null;
   }, [findScroller]);
 
-  const jumpToTurn = useCallback((id: string) => {
+  const scrollToLoadedTurn = useCallback((id: string) => {
     const scroller = findScroller();
     const anchor = findAnchor(id);
-    if (!scroller || !anchor) return;
+    if (!scroller || !anchor) return false;
     const top = scroller.scrollTop
       + anchor.getBoundingClientRect().top
       - scroller.getBoundingClientRect().top
@@ -137,7 +133,22 @@ export function TurnNavigator({ sessionId, turns }: {
     scheduleNavigationUnlock(1200);
     scroller.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
     setActiveTurnId(id);
+    return true;
   }, [findAnchor, findScroller, scheduleNavigationUnlock]);
+
+  const jumpToTurn = useCallback((turn: TurnNavigationEntry) => {
+    if (scrollToLoadedTurn(turn.id)) return;
+    if (!onTurnRequest) return;
+    navigationLockRef.current = turn.id;
+    setActiveTurnId(turn.id);
+    void Promise.resolve(onTurnRequest(turn)).then(() => {
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          scrollToLoadedTurn(turn.id);
+        });
+      });
+    });
+  }, [onTurnRequest, scrollToLoadedTurn]);
 
   useEffect(() => () => {
     if (navigationUnlockTimerRef.current) clearTimeout(navigationUnlockTimerRef.current);
@@ -222,7 +233,7 @@ export function TurnNavigator({ sessionId, turns }: {
             aria-label={`跳转到：${turn.preview}`}
             aria-current={activeTurnId === turn.id ? "true" : undefined}
             data-turn-marker={turn.id}
-            onClick={() => jumpToTurn(turn.id)}
+            onClick={() => jumpToTurn(turn)}
           />
         ))}
       </div>
@@ -236,9 +247,9 @@ export function TurnNavigator({ sessionId, turns }: {
               aria-current={activeTurnId === turn.id ? "true" : undefined}
               data-turn-nav-item={turn.id}
               title={turn.question}
-              onClick={() => jumpToTurn(turn.id)}
+              onClick={() => jumpToTurn(turn)}
             >
-              <span className="turn-directory-index">{String(index + 1).padStart(2, "0")}</span>
+              <span className="turn-directory-index">{String(turn.turnIndex ?? index + 1).padStart(2, "0")}</span>
               <span>{turn.preview}</span>
             </button>
           ))}

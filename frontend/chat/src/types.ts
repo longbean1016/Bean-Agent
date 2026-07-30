@@ -11,6 +11,7 @@ export interface ToolActivity {
 
 export interface ChatMessage {
   id: string;
+  seq?: number;
   role: "user" | "assistant";
   content: string;
   thinking: string;
@@ -52,6 +53,7 @@ export interface SessionSummary {
 
 export interface MessageRow {
   id: string;
+  seq?: number;
   role: string;
   content: string;
   turn_id?: string;
@@ -69,6 +71,16 @@ export interface MessagePage {
   total?: number;
   has_more?: boolean;
   next_before_seq?: number | null;
+  has_before?: boolean;
+  has_after?: boolean;
+}
+
+export interface TurnNavigationEntry {
+  id: string;
+  seq?: number;
+  turnIndex?: number;
+  question: string;
+  preview: string;
 }
 
 export interface UploadedFile {

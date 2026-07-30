@@ -204,6 +204,148 @@ it("刷新已有会话时显示骨架并通过消息接口恢复运行中 turn",
   expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith("/api/chat/sessions/web%3Acomponent/messages"))).toBe(true);
 });
 
+it("点击未加载的全局轮次导航时按 seq 加载正文窗口", async () => {
+  localStorage.setItem("beanagent.session_id", "web:component");
+  vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/api/chat/sessions?page=")) {
+      return { ok: true, json: async () => ({ items: [{
+        key: "web:component",
+        title: "global turns",
+        first_message_content: "",
+        message_count: 122,
+        created_at: "2026-07-30T12:00:00+08:00",
+        updated_at: "2026-07-30T12:00:00+08:00",
+      }], total: 1 }) } as Response;
+    }
+    if (url.endsWith("/api/chat/sessions/web%3Acomponent/turns")) {
+      return { ok: true, json: async () => ({ items: [
+        { id: "turn-old", seq: 0, turn_index: 1, question: "old question", preview: "old question", timestamp: "2026-07-30T10:00:00+08:00" },
+        { id: "turn-new", seq: 120, turn_index: 61, question: "new question", preview: "new question", timestamp: "2026-07-30T12:00:00+08:00" },
+      ] }) } as Response;
+    }
+    if (url.endsWith("/api/chat/sessions/web%3Acomponent/messages")) {
+      return { ok: true, json: async () => ({
+        items: [
+          { id: "web:component:120", seq: 120, role: "user", content: "new question", turn_id: "turn-new", timestamp: "2026-07-30T12:00:00+08:00" },
+          { id: "web:component:121", seq: 121, role: "assistant", content: "new answer", turn_id: "turn-new", timestamp: "2026-07-30T12:00:01+08:00" },
+        ],
+        has_more: true,
+        next_before_seq: 120,
+      }) } as Response;
+    }
+    if (url.includes("/api/chat/sessions/web%3Acomponent/messages/around")) {
+      return { ok: true, json: async () => ({
+        items: [
+          { id: "web:component:0", seq: 0, role: "user", content: "old question", turn_id: "turn-old", timestamp: "2026-07-30T10:00:00+08:00" },
+          { id: "web:component:1", seq: 1, role: "assistant", content: "old answer", turn_id: "turn-old", timestamp: "2026-07-30T10:00:01+08:00" },
+        ],
+        has_before: false,
+        has_after: true,
+        next_before_seq: null,
+      }) } as Response;
+    }
+    if (url.includes("/notifications")) return { ok: true, json: async () => ({ items: [{
+      id: "reminder-outside-window",
+      content: "window outside reminder",
+      source: "scheduled_reminder",
+      source_id: "reminder-1",
+      scheduled_at: "2026-07-30T09:00:00+08:00",
+      generated_at: "2026-07-30T09:00:00+08:00",
+      status: "delivered",
+      recurring: false,
+    }] }) } as Response;
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  });
+
+  render(<App />);
+
+  expect(await screen.findByText("new question", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getByTitle("old question")).toHaveTextContent("01");
+  expect(screen.getByTitle("new question")).toHaveTextContent("61");
+
+  fireEvent.click(screen.getByTitle("old question"));
+
+  expect(await screen.findByText("old question", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getByText("old answer")).toBeVisible();
+  expect(vi.mocked(fetch).mock.calls.some(([input]) => (
+    String(input).endsWith("/api/chat/sessions/web%3Acomponent/messages/around?anchor_seq=0&limit=60")
+  ))).toBe(true);
+});
+
+it("滚动到正文窗口顶部时继续加载更早消息", async () => {
+  localStorage.setItem("beanagent.session_id", "web:component");
+  vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/api/chat/sessions?page=")) {
+      return { ok: true, json: async () => ({ items: [{
+        key: "web:component",
+        title: "paged turns",
+        first_message_content: "",
+        message_count: 64,
+        created_at: "2026-07-30T12:00:00+08:00",
+        updated_at: "2026-07-30T12:00:00+08:00",
+      }], total: 1 }) } as Response;
+    }
+    if (url.endsWith("/api/chat/sessions/web%3Acomponent/turns")) {
+      return { ok: true, json: async () => ({ items: [
+        { id: "turn-old", seq: 58, turn_index: 30, question: "older question", preview: "older question", timestamp: "2026-07-30T10:00:00+08:00" },
+        { id: "turn-current", seq: 60, turn_index: 31, question: "current question", preview: "current question", timestamp: "2026-07-30T12:00:00+08:00" },
+      ] }) } as Response;
+    }
+    if (url.endsWith("/api/chat/sessions/web%3Acomponent/messages")) {
+      return { ok: true, json: async () => ({
+        items: [
+          { id: "web:component:60", seq: 60, role: "user", content: "current question", turn_id: "turn-current", timestamp: "2026-07-30T12:00:00+08:00" },
+          { id: "web:component:61", seq: 61, role: "assistant", content: "current answer", turn_id: "turn-current", timestamp: "2026-07-30T12:00:01+08:00" },
+        ],
+        has_more: true,
+        next_before_seq: 60,
+      }) } as Response;
+    }
+    if (url.includes("/api/chat/sessions/web%3Acomponent/messages/older")) {
+      return { ok: true, json: async () => ({
+        items: [
+          { id: "web:component:58", seq: 58, role: "user", content: "older question", turn_id: "turn-old", timestamp: "2026-07-30T10:00:00+08:00" },
+          { id: "web:component:59", seq: 59, role: "assistant", content: "older answer", turn_id: "turn-old", timestamp: "2026-07-30T10:00:01+08:00" },
+        ],
+        has_more: false,
+        next_before_seq: null,
+      }) } as Response;
+    }
+    if (url.includes("/notifications")) return { ok: true, json: async () => ({ items: [{
+      id: "reminder-outside-window",
+      content: "window outside reminder",
+      source: "scheduled_reminder",
+      source_id: "reminder-1",
+      scheduled_at: "2026-07-30T09:00:00+08:00",
+      generated_at: "2026-07-30T09:00:00+08:00",
+      status: "delivered",
+      recurring: false,
+    }] }) } as Response;
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  });
+
+  render(<App />);
+
+  expect(await screen.findByText("current question", { selector: ".user-text" })).toBeVisible();
+  expect(screen.queryByText("window outside reminder")).not.toBeInTheDocument();
+  const scroller = document.querySelector<HTMLElement>(".conversation-scroll")!;
+  Object.defineProperties(scroller, {
+    clientHeight: { configurable: true, value: 600 },
+    scrollHeight: { configurable: true, writable: true, value: 1200 },
+    scrollTop: { configurable: true, writable: true, value: 0 },
+  });
+  fireEvent.scroll(scroller);
+
+  expect(await screen.findByText("older question", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getByText("older answer")).toBeVisible();
+  expect(screen.queryByText("window outside reminder")).not.toBeInTheDocument();
+  expect(vi.mocked(fetch).mock.calls.some(([input]) => (
+    String(input).endsWith("/api/chat/sessions/web%3Acomponent/messages/older?before_seq=60&limit=60")
+  ))).toBe(true);
+});
+
 it("新建会话会清空其他会话中尚未发送的输入", async () => {
   render(<App />);
   await screen.findByText("已连接");
