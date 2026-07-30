@@ -36,6 +36,7 @@ class FakeWebSocket {
 
 beforeEach(() => {
   localStorage.clear();
+  sessionStorage.clear();
   window.history.replaceState({}, "", "/");
   document.documentElement.removeAttribute("data-theme");
   systemDark = false;
@@ -120,6 +121,126 @@ it("首次连接创建 Session 并发送用户消息", async () => {
   expect(window.location.pathname).toBe("/chat/component");
   expect(screen.getByText("组件测试消息", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
+});
+
+it("根路径刷新时用本地会话恢复运行中的流式 turn", async () => {
+  localStorage.setItem("beanagent.session_id", "web:component");
+  render(<App />);
+
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  await waitFor(() => expect(socket.sent.some((frame) => (
+    frame.type === "session.subscribe" && frame.session_id === "web:component"
+  ))).toBe(true));
+  expect(socket.sent.some((frame) => frame.type === "session.create")).toBe(false);
+  expect(window.location.pathname).toBe("/chat/component");
+  expect(screen.getByText("正在恢复会话")).toBeVisible();
+  expect(screen.queryByText("从一个具体问题开始对话")).not.toBeInTheDocument();
+
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.snapshot",
+    session_id: "web:component",
+    turn_id: "turn-restored",
+    request_id: "r1",
+    user_message: "刷新前的问题",
+    user_media: [],
+    content: "已经生成的内容",
+    thinking: "",
+    tools: [],
+    status: "running",
+  }) } as MessageEvent);
+
+  expect(await screen.findByText("刷新前的问题", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getByText("已经生成的内容")).toBeVisible();
+});
+
+it("刷新时优先用本地 running draft 秒显草稿", async () => {
+  localStorage.setItem("beanagent.session_id", "web:component");
+  sessionStorage.setItem("beanagent.running_draft:web:component", JSON.stringify({
+    version: 1,
+    sessionId: "web:component",
+    activeTurnId: "turn-cache",
+    turnState: { status: "running", queuePosition: null, turnId: "turn-cache", requestId: "r1" },
+    messages: [
+      {
+        id: "user-r1",
+        role: "user",
+        content: "缓存里的问题",
+        thinking: "",
+        media: [],
+        tools: [],
+        turnId: "turn-cache",
+        streaming: false,
+      },
+      {
+        id: "turn-cache",
+        role: "assistant",
+        content: "缓存里的回答",
+        thinking: "缓存里的思考",
+        media: [],
+        tools: [{ callId: "call-1", name: "read_file", status: "running", arguments: { path: "README.md" }, resultPreview: "" }],
+        turnId: "turn-cache",
+        streaming: true,
+      },
+    ],
+    savedAt: Date.now(),
+  }));
+
+  render(<App />);
+
+  expect(screen.getByText("缓存里的问题", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getByText("缓存里的回答")).toBeVisible();
+  expect(screen.getByText("缓存里的思考")).toBeVisible();
+  expect(screen.getByText("read_file")).toBeVisible();
+  expect(screen.queryByText("正在恢复会话")).not.toBeInTheDocument();
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  await waitFor(() => expect(socket.sent.some((frame) => (
+    frame.type === "session.subscribe" && frame.session_id === "web:component"
+  ))).toBe(true));
+});
+
+it("流式过程中写入 running draft 并在 final 后清理", async () => {
+  render(<App />);
+  await screen.findByText("已连接");
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  const socket = FakeWebSocket.instances[0];
+  const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
+  fireEvent.change(input, { target: { value: "需要缓存的问题" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send")).toBe(true));
+  const sent = socket.sent.find((frame) => frame.type === "message.send");
+
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.started",
+    request_id: sent?.request_id,
+    session_id: "web:component",
+    turn_id: "turn-cache-write",
+  }) } as MessageEvent);
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "answer.delta",
+    session_id: "web:component",
+    turn_id: "turn-cache-write",
+    delta: "阶段缓存",
+  }) } as MessageEvent);
+
+  await waitFor(() => {
+    const raw = sessionStorage.getItem("beanagent.running_draft:web:component");
+    expect(raw).not.toBeNull();
+    expect(raw).toContain("阶段缓存");
+  });
+
+  socket.onmessage?.({ data: JSON.stringify({
+    type: "message.final",
+    request_id: sent?.request_id,
+    session_id: "web:component",
+    turn_id: "turn-cache-write",
+    content: "最终内容",
+    thinking: "",
+    media: [],
+  }) } as MessageEvent);
+
+  await waitFor(() => expect(sessionStorage.getItem("beanagent.running_draft:web:component")).toBeNull());
 });
 
 it("新建会话会清空其他会话中尚未发送的输入", async () => {
