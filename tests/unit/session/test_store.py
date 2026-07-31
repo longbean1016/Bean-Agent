@@ -491,6 +491,19 @@ def test_delete_chat_session_cascades_messages_and_is_idempotent(store: SessionS
     assert store.search_messages("待删除内容", session_key="web:delete") == ([], 0)
 
 
+def test_delete_empty_chat_session_does_not_delete_sessions_with_messages(
+    store: SessionStore,
+) -> None:
+    store.create_session("web:empty")
+    store.add_message(NewMessage(session_key="web:with-message", role="user", content="保留"))
+
+    assert store.delete_empty_chat_session("web:empty") is True
+    assert store.get_session_meta("web:empty") is None
+    assert store.delete_empty_chat_session("web:empty") is False
+    assert store.delete_empty_chat_session("web:with-message") is False
+    assert store.get_session_meta("web:with-message") is not None
+
+
 def test_list_chat_messages_returns_persisted_frontend_fields(
     store: SessionStore,
 ) -> None:

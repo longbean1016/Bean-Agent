@@ -200,13 +200,25 @@ class AgentLoop:
                     },
                 )
             )
+            await self._sessions.delete_if_empty(message.session_key)
             return
+
+        # 首条消息进入运行阶段就生成默认标题，刷新会话列表时可以立即恢复标题。
+        # 消息正文仍在 Turn 完成后批量写入，不改变消息持久化边界。
+        session_summary = await self._sessions.ensure_default_title(
+            message.session_key,
+            message.content,
+            list(message.media),
+        )
+        if session_summary is not None:
+            await self._events.emit(SessionUpdated(message.session_key, session_summary))
         try:
             # 正常被动 Turn 对齐参考实现：Pipeline 推理期间不提前把 user 放进 Session；
             # 推理完成后才把 user 与 assistant 作为一个提交批次写入 SQLite。
             result = await self._pipeline.process(message, turn_id=turn_id)
         except asyncio.CancelledError:
             # Channel 已同步返回 turn.interrupted；这里不写 Session 或发送 final，避免覆盖前端半截回复。
+            await self._sessions.delete_if_empty(message.session_key)
             return
         except Exception as error:
             logger.exception("Agent 推理异常: session_key=%s", message.session_key)

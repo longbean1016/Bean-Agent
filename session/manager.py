@@ -425,6 +425,19 @@ class SessionManager:
                 self._cache.pop(key, None)
             return deleted
 
+    async def delete_if_empty(self, session_key: str) -> bool:
+        """清理没有消息的临时会话；有消息的会话不会被此入口删除。"""
+
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            deleted = await asyncio.to_thread(
+                self._store.delete_empty_chat_session,
+                key,
+            )
+            if deleted:
+                self._cache.pop(key, None)
+            return deleted
+
     async def close(self) -> None:
         """幂等关闭 Store，并释放完整消息缓存和会话锁。"""
 
