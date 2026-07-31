@@ -65,7 +65,12 @@ class Provider:
         self.calls += 1
         self.messages.append(list(messages))
         if self.calls == 1:
-            return LLMResponse(None, [ToolCall("call-1", "echo", {"text": "hi"})], provider_fields={"reasoning_content": "想一想"})
+            return LLMResponse(
+                None,
+                [ToolCall("call-1", "echo", {"text": "hi"})],
+                thinking="工具前思考",
+                provider_fields={"reasoning_content": "工具前思考"},
+            )
         if on_content_delta:
             await on_content_delta({"content_delta": "完成"})
         return LLMResponse("完成", thinking="推理")
@@ -373,7 +378,7 @@ async def test_pipeline_runs_tool_loop_and_emits_lifecycle_events() -> None:
     result = await pipeline.process(InboundMessage(channel="web", sender="u", chat_id="c", content="执行"), turn_id="t1")
 
     assert result.content == "完成"
-    assert result.thinking == "推理"
+    assert result.thinking == "工具前思考\n\n推理"
     assert result.tools_used == ["echo"]
     assert result.tool_chain[0]["calls"][0]["result"] == "echo:hi:web:c"
     assert any(isinstance(event, ToolCallStarted) for event in seen)

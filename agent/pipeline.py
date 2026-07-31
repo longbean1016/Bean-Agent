@@ -159,7 +159,20 @@ class Pipeline:
         react_messages: list[dict[str, Any]] = []
         tool_chain: list[dict[str, Any]] = []
         tools_used: list[str] = []
+        thinking_parts: list[str] = []
         last_base_messages: list[dict[str, Any]] = []
+
+        def append_turn_thinking(value: str | None) -> None:
+            text = str(value or "").strip()
+            if not text:
+                return
+            # thinking 是整个 Turn 的过程信息；工具轮与最终轮都要保留，避免完成后缩水。
+            if thinking_parts and thinking_parts[-1] == text:
+                return
+            thinking_parts.append(text)
+
+        def merged_turn_thinking() -> str:
+            return "\n\n".join(thinking_parts)
 
         async def on_delta(delta: dict[str, str]) -> None:
             snapshot = self._interrupt_snapshots[turn_id]
@@ -225,6 +238,7 @@ class Pipeline:
 
         for iteration in range(1, self._max_iterations + 1):
             response = await chat_with_context_retry()
+            append_turn_thinking(response.thinking)
             _log_prompt_cache_usage(
                 session_key=message.session_key,
                 iteration=iteration,
@@ -269,12 +283,13 @@ class Pipeline:
                     )
                     if retry.content:
                         response = retry
+                        append_turn_thinking(response.thinking)
                         content = str(retry.content or "").strip()
                     else:
                         logger.warning("空回复重试仍为空: session=%s", message.session_key)
                 return PipelineResult(
                     content=str(content or ""),
-                    thinking=str(response.thinking or ""),
+                    thinking=merged_turn_thinking(),
                     tool_chain=tool_chain,
                     tools_used=list(dict.fromkeys(tools_used)),
                     context_retry=context_retry,
@@ -374,7 +389,7 @@ class Pipeline:
         )
         return PipelineResult(
             content=summary,
-            thinking="",
+            thinking=merged_turn_thinking(),
             tool_chain=tool_chain,
             tools_used=list(dict.fromkeys(tools_used)),
             context_retry=context_retry,
