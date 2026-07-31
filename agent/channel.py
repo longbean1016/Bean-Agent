@@ -13,6 +13,7 @@ from uuid import uuid4
 from agent.agent_loop import InterruptResult
 from agent.event_bus import (
     EventBus,
+    SessionUpdated,
     StreamDeltaReady,
     ToolCallCompleted,
     ToolCallStarted,
@@ -49,7 +50,6 @@ class WebChannel:
         media_root: Path | None = None,
         proactive_store: ProactiveStore | None = None,
         ensure_session: Callable[[str], Awaitable[object]] | None = None,
-        ensure_session_title: Callable[[str, str, list[str]], Awaitable[dict[str, Any] | None]] | None = None,
     ) -> None:
         self._bus = bus
         self._events = event_bus
@@ -57,7 +57,6 @@ class WebChannel:
         self._media_root = media_root.resolve() if media_root is not None else None
         self._proactive_store = proactive_store
         self._ensure_session = ensure_session
-        self._ensure_session_title = ensure_session_title
         self._connections: dict[str, set[WebSocketApi]] = {}
         self._socket_send_locks: weakref.WeakKeyDictionary[WebSocketApi, asyncio.Lock] = (
             weakref.WeakKeyDictionary()
@@ -65,6 +64,7 @@ class WebChannel:
         self._lock = asyncio.Lock()
         bus.subscribe_outbound(self.name, self._on_response)
         event_bus.on(TurnStarted, self._on_turn_started)
+        event_bus.on(SessionUpdated, self._on_session_updated)
         event_bus.on(TurnQueued, self._on_turn_queued)
         event_bus.on(TurnQueueRejected, self._on_turn_queue_rejected)
         event_bus.on(StreamDeltaReady, self._on_stream_delta)
@@ -107,9 +107,6 @@ class WebChannel:
             await self._replay_pending_notifications(session_key, websocket)
             return
         if frame_type == "message.send":
-            if session_key is None:
-                session_key = await self._create_session()
-                await self._send_json(websocket, {"type": "session.created", "request_id": request_id, "session_id": session_key})
             text = str(frame.get("text") or "")
             media = [str(item).strip() for item in frame.get("media", []) if isinstance(item, str) and str(item).strip()] if isinstance(frame.get("media"), list) else []
             if not text.strip() and not media:
@@ -121,14 +118,10 @@ class WebChannel:
             if not self._media_is_allowed(media):
                 await self._error(websocket, request_id, "invalid_media", "附件路径无效或不属于当前 workspace")
                 return
+            if session_key is None:
+                session_key = await self._create_session()
+                await self._send_json(websocket, {"type": "session.created", "request_id": request_id, "session_id": session_key})
             await self._register(session_key, websocket)
-            if self._ensure_session_title is not None:
-                session = await self._ensure_session_title(session_key, text, list(media))
-                if session is not None:
-                    await self._broadcast(session_key, {
-                        "type": "session.updated",
-                        "session": dict(session),
-                    })
             chat_id = session_key.split(":", 1)[1]
             await self._bus.publish_inbound(InboundMessage(self.name, "web", chat_id, text, list(media), {"request_id": request_id}))
             return
@@ -217,6 +210,12 @@ class WebChannel:
     async def _on_turn_started(self, event: TurnStarted) -> None:
         await self._broadcast(event.session_key, {"type": "turn.started", "request_id": event.request_id, "session_id": event.session_key, "turn_id": event.turn_id})
 
+    async def _on_session_updated(self, event: SessionUpdated) -> None:
+        await self._broadcast(event.session_key, {
+            "type": "session.updated",
+            "session": dict(event.session),
+        })
+
     async def _on_turn_queued(self, event: TurnQueued) -> None:
         await self._broadcast(event.session_key, {
             "type": "turn.queued",
@@ -298,6 +297,7 @@ class WebChannel:
     async def close(self) -> None:
         self._bus.unsubscribe_outbound(self.name, self._on_response)
         self._events.off(TurnStarted, self._on_turn_started)
+        self._events.off(SessionUpdated, self._on_session_updated)
         self._events.off(TurnQueued, self._on_turn_queued)
         self._events.off(TurnQueueRejected, self._on_turn_queue_rejected)
         self._events.off(StreamDeltaReady, self._on_stream_delta)

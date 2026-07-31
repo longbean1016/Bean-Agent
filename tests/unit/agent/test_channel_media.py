@@ -49,22 +49,9 @@ class Socket:
 
 
 @pytest.mark.asyncio
-async def test_message_send_publishes_session_title_update_before_turn_runs() -> None:
+async def test_message_send_does_not_publish_session_title_before_turn_runs() -> None:
     bus = MessageBus()
-    titles: list[tuple[str, str, list[str]]] = []
-
-    async def ensure_title(session_key: str, content: str, media: list[str]) -> dict:
-        titles.append((session_key, content, media))
-        return {
-            "key": session_key,
-            "title": "first question title",
-            "first_message_content": "",
-            "message_count": 0,
-            "created_at": "2026-07-30T12:00:00+08:00",
-            "updated_at": "2026-07-30T12:00:00+08:00",
-        }
-
-    channel = WebChannel(bus, EventBus(), Interrupt(), ensure_session_title=ensure_title)
+    channel = WebChannel(bus, EventBus(), Interrupt())
     socket = Socket()
 
     await channel.handle_frame(socket, {
@@ -75,17 +62,47 @@ async def test_message_send_publishes_session_title_update_before_turn_runs() ->
         "media": [],
     })
 
-    assert titles == [("web:chat", "first question title", [])]
+    assert socket.frames == []
+    assert not bus._inbound.empty()
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_message_send_without_session_creates_session_after_validation() -> None:
+    bus = MessageBus()
+    created: list[str] = []
+
+    async def ensure_session(session_key: str) -> object:
+        created.append(session_key)
+        return object()
+
+    channel = WebChannel(bus, EventBus(), Interrupt(), ensure_session=ensure_session)
+    socket = Socket()
+
+    await channel.handle_frame(socket, {
+        "type": "message.send",
+        "request_id": "r-empty",
+        "text": "   ",
+        "media": [],
+    })
+
+    assert created == []
+    assert socket.frames[-1]["code"] == "empty_message"
+    assert bus._inbound.empty()
+
+    await channel.handle_frame(socket, {
+        "type": "message.send",
+        "request_id": "r-new",
+        "text": "first question",
+        "media": [],
+    })
+
+    assert len(created) == 1
+    assert created[0].startswith("web:")
     assert socket.frames[-1] == {
-        "type": "session.updated",
-        "session": {
-            "key": "web:chat",
-            "title": "first question title",
-            "first_message_content": "",
-            "message_count": 0,
-            "created_at": "2026-07-30T12:00:00+08:00",
-            "updated_at": "2026-07-30T12:00:00+08:00",
-        },
+        "type": "session.created",
+        "request_id": "r-new",
+        "session_id": created[0],
     }
     assert not bus._inbound.empty()
     await channel.close()

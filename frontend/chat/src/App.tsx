@@ -288,6 +288,21 @@ export function App() {
     dispatch(frame);
     if (frame.type === "session.created") {
       localStorage.setItem(SESSION_STORAGE_KEY, frame.session_id);
+      const createdAt = new Date().toISOString();
+      if (!routeSessionRef.current) {
+        window.history.pushState({}, "", pathForSession(frame.session_id));
+        setRouteSession(frame.session_id);
+      }
+      setSessions((current) => current.some((session) => session.key === frame.session_id)
+        ? current
+        : [{
+            key: frame.session_id,
+            title: "新对话",
+            created_at: createdAt,
+            updated_at: createdAt,
+            message_count: 0,
+            first_message_content: "",
+          }, ...current]);
     }
     if (frame.type === "session.updated") {
       setSessions((current) => upsertSessionSummary(current, frame.session));
@@ -312,9 +327,6 @@ export function App() {
       onFrame: handleFrame,
       onStatus: (status) => {
         setConnection(status);
-        if (status === "connected" && !routeSessionRef.current && !chatRef.current.sessionId) {
-          client.send({ type: "session.create", request_id: crypto.randomUUID() });
-        }
       },
     });
     clientRef.current = client;
@@ -373,7 +385,6 @@ export function App() {
     window.history.pushState({}, "", "/");
     setRouteSession("");
     dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
-    clientRef.current?.send({ type: "session.create", request_id: crypto.randomUUID() });
     // 每次点击新建都创建全新的根页面草稿，不影响任何已有会话的独立草稿。
     setTextDrafts((current) => ({ ...current, [routeKey("")]: "" }));
     setFileDrafts((current) => ({ ...current, [routeKey("")]: [] }));
@@ -493,9 +504,6 @@ export function App() {
         return;
       }
       dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
-      if (connection === "connected") {
-        clientRef.current?.send({ type: "session.create", request_id: crypto.randomUUID() });
-      }
     };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
@@ -515,7 +523,7 @@ export function App() {
   const submit = async () => {
     const cleanText = input.trim();
     if ((!cleanText && files.length === 0) || sending || turnActive) return;
-    if (connection !== "connected" || !chat.sessionId) {
+    if (connection !== "connected") {
       dispatch({ type: "error", request_id: "", code: "offline", message: "连接尚未就绪，请重连后再发送" });
       return;
     }
@@ -524,6 +532,7 @@ export function App() {
     try {
       const uploaded = await Promise.all(files.map(uploadAttachment));
       const requestId = crypto.randomUUID();
+      const sessionId = chat.sessionId;
       const optimistic: ChatMessage = {
         id: `user-${requestId}`,
         role: "user",
@@ -533,11 +542,11 @@ export function App() {
         tools: [],
       };
       dispatch({ type: "ui.user.append", message: optimistic });
-      dispatch({ type: "ui.turn.submitted", sessionId: chat.sessionId, requestId });
+      dispatch({ type: "ui.turn.submitted", sessionId, requestId });
       const sent = clientRef.current?.send({
         type: "message.send",
         request_id: requestId,
-        session_id: chat.sessionId,
+        ...(sessionId ? { session_id: sessionId } : {}),
         text: cleanText,
         media: uploaded.map((item) => item.upload_path),
       });
@@ -545,22 +554,18 @@ export function App() {
         dispatch({
           type: "error",
           request_id: requestId,
-          session_id: chat.sessionId,
+          ...(sessionId ? { session_id: sessionId } : {}),
           code: "closed",
           message: "消息未发送，WebSocket 已断开",
         });
         return;
       }
-      if (!routeSession) {
-        window.history.pushState({}, "", pathForSession(chat.sessionId));
-        setRouteSession(chat.sessionId);
-      }
       const submittedAt = new Date().toISOString();
       // 新会话的首轮可能长期运行或排队，发送成功后先放入目录，最终再由服务端标题覆盖。
-      setSessions((current) => current.some((session) => session.key === chat.sessionId)
+      if (sessionId) setSessions((current) => current.some((session) => session.key === sessionId)
         ? current
         : [{
-            key: chat.sessionId,
+            key: sessionId,
             title: "新对话",
             created_at: submittedAt,
             updated_at: submittedAt,
@@ -569,8 +574,8 @@ export function App() {
           }, ...current]);
       setInput("");
       setFiles([]);
-      setTextDrafts((current) => ({ ...current, [routeKey(routeSession || chat.sessionId)]: "", [routeKey("")]: "" }));
-      setFileDrafts((current) => ({ ...current, [routeKey(routeSession || chat.sessionId)]: [], [routeKey("")]: [] }));
+      setTextDrafts((current) => ({ ...current, [routeKey(routeSession || sessionId)]: "", [routeKey("")]: "" }));
+      setFileDrafts((current) => ({ ...current, [routeKey(routeSession || sessionId)]: [], [routeKey("")]: [] }));
     } catch (error) {
       dispatch(errorFrame(error));
     } finally {

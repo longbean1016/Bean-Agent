@@ -141,7 +141,6 @@ class AppRuntime:
             media_root=core.workspace / "uploads",
             proactive_store=core.proactive_store,
             ensure_session=core.sessions.get_or_create,
-            ensure_session_title=core.sessions.ensure_default_title,
         )
         self.maintenance = (
             MemoryMaintenanceLoop(

@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from agent.event_bus import (
     EventBus,
+    SessionUpdated,
     TurnCommitted,
     TurnQueued,
     TurnQueueRejected,
@@ -228,6 +229,13 @@ class AgentLoop:
         # append_messages 依次写入同一批的两条消息并原地回填稳定 ID。只有它完整返回，
         # 后台记忆才能看到完整 Turn，因此 TurnCommitted 必须位于此调用之后。
         await self._sessions.append_messages(session, [user, assistant])
+        session_summary = await self._sessions.ensure_default_title(
+            message.session_key,
+            message.content,
+            list(message.media),
+        )
+        if session_summary is not None:
+            await self._events.emit(SessionUpdated(message.session_key, session_summary))
         await self._events.emit(TurnCommitted(
             message.session_key, turn_id, str(user["id"]), str(assistant["id"]), "ok"
         ))

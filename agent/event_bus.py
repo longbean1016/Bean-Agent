@@ -78,6 +78,14 @@ class TurnCommitted:
     status: str
 
 
+@dataclass(frozen=True, slots=True)
+class SessionUpdated:
+    """会话目录摘要已更新，可安全推送给前端刷新标题和排序。"""
+
+    session_key: str
+    session: dict[str, Any]
+
+
 class EventBus:
     """按注册顺序派发生命周期事件，并隔离单个观察者故障。"""
 
@@ -124,6 +132,7 @@ def _handler_name(handler: EventHandler[object]) -> str:
 __all__ = [
     "EventBus",
     "EventHandler",
+    "SessionUpdated",
     "StreamDeltaReady",
     "ToolCallCompleted",
     "ToolCallStarted",

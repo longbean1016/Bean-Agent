@@ -397,7 +397,7 @@ class SessionManager:
         content: str,
         media: list[str],
     ) -> dict[str, Any] | None:
-        """首条用户消息推理期间提前生成目录标题，不提前写入消息历史。"""
+        """确保首条用户消息已有默认目录标题，并返回前端可用的会话摘要。"""
 
         key = self._validate_session_key(session_key)
         async with self._lock_for(key):

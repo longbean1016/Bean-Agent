@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent.agent_loop import AgentLoop, TurnInterruptState
-from agent.event_bus import EventBus, TurnCommitted
+from agent.event_bus import EventBus, SessionUpdated, TurnCommitted
 from agent.message_bus import InboundMessage, MessageBus, PipelineResult
 from agent.config_models import MemoryConfig
 from memory.consolidator import ConsolidationDraft
@@ -38,7 +38,9 @@ async def test_run_once_persists_complete_turn_before_committed_and_outbound(tmp
     events = EventBus()
     sessions = SessionManager(tmp_path)
     committed = []
+    updated = []
     events.on(TurnCommitted, lambda event: committed.append(event))
+    events.on(SessionUpdated, lambda event: updated.append(event))
     loop = AgentLoop(bus, events, Pipeline(), sessions)
     await bus.publish_inbound(InboundMessage(channel="web", sender="u", chat_id="c", content="问题", metadata={"request_id": "r1"}))
 
@@ -48,6 +50,8 @@ async def test_run_once_persists_complete_turn_before_committed_and_outbound(tmp
     outbound = await bus.consume_outbound()
     assert [row["role"] for row in rows] == ["user", "assistant"]
     assert rows[1]["tool_chain"][0]["iteration"] == 1
+    assert updated[0].session_key == "web:c"
+    assert updated[0].session["title"] == "问题"
     assert committed[0].user_message_id == rows[0]["id"]
     assert committed[0].assistant_message_id == rows[1]["id"]
     assert outbound.content == "回答"

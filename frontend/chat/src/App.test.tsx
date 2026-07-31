@@ -29,6 +29,9 @@ class FakeWebSocket {
     if (frame.type === "session.create") {
       queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ type: "session.created", request_id: frame.request_id, session_id: "web:component" }) } as MessageEvent));
     }
+    if (frame.type === "message.send" && !frame.session_id) {
+      queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ type: "session.created", request_id: frame.request_id, session_id: "web:component" }) } as MessageEvent));
+    }
   }
 
   close() { this.readyState = FakeWebSocket.CLOSED; this.onclose?.(); }
@@ -105,19 +108,21 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-it("首次连接创建 Session 并发送用户消息", async () => {
+it("首条消息发送后创建 Session 并保留用户消息", async () => {
   render(<App />);
 
   await screen.findByText("已连接");
-  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
   const socket = FakeWebSocket.instances[0];
-  expect(socket.sent[0]).toMatchObject({ type: "session.create" });
+  expect(socket.sent.some((frame) => frame.type === "session.create")).toBe(false);
 
   const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
   fireEvent.change(input, { target: { value: "组件测试消息" } });
   fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
   await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send" && frame.text === "组件测试消息")).toBe(true));
+  const sent = socket.sent.find((frame) => frame.type === "message.send");
+  expect(sent).not.toHaveProperty("session_id");
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
   expect(window.location.pathname).toBe("/chat/component");
   expect(screen.getByText("组件测试消息", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
@@ -126,12 +131,12 @@ it("首次连接创建 Session 并发送用户消息", async () => {
 it("运行中新会话收到标题更新后替换侧栏占位", async () => {
   render(<App />);
   await screen.findByText("已连接");
-  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
   const socket = FakeWebSocket.instances[0];
   const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
   fireEvent.change(input, { target: { value: "标题问题" } });
   fireEvent.click(screen.getByRole("button", { name: "发送" }));
   await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send")).toBe(true));
+  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
 
   socket.onmessage?.({ data: JSON.stringify({
     type: "session.updated",
@@ -486,7 +491,6 @@ it("非连续正文窗口只插入已加载区间内的提醒", async () => {
 it("新建会话会清空其他会话中尚未发送的输入", async () => {
   render(<App />);
   await screen.findByText("已连接");
-  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
   const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
   fireEvent.change(input, { target: { value: "不应带到新会话" } });
   const attachment = new File(["draft"], "draft.txt", { type: "text/plain" });
@@ -511,7 +515,6 @@ it("延迟返回的旧会话列表不会移除正在排队的新会话", async (
   render(<App />);
 
   await screen.findByText("已连接");
-  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
   const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
   fireEvent.change(input, { target: { value: "等待队列的消息" } });
   fireEvent.click(screen.getByRole("button", { name: "发送" }));
@@ -527,7 +530,6 @@ it("延迟返回的旧会话列表不会移除正在排队的新会话", async (
 it("排队时展示动态位置并允许停止取消", async () => {
   render(<App />);
   await screen.findByText("已连接");
-  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
   const socket = FakeWebSocket.instances[0];
   const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
   fireEvent.change(input, { target: { value: "需要排队的问题" } });
@@ -575,7 +577,6 @@ it("切回后台运行会话时恢复用户问题流式内容和工具状态", a
   }));
   render(<App />);
   await screen.findByText("已连接");
-  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
   const socket = FakeWebSocket.instances[0];
   const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
   fireEvent.change(input, { target: { value: "分析当前项目" } });
@@ -794,8 +795,9 @@ it("删除当前会话后复用新建流程并回到空白会话", async () => {
     expect.objectContaining({ method: "DELETE" }),
   ));
   const socket = FakeWebSocket.instances[0];
-  await waitFor(() => expect(socket.sent.filter((frame) => frame.type === "session.create")).toHaveLength(1));
-  await waitFor(() => expect(localStorage.getItem("beanagent.session_id")).toBe("web:component"));
+  expect(socket.sent.filter((frame) => frame.type === "session.create")).toHaveLength(0);
+  expect(localStorage.getItem("beanagent.session_id")).toBeNull();
+  expect(window.location.pathname).toBe("/");
   expect(screen.queryAllByText("即将删除")).toHaveLength(0);
 });
 

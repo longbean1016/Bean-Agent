@@ -58,12 +58,20 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
   }
   if (action.type === "ui.error.clear") return { ...state, error: "" };
   if (action.type === "session.created") {
+    const draftMessages = state.sessionId === "" ? state.messages : [];
+    const draftTurn = state.turnStates[""];
+    const turnStates = { ...state.turnStates };
+    if (draftTurn) {
+      turnStates[action.session_id] = { ...draftTurn };
+      delete turnStates[""];
+    }
     return {
       ...state,
       sessionId: action.session_id,
       activeTurnId: "",
-      messages: [],
-      sessionMessages: setSessionMessages(state, action.session_id, []),
+      messages: draftMessages,
+      sessionMessages: setSessionMessages(state, action.session_id, draftMessages),
+      turnStates,
       error: "",
     };
   }
