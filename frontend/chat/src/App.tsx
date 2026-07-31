@@ -65,7 +65,7 @@ const ATTACHMENT_ACCEPT = [
   ...TEXT_SUFFIXES,
 ].join(",");
 type ThemePreference = "light" | "system" | "dark";
-type MessageWindowState = { hasMoreBefore: boolean; nextBeforeSeq: number | null };
+type MessageWindowState = { hasMoreBefore: boolean; nextBeforeSeq: number | null; hasTailWindow: boolean };
 const markdownPlugins = { code, renderers: [{ language: "mermaid", component: MermaidBlock }] };
 const markdownComponents = { inlineCode: MemoryInlineCode };
 const markdownControls = {
@@ -273,7 +273,11 @@ export function App() {
       dispatch({
         type: "ui.session.select",
         sessionId,
-        messages: mergeMessageWindow(persistedMessages, nextNotifications),
+        messages: mergeMessageWindow(
+          persistedMessages,
+          nextNotifications,
+          Boolean(messageWindowsRef.current[sessionId]?.hasTailWindow),
+        ),
       });
     }
     return true;
@@ -347,6 +351,7 @@ export function App() {
         [sessionId]: {
           hasMoreBefore: Boolean(page.has_more),
           nextBeforeSeq: page.next_before_seq ?? firstSeqFromRows(rows),
+          hasTailWindow: true,
         },
       }));
       setNotificationsBySession((current) => ({ ...current, [sessionId]: notificationMessages }));
@@ -400,12 +405,24 @@ export function App() {
       ]);
       const rows = page.items ?? [];
       const notificationMessages = notificationRowsToMessages(notifications);
-      const messages = mergeMessageWindow(rowsToMessages(rows), notificationMessages);
+      const currentMessages = chatRef.current.messages.filter((message) => !isStandaloneNotification(message));
+      const persistedMessages = dedupeMessages(mergeTimeline(
+        rowsToMessages(rows),
+        currentMessages,
+      ));
+      const currentWindow = messageWindowsRef.current[sessionId];
+      const hasTailWindow = Boolean(currentWindow?.hasTailWindow || page.has_after === false);
+      const messages = mergeMessageWindow(
+        persistedMessages,
+        notificationMessages,
+        hasTailWindow,
+      );
       setMessageWindows((current) => ({
         ...current,
         [sessionId]: {
           hasMoreBefore: Boolean(page.has_before),
           nextBeforeSeq: page.next_before_seq ?? firstSeqFromRows(rows),
+          hasTailWindow,
         },
       }));
       setNotificationsBySession((current) => ({ ...current, [sessionId]: notificationMessages }));
@@ -428,13 +445,18 @@ export function App() {
       const olderMessages = rowsToMessages(page.items ?? []);
       const currentMessages = chatRef.current.messages.filter((message) => !isStandaloneNotification(message));
       const persistedMessages = dedupeMessages(mergeTimeline(olderMessages, currentMessages));
-      const messages = mergeMessageWindow(persistedMessages, notificationsBySessionRef.current[sessionId] ?? []);
+      const messages = mergeMessageWindow(
+        persistedMessages,
+        notificationsBySessionRef.current[sessionId] ?? [],
+        Boolean(windowState.hasTailWindow),
+      );
       dispatch({ type: "ui.session.select", sessionId, messages });
       setMessageWindows((current) => ({
         ...current,
         [sessionId]: {
           hasMoreBefore: Boolean(page.has_more),
           nextBeforeSeq: page.next_before_seq ?? firstSeqFromRows(page.items ?? []),
+          hasTailWindow: Boolean(current[sessionId]?.hasTailWindow),
         },
       }));
       requestAnimationFrame(() => {
@@ -1662,25 +1684,62 @@ function upsertMessage(messages: ChatMessage[], incoming: ChatMessage): ChatMess
   return next;
 }
 
-function mergeMessageWindow(persistedMessages: ChatMessage[], notifications: ChatMessage[]): ChatMessage[] {
+function mergeMessageWindow(
+  persistedMessages: ChatMessage[],
+  notifications: ChatMessage[],
+  hasTailWindow = true,
+): ChatMessage[] {
   return dedupeMessages(mergeTimeline(
     persistedMessages,
-    notificationsForMessageWindow(persistedMessages, notifications),
+    notificationsForMessageWindow(persistedMessages, notifications, hasTailWindow),
   ));
 }
 
-function notificationsForMessageWindow(persistedMessages: ChatMessage[], notifications: ChatMessage[]): ChatMessage[] {
-  const times = persistedMessages
-    .map((message) => Date.parse(message.timestamp || ""))
-    .filter((time) => !Number.isNaN(time));
-  if (!times.length) return [];
-  const start = Math.min(...times);
-  const end = Math.max(...times);
+function notificationsForMessageWindow(
+  persistedMessages: ChatMessage[],
+  notifications: ChatMessage[],
+  hasTailWindow: boolean,
+): ChatMessage[] {
+  const ranges = loadedMessageTimeRanges(persistedMessages);
+  if (!ranges.length) return [];
+  const tailRange = hasTailWindow ? ranges[ranges.length - 1] : null;
   return notifications.filter((message) => {
     if (!isStandaloneNotification(message)) return false;
     const time = Date.parse(message.timestamp || "");
-    return !Number.isNaN(time) && time >= start && time <= end;
+    if (Number.isNaN(time)) return false;
+    return ranges.some((range) => time >= range.startTime && time <= range.endTime)
+      || Boolean(tailRange && time > tailRange.endTime);
   });
+}
+
+function loadedMessageTimeRanges(messages: ChatMessage[]): Array<{
+  startSeq: number;
+  endSeq: number;
+  startTime: number;
+  endTime: number;
+}> {
+  const ordered = messages
+    .filter((message) => typeof message.seq === "number" && !isStandaloneNotification(message))
+    .map((message) => ({ ...message, seq: Number(message.seq), time: Date.parse(message.timestamp || "") }))
+    .filter((message) => !Number.isNaN(message.time))
+    .sort((left, right) => left.seq - right.seq);
+  const ranges: Array<{ startSeq: number; endSeq: number; startTime: number; endTime: number }> = [];
+  for (const message of ordered) {
+    const current = ranges[ranges.length - 1];
+    if (!current || message.seq > current.endSeq + 1) {
+      ranges.push({
+        startSeq: message.seq,
+        endSeq: message.seq,
+        startTime: message.time,
+        endTime: message.time,
+      });
+      continue;
+    }
+    current.endSeq = message.seq;
+    current.startTime = Math.min(current.startTime, message.time);
+    current.endTime = Math.max(current.endTime, message.time);
+  }
+  return ranges;
 }
 
 function isStandaloneNotification(message: ChatMessage): boolean {

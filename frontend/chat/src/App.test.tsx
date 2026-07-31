@@ -346,6 +346,143 @@ it("滚动到正文窗口顶部时继续加载更早消息", async () => {
   ))).toBe(true);
 });
 
+it("将晚于最新正文窗口的提醒插入末尾", async () => {
+  localStorage.setItem("beanagent.session_id", "web:component");
+  vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/api/chat/sessions?page=")) {
+      return { ok: true, json: async () => ({ items: [{
+        key: "web:component",
+        title: "notification after window",
+        first_message_content: "",
+        message_count: 2,
+        created_at: "2026-07-30T23:00:00+08:00",
+        updated_at: "2026-07-30T23:56:00+08:00",
+      }], total: 1 }) } as Response;
+    }
+    if (url.endsWith("/api/chat/sessions/web%3Acomponent/turns")) {
+      return { ok: true, json: async () => ({ items: [] }) } as Response;
+    }
+    if (url.endsWith("/api/chat/sessions/web%3Acomponent/messages")) {
+      return { ok: true, json: async () => ({
+        items: [
+          { id: "web:component:291", seq: 291, role: "user", content: "晚安", turn_id: "turn-last", timestamp: "2026-07-30T23:56:00+08:00" },
+          { id: "web:component:292", seq: 292, role: "assistant", content: "明天见", turn_id: "turn-last", timestamp: "2026-07-30T23:56:01+08:00" },
+        ],
+        has_more: false,
+        next_before_seq: null,
+      }) } as Response;
+    }
+    if (url.includes("/notifications")) return { ok: true, json: async () => ({ items: [{
+      id: "morning-news",
+      content: "今日 AI 圈早报",
+      source: "scheduled_soft",
+      source_id: "job-news",
+      scheduled_at: "2026-07-31T10:00:00+08:00",
+      generated_at: "2026-07-31T10:03:41+08:00",
+      status: "delivered",
+      recurring: true,
+    }] }) } as Response;
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  });
+
+  render(<App />);
+
+  expect(await screen.findByText("晚安", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getByText("明天见")).toBeVisible();
+  expect(screen.getByText("今日 AI 圈早报")).toBeVisible();
+});
+
+it("非连续正文窗口只插入已加载区间内的提醒", async () => {
+  localStorage.setItem("beanagent.session_id", "web:component");
+  vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/api/chat/sessions?page=")) {
+      return { ok: true, json: async () => ({ items: [{
+        key: "web:component",
+        title: "split windows",
+        first_message_content: "",
+        message_count: 122,
+        created_at: "2026-07-30T08:00:00+08:00",
+        updated_at: "2026-07-30T12:00:00+08:00",
+      }], total: 1 }) } as Response;
+    }
+    if (url.endsWith("/api/chat/sessions/web%3Acomponent/turns")) {
+      return { ok: true, json: async () => ({ items: [
+        { id: "turn-old", seq: 0, turn_index: 1, question: "old anchor", preview: "old anchor", timestamp: "2026-07-30T08:00:00+08:00" },
+        { id: "turn-new", seq: 120, turn_index: 61, question: "new anchor", preview: "new anchor", timestamp: "2026-07-30T12:00:00+08:00" },
+      ] }) } as Response;
+    }
+    if (url.endsWith("/api/chat/sessions/web%3Acomponent/messages")) {
+      return { ok: true, json: async () => ({
+        items: [
+          { id: "web:component:120", seq: 120, role: "user", content: "new anchor", turn_id: "turn-new", timestamp: "2026-07-30T12:00:00+08:00" },
+          { id: "web:component:121", seq: 121, role: "assistant", content: "new answer", turn_id: "turn-new", timestamp: "2026-07-30T12:00:01+08:00" },
+        ],
+        has_more: true,
+        next_before_seq: 120,
+      }) } as Response;
+    }
+    if (url.includes("/api/chat/sessions/web%3Acomponent/messages/around")) {
+      return { ok: true, json: async () => ({
+        items: [
+          { id: "web:component:0", seq: 0, role: "user", content: "old anchor", turn_id: "turn-old", timestamp: "2026-07-30T08:00:00+08:00" },
+          { id: "web:component:1", seq: 1, role: "assistant", content: "old answer", turn_id: "turn-old", timestamp: "2026-07-30T08:00:01+08:00" },
+        ],
+        has_before: false,
+        has_after: true,
+        next_before_seq: null,
+      }) } as Response;
+    }
+    if (url.includes("/notifications")) return { ok: true, json: async () => ({ items: [
+      {
+        id: "old-window-notice",
+        content: "旧窗口提醒",
+        source: "scheduled_reminder",
+        source_id: "job-old",
+        scheduled_at: "2026-07-30T08:00:00+08:00",
+        generated_at: "2026-07-30T08:00:00+08:00",
+        status: "delivered",
+        recurring: false,
+      },
+      {
+        id: "gap-notice",
+        content: "中间未加载提醒",
+        source: "scheduled_reminder",
+        source_id: "job-gap",
+        scheduled_at: "2026-07-30T10:00:00+08:00",
+        generated_at: "2026-07-30T10:00:00+08:00",
+        status: "delivered",
+        recurring: false,
+      },
+      {
+        id: "tail-notice",
+        content: "尾部之后提醒",
+        source: "scheduled_soft",
+        source_id: "job-tail",
+        scheduled_at: "2026-07-30T12:30:00+08:00",
+        generated_at: "2026-07-30T12:30:00+08:00",
+        status: "delivered",
+        recurring: true,
+      },
+    ] }) } as Response;
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  });
+
+  render(<App />);
+
+  expect(await screen.findByText("new anchor", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getByText("尾部之后提醒")).toBeVisible();
+  expect(screen.queryByText("中间未加载提醒")).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByTitle("old anchor"));
+
+  expect(await screen.findByText("old anchor", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getByText("旧窗口提醒")).toBeVisible();
+  expect(screen.getByText("尾部之后提醒")).toBeVisible();
+  expect(screen.queryByText("中间未加载提醒")).not.toBeInTheDocument();
+});
+
 it("新建会话会清空其他会话中尚未发送的输入", async () => {
   render(<App />);
   await screen.findByText("已连接");
