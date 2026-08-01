@@ -641,6 +641,7 @@ export function App() {
         tools: [],
         timestamp: new Date().toISOString(),
       };
+      setRequestedTurnId("");
       dispatch({ type: "ui.user.append", message: optimistic });
       dispatch({ type: "ui.turn.submitted", sessionId, requestId });
       const sent = clientRef.current?.send({
@@ -854,27 +855,32 @@ function ConversationAutoScroll({ sessionId, messages, navigating }: {
 }) {
   const { scrollToBottom } = useStickToBottomContext();
   const previousSessionRef = useRef("");
-  const previousLastMessageIdRef = useRef("");
+  const previousRuntimeUserIdRef = useRef("");
 
   useEffect(() => {
+    let latestRuntimeUserId = "";
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== "user") continue;
+      if (!message.id.startsWith("user-") && !(typeof message.seq === "number" && message.seq < 0)) continue;
+      latestRuntimeUserId = message.id;
+      break;
+    }
     // 会话切换必须在目标消息已经进入 DOM 后再定位，且不能继承上一会话的
     // escaped lock；相同消息数量的两个会话也必须触发该边界。
     if (sessionId && messages.length > 0 && previousSessionRef.current !== sessionId) {
       previousSessionRef.current = sessionId;
-      previousLastMessageIdRef.current = messages.at(-1)?.id ?? "";
+      previousRuntimeUserIdRef.current = latestRuntimeUserId;
       void scrollToBottom({ animation: "instant", ignoreEscapes: true });
       return;
     }
 
-    const lastMessage = messages.at(-1);
-    const hasNewUserMessage = Boolean(
-      lastMessage
-      && lastMessage.id !== previousLastMessageIdRef.current
-      && lastMessage.role === "user"
-      && (lastMessage.id.startsWith("user-") || (typeof lastMessage.seq === "number" && lastMessage.seq < 0)),
-    );
-    previousLastMessageIdRef.current = lastMessage?.id ?? "";
     if (navigating) return;
+    // turn.started 可能在本 effect 执行前追加 assistant 草稿，不能只检查列表最后一项。
+    const hasNewUserMessage = Boolean(
+      latestRuntimeUserId && latestRuntimeUserId !== previousRuntimeUserIdRef.current,
+    );
+    previousRuntimeUserIdRef.current = latestRuntimeUserId;
     if (hasNewUserMessage) {
       void scrollToBottom({ animation: "instant", ignoreEscapes: true });
       return;
@@ -1419,7 +1425,7 @@ function ToolStep({ tool }: { tool: ToolActivity }) {
 function AttachmentGallery({ paths }: { paths: string[] }) {
   return <div className="attachment-gallery">{paths.map((path) => {
     const image = /\.(png|jpe?g|gif|webp|bmp)$/i.test(path);
-    return image ? <a href={mediaUrl(path)} target="_blank" rel="noreferrer" key={path}><img src={mediaUrl(path)} alt={fileName(path)} /></a> : (
+    return image ? <a className="image-attachment" href={mediaUrl(path)} target="_blank" rel="noreferrer" key={path}><img src={mediaUrl(path)} alt={fileName(path)} /></a> : (
       <a className="file-attachment" href={mediaUrl(path)} target="_blank" rel="noreferrer" key={path}><FileText size={17} /><span>{fileName(path)}</span></a>
     );
   })}</div>;

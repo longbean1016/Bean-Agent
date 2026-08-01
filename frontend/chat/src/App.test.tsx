@@ -1029,6 +1029,70 @@ it("用户向上滚动后流式增量不抢回视口并可主动回到底部", a
   expect(screen.queryByRole("button", { name: "回到最新消息" })).not.toBeInTheDocument();
 });
 
+it("上滑到图片区域发送消息时即使立即开始回复也定位到底部", async () => {
+  window.history.replaceState({}, "", "/chat/image-scroll");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const payload = String(input).includes("/messages") ? {
+      items: [{
+        id: "web:image-scroll:0",
+        seq: 0,
+        role: "user",
+        content: "查看这张图片",
+        media: ["uploads/example.png"],
+        turn_id: "old-turn",
+        tool_chain: [],
+        timestamp: "2026-08-01T10:00:00+08:00",
+      }, {
+        id: "web:image-scroll:1",
+        seq: 1,
+        role: "assistant",
+        content: "图片回复",
+        turn_id: "old-turn",
+        tool_chain: [],
+        timestamp: "2026-08-01T10:00:01+08:00",
+      }],
+      total: 2,
+    } : { items: [], total: 0 };
+    return { ok: true, json: async () => payload } as Response;
+  }));
+
+  const { container } = render(<App />);
+  await screen.findByText("图片回复");
+  const imagePreview = screen.getByRole("img", { name: "example.png" });
+  expect(imagePreview.closest("a")).toHaveClass("image-attachment");
+  expect(imagePreview.closest("a")).toHaveAttribute("target", "_blank");
+  const conversation = container.querySelector<HTMLElement>(".conversation-scroll")!;
+  Object.defineProperties(conversation, {
+    scrollHeight: { configurable: true, value: 1200 },
+    clientHeight: { configurable: true, value: 400 },
+    scrollTop: { configurable: true, writable: true, value: 240 },
+  });
+  conversation.style.overflow = "auto";
+  fireEvent.wheel(conversation, { deltaY: -120 });
+
+  const socket = FakeWebSocket.instances[0];
+  const send = socket.send.bind(socket);
+  socket.send = (raw: string) => {
+    send(raw);
+    const frame = JSON.parse(raw) as Record<string, unknown>;
+    if (frame.type !== "message.send") return;
+    socket.onmessage?.({ data: JSON.stringify({
+      type: "turn.started",
+      request_id: frame.request_id,
+      session_id: "web:image-scroll",
+      turn_id: "new-turn",
+    }) } as MessageEvent);
+  };
+
+  fireEvent.change(screen.getByPlaceholderText("输入消息，或附加文本与图片"), {
+    target: { value: "继续提问" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+  expect(await screen.findByText("继续提问", { selector: ".user-text" })).toBeVisible();
+  await waitFor(() => expect(conversation.scrollTop).toBeGreaterThan(798));
+});
+
 it("点击历史会话后在目标消息渲染完成时强制回到底部", async () => {
   window.history.replaceState({}, "", "/chat/first");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
