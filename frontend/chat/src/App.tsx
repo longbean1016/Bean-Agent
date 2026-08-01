@@ -1724,7 +1724,6 @@ function Composer(props: {
               {props.queuePosition === 1 ? "排队中 · 即将开始" : `排队中 · 前面还有 ${(props.queuePosition ?? 1) - 1} 个会话`}
             </span>
           ) : null}
-          {props.turnStatus === "submitting" ? <span className="queue-status" role="status">正在提交...</span> : null}
           {props.active ? (
             <button className="send-button stop" aria-label="停止" onClick={handleStop}><CircleStop size={18} /><span>停止</span></button>
           ) : (

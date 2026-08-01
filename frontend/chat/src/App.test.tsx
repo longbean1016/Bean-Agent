@@ -115,6 +115,9 @@ it("同步整理上下文时显示状态并允许停止", async () => {
   fireEvent.change(input, { target: { value: "prepare context" } });
   fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
+  await screen.findByRole("button", { name: "停止" });
+  expect(screen.queryByText("正在提交...")).not.toBeInTheDocument();
+
   await waitFor(() => expect(FakeWebSocket.instances[0].sent.some((frame) => frame.type === "message.send")).toBe(true));
   const sent = FakeWebSocket.instances[0].sent.find((frame) => frame.type === "message.send");
   await act(async () => {
