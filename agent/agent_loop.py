@@ -53,6 +53,7 @@ class TurnInterruptState:
     partial_reply: str = ""
     partial_thinking: str | None = None
     tools_used: list[str] = field(default_factory=list)
+    tools: list[dict[str, Any]] = field(default_factory=list)
     tool_chain_partial: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -277,6 +278,7 @@ class AgentLoop:
                 partial_reply=str(snapshot.get("partial_reply") or ""),
                 partial_thinking=str(snapshot.get("partial_thinking") or "") or None,
                 tools_used=list(snapshot.get("tools_used") or []),
+                tools=list(snapshot.get("tools") or []),
                 tool_chain_partial=list(snapshot.get("tool_chain_partial") or []),
             )
         result = await self._scheduler.cancel(session_key)
@@ -291,7 +293,12 @@ class AgentLoop:
         session = await self._sessions.get_or_create(state.session_key)
         if any(str(message.get("turn_id") or "") == turn_id for message in session.messages):
             return
-        tool_chain = completed_tool_chain(state.tool_chain_partial)
+        tool_chain = interrupted_tool_chain(state.tool_chain_partial, state.tools)
+        has_unfinished_tool = any(
+            str(call.get("status") or "") in {"running", "interrupted"}
+            for group in tool_chain
+            for call in group["calls"]
+        )
         tools_used = list(dict.fromkeys(
             str(call.get("name") or "")
             for group in tool_chain
@@ -311,6 +318,15 @@ class AgentLoop:
             status="interrupted",
             tools_used=tools_used,
             tool_chain=tool_chain,
+            interrupted_display_content=state.partial_reply,
+            interrupted_display_reasoning=state.partial_thinking or "",
+            # 模型可能先输出过渡正文、随后才返回 tool_calls，不能仅凭 partial_reply
+            # 判定思考完成；存在未结束工具时，整个 ReAct 推理链仍属于中断状态。
+            interrupted_thinking_status=(
+                "completed"
+                if state.partial_reply and not has_unfinished_tool
+                else "interrupted"
+            ),
         )
         # 中断轮不发 TurnCommitted，避免未完成内容参与长期记忆提取。
         await self._sessions.append_messages(session, [user, assistant])
@@ -364,23 +380,57 @@ class AgentLoop:
             self._finish_waiter(message)
 
 
-def completed_tool_chain(tool_chain: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """只保留已有终态结果的工具调用，丢弃仍在运行的调用。"""
+def interrupted_tool_chain(
+    tool_chain: list[dict[str, Any]],
+    live_tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """保留已发起的工具快照，并将未结束调用标记为中断。"""
 
     completed: list[dict[str, Any]] = []
     for group in tool_chain:
         calls = group.get("calls") if isinstance(group, dict) else None
         if not isinstance(calls, list):
             continue
-        retained = [
-            dict(call)
-            for call in calls
-            if isinstance(call, dict) and str(call.get("status") or "") in {"ok", "completed", "error"}
-        ]
+        retained: list[dict[str, Any]] = []
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            status = str(call.get("status") or "")
+            if status not in {"ok", "completed", "error", "running", "interrupted"}:
+                continue
+            copied_call = dict(call)
+            if status == "running":
+                copied_call["status"] = "interrupted"
+            retained.append(copied_call)
         if retained:
             copied = dict(group)
             copied["calls"] = retained
             completed.append(copied)
+    known_call_ids = {
+        str(call.get("call_id") or "")
+        for group in completed
+        for call in group.get("calls", [])
+        if isinstance(call, dict)
+    }
+    interrupted_calls = [
+        {
+            "call_id": str(tool.get("call_id") or ""),
+            "name": str(tool.get("name") or "tool"),
+            "arguments": dict(tool.get("arguments") or {}),
+            "result": str(tool.get("result_preview") or ""),
+            "status": "interrupted",
+        }
+        for tool in live_tools
+        if isinstance(tool, dict)
+        and str(tool.get("call_id") or "")
+        and str(tool.get("call_id") or "") not in known_call_ids
+        and str(tool.get("status") or "") == "running"
+    ]
+    if interrupted_calls:
+        if completed:
+            completed[-1]["calls"] = [*completed[-1]["calls"], *interrupted_calls]
+        else:
+            completed.append({"iteration": 1, "text": "", "calls": interrupted_calls})
     return completed
 
 
@@ -393,4 +443,4 @@ def _normalize_snapshot_tool_status(value: object) -> str:
     return "completed"
 
 
-__all__ = ["AgentLoop", "InterruptResult", "TurnInterruptState"]
+__all__ = ["AgentLoop", "InterruptResult", "TurnInterruptState", "interrupted_tool_chain"]

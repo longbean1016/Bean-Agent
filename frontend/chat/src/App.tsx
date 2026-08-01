@@ -4,8 +4,8 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { code } from "@streamdown/code";
 import {
   AlertCircle,
+  Atom,
   ArrowDown,
-  Brain,
   Bell,
   Check,
   ChevronDown,
@@ -203,6 +203,7 @@ export function App() {
   const loadingMessageWindowRef = useRef("");
   const routeSessionRef = useRef(routeSession);
   const sessionLoadVersionsRef = useRef<Record<string, number>>({});
+  const reloadSessionRef = useRef<(sessionId: string) => void>(() => undefined);
   chatRef.current = chat;
   messageWindowsRef.current = messageWindows;
   routeSessionRef.current = routeSession;
@@ -322,6 +323,11 @@ export function App() {
       void refreshSessions();
       void refreshTurnPreviews(frame.session_id);
     }
+    if (frame.type === "turn.interrupted") {
+      // 后端发送该帧前已完成中断轮持久化。立刻用带 seq 的权威行替换本地草稿，
+      // 避免连续中断时多个无 seq 草稿按客户端时间错序。
+      reloadSessionRef.current(frame.session_id);
+    }
   }, [handleNotificationFrame, refreshSessions, refreshTurnPreviews]);
 
   useEffect(() => {
@@ -384,6 +390,9 @@ export function App() {
     } finally {
       setLoadingSessionId((current) => current === sessionId ? "" : current);
     }
+  };
+  reloadSessionRef.current = (sessionId: string) => {
+    void loadSession(sessionId, false);
   };
 
   const createSession = () => {
@@ -1277,7 +1286,7 @@ function MessageView({ message, navigationTurnId }: { message: ChatMessage; navi
       <div className="message-body">
         {!isUser && message.source ? <MessageSourceBadge message={message} /> : null}
         {message.media.length ? <AttachmentGallery paths={message.media} /> : null}
-        {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} /> : null}
+        {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} status={message.thinkingStatus} /> : null}
         {message.tools.length ? <div className="tool-timeline">{message.tools.map((tool) => <ToolStep key={tool.callId} tool={tool} />)}</div> : null}
         {isUser ? <p className="user-text">{message.content}</p> : message.content && message.content !== "[用户已停止生成]" ? (
           <div className="beanagent-markdown">
@@ -1368,12 +1377,13 @@ function MemoryCitationList({ citations }: { citations: MemoryCitation[] }) {
   );
 }
 
-function Thinking({ content, streaming }: { content: string; streaming: boolean }) {
+function Thinking({ content, streaming, status }: { content: string; streaming: boolean; status?: "running" | "completed" | "interrupted" }) {
+  const visibleStatus = status ?? (streaming ? "running" : "completed");
   return (
-    <Collapsible.Root className="thinking" defaultOpen={streaming}>
+    <Collapsible.Root className={`thinking ${visibleStatus}`} defaultOpen={streaming}>
       <Collapsible.Trigger className="thinking-trigger">
-        <Brain size={14} />
-        <span>{streaming ? "正在思考…" : "思考完成"}</span>
+        <Atom size={16} />
+        <span>{visibleStatus === "interrupted" ? "已停止" : visibleStatus === "running" ? "正在思考…" : "思考完成"}</span>
         <ChevronDown size={14} />
       </Collapsible.Trigger>
       <Collapsible.Content className="thinking-content beanagent-markdown">
@@ -1386,11 +1396,17 @@ function Thinking({ content, streaming }: { content: string; streaming: boolean 
 }
 
 function ToolStep({ tool }: { tool: ToolActivity }) {
-  const icon = tool.status === "completed" ? <Check size={14} /> : tool.status === "error" ? <AlertCircle size={14} /> : <Wrench size={14} />;
+  const icon = tool.status === "completed"
+    ? <Check size={14} />
+    : tool.status === "error"
+      ? <AlertCircle size={14} />
+      : tool.status === "interrupted"
+        ? <CircleStop size={14} />
+        : <Wrench size={14} />;
   return (
     <Collapsible.Root className={`tool-step ${tool.status}`}>
       <Collapsible.Trigger className="tool-trigger">
-        <span className="tool-icon">{icon}</span><strong>{tool.name}</strong><span>{tool.status === "running" ? "执行中" : tool.status === "error" ? "失败" : "完成"}</span><ChevronDown size={14} />
+        <span className="tool-icon">{icon}</span><strong>{tool.name}</strong><span>{tool.status === "running" ? "执行中" : tool.status === "error" ? "失败" : tool.status === "interrupted" ? "已中断" : "完成"}</span><ChevronDown size={14} />
       </Collapsible.Trigger>
       <Collapsible.Content className="tool-detail">
         <pre>{JSON.stringify(tool.arguments, null, 2)}</pre>

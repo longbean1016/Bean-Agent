@@ -176,8 +176,16 @@ class Session:
             if role != "assistant":
                 continue
 
+            interrupted = message.get("status") == "interrupted"
             for group in message.get("tool_chain") or []:
                 calls = group.get("calls") or []
+                if interrupted:
+                    # 中断轮完整保留页面审计数据，但模型历史只能重放已有终态结果的
+                    # 调用；运行中调用没有匹配的最终 tool result，不能进入协议消息链。
+                    calls = [
+                        call for call in calls
+                        if str(call.get("status") or "") in {"ok", "completed", "error"}
+                    ]
                 if not calls:
                     continue
                 assistant_message: dict[str, Any] = {
@@ -197,7 +205,12 @@ class Session:
                         for call in calls
                     ],
                 }
-                reasoning = group.get("reasoning_content")
+                provider_fields = group.get("provider_fields")
+                reasoning = (
+                    provider_fields.get("reasoning_content")
+                    if isinstance(provider_fields, dict)
+                    else group.get("reasoning_content")
+                )
                 if isinstance(reasoning, str):
                     assistant_message["reasoning_content"] = reasoning
                 history.append(assistant_message)
@@ -215,7 +228,7 @@ class Session:
                 "content": message.get("content", "") or "",
             }
             reasoning = message.get("reasoning_content")
-            if isinstance(reasoning, str):
+            if not interrupted and isinstance(reasoning, str):
                 final_message["reasoning_content"] = reasoning
             history.append(final_message)
         return history

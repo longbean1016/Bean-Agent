@@ -159,7 +159,12 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       || (current ? state.activeTurnId : "");
     const sessionMessages = interruptedTurnId
       ? getSessionMessages(state, action.session_id).map((message) => message.turnId === interruptedTurnId
-        ? { ...message, streaming: false, status: "interrupted" }
+        ? {
+          ...message,
+          streaming: false,
+          status: "interrupted",
+          thinkingStatus: message.thinking ? "interrupted" : message.thinkingStatus,
+        }
         : message)
       : getSessionMessages(state, action.session_id);
     const nextState = {
@@ -214,6 +219,9 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       role: "assistant",
       content: longestText(existingAssistant?.content ?? "", action.content ?? ""),
       thinking: longestText(existingAssistant?.thinking ?? "", action.thinking ?? ""),
+      thinkingStatus: (action.thinking || existingAssistant?.thinking)
+        ? "running"
+        : existingAssistant?.thinkingStatus,
       media: existingAssistant?.media ?? [],
       tools: mergeTools(existingAssistant?.tools ?? [], incomingTools),
       streaming: true,
@@ -249,11 +257,13 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       ...message,
       thinking: message.thinking + action.delta,
       streaming: true,
+      thinkingStatus: message.thinkingStatus === "completed" ? "completed" : "running",
     }));
   }
   if (action.type === "react.tool.started") {
     return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
       ...message,
+      thinkingStatus: message.thinking ? "running" : message.thinkingStatus,
       tools: mergeTools(message.tools, [{
         callId: action.call_id,
         name: action.tool_name,
@@ -306,6 +316,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       ...message,
       content: action.content || message.content,
       thinking: action.thinking || message.thinking,
+      thinkingStatus: (action.thinking || message.thinking) ? "completed" : message.thinkingStatus,
       media: action.media ?? message.media,
       streaming: false,
       timestamp: String(action.metadata?.generated_at || "") || message.timestamp,
@@ -401,23 +412,34 @@ function updateSessionTurn(
 }
 
 export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {
-  return rows.filter((row) => row.role === "user" || row.role === "assistant").map((row) => ({
-    id: row.id,
-    seq: typeof row.seq === "number" ? row.seq : undefined,
-    role: row.role === "user" ? "user" : "assistant",
-    content: row.content,
-    thinking: row.proactive ? "" : (row.reasoning_content ?? ""),
-    media: Array.isArray(row.media) ? row.media : [],
-    tools: row.proactive ? [] : toolChainToActivities(row.tool_chain),
-    turnId: row.turn_id,
-    streaming: Boolean(row.metadata?.running) && row.role === "assistant",
-    status: row.status,
-    timestamp: row.timestamp,
-    proactive: Boolean(row.proactive),
-    source: row.proactive
-      ? (String(row.metadata?.source || "proactive_conversation") as ChatMessage["source"])
-      : undefined,
-  }));
+  return rows.filter((row) => row.role === "user" || row.role === "assistant").map((row) => {
+    const interrupted = row.status === "interrupted" && row.role === "assistant";
+    const thinking = row.proactive ? "" : interrupted
+      ? (row.interrupted_display_reasoning ?? "")
+      : (row.reasoning_content ?? "");
+    const content = interrupted ? (row.interrupted_display_content ?? "") : row.content;
+    return {
+      id: row.id,
+      seq: typeof row.seq === "number" ? row.seq : undefined,
+      role: row.role === "user" ? "user" : "assistant",
+      content,
+      thinking,
+      thinkingStatus: thinking ? interrupted
+        ? "interrupted"
+        : Boolean(row.metadata?.running) ? "running" : "completed"
+        : undefined,
+      media: Array.isArray(row.media) ? row.media : [],
+      tools: row.proactive ? [] : toolChainToActivities(row.tool_chain),
+      turnId: row.turn_id,
+      streaming: Boolean(row.metadata?.running) && row.role === "assistant",
+      status: row.status,
+      timestamp: row.timestamp,
+      proactive: Boolean(row.proactive),
+      source: row.proactive
+        ? (String(row.metadata?.source || "proactive_conversation") as ChatMessage["source"])
+        : undefined,
+    };
+  });
 }
 
 export function notificationRowsToMessages(rows: ProactiveNotificationRow[]): ChatMessage[] {
@@ -455,7 +477,13 @@ function toolChainToActivities(chain: MessageRow["tool_chain"]): ToolActivity[] 
   return (chain ?? []).flatMap((group) => (group.calls ?? []).map((call) => ({
     callId: String(call.call_id ?? ""),
     name: String(call.name ?? "tool"),
-    status: call.status === "error" ? "error" : call.status === "running" ? "running" : "completed",
+    status: call.status === "error"
+      ? "error"
+      : call.status === "running"
+        ? "running"
+        : call.status === "interrupted"
+          ? "interrupted"
+          : "completed",
     arguments: call.arguments,
     resultPreview: String(call.result ?? ""),
   })));

@@ -1287,9 +1287,17 @@ class SessionStore:
                 }
             ]
 
+        interrupted = message.get("status") == "interrupted"
         result: list[dict[str, Any]] = []
         for group in message["tool_chain"]:
             calls = group.get("calls") or []
+            if interrupted:
+                # 数据库保留全部已发起工具供前端恢复；给模型重建历史时只允许
+                # 具有最终结果的调用，避免产生缺少 tool result 的非法协议链。
+                calls = [
+                    call for call in calls
+                    if str(call.get("status") or "") in {"ok", "completed", "error"}
+                ]
             if not calls:
                 continue
             assistant_message: dict[str, Any] = {
@@ -1333,7 +1341,7 @@ class SessionStore:
             "role": "assistant",
             "content": message["content"],
         }
-        if message["reasoning_content"]:
+        if not interrupted and message["reasoning_content"]:
             final_message["reasoning_content"] = message["reasoning_content"]
         result.append(final_message)
         return result

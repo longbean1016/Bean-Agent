@@ -157,6 +157,63 @@ async def test_load_history_expands_tool_chain_and_reasoning(
 
 
 @pytest.mark.asyncio
+async def test_load_history_keeps_finished_tools_from_interrupted_turn(
+    store: SessionStore,
+) -> None:
+    store.add_message(NewMessage(session_key="web:chat-1", role="user", content="question"))
+    store.add_message(NewMessage(
+        session_key="web:chat-1",
+        role="assistant",
+        content="[用户已停止生成]",
+        status="interrupted",
+        tool_chain=[{
+            "text": "",
+            "provider_fields": {"reasoning_content": "先读取文件"},
+            "calls": [
+                {
+                    "call_id": "call-ok", "name": "read_file", "status": "ok",
+                    "arguments": {"path": "a.txt"}, "result": "文件内容",
+                },
+                {
+                    "call_id": "call-error", "name": "shell", "status": "error",
+                    "arguments": {"command": "bad"}, "result": "命令失败",
+                },
+                {
+                    "call_id": "call-running", "name": "search", "status": "interrupted",
+                    "arguments": {"query": "weather"}, "result": "partial",
+                },
+            ],
+        }],
+        extra={
+            "interrupted_display_content": "partial reply",
+            "interrupted_display_reasoning": "partial thinking",
+        },
+    ))
+
+    assert store.load_history("web:chat-1", limit=40) == [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-ok", "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+                },
+                {
+                    "id": "call-error", "type": "function",
+                    "function": {"name": "shell", "arguments": '{"command": "bad"}'},
+                },
+            ],
+            "reasoning_content": "先读取文件",
+        },
+        {"role": "tool", "tool_call_id": "call-ok", "content": "文件内容"},
+        {"role": "tool", "tool_call_id": "call-error", "content": "命令失败"},
+        {"role": "assistant", "content": "[用户已停止生成]"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_load_history_limit_expands_to_complete_user_turn(
     store: SessionStore,
 ) -> None:

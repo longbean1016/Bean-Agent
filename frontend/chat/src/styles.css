@@ -377,9 +377,11 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 @keyframes msg-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
 
 .thinking { margin-bottom: 11px; border-left: 2px solid #b8c7c2; padding-left: 12px; }
+.thinking.running, .thinking.completed { border-left-color: var(--primary-border); }
 .thinking-trigger, .tool-trigger { display: flex; align-items: center; gap: 7px; width: 100%; padding: 5px 0; border: 0; background: transparent; cursor: pointer; color: var(--text-muted); font-size: 12px; text-align: left; }
+.thinking.running .thinking-trigger, .thinking.completed .thinking-trigger { color: var(--primary); }
 .thinking-trigger > svg:last-child, .tool-trigger > svg:last-child { margin-left: auto; transition: transform .15s ease; }
-[data-state="open"] > .thinking-trigger svg, [data-state="open"] > .tool-trigger > svg:last-child { transform: rotate(180deg); }
+[data-state="open"] > .thinking-trigger > svg:last-child, [data-state="open"] > .tool-trigger > svg:last-child { transform: rotate(180deg); }
 .thinking-content { color: #5d6965; font-size: 13px; }
 .tool-timeline { margin: 12px 0; border-left: 1px solid #ccd6d2; }
 .tool-step { position: relative; margin: 0 0 8px 13px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-elevated); }
@@ -484,10 +486,14 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 :root[data-theme="dark"] .tool-trigger strong { color: var(--text); }
 :root[data-theme="dark"] .tool-step::before { border-color: var(--surface-raised); }
 :root[data-theme="dark"] .thinking { border-color: #52625c; }
+:root[data-theme="dark"] .thinking.running,
+:root[data-theme="dark"] .thinking.completed { border-color: var(--primary-border); }
 :root[data-theme="dark"] .thinking-trigger,
 :root[data-theme="dark"] .tool-trigger,
 :root[data-theme="dark"] .thinking-content,
 :root[data-theme="dark"] .tool-detail { color: var(--text-faint); }
+:root[data-theme="dark"] .thinking.running .thinking-trigger,
+:root[data-theme="dark"] .thinking.completed .thinking-trigger { color: var(--primary); }
 :root[data-theme="dark"] .tool-detail pre,
 :root[data-theme="dark"] [data-streamdown="code-block-header"] { border-color: var(--border-soft); background: var(--code-header-bg); }
 :root[data-theme="dark"] [data-streamdown="code-block"],

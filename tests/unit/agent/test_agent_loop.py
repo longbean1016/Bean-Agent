@@ -244,9 +244,18 @@ async def test_interrupt_immediately_persists_marker_and_completed_tools(tmp_pat
                 "partial_reply": "未完成回答",
                 "partial_thinking": "未完成思考",
                 "tools_used": ["read_file"],
+                "tools": [{
+                    "call_id": "call-2",
+                    "name": "long_running_tool",
+                    "arguments": {},
+                    "result_preview": "部分输出",
+                    "status": "running",
+                }],
                 "tool_chain_partial": [
                     {
                         "iteration": 1,
+                        "text": "",
+                        "provider_fields": {"reasoning_content": "先读取文件"},
                         "calls": [
                             {
                                 "call_id": "call-1",
@@ -255,13 +264,6 @@ async def test_interrupt_immediately_persists_marker_and_completed_tools(tmp_pat
                                 "result": "文件内容",
                                 "status": "ok",
                             },
-                            {
-                                "call_id": "call-2",
-                                "name": "long_running_tool",
-                                "arguments": {},
-                                "result": "",
-                                "status": "running",
-                            }
                         ],
                     }
                 ],
@@ -288,9 +290,32 @@ async def test_interrupt_immediately_persists_marker_and_completed_tools(tmp_pat
     assert [row["content"] for row in rows] == ["读取文件", "[用户已停止生成]"]
     assert rows[0]["turn_id"] == rows[1]["turn_id"] == result.turn_id
     assert rows[1]["status"] == "interrupted"
-    assert rows[1]["tools_used"] == ["read_file"]
+    assert rows[1]["reasoning_content"] == ""
+    assert rows[1]["interrupted_display_content"] == "未完成回答"
+    assert rows[1]["interrupted_display_reasoning"] == "未完成思考"
+    assert rows[1]["interrupted_thinking_status"] == "interrupted"
+    assert rows[1]["tools_used"] == ["read_file", "long_running_tool"]
     assert rows[1]["tool_chain"][0]["calls"][0]["result"] == "文件内容"
-    assert len(rows[1]["tool_chain"][0]["calls"]) == 1
+    assert rows[1]["tool_chain"][0]["calls"][0]["status"] == "ok"
+    assert rows[1]["tool_chain"][0]["calls"][1]["status"] == "interrupted"
+    assert rows[1]["tool_chain"][0]["calls"][1]["result"] == "部分输出"
+    assert len(rows[1]["tool_chain"][0]["calls"]) == 2
+    history = (await sessions.get_or_create("web:c")).get_history(max_messages=20)
+    assert history == [
+        {"role": "user", "content": "读取文件"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+            }],
+            "reasoning_content": "先读取文件",
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "文件内容"},
+        {"role": "assistant", "content": "[用户已停止生成]"},
+    ]
     await sessions.close()
 
 

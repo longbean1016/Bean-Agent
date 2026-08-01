@@ -1,5 +1,6 @@
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "offline";
-export type ToolStatus = "running" | "completed" | "error";
+export type ToolStatus = "running" | "completed" | "error" | "interrupted";
+export type ThinkingStatus = "running" | "completed" | "interrupted";
 
 export interface ToolActivity {
   callId: string;
@@ -19,6 +20,7 @@ export interface ChatMessage {
   tools: ToolActivity[];
   turnId?: string;
   streaming?: boolean;
+  thinkingStatus?: ThinkingStatus;
   status?: string;
   timestamp?: string;
   proactive?: boolean;
@@ -58,6 +60,9 @@ export interface MessageRow {
   content: string;
   turn_id?: string;
   reasoning_content?: string;
+  interrupted_display_content?: string;
+  interrupted_display_reasoning?: string;
+  interrupted_thinking_status?: ThinkingStatus;
   media?: string[];
   tool_chain?: Array<{ calls?: Array<{ call_id?: string; name?: string; arguments?: unknown; result?: string; status?: string }> }>;
   status?: string;

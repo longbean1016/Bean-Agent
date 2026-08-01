@@ -148,6 +148,12 @@ it("中断消息只显示状态标签，不渲染持久化占位正文", async (
           seq: 1,
           role: "assistant",
           content: "[用户已停止生成]",
+          interrupted_display_content: "partial reply",
+          interrupted_display_reasoning: "partial thinking",
+          interrupted_thinking_status: "interrupted",
+          tool_chain: [{ calls: [{
+            call_id: "call-running", name: "shell", status: "interrupted", result: "",
+          }] }],
           status: "interrupted",
           turn_id: "turn-interrupted",
           timestamp: "2026-08-01T16:10:01+08:00",
@@ -160,7 +166,11 @@ it("中断消息只显示状态标签，不渲染持久化占位正文", async (
   render(<App />);
 
   expect(await screen.findByText("hello", { selector: ".user-text" })).toBeVisible();
-  expect(screen.getAllByText("已停止")).toHaveLength(1);
+  expect(screen.getByText("partial reply")).toBeVisible();
+  const stoppedLabels = screen.getAllByText("已停止");
+  expect(stoppedLabels).toHaveLength(2);
+  fireEvent.click(stoppedLabels.find((label) => label.closest("button"))!.closest("button")!);
+  expect(screen.getByText("partial thinking")).toBeVisible();
   expect(screen.queryByText("[用户已停止生成]")).not.toBeInTheDocument();
 });
 
