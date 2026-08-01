@@ -20,7 +20,7 @@ export const initialChatState: ChatState = {
 export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState {
   if (action.type === "ui.session.select") {
     const turn = state.turnStates[action.sessionId] ?? idleTurnState;
-    const active = turn.status === "submitting" || turn.status === "queued" || turn.status === "running";
+    const active = turn.status === "submitting" || turn.status === "queued" || turn.status === "preparing" || turn.status === "running";
     const cached = state.sessionMessages[action.sessionId];
     // HTTP 历史可能在发送确认前返回空结果；只要本地有快照，就不能用空历史覆盖它。
     let messages = action.messages;
@@ -29,9 +29,9 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
         ? reconcileMessages([...action.messages, ...cached])
         : action.messages.length === 0 ? cached : action.messages;
     }
-    if (!action.replace && turn.status === "running" && turn.turnId
+    if (!action.replace && (turn.status === "preparing" || turn.status === "running") && turn.turnId
       && !messages.some((message) => message.turnId === turn.turnId)) {
-      messages = [...messages, createDraft(turn.turnId)];
+      messages = [...messages, createDraft(turn.turnId, turn.status === "preparing")];
     }
     messages = reconcileMessages(messages);
     return {
@@ -119,13 +119,15 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       requestId: action.request_id ?? "",
     });
     const requestId = action.request_id || state.turnStates[action.session_id]?.requestId;
+    const source = getSessionMessages(state, action.session_id);
+    const userId = `user-${requestId}`;
+    const existingUser = source.find((item) => (
+      item.role === "user" && (item.turnId === action.turn_id || item.id === userId)
+    ));
     const draft = createDraft(action.turn_id);
     const sessionMessages = [
-      ...getSessionMessages(state, action.session_id)
-        .filter((item) => item.turnId !== action.turn_id)
-        .map((item) => item.id === `user-${requestId}`
-          ? { ...item, turnId: action.turn_id }
-          : item),
+      ...source.filter((item) => item.turnId !== action.turn_id && item.id !== userId),
+      ...(existingUser ? [{ ...existingUser, turnId: action.turn_id }] : []),
       draft,
     ];
     if (state.sessionId && action.session_id !== state.sessionId) {
@@ -177,6 +179,44 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     return {
       ...nextState,
       messages: sessionMessages,
+    };
+  }
+  if (action.type === "turn.preparing") {
+    const source = getSessionMessages(state, action.session_id);
+    const userId = `user-${action.request_id}`;
+    const existingUser = source.find((item) => item.role === "user" && (
+      item.id === userId || item.turnId === action.turn_id
+    ));
+    const user: ChatMessage = existingUser ? {
+      ...existingUser,
+      turnId: action.turn_id,
+    } : {
+      id: userId,
+      role: "user",
+      content: action.user_message,
+      thinking: "",
+      media: action.user_media,
+      tools: [],
+      turnId: action.turn_id,
+      streaming: false,
+      timestamp: new Date().toISOString(),
+    };
+    const draft = createDraft(action.turn_id, true);
+    const sessionMessages = [
+      ...source.filter((item) => item.turnId !== action.turn_id && item.id !== userId),
+      user,
+      draft,
+    ];
+    const current = action.session_id === state.sessionId;
+    return {
+      ...state,
+      activeTurnId: current ? action.turn_id : state.activeTurnId,
+      turnStates: setTurnState(state, action.session_id, {
+        status: "preparing", queuePosition: null, turnId: action.turn_id, requestId: action.request_id,
+      }),
+      messages: current ? sessionMessages : state.messages,
+      sessionMessages: setSessionMessages(state, action.session_id, sessionMessages),
+      error: current ? "" : state.error,
     };
   }
   if (action.type === "turn.snapshot") {
@@ -329,7 +369,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
   return state;
 }
 
-function createDraft(turnId: string): ChatMessage {
+function createDraft(turnId: string, preparing = false): ChatMessage {
   return {
     id: turnId,
     turnId,
@@ -339,6 +379,7 @@ function createDraft(turnId: string): ChatMessage {
     media: [],
     tools: [],
     streaming: true,
+    preparing,
     timestamp: new Date().toISOString(),
   };
 }

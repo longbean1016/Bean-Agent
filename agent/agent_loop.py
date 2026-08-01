@@ -14,6 +14,7 @@ from agent.event_bus import (
     TurnCommitted,
     TurnQueued,
     TurnQueueRejected,
+    TurnPreparing,
     TurnStarted,
 )
 from agent.message_bus import InboundMessage, MessageBus, OutboundMessage, PipelineResult
@@ -33,6 +34,8 @@ class ContextGuardApi(Protocol):
     """普通 Turn 在推理前调用的记忆积压保护接口。"""
 
     async def ensure_context_ready(self, session_key: str) -> bool: ...
+
+    def needs_context_preparation(self, session_key: str) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,7 +176,20 @@ class AgentLoop:
         message.metadata["current_user_source_ref"] = (
             await self._sessions.peek_next_message_id(message.session_key)
         )
-        await self._events.emit(TurnStarted(message.session_key, turn_id, request_id, message.content))
+        needs_preparation = getattr(self._context_guard, "needs_context_preparation", None)
+        if (
+            self._context_guard is not None
+            and not bool(message.metadata.get("skip_memory_context_guard"))
+            and callable(needs_preparation)
+            and needs_preparation(message.session_key)
+        ):
+            await self._events.emit(TurnPreparing(
+                message.session_key,
+                turn_id,
+                request_id,
+                message.content,
+                list(message.media),
+            ))
         if (
             self._context_guard is not None
             and not bool(message.metadata.get("skip_memory_context_guard"))
@@ -196,6 +212,8 @@ class AgentLoop:
             )
             await self._sessions.delete_if_empty(message.session_key)
             return
+
+        await self._events.emit(TurnStarted(message.session_key, turn_id, request_id, message.content))
 
         # 首条消息进入运行阶段就生成默认标题，刷新会话列表时可以立即恢复标题。
         # 消息正文仍在 Turn 完成后批量写入，不改变消息持久化边界。

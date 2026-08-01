@@ -3,6 +3,192 @@ import { describe, expect, it } from "vitest";
 import { initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
 
 describe("reduceChatFrame", () => {
+  it("marks a turn as preparing until it starts running", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.preparing", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+      user_message: "question", user_media: [],
+    });
+
+    expect(state.turnStates["web:one"]).toMatchObject({ status: "preparing", turnId: "turn-1" });
+    expect(state.messages).toMatchObject([
+      { role: "user", content: "question", turnId: "turn-1" },
+      { role: "assistant", turnId: "turn-1", preparing: true, streaming: true },
+    ]);
+
+    state = reduceChatFrame(state, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+
+    expect(state.turnStates["web:one"].status).toBe("running");
+    expect(state.messages).toMatchObject([
+      { role: "user", content: "question", turnId: "turn-1" },
+      { role: "assistant", turnId: "turn-1", preparing: false, streaming: true },
+    ]);
+  });
+
+  it("maps interrupted display snapshots without exposing placeholder content", () => {
+    const [message] = rowsToMessages([{
+      id: "web:one:1", seq: 1, role: "assistant", content: "[用户已停止生成]",
+      status: "interrupted", turn_id: "turn-1", reasoning_content: "",
+      interrupted_display_content: "partial reply",
+      interrupted_display_reasoning: "partial thinking",
+      tool_chain: [{ calls: [
+        { call_id: "done", name: "shell", status: "ok", result: "done" },
+        { call_id: "stopped", name: "search", status: "interrupted", result: "partial" },
+      ] }],
+    }]);
+
+    expect(message).toMatchObject({
+      content: "partial reply", thinking: "partial thinking", status: "interrupted",
+      thinkingStatus: "interrupted",
+      tools: [{ status: "completed" }, { status: "interrupted" }],
+    });
+  });
+
+  it("restores every interrupted thinking message as stopped", () => {
+    const [message] = rowsToMessages([{
+      id: "web:one:1", seq: 1, role: "assistant", content: "[用户已停止生成]",
+      status: "interrupted", turn_id: "turn-1", reasoning_content: "",
+      interrupted_display_content: "partial reply",
+      interrupted_display_reasoning: "partial thinking",
+      interrupted_thinking_status: "completed",
+      tool_chain: [],
+    }]);
+
+    expect(message).toMatchObject({
+      content: "partial reply",
+      thinking: "partial thinking",
+      thinkingStatus: "interrupted",
+    });
+  });
+
+  it("keeps thinking active until message.final completes the turn", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+    state = reduceChatFrame(state, {
+      type: "react.thinking.delta", session_id: "web:one", turn_id: "turn-1", delta: "先查询资料",
+    });
+    expect(state.messages[0]).toMatchObject({ thinkingStatus: "running" });
+
+    state = reduceChatFrame(state, {
+      type: "react.tool.started", session_id: "web:one", turn_id: "turn-1",
+      call_id: "call-1", tool_name: "search", arguments: {},
+    });
+    expect(state.messages[0]).toMatchObject({ thinkingStatus: "running" });
+
+    state = reduceChatFrame(state, {
+      type: "react.tool.completed", session_id: "web:one", turn_id: "turn-1",
+      call_id: "call-1", tool_name: "search", status: "ok", result_preview: "result",
+    });
+    expect(state.messages[0]).toMatchObject({ thinkingStatus: "running" });
+
+    state = reduceChatFrame(state, {
+      type: "answer.delta", session_id: "web:one", turn_id: "turn-1", delta: "最终回答",
+    });
+    expect(state.messages[0]).toMatchObject({ thinkingStatus: "running" });
+
+    state = reduceChatFrame(state, {
+      type: "message.final", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+      content: "最终回答", thinking: "先查询资料", metadata: { status: "ok" },
+    });
+    expect(state.messages[0]).toMatchObject({ thinkingStatus: "completed" });
+  });
+
+  it("marks thinking as stopped whenever the turn is interrupted", () => {
+    let beforeAnswer = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+    beforeAnswer = reduceChatFrame(beforeAnswer, {
+      type: "react.thinking.delta", session_id: "web:one", turn_id: "turn-1", delta: "正在思考",
+    });
+    beforeAnswer = reduceChatFrame(beforeAnswer, {
+      type: "turn.interrupted", request_id: "stop-1", session_id: "web:one", turn_id: "turn-1", status: "interrupted",
+    });
+    expect(beforeAnswer.messages[0]).toMatchObject({ thinkingStatus: "interrupted" });
+
+    let afterAnswer = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.started", request_id: "r2", session_id: "web:one", turn_id: "turn-2",
+    });
+    afterAnswer = reduceChatFrame(afterAnswer, {
+      type: "react.thinking.delta", session_id: "web:one", turn_id: "turn-2", delta: "已经想好",
+    });
+    afterAnswer = reduceChatFrame(afterAnswer, {
+      type: "answer.delta", session_id: "web:one", turn_id: "turn-2", delta: "部分正文",
+    });
+    afterAnswer = reduceChatFrame(afterAnswer, {
+      type: "turn.interrupted", request_id: "stop-2", session_id: "web:one", turn_id: "turn-2", status: "interrupted",
+    });
+    expect(afterAnswer.messages[0]).toMatchObject({ thinkingStatus: "interrupted" });
+  });
+
+  it("keeps a running snapshot in thinking state even when it already has content", () => {
+    const state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.snapshot", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+      user_message: "question", user_media: [], content: "partial answer", thinking: "partial thinking", tools: [],
+      status: "running",
+    });
+
+    expect(state.messages.find((message) => message.role === "assistant")).toMatchObject({
+      content: "partial answer",
+      thinkingStatus: "running",
+      streaming: true,
+    });
+  });
+
+  it("treats an interrupted tool as unfinished thinking even after transitional content", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+    state = reduceChatFrame(state, {
+      type: "react.thinking.delta", session_id: "web:one", turn_id: "turn-1", delta: "准备查询",
+    });
+    state = reduceChatFrame(state, {
+      type: "answer.delta", session_id: "web:one", turn_id: "turn-1", delta: "我先查一下",
+    });
+    state = reduceChatFrame(state, {
+      type: "react.tool.started", session_id: "web:one", turn_id: "turn-1",
+      call_id: "call-1", tool_name: "shell", arguments: {},
+    });
+    expect(state.messages[0]).toMatchObject({ thinkingStatus: "running" });
+    state = reduceChatFrame(state, {
+      type: "turn.interrupted", request_id: "stop-1", session_id: "web:one", turn_id: "turn-1", status: "interrupted",
+    });
+
+    expect(state.messages[0]).toMatchObject({
+      content: "我先查一下",
+      thinkingStatus: "interrupted",
+      tools: [{ callId: "call-1", status: "running" }],
+    });
+  });
+
+  it("renders the next turn after a context-preparing turn completes", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.preparing", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+      user_message: "first", user_media: [],
+    });
+    state = reduceChatFrame(state, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+    state = reduceChatFrame(state, {
+      type: "message.final", request_id: "r1", session_id: "web:one", turn_id: "turn-1", content: "first answer",
+    });
+    state = reduceChatFrame(state, {
+      type: "ui.user.append",
+      message: { id: "user-r2", role: "user", content: "second", thinking: "", media: [], tools: [] },
+    });
+    state = reduceChatFrame(state, { type: "ui.turn.submitted", sessionId: "web:one", requestId: "r2" });
+    state = reduceChatFrame(state, {
+      type: "turn.started", request_id: "r2", session_id: "web:one", turn_id: "turn-2",
+    });
+    state = reduceChatFrame(state, {
+      type: "answer.delta", session_id: "web:one", turn_id: "turn-2", delta: "second answer",
+    });
+
+    expect(state.turnStates["web:one"].status).toBe("running");
+    expect(state.messages.find((message) => message.turnId === "turn-2" && message.role === "assistant"))
+      .toMatchObject({ content: "second answer", streaming: true, preparing: false });
+  });
   it("提交确认后会从提交中切换到排队状态", () => {
     let state = { ...initialChatState, sessionId: "web:one" };
     state = reduceChatFrame(state, {

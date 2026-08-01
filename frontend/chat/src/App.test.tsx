@@ -108,6 +108,27 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it("同步整理上下文时显示状态并允许停止", async () => {
+  render(<App />);
+  await screen.findByText("已连接");
+  const input = document.querySelector<HTMLTextAreaElement>("textarea")!;
+  fireEvent.change(input, { target: { value: "prepare context" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+  await waitFor(() => expect(FakeWebSocket.instances[0].sent.some((frame) => frame.type === "message.send")).toBe(true));
+  const sent = FakeWebSocket.instances[0].sent.find((frame) => frame.type === "message.send");
+  await act(async () => {
+    FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify({
+      type: "turn.preparing", request_id: sent?.request_id, session_id: "web:component", turn_id: "turn-prepare",
+      user_message: "prepare context", user_media: [],
+    }) } as MessageEvent);
+  });
+
+  expect(screen.getAllByText("正在整理会话上下文...")).toHaveLength(1);
+  expect(screen.getByText("prepare context", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "停止" })).toBeVisible();
+});
+
 it("首条消息发送后创建 Session 并保留用户消息", async () => {
   render(<App />);
 

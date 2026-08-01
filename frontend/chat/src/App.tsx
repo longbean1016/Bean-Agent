@@ -208,7 +208,7 @@ export function App() {
   messageWindowsRef.current = messageWindows;
   routeSessionRef.current = routeSession;
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
-  const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running";
+  const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "preparing" || currentTurn.status === "running";
   const restoringSession = Boolean(chat.sessionId && loadingSessionId === chat.sessionId && chat.messages.length === 0);
   const displayMessages = useMemo(() => composeTimeline(
     messageWindows[chat.sessionId]?.hasTailWindow === false
@@ -1303,7 +1303,7 @@ function MessageView({ message, navigationTurnId }: { message: ChatMessage; navi
               {prepareMessageMarkdown(parsed.markdown)}
             </Streamdown>
           </div>
-        ) : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
+        ) : message.preparing ? <span className="queue-status" role="status">正在整理会话上下文...</span> : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
         {!isUser && parsed.citations.length ? <MemoryCitationList citations={parsed.citations} /> : null}
         {!isUser && message.status === "interrupted" ? <span className="interrupted-label">已停止</span> : null}
       </div>
@@ -1426,7 +1426,7 @@ function AttachmentGallery({ paths }: { paths: string[] }) {
 }
 
 function Composer(props: {
-  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running"; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string;
+  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "preparing" | "running"; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string;
   onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");

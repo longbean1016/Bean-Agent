@@ -434,6 +434,16 @@ class MemoryEngine:
             return False
         return self._sessions.get_cursor(key) > before
 
+    def needs_context_preparation(self, session_key: str) -> bool:
+        """只判断下一轮是否需要同步归档，不触发任何维护任务。"""
+
+        key = str(session_key or "").strip()
+        if not key:
+            raise ValueError("session_key 不能为空")
+        messages = self._sessions.fetch_session_messages(key)
+        cursor = max(0, min(self._sessions.get_cursor(key), len(messages)))
+        return len(messages) - cursor >= self._context_guard_threshold
+
     async def _run_consolidation_serialized(
         self,
         event: TurnIngested,

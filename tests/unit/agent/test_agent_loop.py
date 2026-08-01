@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent.agent_loop import AgentLoop
-from agent.event_bus import EventBus, SessionUpdated, TurnCommitted
+from agent.event_bus import EventBus, SessionUpdated, TurnCommitted, TurnPreparing, TurnStarted
 from agent.message_bus import InboundMessage, MessageBus, PipelineResult
 from agent.config_models import MemoryConfig
 from memory.consolidator import ConsolidationDraft
@@ -29,6 +29,43 @@ class BlockingContextGuard:
     async def ensure_context_ready(self, session_key: str) -> bool:
         self.calls.append(session_key)
         return self.ready
+
+
+class PreparingContextGuard(BlockingContextGuard):
+    def needs_context_preparation(self, session_key: str) -> bool:
+        return True
+
+
+@pytest.mark.asyncio
+async def test_context_guard_emits_preparing_before_ensuring_context(tmp_path: Path) -> None:
+    class OrderedGuard(PreparingContextGuard):
+        def __init__(self) -> None:
+            super().__init__(True)
+            self.order: list[str] = []
+
+        def needs_context_preparation(self, session_key: str) -> bool:
+            self.order.append("preflight")
+            return True
+
+        async def ensure_context_ready(self, session_key: str) -> bool:
+            self.order.append("ensure")
+            return await super().ensure_context_ready(session_key)
+
+    bus = MessageBus()
+    events = EventBus()
+    sessions = SessionManager(tmp_path)
+    guard = OrderedGuard()
+    received: list[object] = []
+    events.on(TurnPreparing, lambda event: received.append(event))
+    events.on(TurnStarted, lambda event: received.append(event))
+    loop = AgentLoop(bus, events, Pipeline(), sessions, context_guard=guard)
+    await bus.publish_inbound(InboundMessage("web", "u", "c", "question", metadata={"request_id": "r1"}))
+
+    await loop.run_once()
+
+    assert [type(event) for event in received] == [TurnPreparing, TurnStarted]
+    assert guard.order == ["preflight", "ensure"]
+    await sessions.close()
 
 
 @pytest.mark.asyncio

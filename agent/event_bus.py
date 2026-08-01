@@ -23,6 +23,17 @@ class TurnStarted:
 
 
 @dataclass(frozen=True, slots=True)
+class TurnPreparing:
+    """Turn 在模型请求前同步整理会话上下文。"""
+
+    session_key: str
+    turn_id: str
+    request_id: str
+    content: str
+    media: list[str]
+
+
+@dataclass(frozen=True, slots=True)
 class TurnQueued:
     """普通 Turn 已进入全局等待队列，position 从 1 开始。"""
 
@@ -139,5 +150,6 @@ __all__ = [
     "TurnCommitted",
     "TurnQueued",
     "TurnQueueRejected",
+    "TurnPreparing",
     "TurnStarted",
 ]
