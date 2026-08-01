@@ -414,6 +414,92 @@ describe("reduceChatFrame", () => {
     expect(timeline.map((message) => message.id)).toEqual(["user-1", "notice-1"]);
     expect(timeline[1]).toMatchObject({ source: "scheduled_reminder", scheduledAt: "2026-07-20T09:00:00+08:00" });
   });
+
+  it("turn.started 将乐观用户消息绑定到真实 turn", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "ui.user.append",
+      message: {
+        id: "user-r1", role: "user", content: "question", thinking: "", media: [], tools: [],
+      },
+    });
+    state = reduceChatFrame(state, {
+      type: "turn.started",
+      request_id: "r1",
+      session_id: "web:one",
+      turn_id: "turn-1",
+    });
+
+    expect(state.messages.find((message) => message.role === "user")).toMatchObject({ turnId: "turn-1" });
+  });
+
+  it("does not inject a distant running draft into an explicitly replaced window", () => {
+    const current = {
+      ...initialChatState,
+      sessionId: "web:one",
+      messages: [{
+        id: "latest", role: "user" as const, content: "latest", thinking: "", media: [], tools: [],
+      }],
+      sessionMessages: {
+        "web:one": [{
+          id: "latest", role: "user" as const, content: "latest", thinking: "", media: [], tools: [],
+        }],
+      },
+      turnStates: {
+        "web:one": { status: "running" as const, queuePosition: null, turnId: "turn-latest", requestId: "r1" },
+      },
+    };
+
+    const next = reduceChatFrame(current, {
+      type: "ui.session.select",
+      sessionId: "web:one",
+      replace: true,
+      messages: [{
+        id: "old", role: "user", content: "old", thinking: "", media: [], tools: [], turnId: "turn-old",
+      }],
+    });
+
+    expect(next.messages.some((message) => message.id === "old")).toBe(true);
+    expect(next.messages.some((message) => message.turnId === "turn-latest")).toBe(false);
+  });
+
+  it("无时间的流式草稿不会阻止提醒回到正确时间位置", () => {
+    const timeline = mergeTimeline(
+      [{
+        id: "user-latest", role: "user", content: "晚上提问", thinking: "", media: [], tools: [],
+        timestamp: "2026-07-20T20:00:00+08:00",
+      }, {
+        id: "draft", role: "assistant", content: "", thinking: "", media: [], tools: [],
+        streaming: true,
+      }],
+      [{
+        id: "notice-morning", role: "assistant", content: "早上提醒", thinking: "", media: [], tools: [],
+        source: "scheduled_reminder", timestamp: "2026-07-20T10:00:00+08:00",
+      }],
+    );
+
+    expect(timeline.map((message) => message.id)).toEqual([
+      "notice-morning", "user-latest", "draft",
+    ]);
+  });
+
+  it("运行中的用户消息和助手草稿始终带有时间", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.snapshot",
+      session_id: "web:one",
+      turn_id: "turn-1",
+      request_id: "r1",
+      user_message: "继续测试",
+      user_media: [],
+      content: "处理中",
+      thinking: "",
+      tools: [],
+      status: "running",
+    });
+
+    expect(state.messages).toHaveLength(2);
+    expect(state.messages.every((message) => !Number.isNaN(Date.parse(message.timestamp || "")))).toBe(true);
+  });
+
   it("主动历史消息只展示最终正文，不暴露持久化工具链", () => {
     const [message] = rowsToMessages([{
       id: "proactive-1",
@@ -426,5 +512,57 @@ describe("reduceChatFrame", () => {
 
     expect(message.thinking).toBe("");
     expect(message.tools).toEqual([]);
+  });
+
+  it("merges a fresh running snapshot when returning to an active session", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "ui.user.append",
+      message: {
+        id: "user-r1", role: "user", content: "inspect project", thinking: "", media: [], tools: [],
+      },
+    });
+    state = reduceChatFrame(state, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+    state = reduceChatFrame(state, {
+      type: "answer.delta", session_id: "web:one", turn_id: "turn-1", delta: "stale partial",
+    });
+    state = reduceChatFrame(state, {
+      type: "ui.session.select", sessionId: "web:two", messages: [],
+    });
+
+    state = reduceChatFrame(state, {
+      type: "ui.session.select",
+      sessionId: "web:one",
+      messages: [{
+        id: "running:user:turn-1",
+        seq: -2,
+        role: "user",
+        content: "inspect project",
+        thinking: "",
+        media: [],
+        tools: [],
+        turnId: "turn-1",
+        streaming: false,
+        status: "running",
+      }, {
+        id: "running:assistant:turn-1",
+        seq: -1,
+        role: "assistant",
+        content: "fresh snapshot with more output",
+        thinking: "fresh thinking",
+        media: [],
+        tools: [],
+        turnId: "turn-1",
+        streaming: true,
+        status: "running",
+      }],
+    });
+
+    expect(state.messages.find((message) => message.role === "assistant")).toMatchObject({
+      content: "fresh snapshot with more output",
+      thinking: "fresh thinking",
+      streaming: true,
+    });
   });
 });

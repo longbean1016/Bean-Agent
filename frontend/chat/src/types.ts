@@ -146,7 +146,7 @@ export type ChatFrame =
 
 export type ChatAction =
   | ChatFrame
-  | { type: "ui.session.select"; sessionId: string; messages: ChatMessage[] }
+  | { type: "ui.session.select"; sessionId: string; messages: ChatMessage[]; replace?: boolean }
   | { type: "ui.user.append"; message: ChatMessage }
   | { type: "ui.turn.submitted"; sessionId: string; requestId: string }
   | { type: "ui.error.clear" };

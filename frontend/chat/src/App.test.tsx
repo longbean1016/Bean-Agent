@@ -128,6 +128,42 @@ it("首条消息发送后创建 Session 并保留用户消息", async () => {
   expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
 });
 
+it("中断消息只显示状态标签，不渲染持久化占位正文", async () => {
+  window.history.replaceState({}, "", "/chat/interrupted");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/messages")) {
+      return { ok: true, json: async () => ({ items: [
+        {
+          id: "web:interrupted:0",
+          seq: 0,
+          role: "user",
+          content: "hello",
+          status: "interrupted",
+          turn_id: "turn-interrupted",
+          timestamp: "2026-08-01T16:10:00+08:00",
+        },
+        {
+          id: "web:interrupted:1",
+          seq: 1,
+          role: "assistant",
+          content: "[用户已停止生成]",
+          status: "interrupted",
+          turn_id: "turn-interrupted",
+          timestamp: "2026-08-01T16:10:01+08:00",
+        },
+      ] }) } as Response;
+    }
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+
+  render(<App />);
+
+  expect(await screen.findByText("hello", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getAllByText("已停止")).toHaveLength(1);
+  expect(screen.queryByText("[用户已停止生成]")).not.toBeInTheDocument();
+});
+
 it("运行中新会话收到标题更新后替换侧栏占位", async () => {
   render(<App />);
   await screen.findByText("已连接");
@@ -211,6 +247,11 @@ it("刷新已有会话时显示骨架并通过消息接口恢复运行中 turn",
 
 it("点击未加载的全局轮次导航时按 seq 加载正文窗口", async () => {
   localStorage.setItem("beanagent.session_id", "web:component");
+  let latestMessageRequests = 0;
+  let resolveLatestMessageRequest!: (response: Response) => void;
+  const latestMessageRequest = new Promise<Response>((resolve) => {
+    resolveLatestMessageRequest = resolve;
+  });
   vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.includes("/api/chat/sessions?page=")) {
@@ -225,11 +266,15 @@ it("点击未加载的全局轮次导航时按 seq 加载正文窗口", async ()
     }
     if (url.endsWith("/api/chat/sessions/web%3Acomponent/turns")) {
       return { ok: true, json: async () => ({ items: [
-        { id: "turn-old", seq: 0, turn_index: 1, question: "old question", preview: "old question", timestamp: "2026-07-30T10:00:00+08:00" },
+        { id: "turn-old", seq: 40, turn_index: 21, question: "old question", preview: "old question", timestamp: "2026-07-30T10:00:00+08:00" },
         { id: "turn-new", seq: 120, turn_index: 61, question: "new question", preview: "new question", timestamp: "2026-07-30T12:00:00+08:00" },
       ] }) } as Response;
     }
     if (url.endsWith("/api/chat/sessions/web%3Acomponent/messages")) {
+      latestMessageRequests += 1;
+      if (latestMessageRequests === 3) {
+        return latestMessageRequest;
+      }
       return { ok: true, json: async () => ({
         items: [
           { id: "web:component:120", seq: 120, role: "user", content: "new question", turn_id: "turn-new", timestamp: "2026-07-30T12:00:00+08:00" },
@@ -240,10 +285,21 @@ it("点击未加载的全局轮次导航时按 seq 加载正文窗口", async ()
       }) } as Response;
     }
     if (url.includes("/api/chat/sessions/web%3Acomponent/messages/around")) {
+      if (url.includes("anchor_seq=42")) {
+        return { ok: true, json: async () => ({
+          items: [
+            { id: "web:component:42", seq: 42, role: "user", content: "next question", turn_id: "turn-next", timestamp: "2026-07-30T10:01:00+08:00" },
+            { id: "web:component:43", seq: 43, role: "assistant", content: "next answer", turn_id: "turn-next", timestamp: "2026-07-30T10:01:01+08:00" },
+          ],
+          has_before: true,
+          has_after: true,
+          next_before_seq: 42,
+        }) } as Response;
+      }
       return { ok: true, json: async () => ({
         items: [
-          { id: "web:component:0", seq: 0, role: "user", content: "old question", turn_id: "turn-old", timestamp: "2026-07-30T10:00:00+08:00" },
-          { id: "web:component:1", seq: 1, role: "assistant", content: "old answer", turn_id: "turn-old", timestamp: "2026-07-30T10:00:01+08:00" },
+          { id: "web:component:40", seq: 40, role: "user", content: "old question", turn_id: "turn-old", timestamp: "2026-07-30T10:00:00+08:00" },
+          { id: "web:component:41", seq: 41, role: "assistant", content: "old answer", turn_id: "turn-old", timestamp: "2026-07-30T10:00:01+08:00" },
         ],
         has_before: false,
         has_after: true,
@@ -266,16 +322,80 @@ it("点击未加载的全局轮次导航时按 seq 加载正文窗口", async ()
   render(<App />);
 
   expect(await screen.findByText("new question", { selector: ".user-text" })).toBeVisible();
-  expect(screen.getByTitle("old question")).toHaveTextContent("01");
+  expect(screen.getByTitle("old question")).toHaveTextContent("21");
   expect(screen.getByTitle("new question")).toHaveTextContent("61");
 
   fireEvent.click(screen.getByTitle("old question"));
 
+  expect(await screen.findByRole("button", { name: "回到最新消息" })).toBeVisible();
   expect(await screen.findByText("old question", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByText("old answer")).toBeVisible();
+  expect(screen.queryByText("new question", { selector: ".user-text" })).not.toBeInTheDocument();
+  await waitFor(() => expect(
+    document.querySelector<HTMLElement>(".conversation-scroll")?.scrollTo,
+  ).toHaveBeenCalled());
   expect(vi.mocked(fetch).mock.calls.some(([input]) => (
-    String(input).endsWith("/api/chat/sessions/web%3Acomponent/messages/around?anchor_seq=0&limit=60")
+    String(input).endsWith("/api/chat/sessions/web%3Acomponent/messages/around?anchor_seq=20&limit=60")
   ))).toBe(true);
+
+  fireEvent.click(screen.getByRole("button", { name: "回到最新消息" }));
+
+  expect(await screen.findByText("new question", { selector: ".user-text" })).toBeVisible();
+  expect(screen.queryByText("old question", { selector: ".user-text" })).not.toBeInTheDocument();
+  expect(vi.mocked(fetch).mock.calls.filter(([input]) => (
+    String(input).endsWith("/api/chat/sessions/web%3Acomponent/messages")
+  ))).toHaveLength(2);
+
+  fireEvent.click(screen.getByTitle("old question"));
+  expect(await screen.findByText("old question", { selector: ".user-text" })).toBeVisible();
+
+  const scroller = document.querySelector<HTMLElement>(".conversation-scroll")!;
+  Object.defineProperties(scroller, {
+    clientHeight: { configurable: true, value: 600 },
+    scrollHeight: { configurable: true, value: 1200 },
+    scrollTop: { configurable: true, writable: true, value: 600 },
+  });
+  fireEvent.scroll(scroller);
+
+  expect(await screen.findByText("next question", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "回到最新消息" })).toBeVisible();
+  expect(vi.mocked(fetch).mock.calls.some(([input]) => (
+    String(input).endsWith("/api/chat/sessions/web%3Acomponent/messages/around?anchor_seq=42&limit=60")
+  ))).toBe(true);
+
+  const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
+  fireEvent.change(input, { target: { value: "send from history window" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+  await waitFor(() => expect(FakeWebSocket.instances[0].sent.some((frame) => (
+    frame.type === "message.send" && frame.text === "send from history window"
+  ))).toBe(true));
+  const sent = FakeWebSocket.instances[0].sent.find((frame) => (
+    frame.type === "message.send" && frame.text === "send from history window"
+  ));
+  await act(async () => {
+    FakeWebSocket.instances[0].onmessage?.({ data: JSON.stringify({
+      type: "turn.started",
+      request_id: sent?.request_id,
+      session_id: "web:component",
+      turn_id: "turn-sent",
+    }) } as MessageEvent);
+    resolveLatestMessageRequest({ ok: true, json: async () => ({
+      items: [
+        { id: "web:component:120", seq: 120, role: "user", content: "new question", turn_id: "turn-new", timestamp: "2026-07-30T12:00:00+08:00" },
+        { id: "web:component:121", seq: 121, role: "assistant", content: "new answer", turn_id: "turn-new", timestamp: "2026-07-30T12:00:01+08:00" },
+      ],
+      has_more: true,
+      next_before_seq: 120,
+    }) } as Response);
+    await latestMessageRequest;
+  });
+  expect(await screen.findByText("send from history window", { selector: ".user-text" })).toBeVisible();
+  expect(screen.getAllByText("send from history window", { selector: ".user-text" })).toHaveLength(1);
+  expect(screen.queryByText("old question", { selector: ".user-text" })).not.toBeInTheDocument();
+  expect(vi.mocked(fetch).mock.calls.filter(([request]) => (
+    String(request).endsWith("/api/chat/sessions/web%3Acomponent/messages")
+  ))).toHaveLength(3);
 });
 
 it("滚动到正文窗口顶部时继续加载更早消息", async () => {
@@ -302,20 +422,29 @@ it("滚动到正文窗口顶部时继续加载更早消息", async () => {
       return { ok: true, json: async () => ({
         items: [
           { id: "web:component:60", seq: 60, role: "user", content: "current question", turn_id: "turn-current", timestamp: "2026-07-30T12:00:00+08:00" },
-          { id: "web:component:61", seq: 61, role: "assistant", content: "current answer", turn_id: "turn-current", timestamp: "2026-07-30T12:00:01+08:00" },
         ],
         has_more: true,
         next_before_seq: 60,
       }) } as Response;
     }
     if (url.includes("/api/chat/sessions/web%3Acomponent/messages/older")) {
+      if (url.includes("before_seq=58")) {
+        return { ok: true, json: async () => ({
+          items: [
+            { id: "web:component:56", seq: 56, role: "user", content: "oldest question", turn_id: "turn-oldest", timestamp: "2026-07-30T09:00:00+08:00" },
+            { id: "web:component:57", seq: 57, role: "assistant", content: "oldest answer", turn_id: "turn-oldest", timestamp: "2026-07-30T09:00:01+08:00" },
+          ],
+          has_more: false,
+          next_before_seq: null,
+        }) } as Response;
+      }
       return { ok: true, json: async () => ({
         items: [
           { id: "web:component:58", seq: 58, role: "user", content: "older question", turn_id: "turn-old", timestamp: "2026-07-30T10:00:00+08:00" },
           { id: "web:component:59", seq: 59, role: "assistant", content: "older answer", turn_id: "turn-old", timestamp: "2026-07-30T10:00:01+08:00" },
         ],
-        has_more: false,
-        next_before_seq: null,
+        has_more: true,
+        next_before_seq: 58,
       }) } as Response;
     }
     if (url.includes("/notifications")) return { ok: true, json: async () => ({ items: [{
@@ -338,14 +467,34 @@ it("滚动到正文窗口顶部时继续加载更早消息", async () => {
   const scroller = document.querySelector<HTMLElement>(".conversation-scroll")!;
   Object.defineProperties(scroller, {
     clientHeight: { configurable: true, value: 600 },
-    scrollHeight: { configurable: true, writable: true, value: 1200 },
+    scrollHeight: {
+      configurable: true,
+      get: () => screen.queryByText("older question", { selector: ".user-text" }) ? 2400 : 1200,
+    },
     scrollTop: { configurable: true, writable: true, value: 0 },
   });
+  vi.mocked(scroller.scrollTo).mockClear();
   fireEvent.scroll(scroller);
 
   expect(await screen.findByText("older question", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByText("older answer")).toBeVisible();
-  expect(screen.queryByText("window outside reminder")).not.toBeInTheDocument();
+  await act(async () => {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  });
+  expect(vi.mocked(scroller.scrollTo).mock.calls.some(([options]) => (
+    typeof options === "object" && options !== null && Number((options as ScrollToOptions).top) > 0
+  ))).toBe(true);
+
+  await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
+  scroller.scrollTop = 0;
+  vi.mocked(scroller.scrollTo).mockClear();
+  fireEvent.scroll(scroller);
+
+  expect(await screen.findByText("oldest question", { selector: ".user-text" })).toBeVisible();
+  expect(vi.mocked(scroller.scrollTo).mock.calls.some(([options]) => (
+    typeof options === "object" && options !== null && Number((options as ScrollToOptions).top) > 0
+  ))).toBe(true);
+  expect(screen.getByText("window outside reminder")).toBeVisible();
   expect(vi.mocked(fetch).mock.calls.some(([input]) => (
     String(input).endsWith("/api/chat/sessions/web%3Acomponent/messages/older?before_seq=60&limit=60")
   ))).toBe(true);
@@ -484,7 +633,7 @@ it("非连续正文窗口只插入已加载区间内的提醒", async () => {
 
   expect(await screen.findByText("old anchor", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByText("旧窗口提醒")).toBeVisible();
-  expect(screen.getByText("尾部之后提醒")).toBeVisible();
+  expect(screen.queryByText("尾部之后提醒")).not.toBeInTheDocument();
   expect(screen.queryByText("中间未加载提醒")).not.toBeInTheDocument();
 });
 
@@ -880,9 +1029,11 @@ it("点击历史会话后在目标消息渲染完成时强制回到底部", asyn
     clientHeight: { configurable: true, value: 400 },
     scrollTop: { configurable: true, writable: true, value: 250 },
   });
+  const firstVirtualConversation = container.querySelector(".virtual-conversation");
   fireEvent.click(screen.getByRole("button", { name: "第二个会话" }));
 
   await screen.findByText("第二个会话的末尾");
+  expect(container.querySelector(".virtual-conversation")).not.toBe(firstVirtualConversation);
   await waitFor(() => expect(conversation!.scrollTop).toBeGreaterThanOrEqual(1197));
   expect(container.querySelector(".conversation-content")).not.toBeNull();
 });
@@ -1140,4 +1291,46 @@ it("附件数量、格式和大小不符合要求时显示错误且不静默截�
   fireEvent.drop(composer!, { dataTransfer: { files } });
   expect(screen.getByRole("alert")).toHaveTextContent("最多添加 8 个附件");
   expect(screen.queryByText("8.txt")).not.toBeInTheDocument();
+});
+
+it("ignores a stale session history response after navigating elsewhere", async () => {
+  let resolveFirstHistory!: (response: Response) => void;
+  const firstHistory = new Promise<Response>((resolve) => { resolveFirstHistory = resolve; });
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/api/chat/sessions?page=")) {
+      return { ok: true, json: async () => ({ items: [{
+        key: "web:first", title: "First session", first_message_content: "",
+        created_at: "2026-08-01T09:00:00+08:00", updated_at: "2026-08-01T09:00:00+08:00", message_count: 1,
+      }, {
+        key: "web:second", title: "Second session", first_message_content: "",
+        created_at: "2026-08-01T10:00:00+08:00", updated_at: "2026-08-01T10:00:00+08:00", message_count: 1,
+      }], total: 2 }) } as Response;
+    }
+    if (url.endsWith("/api/chat/sessions/web%3Afirst/messages")) return firstHistory;
+    if (url.endsWith("/api/chat/sessions/web%3Asecond/messages")) {
+      return { ok: true, json: async () => ({ items: [{
+        id: "web:second:0", seq: 0, role: "user", content: "second history", turn_id: "turn-second",
+        timestamp: "2026-08-01T10:00:00+08:00",
+      }], has_more: false }) } as Response;
+    }
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "First session" }));
+  fireEvent.click(screen.getByRole("button", { name: "Second session" }));
+  expect(await screen.findByText("second history", { selector: ".user-text" })).toBeVisible();
+
+  await act(async () => {
+    resolveFirstHistory({ ok: true, json: async () => ({ items: [{
+      id: "web:first:0", seq: 0, role: "user", content: "stale first history", turn_id: "turn-first",
+      timestamp: "2026-08-01T09:00:00+08:00",
+    }], has_more: false }) } as Response);
+    await firstHistory;
+  });
+
+  expect(window.location.pathname).toBe("/chat/second");
+  expect(screen.getByText("second history", { selector: ".user-text" })).toBeVisible();
+  expect(screen.queryByText("stale first history", { selector: ".user-text" })).not.toBeInTheDocument();
 });

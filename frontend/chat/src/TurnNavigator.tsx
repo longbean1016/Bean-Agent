@@ -26,15 +26,19 @@ export function activeTurnFromVisibleRegions(
   viewportBottom: number,
   atConversationEnd = false,
   direction: "up" | "down" = "down",
+  previousActiveTurnId = "",
 ): string {
   if (atConversationEnd) return turns.at(-1)?.id ?? "";
+  if (previousActiveTurnId && regions.get(previousActiveTurnId)?.some((region) => (
+    region.bottom > viewportTop && region.top < viewportBottom
+  ))) return previousActiveTurnId;
   const orderedTurns = direction === "up" ? [...turns].reverse() : turns;
   for (const turn of orderedTurns) {
     if (regions.get(turn.id)?.some((region) => (
       region.bottom > viewportTop && region.top < viewportBottom
     ))) return turn.id;
   }
-  return turns[0]?.id ?? "";
+  return previousActiveTurnId || turns.at(-1)?.id || "";
 }
 
 export function scrollTopToRevealItem(
@@ -44,8 +48,11 @@ export function scrollTopToRevealItem(
   itemTop: number,
   itemBottom: number,
 ): number {
-  if (itemTop < containerTop) return scrollTop - (containerTop - itemTop);
-  if (itemBottom > containerBottom) return scrollTop + (itemBottom - containerBottom);
+  if (itemTop < containerTop || itemBottom > containerBottom) {
+    const containerCenter = (containerTop + containerBottom) / 2;
+    const itemCenter = (itemTop + itemBottom) / 2;
+    return Math.max(0, scrollTop + itemCenter - containerCenter);
+  }
   return scrollTop;
 }
 
@@ -101,6 +108,8 @@ export function TurnNavigator({ sessionId, turns, onTurnRequest }: {
   const navigationLockRef = useRef("");
   const navigationUnlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [activeTurnId, setActiveTurnId] = useState(() => turns.at(-1)?.id ?? "");
+  const activeTurnIdRef = useRef(activeTurnId);
+  activeTurnIdRef.current = activeTurnId;
 
   const scheduleNavigationUnlock = useCallback((delay: number) => {
     if (navigationUnlockTimerRef.current) clearTimeout(navigationUnlockTimerRef.current);
@@ -114,41 +123,12 @@ export function TurnNavigator({ sessionId, turns, onTurnRequest }: {
     navRef.current?.closest(".conversation")?.querySelector<HTMLElement>(".conversation-scroll") ?? null
   ), []);
 
-  const findAnchor = useCallback((id: string) => {
-    const scroller = findScroller();
-    if (!scroller) return null;
-    return Array.from(scroller.querySelectorAll<HTMLElement>("[data-turn-anchor]"))
-      .find((element) => element.dataset.turnAnchor === id) ?? null;
-  }, [findScroller]);
-
-  const scrollToLoadedTurn = useCallback((id: string) => {
-    const scroller = findScroller();
-    const anchor = findAnchor(id);
-    if (!scroller || !anchor) return false;
-    const top = scroller.scrollTop
-      + anchor.getBoundingClientRect().top
-      - scroller.getBoundingClientRect().top
-      - 24;
-    navigationLockRef.current = id;
-    scheduleNavigationUnlock(1200);
-    scroller.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
-    setActiveTurnId(id);
-    return true;
-  }, [findAnchor, findScroller, scheduleNavigationUnlock]);
-
   const jumpToTurn = useCallback((turn: TurnNavigationEntry) => {
-    if (scrollToLoadedTurn(turn.id)) return;
-    if (!onTurnRequest) return;
     navigationLockRef.current = turn.id;
+    scheduleNavigationUnlock(1200);
     setActiveTurnId(turn.id);
-    void Promise.resolve(onTurnRequest(turn)).then(() => {
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(() => {
-          scrollToLoadedTurn(turn.id);
-        });
-      });
-    });
-  }, [onTurnRequest, scrollToLoadedTurn]);
+    void onTurnRequest?.(turn);
+  }, [onTurnRequest, scheduleNavigationUnlock]);
 
   useEffect(() => () => {
     if (navigationUnlockTimerRef.current) clearTimeout(navigationUnlockTimerRef.current);
@@ -188,6 +168,7 @@ export function TurnNavigator({ sessionId, turns, onTurnRequest }: {
         scrollerRect.bottom,
         atConversationEnd,
         scrollDirectionRef.current,
+        activeTurnIdRef.current,
       ));
     };
     updateActiveTurn();
@@ -197,7 +178,7 @@ export function TurnNavigator({ sessionId, turns, onTurnRequest }: {
       scroller.removeEventListener("scroll", updateActiveTurn);
       window.removeEventListener("resize", updateActiveTurn);
     };
-  }, [findAnchor, findScroller, scheduleNavigationUnlock, sessionId, turns]);
+  }, [findScroller, scheduleNavigationUnlock, sessionId, turns]);
 
   useLayoutEffect(() => {
     const reveal = (selector: string) => {

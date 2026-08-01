@@ -45,6 +45,47 @@ describe("TurnNavigator", () => {
     ]), 0, 600, true)).toBe("u3");
   });
 
+  it("keeps the previous turn active while layout changes leave no visible region", () => {
+    const turns = [
+      { id: "u1", question: "第一问", preview: "第一问" },
+      { id: "u2", question: "第二问", preview: "第二问" },
+      { id: "u3", question: "第三问", preview: "第三问" },
+    ];
+
+    expect(activeTurnFromVisibleRegions(
+      turns,
+      new Map(),
+      0,
+      600,
+      false,
+      "down",
+      "u3",
+    )).toBe("u3");
+  });
+
+  it("keeps the active turn while its region remains visible", () => {
+    const turns = [
+      { id: "u1", question: "第一问", preview: "第一问" },
+      { id: "u2", question: "第二问", preview: "第二问" },
+      { id: "u3", question: "第三问", preview: "第三问" },
+    ];
+    const regions = new Map([
+      ["u1", [{ top: -300, bottom: 80 }]],
+      ["u2", [{ top: 100, bottom: 420 }]],
+      ["u3", [{ top: 450, bottom: 700 }]],
+    ]);
+
+    expect(activeTurnFromVisibleRegions(
+      turns,
+      regions,
+      0,
+      600,
+      false,
+      "up",
+      "u2",
+    )).toBe("u2");
+  });
+
   it("assigns each assistant response to the preceding user turn", () => {
     expect(messagesWithNavigationTurns([
       message("u1", "user", "第一问"),
@@ -105,9 +146,9 @@ describe("TurnNavigator", () => {
     ]);
   });
 
-  it("uses actual rectangles to reveal an active navigation item inside its rail", () => {
-    expect(scrollTopToRevealItem(0, 0, 100, 220, 240)).toBe(140);
-    expect(scrollTopToRevealItem(180, 100, 220, 80, 100)).toBe(160);
+  it("centers an active navigation item only after it leaves its rail", () => {
+    expect(scrollTopToRevealItem(0, 0, 100, 220, 240)).toBe(180);
+    expect(scrollTopToRevealItem(180, 100, 220, 80, 100)).toBe(110);
     expect(scrollTopToRevealItem(100, 100, 220, 140, 160)).toBe(100);
   });
 
@@ -126,6 +167,7 @@ describe("TurnNavigator", () => {
 
   it("renders the full question directory and scrolls to a selected turn", () => {
     const scrollTo = vi.fn();
+    const onTurnRequest = vi.fn();
     const turns = [
       { id: "u1", question: "第一个问题", preview: "第一个问题" },
       { id: "u2", question: "第二个问题", preview: "第二个问题" },
@@ -136,7 +178,7 @@ describe("TurnNavigator", () => {
           <section data-turn-region="u1"><article data-turn-anchor="u1" /></section>
           <section data-turn-region="u2"><article data-turn-anchor="u2" /></section>
         </div>
-        <TurnNavigator sessionId="web:test" turns={turns} />
+        <TurnNavigator sessionId="web:test" turns={turns} onTurnRequest={onTurnRequest} />
       </div>,
     );
     const scroller = container.querySelector<HTMLElement>(".conversation-scroll")!;
@@ -158,7 +200,8 @@ describe("TurnNavigator", () => {
     expect(screen.getByRole("button", { name: "02第二个问题" })).toHaveAttribute("aria-current", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "01第一个问题" }));
-    expect(scrollTo).toHaveBeenCalledWith({ top: 16, behavior: "smooth" });
+    expect(onTurnRequest).toHaveBeenCalledWith(turns[0]);
+    expect(scrollTo).not.toHaveBeenCalled();
     const firstTurnButton = screen.getByRole("button", { name: "01第一个问题" });
     expect(firstTurnButton).toHaveAttribute("aria-current", "true");
 

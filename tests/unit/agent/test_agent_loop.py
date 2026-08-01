@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from pathlib import Path
 
 import pytest
 
-from agent.agent_loop import AgentLoop, TurnInterruptState
+from agent.agent_loop import AgentLoop
 from agent.event_bus import EventBus, SessionUpdated, TurnCommitted
 from agent.message_bus import InboundMessage, MessageBus, PipelineResult
 from agent.config_models import MemoryConfig
@@ -231,7 +230,7 @@ async def test_context_guard_can_be_explicitly_skipped_for_internal_turn(
 
 
 @pytest.mark.asyncio
-async def test_interrupt_defers_persistence_until_next_message_and_preserves_tools(tmp_path: Path) -> None:
+async def test_interrupt_immediately_persists_marker_and_completed_tools(tmp_path: Path) -> None:
     class BlockingPipeline:
         def __init__(self) -> None:
             self.started = asyncio.Event()
@@ -255,6 +254,13 @@ async def test_interrupt_defers_persistence_until_next_message_and_preserves_too
                                 "arguments": {"path": "a.txt"},
                                 "result": "文件内容",
                                 "status": "ok",
+                            },
+                            {
+                                "call_id": "call-2",
+                                "name": "long_running_tool",
+                                "arguments": {},
+                                "result": "",
+                                "status": "running",
                             }
                         ],
                     }
@@ -278,25 +284,13 @@ async def test_interrupt_defers_persistence_until_next_message_and_preserves_too
     await running
 
     assert result.status == "interrupted"
-    assert sessions.store.fetch_session_messages("web:c") == []
-    state = loop.interrupt_states["web:c"]
-    assert state.original_user_message == "读取文件"
-    assert state.partial_reply == "未完成回答"
-    assert state.partial_thinking == "未完成思考"
-    assert state.tools_used == ["read_file"]
-
-    loop._pipeline = Pipeline()
-    await bus.publish_inbound(
-        InboundMessage(channel="web", sender="u", chat_id="c", content="继续")
-    )
-    await loop.run_once()
-
     rows = sessions.store.fetch_session_messages("web:c")
-    assert [row["content"] for row in rows] == ["读取文件", "[interrupted]", "继续", "回答"]
+    assert [row["content"] for row in rows] == ["读取文件", "[用户已停止生成]"]
+    assert rows[0]["turn_id"] == rows[1]["turn_id"] == result.turn_id
     assert rows[1]["status"] == "interrupted"
     assert rows[1]["tools_used"] == ["read_file"]
     assert rows[1]["tool_chain"][0]["calls"][0]["result"] == "文件内容"
-    assert "web:c" not in loop.interrupt_states
+    assert len(rows[1]["tool_chain"][0]["calls"]) == 1
     await sessions.close()
 
 
@@ -362,29 +356,6 @@ async def test_active_turn_snapshot_exports_running_state_for_resubscribe(tmp_pa
         with pytest.raises(asyncio.CancelledError):
             await running
         await sessions.close()
-
-
-@pytest.mark.asyncio
-async def test_expired_interrupt_state_is_discarded_without_marker(tmp_path: Path) -> None:
-    bus = MessageBus()
-    sessions = SessionManager(tmp_path)
-    loop = AgentLoop(bus, EventBus(), Pipeline(), sessions)
-    loop.interrupt_states["web:c"] = TurnInterruptState(
-        session_key="web:c",
-        original_user_message="旧问题",
-        interrupted_at=time.monotonic() - 1801,
-    )
-    await bus.publish_inbound(
-        InboundMessage(channel="web", sender="u", chat_id="c", content="新问题")
-    )
-
-    await loop.run_once()
-
-    rows = sessions.store.fetch_session_messages("web:c")
-    assert [row["content"] for row in rows] == ["新问题", "回答"]
-    assert "web:c" not in loop.interrupt_states
-    await sessions.close()
-
 
 @pytest.mark.asyncio
 async def test_turn_committed_reaches_memory_worker_with_persisted_snapshot(tmp_path: Path) -> None:

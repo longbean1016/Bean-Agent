@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import uuid4
@@ -22,6 +21,8 @@ from agent.turn_scheduler import QueuePosition, TurnScheduler
 from session.manager import SessionManager
 
 logger = logging.getLogger(__name__)
+
+INTERRUPTED_ASSISTANT_CONTENT = "[用户已停止生成]"
 
 
 class PipelineApi(Protocol):
@@ -43,7 +44,7 @@ class InterruptResult:
 
 @dataclass(slots=True)
 class TurnInterruptState:
-    """被中断 Turn 的纯内存快照；30 分钟内由同一会话的下一条消息消费。"""
+    """运行中 Turn 的内存快照，用于刷新恢复和中断持久化。"""
 
     session_key: str
     original_user_message: str
@@ -53,12 +54,6 @@ class TurnInterruptState:
     partial_thinking: str | None = None
     tools_used: list[str] = field(default_factory=list)
     tool_chain_partial: list[dict[str, Any]] = field(default_factory=list)
-    interrupted_at: float = field(default_factory=time.monotonic)
-    ttl_seconds: int = 1800
-
-    @property
-    def expired(self) -> bool:
-        return (time.monotonic() - self.interrupted_at) > self.ttl_seconds
 
 
 class AgentLoop:
@@ -83,7 +78,6 @@ class AgentLoop:
         self._active_tasks: dict[str, asyncio.Task[None]] = {}
         self._active_turn_ids: dict[str, str] = {}
         self._active_turn_states: dict[str, TurnInterruptState] = {}
-        self.interrupt_states: dict[str, TurnInterruptState] = {}
         self._completion_waiters: dict[int, asyncio.Event] = {}
         self._scheduler = TurnScheduler(
             max_running=max_concurrent_turns,
@@ -173,7 +167,6 @@ class AgentLoop:
 
     async def _process_message(self, message: InboundMessage, turn_id: str) -> None:
         request_id = str(message.metadata.get("request_id") or "")
-        resumed = await self._persist_pending_interrupt(message.session_key)
         # 用户消息在推理结束后才批量落库，因此工具执行前只能从 Session 的
         # 权威 next_seq 预测 ID。系统值必须覆盖入站同名字段，避免伪造 evidence。
         message.metadata["current_user_source_ref"] = (
@@ -260,33 +253,6 @@ class AgentLoop:
                 "context_retry": context_retry,
             },
         ))
-        if resumed:
-            self.interrupt_states.pop(message.session_key, None)
-
-    async def _persist_pending_interrupt(self, session_key: str) -> bool:
-        state = self.interrupt_states.get(session_key)
-        if state is None:
-            return False
-        if state.expired:
-            # TTL 在下一条消息到达时惰性检查，避免为少量内存状态启动额外清理任务。
-            self.interrupt_states.pop(session_key, None)
-            return False
-        if not state.original_user_message.strip():
-            return True
-
-        session = await self._sessions.get_or_create(session_key)
-        user = session.add_message("user", state.original_user_message)
-        assistant = session.add_message(
-            "assistant",
-            "[interrupted]",
-            status="interrupted",
-            tools_used=list(state.tools_used),
-            tool_chain=list(state.tool_chain_partial),
-        )
-        # 中断标记必须成对批量落库；不发 TurnCommitted，避免未完成 Turn 进入长期记忆。
-        await self._sessions.append_messages(session, [user, assistant])
-        return True
-
     async def _persist_terminal_turn(self, message: InboundMessage, turn_id: str, status: str, assistant_content: str) -> None:
         session = await self._sessions.get_or_create(message.session_key)
         user = session.add_message("user", message.content, media=message.media, turn_id=turn_id)
@@ -299,10 +265,11 @@ class AgentLoop:
         task = self._active_tasks.get(session_key)
         turn_id = self._active_turn_ids.get(session_key, "")
         state = self._active_turn_states.get(session_key)
+        interrupted: TurnInterruptState | None = None
         if task is not None and not task.done() and state is not None:
             snapshotter = getattr(self._pipeline, "snapshot_interrupt_state", None)
             snapshot = snapshotter(turn_id) if callable(snapshotter) else {}
-            self.interrupt_states[session_key] = TurnInterruptState(
+            interrupted = TurnInterruptState(
                 session_key=session_key,
                 original_user_message=state.original_user_message,
                 original_media=list(state.original_media),
@@ -313,7 +280,40 @@ class AgentLoop:
                 tool_chain_partial=list(snapshot.get("tool_chain_partial") or []),
             )
         result = await self._scheduler.cancel(session_key)
+        if result.status == "interrupted" and task is not None and interrupted is not None:
+            await asyncio.gather(task, return_exceptions=True)
+            await self._persist_interrupted_turn(interrupted, turn_id)
         return InterruptResult(result.status, session_key, turn_id)
+
+    async def _persist_interrupted_turn(self, state: TurnInterruptState, turn_id: str) -> None:
+        """立即保存中断轮，避免刷新或进程退出后丢失可见历史。"""
+
+        session = await self._sessions.get_or_create(state.session_key)
+        if any(str(message.get("turn_id") or "") == turn_id for message in session.messages):
+            return
+        tool_chain = completed_tool_chain(state.tool_chain_partial)
+        tools_used = list(dict.fromkeys(
+            str(call.get("name") or "")
+            for group in tool_chain
+            for call in group["calls"]
+            if str(call.get("name") or "")
+        ))
+        user = session.add_message(
+            "user",
+            state.original_user_message,
+            media=state.original_media,
+            turn_id=turn_id,
+        )
+        assistant = session.add_message(
+            "assistant",
+            INTERRUPTED_ASSISTANT_CONTENT,
+            turn_id=turn_id,
+            status="interrupted",
+            tools_used=tools_used,
+            tool_chain=tool_chain,
+        )
+        # 中断轮不发 TurnCommitted，避免未完成内容参与长期记忆提取。
+        await self._sessions.append_messages(session, [user, assistant])
 
     def get_active_turn_snapshot(self, session_key: str) -> dict[str, Any] | None:
         """导出正在运行的 Turn 快照，供 WebSocket 刷新/重连后按 session 补发。"""
@@ -362,6 +362,26 @@ class AgentLoop:
         discarded = await self._bus.discard_pending_inbound()
         for message in discarded:
             self._finish_waiter(message)
+
+
+def completed_tool_chain(tool_chain: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """只保留已有终态结果的工具调用，丢弃仍在运行的调用。"""
+
+    completed: list[dict[str, Any]] = []
+    for group in tool_chain:
+        calls = group.get("calls") if isinstance(group, dict) else None
+        if not isinstance(calls, list):
+            continue
+        retained = [
+            dict(call)
+            for call in calls
+            if isinstance(call, dict) and str(call.get("status") or "") in {"ok", "completed", "error"}
+        ]
+        if retained:
+            copied = dict(group)
+            copied["calls"] = retained
+            completed.append(copied)
+    return completed
 
 
 def _normalize_snapshot_tool_status(value: object) -> str:

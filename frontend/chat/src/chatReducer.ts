@@ -1,4 +1,5 @@
 import type { ChatAction, ChatMessage, ChatState, MessageRow, ProactiveNotificationRow, ToolActivity, TurnRuntimeState } from "./types";
+import { reconcileMessages } from "./timeline";
 
 export const idleTurnState: TurnRuntimeState = {
   status: "idle",
@@ -22,11 +23,17 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     const active = turn.status === "submitting" || turn.status === "queued" || turn.status === "running";
     const cached = state.sessionMessages[action.sessionId];
     // HTTP 历史可能在发送确认前返回空结果；只要本地有快照，就不能用空历史覆盖它。
-    let messages = cached && (active || action.messages.length === 0) ? cached : action.messages;
-    if (turn.status === "running" && turn.turnId
+    let messages = action.messages;
+    if (!action.replace && cached) {
+      messages = active
+        ? reconcileMessages([...action.messages, ...cached])
+        : action.messages.length === 0 ? cached : action.messages;
+    }
+    if (!action.replace && turn.status === "running" && turn.turnId
       && !messages.some((message) => message.turnId === turn.turnId)) {
       messages = [...messages, createDraft(turn.turnId)];
     }
+    messages = reconcileMessages(messages);
     return {
       ...state,
       sessionId: action.sessionId,
@@ -111,9 +118,14 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       turnId: action.turn_id,
       requestId: action.request_id ?? "",
     });
+    const requestId = action.request_id || state.turnStates[action.session_id]?.requestId;
     const draft = createDraft(action.turn_id);
     const sessionMessages = [
-      ...getSessionMessages(state, action.session_id).filter((item) => item.turnId !== action.turn_id),
+      ...getSessionMessages(state, action.session_id)
+        .filter((item) => item.turnId !== action.turn_id)
+        .map((item) => item.id === `user-${requestId}`
+          ? { ...item, turnId: action.turn_id }
+          : item),
       draft,
     ];
     if (state.sessionId && action.session_id !== state.sessionId) {
@@ -163,6 +175,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     };
   }
   if (action.type === "turn.snapshot") {
+    const snapshotTimestamp = new Date().toISOString();
     const current = action.session_id === state.sessionId;
     const turnStates = setTurnState(state, action.session_id, {
       status: "running",
@@ -181,6 +194,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       tools: [],
       turnId: action.turn_id,
       streaming: false,
+      timestamp: snapshotTimestamp,
     };
     const incomingTools = action.tools.map((tool) => ({
       callId: tool.call_id,
@@ -203,6 +217,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       media: existingAssistant?.media ?? [],
       tools: mergeTools(existingAssistant?.tools ?? [], incomingTools),
       streaming: true,
+      timestamp: existingAssistant?.timestamp ?? snapshotTimestamp,
     };
     const withoutTurn = source.filter((message) => message.turnId !== action.turn_id && message.id !== userId);
     const restoredUser = existingUser ? {
@@ -293,6 +308,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       thinking: action.thinking || message.thinking,
       media: action.media ?? message.media,
       streaming: false,
+      timestamp: String(action.metadata?.generated_at || "") || message.timestamp,
     }));
     return {
       ...next,
@@ -312,6 +328,7 @@ function createDraft(turnId: string): ChatMessage {
     media: [],
     tools: [],
     streaming: true,
+    timestamp: new Date().toISOString(),
   };
 }
 
@@ -425,7 +442,11 @@ export function mergeTimeline(...groups: ChatMessage[][]): ChatMessage[] {
   return groups.flat().sort((left, right) => {
     const leftTime = Date.parse(left.timestamp || "");
     const rightTime = Date.parse(right.timestamp || "");
-    if (Number.isNaN(leftTime) || Number.isNaN(rightTime)) return 0;
+    const leftMissing = Number.isNaN(leftTime);
+    const rightMissing = Number.isNaN(rightTime);
+    if (leftMissing && rightMissing) return 0;
+    if (leftMissing) return 1;
+    if (rightMissing) return -1;
     return leftTime - rightTime;
   });
 }

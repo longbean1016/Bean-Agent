@@ -349,8 +349,9 @@ async def test_interrupted_turn_is_expanded_into_next_provider_messages(
         assert (await loop.request_interrupt("web:c")).status == "interrupted"
         await interrupted_turn
 
-        # 中断发生时不落库；同一会话的下一条消息负责补写中断标记。
-        assert sessions.store.fetch_session_messages("web:c") == []
+        # 中断完成后立即落库，刷新或进程退出不应丢失这一轮。
+        interrupted_rows = sessions.store.fetch_session_messages("web:c")
+        assert [row["content"] for row in interrupted_rows] == ["读取文件并分析", "[用户已停止生成]"]
         await bus.publish_inbound(InboundMessage("web", "u", "c", "继续"))
         await loop.run_once()
 
@@ -365,7 +366,7 @@ async def test_interrupted_turn_is_expanded_into_next_provider_messages(
             "content": "echo:已读取内容",
         }
         assert history[3]["role"] == "assistant"
-        assert history[3]["content"] == "[interrupted]"
+        assert history[3]["content"] == "[用户已停止生成]"
         assert history[-1]["role"] == "user"
         assert str(history[-1]["content"]).endswith("\n继续")
     finally:

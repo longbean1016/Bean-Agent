@@ -1,5 +1,6 @@
 import * as Collapsible from "@radix-ui/react-collapsible";
 import * as Dialog from "@radix-ui/react-dialog";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { code } from "@streamdown/code";
 import {
   AlertCircle,
@@ -28,14 +29,16 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { ComponentPropsWithoutRef, ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
+import type { StickToBottomContext } from "use-stick-to-bottom";
 
 import { deleteReminder, deleteSession, fetchMessagePage, fetchMessagesAroundPage, fetchNotifications, fetchOlderMessages, fetchProactiveSettings, fetchReminders, fetchSessions, fetchTurns, mediaUrl, renameSession, saveProactiveSettings, uploadAttachment } from "./api";
-import { idleTurnState, initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
+import { idleTurnState, initialChatState, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
+import { composeTimeline, reconcileMessages } from "./timeline";
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
@@ -50,6 +53,7 @@ const THEME_STORAGE_KEY = "beanagent.theme";
 const MAX_ATTACHMENTS = 8;
 const MAX_TEXT_ATTACHMENT_SIZE = 2 * 1024 * 1024;
 const MAX_IMAGE_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+const TURN_CONTEXT_BEFORE_MESSAGES = 20;
 const IMAGE_SUFFIXES = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
 const TEXT_SUFFIXES = new Set([
   ".txt", ".md", ".markdown", ".py", ".json", ".toml", ".yaml", ".yml",
@@ -65,7 +69,13 @@ const ATTACHMENT_ACCEPT = [
   ...TEXT_SUFFIXES,
 ].join(",");
 type ThemePreference = "light" | "system" | "dark";
-type MessageWindowState = { hasMoreBefore: boolean; nextBeforeSeq: number | null; hasTailWindow: boolean };
+type MessageWindowState = {
+  hasMoreBefore: boolean;
+  nextBeforeSeq: number | null;
+  hasMoreAfter: boolean;
+  nextAfterSeq: number | null;
+  hasTailWindow: boolean;
+};
 const markdownPlugins = { code, renderers: [{ language: "mermaid", component: MermaidBlock }] };
 const markdownComponents = { inlineCode: MemoryInlineCode };
 const markdownControls = {
@@ -172,9 +182,9 @@ export function App() {
   const [connection, setConnection] = useState<ConnectionStatus>("connecting");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [turnsBySession, setTurnsBySession] = useState<Record<string, TurnNavigationEntry[]>>({});
+  const [requestedTurnId, setRequestedTurnId] = useState("");
   const [notificationsBySession, setNotificationsBySession] = useState<Record<string, ChatMessage[]>>({});
   const [messageWindows, setMessageWindows] = useState<Record<string, MessageWindowState>>({});
-  const [loadingOlderSessionId, setLoadingOlderSessionId] = useState("");
   const [loadingSessionId, setLoadingSessionId] = useState(initialSession);
   const [input, setInput] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -187,24 +197,30 @@ export function App() {
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const clientRef = useRef<BeanWebSocketClient | null>(null);
+  const stickToBottomRef = useRef<StickToBottomContext | null>(null);
   const chatRef = useRef(chat);
   const messageWindowsRef = useRef(messageWindows);
-  const notificationsBySessionRef = useRef(notificationsBySession);
-  const loadingOlderSessionIdRef = useRef(loadingOlderSessionId);
+  const loadingMessageWindowRef = useRef("");
   const routeSessionRef = useRef(routeSession);
+  const sessionLoadVersionsRef = useRef<Record<string, number>>({});
   chatRef.current = chat;
   messageWindowsRef.current = messageWindows;
-  notificationsBySessionRef.current = notificationsBySession;
-  loadingOlderSessionIdRef.current = loadingOlderSessionId;
   routeSessionRef.current = routeSession;
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
   const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running";
   const restoringSession = Boolean(chat.sessionId && loadingSessionId === chat.sessionId && chat.messages.length === 0);
-  const messageTurns = useMemo(() => turnsFromMessages(chat.messages), [chat.messages]);
+  const displayMessages = useMemo(() => composeTimeline(
+    messageWindows[chat.sessionId]?.hasTailWindow === false
+      ? chat.messages.filter((message) => typeof message.seq === "number" && message.seq >= 0)
+      : chat.messages,
+    notificationsBySession[chat.sessionId] ?? [],
+    Boolean(messageWindows[chat.sessionId]?.hasTailWindow ?? true),
+  ), [chat.messages, chat.sessionId, messageWindows, notificationsBySession]);
+  const messageTurns = useMemo(() => turnsFromMessages(displayMessages), [displayMessages]);
   const conversationTurns = useMemo(() => (
     mergeNavigationTurns(turnsBySession[chat.sessionId] ?? [], messageTurns)
   ), [chat.sessionId, messageTurns, turnsBySession]);
-  const conversationTurnGroups = useMemo(() => groupMessagesIntoNavigationTurns(chat.messages), [chat.messages]);
+  const conversationTurnGroups = useMemo(() => groupMessagesIntoNavigationTurns(displayMessages), [displayMessages]);
 
   useEffect(() => {
     if (!initialRouteSession && initialSession) {
@@ -262,24 +278,10 @@ export function App() {
     const notification = notificationFrameToMessage(frame);
     if (!notification) return true;
     const sessionId = frame.session_id;
-    const currentNotifications = notificationsBySessionRef.current[sessionId] ?? [];
-    const nextNotifications = upsertMessage(currentNotifications, notification);
     setNotificationsBySession((current) => ({
       ...current,
       [sessionId]: upsertMessage(current[sessionId] ?? [], notification),
     }));
-    if (sessionId === chatRef.current.sessionId) {
-      const persistedMessages = chatRef.current.messages.filter((message) => !isStandaloneNotification(message));
-      dispatch({
-        type: "ui.session.select",
-        sessionId,
-        messages: mergeMessageWindow(
-          persistedMessages,
-          nextNotifications,
-          Boolean(messageWindowsRef.current[sessionId]?.hasTailWindow),
-        ),
-      });
-    }
     return true;
   }, []);
 
@@ -348,6 +350,8 @@ export function App() {
   }, [chat.sessionId]);
 
   const loadSession = async (sessionId: string, closeSidebar = true) => {
+    const loadVersion = (sessionLoadVersionsRef.current[sessionId] ?? 0) + 1;
+    sessionLoadVersionsRef.current[sessionId] = loadVersion;
     setLoadingSessionId(sessionId);
     try {
       const [page, notifications, turns] = await Promise.all([
@@ -357,17 +361,21 @@ export function App() {
       ]);
       const rows = page.items ?? [];
       const notificationMessages = notificationRowsToMessages(notifications);
-      const messages = mergeMessageWindow(rowsToMessages(rows), notificationMessages);
+      const messages = rowsToMessages(rows);
+      if (sessionLoadVersionsRef.current[sessionId] !== loadVersion) return;
       setMessageWindows((current) => ({
         ...current,
         [sessionId]: {
           hasMoreBefore: Boolean(page.has_more),
           nextBeforeSeq: page.next_before_seq ?? firstSeqFromRows(rows),
+          hasMoreAfter: false,
+          nextAfterSeq: null,
           hasTailWindow: true,
         },
       }));
       setNotificationsBySession((current) => ({ ...current, [sessionId]: notificationMessages }));
       setTurnsBySession((current) => ({ ...current, [sessionId]: turns }));
+      if (routeSessionRef.current !== sessionId) return;
       localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
       dispatch({ type: "ui.session.select", sessionId, messages });
       if (closeSidebar) setSidebarOpen(false);
@@ -383,6 +391,7 @@ export function App() {
     setLoadingSessionId("");
     localStorage.removeItem(SESSION_STORAGE_KEY);
     window.history.pushState({}, "", "/");
+    routeSessionRef.current = "";
     setRouteSession("");
     dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
     // 每次点击新建都创建全新的根页面草稿，不影响任何已有会话的独立草稿。
@@ -395,6 +404,7 @@ export function App() {
 
   const selectSession = (sessionId: string) => {
     window.history.pushState({}, "", pathForSession(sessionId));
+    routeSessionRef.current = sessionId;
     setRouteSession(sessionId);
     setInput(textDrafts[routeKey(sessionId)] ?? "");
     setFiles(fileDrafts[routeKey(sessionId)] ?? []);
@@ -403,81 +413,156 @@ export function App() {
 
   const handleTurnRequest = useCallback(async (turn: TurnNavigationEntry) => {
     const sessionId = chatRef.current.sessionId;
-    if (!sessionId || typeof turn.seq !== "number") return;
+    if (!sessionId) return;
+    stickToBottomRef.current?.stopScroll();
+    setRequestedTurnId(turn.id);
     const loaded = chatRef.current.messages.some((message) => (
       message.role === "user"
       && (message.turnId === turn.id || message.id === turn.id || message.seq === turn.seq)
     ));
     if (loaded) return;
+    if (typeof turn.seq !== "number") {
+      setRequestedTurnId("");
+      return;
+    }
     try {
       const [page, notifications] = await Promise.all([
-        fetchMessagesAroundPage(sessionId, turn.seq),
+        fetchMessagesAroundPage(sessionId, Math.max(0, turn.seq - TURN_CONTEXT_BEFORE_MESSAGES)),
         fetchNotifications(sessionId),
       ]);
       const rows = page.items ?? [];
       const notificationMessages = notificationRowsToMessages(notifications);
-      const currentMessages = chatRef.current.messages.filter((message) => !isStandaloneNotification(message));
-      const persistedMessages = dedupeMessages(mergeTimeline(
-        rowsToMessages(rows),
-        currentMessages,
+      const currentMessages = chatRef.current.messages;
+      const runtimeMessages = currentMessages.filter((message) => (
+        typeof message.seq !== "number" || message.seq < 0
       ));
-      const currentWindow = messageWindowsRef.current[sessionId];
-      const hasTailWindow = Boolean(currentWindow?.hasTailWindow || page.has_after === false);
-      const messages = mergeMessageWindow(
-        persistedMessages,
-        notificationMessages,
-        hasTailWindow,
-      );
+      const persistedMessages = reconcileMessages([...rowsToMessages(rows), ...runtimeMessages]);
+      const hasTailWindow = page.has_after === false;
       setMessageWindows((current) => ({
         ...current,
         [sessionId]: {
           hasMoreBefore: Boolean(page.has_before),
           nextBeforeSeq: page.next_before_seq ?? firstSeqFromRows(rows),
+          hasMoreAfter: Boolean(page.has_after),
+          nextAfterSeq: page.has_after ? nextSeqFromRows(rows) : null,
           hasTailWindow,
         },
       }));
       setNotificationsBySession((current) => ({ ...current, [sessionId]: notificationMessages }));
-      dispatch({ type: "ui.session.select", sessionId, messages });
+      dispatch({ type: "ui.session.select", sessionId, messages: persistedMessages, replace: true });
     } catch (error) {
+      setRequestedTurnId((current) => current === turn.id ? "" : current);
       dispatch(errorFrame(error));
     }
   }, []);
 
-  const loadOlderMessages = useCallback(async (scroller: HTMLElement) => {
+  const handleTurnPositioned = useCallback((turnId: string) => {
+    setRequestedTurnId((current) => current === turnId ? "" : current);
+  }, []);
+
+  const loadOlderMessages = useCallback(async () => {
     const sessionId = chatRef.current.sessionId;
     const windowState = messageWindowsRef.current[sessionId];
     if (!sessionId || !windowState?.hasMoreBefore || typeof windowState.nextBeforeSeq !== "number") return;
-    if (loadingOlderSessionIdRef.current === sessionId) return;
-    const previousHeight = scroller.scrollHeight;
-    const previousTop = scroller.scrollTop;
-    setLoadingOlderSessionId(sessionId);
+    const loadingKey = `${sessionId}:before`;
+    if (loadingMessageWindowRef.current) return;
+    loadingMessageWindowRef.current = loadingKey;
     try {
       const page = await fetchOlderMessages(sessionId, windowState.nextBeforeSeq);
       const olderMessages = rowsToMessages(page.items ?? []);
-      const currentMessages = chatRef.current.messages.filter((message) => !isStandaloneNotification(message));
-      const persistedMessages = dedupeMessages(mergeTimeline(olderMessages, currentMessages));
-      const messages = mergeMessageWindow(
-        persistedMessages,
-        notificationsBySessionRef.current[sessionId] ?? [],
-        Boolean(windowState.hasTailWindow),
-      );
-      dispatch({ type: "ui.session.select", sessionId, messages });
+      const persistedMessages = reconcileMessages([...olderMessages, ...chatRef.current.messages]);
+      dispatch({ type: "ui.session.select", sessionId, messages: persistedMessages, replace: true });
       setMessageWindows((current) => ({
         ...current,
         [sessionId]: {
           hasMoreBefore: Boolean(page.has_more),
           nextBeforeSeq: page.next_before_seq ?? firstSeqFromRows(page.items ?? []),
+          hasMoreAfter: Boolean(current[sessionId]?.hasMoreAfter),
+          nextAfterSeq: current[sessionId]?.nextAfterSeq ?? null,
           hasTailWindow: Boolean(current[sessionId]?.hasTailWindow),
         },
       }));
-      requestAnimationFrame(() => {
-        const delta = scroller.scrollHeight - previousHeight;
-        scroller.scrollTop = Math.max(0, previousTop + delta);
-      });
     } catch (error) {
       dispatch(errorFrame(error));
     } finally {
-      setLoadingOlderSessionId((current) => current === sessionId ? "" : current);
+      if (loadingMessageWindowRef.current === loadingKey) loadingMessageWindowRef.current = "";
+    }
+  }, []);
+
+  const loadNewerMessages = useCallback(async () => {
+    const sessionId = chatRef.current.sessionId;
+    const windowState = messageWindowsRef.current[sessionId];
+    if (!sessionId || !windowState?.hasMoreAfter || typeof windowState.nextAfterSeq !== "number") return;
+    const loadingKey = `${sessionId}:after`;
+    if (loadingMessageWindowRef.current) return;
+    loadingMessageWindowRef.current = loadingKey;
+    try {
+      const page = await fetchMessagesAroundPage(sessionId, windowState.nextAfterSeq);
+      const rows = page.items ?? [];
+      const messages = reconcileMessages([...chatRef.current.messages, ...rowsToMessages(rows)]);
+      dispatch({ type: "ui.session.select", sessionId, messages, replace: true });
+      setMessageWindows((current) => ({
+        ...current,
+        [sessionId]: {
+          hasMoreBefore: Boolean(current[sessionId]?.hasMoreBefore),
+          nextBeforeSeq: current[sessionId]?.nextBeforeSeq ?? firstSeqFromRows(rows),
+          hasMoreAfter: Boolean(page.has_after),
+          nextAfterSeq: page.has_after ? nextSeqFromRows(rows) : null,
+          hasTailWindow: page.has_after === false,
+        },
+      }));
+    } catch (error) {
+      dispatch(errorFrame(error));
+    } finally {
+      if (loadingMessageWindowRef.current === loadingKey) loadingMessageWindowRef.current = "";
+    }
+  }, []);
+
+  const returnToLatestMessages = useCallback(async (runtimeSeed: ChatMessage[] = []) => {
+    const sessionId = chatRef.current.sessionId;
+    if (!sessionId) return;
+    const loadingKey = `${sessionId}:tail`;
+    if (loadingMessageWindowRef.current) return;
+    loadingMessageWindowRef.current = loadingKey;
+    setRequestedTurnId("");
+    try {
+      const [page, notifications] = await Promise.all([
+        fetchMessagePage(sessionId),
+        fetchNotifications(sessionId),
+      ]);
+      if (chatRef.current.sessionId !== sessionId) return;
+      const rows = page.items ?? [];
+      const currentRuntimeMessages = chatRef.current.messages.filter((message) => (
+          typeof message.seq !== "number" || message.seq < 0
+        ));
+      const currentRuntimeIds = new Set(currentRuntimeMessages.map((message) => message.id));
+      const runtimeMessages = reconcileMessages([
+        ...currentRuntimeMessages,
+        ...runtimeSeed.filter((message) => !currentRuntimeIds.has(message.id)),
+      ]);
+      const messages = reconcileMessages([...rowsToMessages(rows), ...runtimeMessages]);
+      setNotificationsBySession((current) => ({
+        ...current,
+        [sessionId]: notificationRowsToMessages(notifications),
+      }));
+      setMessageWindows((current) => ({
+        ...current,
+        [sessionId]: {
+          hasMoreBefore: Boolean(page.has_more),
+          nextBeforeSeq: page.next_before_seq ?? firstSeqFromRows(rows),
+          hasMoreAfter: false,
+          nextAfterSeq: null,
+          hasTailWindow: true,
+        },
+      }));
+      dispatch({ type: "ui.session.select", sessionId, messages, replace: true });
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        void stickToBottomRef.current?.scrollToBottom({ animation: "instant", ignoreEscapes: true });
+      }));
+    } catch (error) {
+      dispatch(errorFrame(error));
+    } finally {
+      if (loadingMessageWindowRef.current === loadingKey) loadingMessageWindowRef.current = "";
     }
   }, []);
 
@@ -486,16 +571,21 @@ export function App() {
     const scroller = document.querySelector<HTMLElement>(".conversation-scroll");
     if (!scroller) return;
     const handleScroll = () => {
-      if (scroller.scrollTop > 48) return;
-      void loadOlderMessages(scroller);
+      if (scroller.scrollTop <= 48) {
+        void loadOlderMessages();
+        return;
+      }
+      const distanceFromBottom = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
+      if (distanceFromBottom <= 48) void loadNewerMessages();
     };
     scroller.addEventListener("scroll", handleScroll, { passive: true });
     return () => scroller.removeEventListener("scroll", handleScroll);
-  }, [chat.sessionId, loadOlderMessages]);
+  }, [chat.sessionId, loadNewerMessages, loadOlderMessages]);
 
   useEffect(() => {
     const handlePopState = () => {
       const sessionId = sessionFromPath(window.location.pathname);
+      routeSessionRef.current = sessionId;
       setRouteSession(sessionId);
       setInput(textDrafts[routeKey(sessionId)] ?? "");
       setFiles(fileDrafts[routeKey(sessionId)] ?? []);
@@ -540,6 +630,7 @@ export function App() {
         thinking: "",
         media: uploaded.map((item) => item.upload_path),
         tools: [],
+        timestamp: new Date().toISOString(),
       };
       dispatch({ type: "ui.user.append", message: optimistic });
       dispatch({ type: "ui.turn.submitted", sessionId, requestId });
@@ -559,6 +650,9 @@ export function App() {
           message: "消息未发送，WebSocket 已断开",
         });
         return;
+      }
+      if (sessionId && messageWindowsRef.current[sessionId]?.hasTailWindow === false) {
+        void returnToLatestMessages([optimistic]);
       }
       const submittedAt = new Date().toISOString();
       // 新会话的首轮可能长期运行或排队，发送成功后先放入目录，最终再由服务端标题覆盖。
@@ -695,23 +789,28 @@ export function App() {
           </div>
         ) : null}
 
-        <StickToBottom className="conversation" initial="instant" resize="smooth" role="log">
+        <StickToBottom contextRef={stickToBottomRef} className="conversation" initial="instant" resize="instant" role="log">
           <StickToBottom.Content className="conversation-content" scrollClassName="conversation-scroll">
-            {restoringSession ? <ConversationSkeleton /> : chat.messages.length === 0 ? <EmptyConversation /> : conversationTurnGroups.map((group) => (
-              <section
-                key={group.messages[0].id}
-                className="turn-section"
-                data-turn-region={group.navigationTurnId || undefined}
-              >
-                {group.messages.map((message) => (
-                  <MessageView key={message.id} message={message} navigationTurnId={group.navigationTurnId} />
-                ))}
-              </section>
-            ))}
+            {restoringSession ? <ConversationSkeleton /> : displayMessages.length === 0 ? <EmptyConversation /> : (
+              <VirtualConversation
+                key={chat.sessionId}
+                groups={conversationTurnGroups}
+                sessionId={chat.sessionId}
+                requestedTurnId={requestedTurnId}
+                onTurnPositioned={handleTurnPositioned}
+              />
+            )}
           </StickToBottom.Content>
           <TurnNavigator sessionId={chat.sessionId} turns={conversationTurns} onTurnRequest={handleTurnRequest} />
-          <ConversationAutoScroll sessionId={chat.sessionId} messages={chat.messages} active={currentTurn.status === "running"} />
-          <ConversationScrollButton />
+          <ConversationAutoScroll
+            sessionId={chat.sessionId}
+            messages={displayMessages}
+            navigating={Boolean(requestedTurnId)}
+          />
+          <ConversationScrollButton
+            hasTailWindow={Boolean(messageWindows[chat.sessionId]?.hasTailWindow ?? true)}
+            onReturnToLatest={returnToLatestMessages}
+          />
         </StickToBottom>
 
         <Composer
@@ -739,49 +838,61 @@ export function App() {
   );
 }
 
-function ConversationAutoScroll({ sessionId, messages, active }: {
+function ConversationAutoScroll({ sessionId, messages, navigating }: {
   sessionId: string;
   messages: ChatMessage[];
-  active: boolean;
+  navigating: boolean;
 }) {
-  const { escapedFromLock, isAtBottom, scrollToBottom } = useStickToBottomContext();
+  const { scrollToBottom } = useStickToBottomContext();
   const previousSessionRef = useRef("");
-  const previousCountRef = useRef(0);
+  const previousLastMessageIdRef = useRef("");
 
   useEffect(() => {
     // 会话切换必须在目标消息已经进入 DOM 后再定位，且不能继承上一会话的
     // escaped lock；相同消息数量的两个会话也必须触发该边界。
     if (sessionId && messages.length > 0 && previousSessionRef.current !== sessionId) {
       previousSessionRef.current = sessionId;
-      previousCountRef.current = messages.length;
+      previousLastMessageIdRef.current = messages.at(-1)?.id ?? "";
       void scrollToBottom({ animation: "instant", ignoreEscapes: true });
       return;
     }
 
     const lastMessage = messages.at(-1);
-    const hasNewUserMessage = messages.length > previousCountRef.current && lastMessage?.role === "user";
-    previousCountRef.current = messages.length;
+    const hasNewUserMessage = Boolean(
+      lastMessage
+      && lastMessage.id !== previousLastMessageIdRef.current
+      && lastMessage.role === "user"
+      && (lastMessage.id.startsWith("user-") || (typeof lastMessage.seq === "number" && lastMessage.seq < 0)),
+    );
+    previousLastMessageIdRef.current = lastMessage?.id ?? "";
+    if (navigating) return;
     if (hasNewUserMessage) {
-      void scrollToBottom({ animation: "smooth", ignoreEscapes: true });
+      void scrollToBottom({ animation: "instant", ignoreEscapes: true });
       return;
     }
-    if (active && isAtBottom && !escapedFromLock) {
-      void scrollToBottom({ animation: "smooth", ignoreEscapes: false });
-    }
-  }, [active, escapedFromLock, isAtBottom, messages, sessionId, scrollToBottom]);
+  }, [messages, navigating, sessionId, scrollToBottom]);
 
   return null;
 }
 
-function ConversationScrollButton() {
+function ConversationScrollButton({ hasTailWindow, onReturnToLatest }: {
+  hasTailWindow: boolean;
+  onReturnToLatest: () => Promise<void>;
+}) {
   const { isAtBottom, scrollToBottom } = useStickToBottomContext();
-  if (isAtBottom) return null;
+  if (isAtBottom && hasTailWindow) return null;
   return (
     <button
       className="scroll-latest"
       aria-label="回到最新消息"
       title="回到最新消息"
-      onClick={() => void scrollToBottom({ animation: "smooth", ignoreEscapes: true })}
+      onClick={() => {
+        if (!hasTailWindow) {
+          void onReturnToLatest();
+          return;
+        }
+        void scrollToBottom({ animation: "instant", ignoreEscapes: true });
+      }}
     >
       <ArrowDown size={18} />
     </button>
@@ -1168,7 +1279,7 @@ function MessageView({ message, navigationTurnId }: { message: ChatMessage; navi
         {message.media.length ? <AttachmentGallery paths={message.media} /> : null}
         {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} /> : null}
         {message.tools.length ? <div className="tool-timeline">{message.tools.map((tool) => <ToolStep key={tool.callId} tool={tool} />)}</div> : null}
-        {isUser ? <p className="user-text">{message.content}</p> : message.content ? (
+        {isUser ? <p className="user-text">{message.content}</p> : message.content && message.content !== "[用户已停止生成]" ? (
           <div className="beanagent-markdown">
             <Streamdown
               key={`${message.id}-${message.streaming ? "stream" : "final"}`}
@@ -1185,7 +1296,7 @@ function MessageView({ message, navigationTurnId }: { message: ChatMessage; navi
           </div>
         ) : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
         {!isUser && parsed.citations.length ? <MemoryCitationList citations={parsed.citations} /> : null}
-        {message.status === "interrupted" ? <span className="interrupted-label">已停止</span> : null}
+        {!isUser && message.status === "interrupted" ? <span className="interrupted-label">已停止</span> : null}
       </div>
     </article>
   );
@@ -1610,6 +1721,77 @@ function Composer(props: {
   );
 }
 
+function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositioned }: {
+  groups: ReturnType<typeof groupMessagesIntoNavigationTurns>;
+  sessionId: string;
+  requestedTurnId: string;
+  onTurnPositioned: (turnId: string) => void;
+}) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const [scrollElement, setScrollElement] = useState<HTMLElement | null>(null);
+  const virtualizer = useVirtualizer({
+    count: groups.length,
+    anchorTo: "end",
+    getScrollElement: () => scrollElement,
+    estimateSize: () => 220,
+    getItemKey: (index) => `${groups[index].navigationTurnId}:${groups[index].messages[0].id}`,
+    measureElement: (element) => element.getBoundingClientRect().height,
+    initialRect: { width: 880, height: 800 },
+    observeElementRect: (instance, callback) => {
+      const element = instance.scrollElement;
+      if (!element) return undefined;
+      const update = () => callback({
+        width: element.clientWidth || 880,
+        height: element.clientHeight || 800,
+      });
+      update();
+      if (typeof ResizeObserver === "undefined") return undefined;
+      const observer = new ResizeObserver(update);
+      observer.observe(element);
+      return () => observer.disconnect();
+    },
+    overscan: 4,
+  });
+
+  useLayoutEffect(() => {
+    setScrollElement(hostRef.current?.closest<HTMLElement>(".conversation-scroll") ?? null);
+  }, [sessionId]);
+
+  useLayoutEffect(() => {
+    if (!requestedTurnId || !scrollElement) return;
+    const index = groups.findIndex((group) => group.navigationTurnId === requestedTurnId);
+    if (index < 0) return;
+    virtualizer.scrollToIndex(index, { align: "start", behavior: "auto" });
+    onTurnPositioned(requestedTurnId);
+  }, [groups, onTurnPositioned, requestedTurnId, scrollElement, virtualizer]);
+
+  return (
+    <div
+      ref={hostRef}
+      className="virtual-conversation"
+      style={{ height: `${virtualizer.getTotalSize()}px` }}
+    >
+      {virtualizer.getVirtualItems().map((item) => {
+        const group = groups[item.index];
+        return (
+          <section
+            key={item.key}
+            ref={virtualizer.measureElement}
+            className="turn-section virtual-turn-section"
+            data-index={item.index}
+            data-turn-region={group.navigationTurnId || undefined}
+            style={{ transform: `translateY(${item.start}px)` }}
+          >
+            {group.messages.map((message) => (
+              <MessageView key={message.id} message={message} navigationTurnId={group.navigationTurnId} />
+            ))}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
 function EmptyConversation() {
   return (
     <div className="empty-conversation">
@@ -1670,86 +1852,12 @@ function mergeNavigationTurns(globalTurns: TurnNavigationEntry[], messageTurns: 
   return next;
 }
 
-function dedupeMessages(messages: ChatMessage[]): ChatMessage[] {
-  const seen = new Set<string>();
-  const next: ChatMessage[] = [];
-  for (const message of messages) {
-    if (seen.has(message.id)) continue;
-    seen.add(message.id);
-    next.push(message);
-  }
-  return next;
-}
-
 function upsertMessage(messages: ChatMessage[], incoming: ChatMessage): ChatMessage[] {
   const index = messages.findIndex((message) => message.id === incoming.id);
   if (index < 0) return [...messages, incoming];
   const next = [...messages];
   next[index] = { ...next[index], ...incoming };
   return next;
-}
-
-function mergeMessageWindow(
-  persistedMessages: ChatMessage[],
-  notifications: ChatMessage[],
-  hasTailWindow = true,
-): ChatMessage[] {
-  return dedupeMessages(mergeTimeline(
-    persistedMessages,
-    notificationsForMessageWindow(persistedMessages, notifications, hasTailWindow),
-  ));
-}
-
-function notificationsForMessageWindow(
-  persistedMessages: ChatMessage[],
-  notifications: ChatMessage[],
-  hasTailWindow: boolean,
-): ChatMessage[] {
-  const ranges = loadedMessageTimeRanges(persistedMessages);
-  if (!ranges.length) return [];
-  const tailRange = hasTailWindow ? ranges[ranges.length - 1] : null;
-  return notifications.filter((message) => {
-    if (!isStandaloneNotification(message)) return false;
-    const time = Date.parse(message.timestamp || "");
-    if (Number.isNaN(time)) return false;
-    return ranges.some((range) => time >= range.startTime && time <= range.endTime)
-      || Boolean(tailRange && time > tailRange.endTime);
-  });
-}
-
-function loadedMessageTimeRanges(messages: ChatMessage[]): Array<{
-  startSeq: number;
-  endSeq: number;
-  startTime: number;
-  endTime: number;
-}> {
-  const ordered = messages
-    .filter((message) => typeof message.seq === "number" && !isStandaloneNotification(message))
-    .map((message) => ({ ...message, seq: Number(message.seq), time: Date.parse(message.timestamp || "") }))
-    .filter((message) => !Number.isNaN(message.time))
-    .sort((left, right) => left.seq - right.seq);
-  const ranges: Array<{ startSeq: number; endSeq: number; startTime: number; endTime: number }> = [];
-  for (const message of ordered) {
-    const current = ranges[ranges.length - 1];
-    if (!current || message.seq > current.endSeq + 1) {
-      ranges.push({
-        startSeq: message.seq,
-        endSeq: message.seq,
-        startTime: message.time,
-        endTime: message.time,
-      });
-      continue;
-    }
-    current.endSeq = message.seq;
-    current.startTime = Math.min(current.startTime, message.time);
-    current.endTime = Math.max(current.endTime, message.time);
-  }
-  return ranges;
-}
-
-function isStandaloneNotification(message: ChatMessage): boolean {
-  return typeof message.seq !== "number"
-    && (message.source === "scheduled_reminder" || message.source === "scheduled_soft");
 }
 
 function isNotificationFinalFrame(frame: ChatFrame): frame is Extract<ChatFrame, { type: "message.final" }> {
@@ -1780,6 +1888,11 @@ function notificationFrameToMessage(frame: Extract<ChatFrame, { type: "message.f
 function firstSeqFromRows(rows: MessageRow[]): number | null {
   const first = rows.find((row) => typeof row.seq === "number");
   return typeof first?.seq === "number" ? first.seq : null;
+}
+
+function nextSeqFromRows(rows: MessageRow[]): number | null {
+  const seqs = rows.map((row) => row.seq).filter((seq): seq is number => typeof seq === "number" && seq >= 0);
+  return seqs.length ? Math.max(...seqs) + 1 : null;
 }
 
 function shortSession(sessionId: string): string { return sessionId ? `会话 ${sessionId.slice(-8)}` : "正在创建会话"; }
