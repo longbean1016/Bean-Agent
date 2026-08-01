@@ -40,6 +40,7 @@ def test_build_core_runtime_wires_singletons_and_all_tools(tmp_path: Path) -> No
     assert runtime.memory is not None
     assert runtime.memory._consolidator._keep_count == config.memory.keep_count
     assert runtime.memory._consolidator._threshold == config.memory.consolidation_min_new_messages
+    assert runtime.memory._context_guard_threshold == config.memory.context_guard_threshold
 
     assert runtime.provider is provider
     assert runtime.embedder is embedder

@@ -554,6 +554,27 @@ async def test_context_guard_skips_consolidation_below_threshold(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_default_context_guard_starts_at_36_pending_messages(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(35):
+        sessions.add_message(
+            NewMessage(session_key="web:c", role="user", content=f"消息 {index}")
+        )
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    try:
+        assert engine.needs_context_preparation("web:c") is False
+        sessions.add_message(
+            NewMessage(session_key="web:c", role="user", content="第 36 条消息")
+        )
+        assert engine.needs_context_preparation("web:c") is True
+    finally:
+        await engine.close()
+        sessions.close()
+
+
+@pytest.mark.asyncio
 async def test_context_guard_consolidates_and_requires_cursor_progress(
     tmp_path: Path,
 ) -> None:

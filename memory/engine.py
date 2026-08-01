@@ -89,7 +89,13 @@ class MemoryEngine:
             if consolidation_threshold is None
             else consolidation_threshold
         )
-        self._context_guard_threshold = derived_keep_count + derived_threshold
+        # 生产环境将后台压缩软门槛与 Turn 前积压保护分开：默认在 30 条启动后台
+        # 压缩，只有继续积压到 36 条才同步等待。显式覆盖继续服务小窗口测试。
+        self._context_guard_threshold = (
+            self._config.context_guard_threshold
+            if keep_count is None and consolidation_threshold is None
+            else derived_keep_count + derived_threshold
+        )
         self._consolidator = Consolidator(
             sessions, self._markdown,
             consolidation_extractor or _LLMConsolidationExtractor(provider),

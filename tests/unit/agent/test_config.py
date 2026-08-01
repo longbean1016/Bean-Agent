@@ -31,7 +31,7 @@ def test_config_defaults_and_nested_instances_are_independent() -> None:
     assert first.memory.aligned_context_window == 40
     assert first.memory.keep_count == 20
     assert first.memory.consolidation_min_new_messages == 10
-    assert first.memory.context_guard_threshold == 30
+    assert first.memory.context_guard_threshold == 36
     assert first.agent.max_concurrent_turns == 5
     assert first.agent.max_queued_turns == 20
     assert first.channels.chat.port == 6322
@@ -144,7 +144,7 @@ port = 8000
     assert config.memory.context_window == 44
     assert config.memory.keep_count == 22
     assert config.memory.consolidation_min_new_messages == 11
-    assert config.memory.context_guard_threshold == 33
+    assert config.memory.context_guard_threshold == 39
     assert config.agent.workdir == "runtime"
     assert config.agent.max_concurrent_turns == 3
     assert config.agent.max_queued_turns == 12
@@ -181,7 +181,7 @@ def test_memory_context_window_rounds_up_to_message_boundary(tmp_path: Path) -> 
     assert memory.aligned_context_window == 44
     assert memory.keep_count == 22
     assert memory.consolidation_min_new_messages == 11
-    assert memory.context_guard_threshold == 33
+    assert memory.context_guard_threshold == 39
 
 
 def test_explicit_base_url_overrides_provider_preset(tmp_path: Path) -> None:
