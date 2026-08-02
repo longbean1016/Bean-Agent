@@ -95,27 +95,20 @@ class Consolidator:
         self._keep_count = max(0, int(keep_count))
         self._threshold = max(1, int(threshold if threshold is not None else max(5, self._keep_count // 2)))
 
-    def _select_recent_messages(
-        self,
-        messages: list[dict[str, object]],
-    ) -> list[dict[str, object]]:
-        """按 Akashic 派生规则选择用于预览的最新热历史。"""
-
-        tail = messages[-self._keep_count:] if self._keep_count else messages
-        recent_count = max(1, self._keep_count // 2) if self._keep_count else len(tail)
-        return tail[-recent_count:] if recent_count else []
-
     async def consolidate(self, session_key: str) -> ConsolidationResult | None:
-        messages = self._sessions.fetch_session_messages(session_key)
-        cursor = self._sessions.get_cursor(session_key)
-        end = max(cursor, len(messages) - self._keep_count)
-        window = messages[cursor:end]
-        recent = self._select_recent_messages(messages)
-        if len(window) < self._threshold:
-            # 未达到归档阈值时不调用 LLM，也不再持久化 Recent Turns；cursor 保持不变。
+        recent_count = max(1, self._keep_count // 2) if self._keep_count else 0
+        snapshot = self._sessions.fetch_consolidation_window(
+            session_key,
+            keep_count=self._keep_count,
+            threshold=self._threshold,
+            recent_count=recent_count,
+        )
+        if snapshot is None:
+            # 未达到归档阈值时 Store 只做索引计数，不读取正文，cursor 保持不变。
             return None
 
-        recent_turns = _format_recent_turns_for_prompt(recent)
+        window = snapshot.messages
+        recent_turns = _format_recent_turns_for_prompt(snapshot.recent_messages)
         current_memory = self._markdown.read_long_term().strip()
         previous_recent_context = _stable_recent_context(
             self._sessions.get_recent_context(session_key)
@@ -126,7 +119,7 @@ class Consolidator:
             recent_turns=recent_turns,
             current_memory=current_memory,
         )
-        source_ref = f"{session_key}@{cursor}-{end - 1}"
+        source_ref = f"{session_key}@{snapshot.cursor}-{snapshot.next_cursor - 1}"
         pending_lines = [
             f"- [{str(item.get('tag') or 'key_info')}] {str(item.get('content') or '').strip()}"
             for item in draft.pending_items if str(item.get("content") or "").strip()
@@ -148,7 +141,13 @@ class Consolidator:
         conversation = render_consolidation_conversation(window)
         # 此处只返回候选 cursor。MemoryEngine 必须先持久化 outbox 再推进它，
         # 否则进程在两步之间失败会让原文退出模型历史却没有可恢复的派生任务。
-        return ConsolidationResult(session_key, source_ref, end, draft.history_entries, conversation)
+        return ConsolidationResult(
+            session_key,
+            source_ref,
+            snapshot.next_cursor,
+            draft.history_entries,
+            conversation,
+        )
 
 
 __all__ = [

@@ -56,6 +56,17 @@ class NewMessage:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class ConsolidationMessageWindow:
+    """一次归档判断所需的活动消息快照。"""
+
+    cursor: int
+    next_cursor: int
+    active_count: int
+    messages: list[dict[str, Any]]
+    recent_messages: list[dict[str, Any]]
+
+
 class SessionStore:
     """为 SessionManager、消息工具和记忆归档提供持久化接口。"""
 
@@ -95,6 +106,23 @@ class SessionStore:
         """按 seq 升序读取会话的全部持久化消息。"""
 
         return self._fetch_session_messages_sync(session_key)
+
+    def fetch_consolidation_window(
+        self,
+        session_key: str,
+        *,
+        keep_count: int,
+        threshold: int,
+        recent_count: int,
+    ) -> ConsolidationMessageWindow | None:
+        """只读取 cursor 后达到归档门槛的消息窗口。"""
+
+        return self._fetch_consolidation_window_sync(
+            session_key,
+            keep_count=keep_count,
+            threshold=threshold,
+            recent_count=recent_count,
+        )
 
     def upsert_session(
         self,
@@ -915,6 +943,76 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_message(row) for row in rows]
 
+    def _fetch_consolidation_window_sync(
+        self,
+        session_key: str,
+        *,
+        keep_count: int,
+        threshold: int,
+        recent_count: int,
+    ) -> ConsolidationMessageWindow | None:
+        key = self._validate_session_key(session_key)
+        safe_keep = max(0, int(keep_count))
+        safe_threshold = max(1, int(threshold))
+        safe_recent = max(0, int(recent_count))
+        with self._lock:
+            self._ensure_open()
+            meta = self._conn.execute(
+                "SELECT last_consolidated FROM sessions WHERE key = ?",
+                (key,),
+            ).fetchone()
+            cursor = max(0, int(meta["last_consolidated"] or 0)) if meta else 0
+            count_row = self._conn.execute(
+                """
+                SELECT COUNT(1) AS count
+                FROM messages
+                WHERE session_key = ? AND seq >= ?
+                """,
+                (key, cursor),
+            ).fetchone()
+            active_count = int((count_row["count"] if count_row else 0) or 0)
+            archive_count = max(0, active_count - safe_keep)
+            if archive_count < safe_threshold:
+                # 未到门槛时只读取索引计数，不构建正文、tool_chain 或 extra 对象。
+                return None
+
+            rows = self._conn.execute(
+                f"""
+                SELECT {_MESSAGE_COLUMNS}
+                FROM messages
+                WHERE session_key = ? AND seq >= ?
+                ORDER BY seq ASC
+                LIMIT ?
+                """,
+                (key, cursor, archive_count),
+            ).fetchall()
+            recent_rows = []
+            if safe_recent:
+                recent_rows = self._conn.execute(
+                    f"""
+                    SELECT {_MESSAGE_COLUMNS}
+                    FROM messages
+                    WHERE session_key = ? AND seq >= ?
+                    ORDER BY seq DESC
+                    LIMIT ?
+                    """,
+                    (key, cursor, safe_recent),
+                ).fetchall()
+
+        messages = [self._row_to_message(row) for row in rows]
+        recent_messages = [
+            self._row_to_message(row) for row in reversed(recent_rows)
+        ]
+        if not messages:
+            return None
+        return ConsolidationMessageWindow(
+            cursor=cursor,
+            next_cursor=int(messages[-1]["seq"]) + 1,
+            active_count=active_count,
+            messages=messages,
+            recent_messages=recent_messages,
+        )
+
     def _upsert_session_sync(
         self,
         session_key: str,
@@ -1425,4 +1523,4 @@ def _load_json_list(value: object) -> list[dict[str, Any]]:
     return [item for item in loaded if isinstance(item, dict)]
 
 
-__all__ = ["NewMessage", "SessionStore"]
+__all__ = ["ConsolidationMessageWindow", "NewMessage", "SessionStore"]

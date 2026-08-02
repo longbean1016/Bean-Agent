@@ -10,35 +10,91 @@ from memory.implicit_extractor import ImplicitLongTermExtractor, _build_prompt
 
 
 class Provider:
-    async def complete(self, messages, tools=None):
-        return SimpleNamespace(content="""```json
-{
-  "profile": [{"summary": "用户是后端开发者", "category": "personal_fact", "emotional_weight": 0}],
-  "preference": [{"summary": "用户偏好中文回答", "emotional_weight": 2}],
-  "procedure": [{"summary": "修改后运行测试", "tool_requirement": "shell", "steps": ["修改代码", "运行测试"], "rule_schema": {"when": "修改代码"}}]
-}
-```""")
+    def __init__(self):
+        self.calls = []
+
+    async def complete(self, messages, tools=None, **kwargs):
+        self.calls.append((messages, tools, kwargs))
+        return SimpleNamespace(
+            content=None,
+            tool_calls=[SimpleNamespace(
+                name="submit_implicit_memory",
+                arguments={
+                    "profile": [{"summary": "用户是后端开发者", "category": "personal_fact", "emotional_weight": 0}],
+                    "preference": [{"summary": "用户偏好中文回答", "emotional_weight": 2}],
+                    "procedure": [{
+                        "summary": "修改后运行测试",
+                        "tool_requirement": "shell",
+                        "steps": ["修改代码", "运行测试"],
+                        "rule_schema": {
+                            "required_tools": ["shell"],
+                            "forbidden_tools": [],
+                            "mentioned_tools": ["shell"],
+                        },
+                        "emotional_weight": 0,
+                    }],
+                },
+            )],
+        )
 
 
 @pytest.mark.asyncio
 async def test_extracts_profile_preference_and_procedure_fields() -> None:
-    result = await ImplicitLongTermExtractor(Provider()).extract("[user] 我是后端开发者，以后用中文并在修改后运行测试")
+    provider = Provider()
+    result = await ImplicitLongTermExtractor(provider).extract("[user] 我是后端开发者，以后用中文并在修改后运行测试")
 
+    _, tools, kwargs = provider.calls[0]
+    assert tools[0]["function"]["name"] == "submit_implicit_memory"
+    assert kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "submit_implicit_memory"},
+    }
+    assert kwargs.get("disable_thinking") is not True
     assert result.profile[0]["category"] == "personal_fact"
     assert result.preference[0]["summary"] == "用户偏好中文回答"
     assert result.procedure[0]["tool_requirement"] == "shell"
     assert result.procedure[0]["steps"] == ["修改代码", "运行测试"]
-    assert result.procedure[0]["rule_schema"] == {"when": "修改代码"}
+    assert result.procedure[0]["rule_schema"] == {
+        "required_tools": ["shell"],
+        "forbidden_tools": [],
+        "mentioned_tools": ["shell"],
+    }
 
 
 @pytest.mark.asyncio
-async def test_rejects_non_object_json() -> None:
-    class ListProvider:
-        async def complete(self, messages, tools=None):
-            return SimpleNamespace(content="[]")
+async def test_retries_invalid_function_arguments_once_then_raises() -> None:
+    class InvalidProvider:
+        def __init__(self):
+            self.calls = 0
 
-    with pytest.raises(ValueError, match="JSON object"):
-        await ImplicitLongTermExtractor(ListProvider()).extract("[user] 普通对话")
+        async def complete(self, messages, tools=None, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                content=None,
+                tool_calls=[SimpleNamespace(name="submit_implicit_memory", arguments={})],
+            )
+
+    provider = InvalidProvider()
+    with pytest.raises(ValueError, match="profile"):
+        await ImplicitLongTermExtractor(provider).extract("[user] 普通对话")
+
+    assert provider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_retries_empty_function_response_and_uses_second_result() -> None:
+    class RetryProvider(Provider):
+        async def complete(self, messages, tools=None, **kwargs):
+            if not self.calls:
+                self.calls.append((messages, tools, kwargs))
+                return SimpleNamespace(content="", tool_calls=[])
+            return await super().complete(messages, tools=tools, **kwargs)
+
+    provider = RetryProvider()
+    result = await ImplicitLongTermExtractor(provider).extract("[user] 普通对话")
+
+    assert len(provider.calls) == 2
+    assert result.profile[0]["summary"] == "用户是后端开发者"
 
 
 def test_prompt_contains_full_evidence_gates_and_counterexamples() -> None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -16,10 +15,10 @@ from memory.query_rewriter import QueryRewriter
 class ScenarioProvider:
     """用确定性规则模拟遵守 Prompt 的 LLM，验证后续解析与边界。"""
 
-    async def complete(self, messages, tools=None):
+    async def complete(self, messages, tools=None, **kwargs):
         prompt = messages[0]["content"]
         if "长期记忆提取专家" in prompt:
-            conversation = prompt.split("【待处理对话】", 1)[1].split("只返回合法 JSON", 1)[0]
+            conversation = prompt.split("【待处理对话】", 1)[1].split("完成判断后必须", 1)[0]
             if "我在互联网公司做产品经理" in conversation:
                 data = {"profile": [{"summary": "用户在互联网公司做产品经理", "category": "personal_fact"}], "preference": [], "procedure": []}
             elif "以后讲复杂问题" in conversation:
@@ -28,7 +27,14 @@ class ScenarioProvider:
                 data = {"profile": [], "preference": [], "procedure": [{"summary": "查询耳机时先查看评测和社区讨论", "steps": ["查看评测", "查看社区讨论"]}]}
             else:
                 data = {"profile": [], "preference": [], "procedure": []}
-            return SimpleNamespace(content=json.dumps(data, ensure_ascii=False))
+            # 质量场景保持原判断不变，仅模拟模型通过强制 Function Call 提交参数。
+            return SimpleNamespace(
+                content=None,
+                tool_calls=[SimpleNamespace(
+                    name="submit_implicit_memory",
+                    arguments=data,
+                )],
+            )
         if "记忆检索决策器" in prompt:
             current = prompt.split("当前用户消息：", 1)[1].split("规则：", 1)[0]
             retrieve = any(text in current for text in ("你还记得", "都有哪些"))

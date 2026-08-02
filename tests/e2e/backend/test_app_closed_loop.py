@@ -119,18 +119,29 @@ class CompressionProvider:
     async def complete(self, messages, tools=None, **kwargs):
         prompt = str(messages[0]["content"])
         if "记忆提取代理" in prompt:
-            return SimpleNamespace(content='{"history_entries":[],"pending_items":[]}')
+            return _structured_memory_response(
+                "submit_consolidation_events",
+                {"history_entries": [], "pending_items": []},
+            )
         if "近期语境压缩代理" in prompt:
-            return SimpleNamespace(
-                content=(
-                    '{"active_topics":["第一阶段"],"user_preferences":[],'
-                    '"follow_ups":[],"avoidances":[],"ongoing_threads":[]}'
-                )
+            return _structured_memory_response(
+                "submit_recent_context",
+                {
+                    "active_topics": ["第一阶段"],
+                    "user_preferences": [],
+                    "follow_ups": [],
+                    "avoidances": [],
+                    "dormant_threads": [],
+                    "ongoing_threads": [],
+                },
             )
         if "记忆检索决策器" in prompt:
             return SimpleNamespace(content="<decision>SKIP</decision>")
         if "长期记忆提取专家" in prompt:
-            return SimpleNamespace(content='{"profile":[],"preference":[],"procedure":[]}')
+            return _structured_memory_response(
+                "submit_implicit_memory",
+                {"profile": [], "preference": [], "procedure": []},
+            )
         return SimpleNamespace(content="[]")
 
     async def chat(self, messages, tools=None, on_content_delta=None, **kwargs):
@@ -142,6 +153,15 @@ class CompressionProvider:
 
     async def close(self):
         self.closed = True
+
+
+def _structured_memory_response(name: str, arguments: dict[str, object]) -> SimpleNamespace:
+    """模拟模型按强制 Function Call 协议提交记忆提取结果。"""
+
+    return SimpleNamespace(
+        content=None,
+        tool_calls=[SimpleNamespace(name=name, arguments=arguments)],
+    )
 
 
 def test_websocket_consolidation_advances_cursor_and_next_turn_uses_summary(

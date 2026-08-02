@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+from memory.structured_output import (
+    IMPLICIT_MEMORY_TOOL,
+    complete_forced_function,
+)
 
 
 @dataclass(slots=True)
@@ -15,7 +19,13 @@ class ImplicitMemoryDraft:
 
 
 class ProviderApi(Protocol):
-    async def complete(self, messages: list[dict[str, str]], tools: list[dict[str, Any]] | None = None) -> Any: ...
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        tool_choice: str | dict[str, Any] = "auto",
+    ) -> Any: ...
 
 
 class ImplicitLongTermExtractor:
@@ -25,16 +35,12 @@ class ImplicitLongTermExtractor:
         self._provider = provider
 
     async def extract(self, conversation: str, existing_profile: str = "") -> ImplicitMemoryDraft:
-        response = await self._provider.complete(
-            [{"role": "user", "content": _build_prompt(conversation, existing_profile)}],
-            tools=[],
+        data = await complete_forced_function(
+            self._provider,
+            _build_prompt(conversation, existing_profile),
+            IMPLICIT_MEMORY_TOOL,
+            required_arrays=("profile", "preference", "procedure"),
         )
-        text = str(getattr(response, "content", response) or "").strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            raise ValueError("隐式长期记忆提取必须返回 JSON object")
         return ImplicitMemoryDraft(
             profile=_items(data.get("profile")),
             preference=_items(data.get("preference")),
@@ -177,7 +183,8 @@ USER: 那就直接写个脚本绕过去吧
 【待处理对话】
 {conversation}
 
-只返回合法 JSON，不要 markdown 代码块：
+完成判断后必须且只能调用 submit_implicit_memory；不得通过普通正文返回结果。
+没有符合条件的记忆时也必须调用，并将三个参数全部设为空数组。参数结构如下：
 {{
   "profile": [{{"summary": "...", "category": "personal_fact|purchase|decision|status", "happened_at": null, "emotional_weight": 0}}],
   "preference": [{{"summary": "...", "emotional_weight": 0}}],

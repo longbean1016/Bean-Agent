@@ -27,9 +27,15 @@ class Embedder:
 
 
 class Provider:
-    async def complete(self, messages, tools=None):
+    async def complete(self, messages, tools=None, **kwargs):
         if "长期记忆提取专家" in messages[0]["content"]:
-            return type("Response", (), {"content": "{}"})()
+            return SimpleNamespace(
+                content=None,
+                tool_calls=[SimpleNamespace(
+                    name="submit_implicit_memory",
+                    arguments={"profile": [], "preference": [], "procedure": []},
+                )],
+            )
         return type("Response", (), {"content": "<decision>RETRIEVE</decision><history_query>回答风格</history_query>"})()
 
 

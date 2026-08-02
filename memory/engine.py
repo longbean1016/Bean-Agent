@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import json
 import logging
 from collections import deque
 from pathlib import Path
@@ -36,6 +35,11 @@ from memory.query_rewriter import QueryRewriter
 from memory.retriever import Retriever
 from memory.rule_schema import build_procedure_rule_schema
 from memory.store import MemoryStore2
+from memory.structured_output import (
+    CONSOLIDATION_EVENTS_TOOL,
+    RECENT_CONTEXT_TOOL,
+    complete_forced_function,
+)
 from memory.sufficiency_checker import should_enhance_retrieval
 from session.store import SessionStore
 
@@ -652,8 +656,29 @@ class _LLMConsolidationExtractor:
 
     async def extract(self, messages: list[dict[str, object]], previous_recent_context: str, *, recent_turns: str = "", current_memory: str = "") -> ConsolidationDraft:
         conversation = render_consolidation_conversation(messages)
-        event_data = await self._complete_json(_event_extraction_prompt(conversation, current_memory=current_memory))
-        recent_data = await self._complete_json(_recent_context_prompt(conversation, previous_recent_context, recent_turns=recent_turns))
+        event_data = await complete_forced_function(
+            self._provider,
+            _event_extraction_prompt(conversation, current_memory=current_memory),
+            CONSOLIDATION_EVENTS_TOOL,
+            required_arrays=("history_entries", "pending_items"),
+        )
+        recent_data = await complete_forced_function(
+            self._provider,
+            _recent_context_prompt(
+                conversation,
+                previous_recent_context,
+                recent_turns=recent_turns,
+            ),
+            RECENT_CONTEXT_TOOL,
+            required_arrays=(
+                "active_topics",
+                "user_preferences",
+                "follow_ups",
+                "avoidances",
+                "dormant_threads",
+                "ongoing_threads",
+            ),
+        )
         history_entries = []
         for item in event_data.get("history_entries") or []:
             if not isinstance(item, dict) or not str(item.get("summary") or "").strip():
@@ -675,17 +700,6 @@ class _LLMConsolidationExtractor:
             pending_items=pending_items,
             recent_context=_render_recent_context(recent_data),
         )
-
-    async def _complete_json(self, prompt: str) -> dict[str, object]:
-        response = await self._provider.complete([{"role": "user", "content": prompt}], tools=[])
-        text = str(getattr(response, "content", response) or "").strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            raise ValueError("Consolidation LLM 必须返回 JSON object")
-        return data
-
 
 def _event_extraction_prompt(conversation: str, *, current_memory: str = "") -> str:
     memory_section = ""
@@ -785,7 +799,8 @@ history_entries.emotional_weight 规则：
 {memory_section}待处理对话：
 {conversation}
 
-只返回合法 JSON，不要 markdown 代码块。"""
+完成判断后必须且只能调用 submit_consolidation_events；不得通过普通正文返回结果。
+没有符合条件的内容时也必须调用，并将 history_entries 和 pending_items 设为空数组。"""
 
 
 def _recent_context_prompt(conversation: str, old_context: str, *, recent_turns: str = "") -> str:
@@ -865,7 +880,9 @@ ongoing_threads 严格限制：
 - 严禁将 `[a-preview]` 作为用户身份、事实、偏好、关系、回避事项或 ongoing thread 的证据
 {recent_turns or '（空）'}
 
-返回：{{"active_topics": [], "user_preferences": [], "follow_ups": [], "avoidances": [], "dormant_threads": [], "ongoing_threads": []}}"""
+完成判断后必须且只能调用 submit_recent_context；不得通过普通正文返回结果。
+没有符合条件的内容时也必须调用，参数为：
+{{"active_topics": [], "user_preferences": [], "follow_ups": [], "avoidances": [], "dormant_threads": [], "ongoing_threads": []}}"""
 
 
 def _render_recent_context(data: dict[str, object]) -> str:

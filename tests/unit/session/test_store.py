@@ -561,6 +561,78 @@ def test_delete_empty_chat_session_does_not_delete_sessions_with_messages(
     assert store.get_session_meta("web:with-message") is not None
 
 
+def test_consolidation_window_counts_before_decoding_messages(
+    store: SessionStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(3):
+        store.add_message(NewMessage(
+            session_key="web:below-threshold",
+            role="user" if index % 2 == 0 else "assistant",
+            content=f"消息 {index}",
+        ))
+    # 阈值以下只能执行 COUNT；即使消息扩展字段损坏，也不应读取或反序列化正文行。
+    store._conn.execute(
+        "UPDATE messages SET extra='not-json' WHERE session_key=? AND seq=?",
+        ("web:below-threshold", 0),
+    )
+    store._conn.commit()
+    monkeypatch.setattr(
+        SessionStore,
+        "_row_to_message",
+        staticmethod(lambda row: pytest.fail("阈值以下不应解码消息行")),
+    )
+
+    result = store.fetch_consolidation_window(
+        "web:below-threshold",
+        keep_count=2,
+        threshold=2,
+        recent_count=1,
+    )
+
+    assert result is None
+
+
+def test_consolidation_window_reads_only_cursor_tail(
+    store: SessionStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(6):
+        store.add_message(NewMessage(
+            session_key="web:window",
+            role="user" if index % 2 == 0 else "assistant",
+            content=f"消息 {index}",
+        ))
+    store.set_cursor("web:window", 2)
+    # cursor 以前的数据不属于活动窗口，不能再被归档查询反序列化。
+    store._conn.execute(
+        "UPDATE messages SET extra='not-json' WHERE session_key=? AND seq=?",
+        ("web:window", 0),
+    )
+    store._conn.commit()
+    original = SessionStore._row_to_message
+
+    def decode_active_row(row):
+        assert int(row["seq"]) >= 2
+        return original(row)
+
+    monkeypatch.setattr(SessionStore, "_row_to_message", staticmethod(decode_active_row))
+
+    result = store.fetch_consolidation_window(
+        "web:window",
+        keep_count=2,
+        threshold=2,
+        recent_count=1,
+    )
+
+    assert result is not None
+    assert result.cursor == 2
+    assert result.next_cursor == 4
+    assert result.active_count == 4
+    assert [item["seq"] for item in result.messages] == [2, 3]
+    assert [item["seq"] for item in result.recent_messages] == [5]
+
+
 def test_list_chat_messages_returns_persisted_frontend_fields(
     store: SessionStore,
 ) -> None:
