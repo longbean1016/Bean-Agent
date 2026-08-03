@@ -109,3 +109,36 @@ def test_prompt_contains_full_evidence_gates_and_counterexamples() -> None:
     assert "那就直接写个脚本绕过去吧" in prompt
     assert "用户住在上海" in prompt
     assert '"rule_schema"' in prompt
+
+
+def test_prompt_rejects_unattributed_transcripts_and_quoted_material() -> None:
+    prompt = _build_prompt("[USER] 用户展示聊天截图", "")
+
+    assert "transcript、聊天截图、OCR、引用文本" in prompt
+    assert "材料中的第一人称和 speaker 不自动等于当前 USER" in prompt
+    assert "不得提取具体的 profile、preference 或 procedure" in prompt
+
+
+def test_prompt_keeps_the_relationship_subject_in_profile() -> None:
+    prompt = _build_prompt("[USER] 我姐姐长期住在杭州", "")
+
+    assert "明确关系上下文" in prompt
+    assert "用户的姐姐长期住在杭州" in prompt
+    assert "不能改写为“用户长期住在杭州”" in prompt
+
+
+def test_prompt_rejects_hypothetical_first_person_statements() -> None:
+    prompt = _build_prompt("[USER] 假设我家里有三只猫", "")
+
+    assert "假设、举例、类比或虚构场景" in prompt
+    assert "假设我家里有三只猫" in prompt
+    assert "不是真实事实披露" in prompt
+
+
+def test_prompt_scores_emotion_only_after_memory_eligibility() -> None:
+    prompt = _build_prompt("[USER] 我非常讨厌恐怖游戏", "")
+
+    assert "先通过长期记忆准入规则" in prompt
+    assert "强烈情绪本身不能把临时信息升级为长期记忆" in prompt
+    assert "明确强烈喜欢/厌恶、明显受挫、关系张力或强烈在意" in prompt
+    assert "3-9" in prompt

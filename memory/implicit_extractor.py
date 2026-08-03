@@ -56,8 +56,8 @@ def _items(value: object) -> list[dict[str, object]]:
 
 
 def _build_prompt(conversation: str, existing_profile: str) -> str:
-    # 这里刻意强调 USER 证据锚点：assistant 的总结、猜测和示例只能提供上下文，
-    # 不能反向生成用户画像或长期规则，避免将模型自己的话写成用户事实。
+    # 先约束证据来源和材料主体，再判断长期价值并评分情绪；顺序不能倒置，
+    # 否则截图中的第一人称或强烈但短暂的情绪容易被误写为用户长期记忆。
     return f"""你是长期记忆提取专家。从对话窗口中一次性提取三类长期记忆，返回 JSON。
 
 默认答案是所有数组为空。提取门槛要高，宁可不提取，也不要把临时信息写进长期记忆。
@@ -72,7 +72,11 @@ preference：USER 明确表达、跨 session 稳定成立的服务、讲解或�
 procedure：agent 在未来类似场景下应遵守的长期执行规则，来自 USER 的长期要求或明确确认。
 绝对不输出 event；有时间性的具体事件由 history_entries 处理。
 
-每条记忆必须输出 emotional_weight（0-10）。普通事实、技术讨论和工具步骤为 0；不确定时保守输出 0。
+每条记忆必须输出 emotional_weight（0-10），但只有候选先通过长期记忆准入规则后才评估：
+- 普通事实、技术讨论、工具步骤和没有明显情绪色彩的内容 → 0
+- 明确强烈喜欢/厌恶、明显受挫、关系张力或强烈在意 → 按强度给 3-9
+- 不确定时保守输出 0
+- 强烈情绪本身不能把临时信息升级为长期记忆
 区分标准：用户是什么/拥有什么 → profile；希望怎样被服务 → preference；agent 必须怎样执行/用什么工具 → procedure。只是方向性偏好时优先 preference。
 
 【preference / procedure 提取前四项检查，任一不通过即不提取】
@@ -93,14 +97,20 @@ procedure：agent 在未来类似场景下应遵守的长期执行规则，来�
 - 核心内容来自 ASSISTANT 时不提取。
 - ASSISTANT 主动建议后，USER 未明确说“以后都这样”或“记住这个”时不提取。
 
+【材料层级与主体归属（适用于三类记忆）】
+- USER 粘贴 transcript、聊天截图、OCR、引用文本时，外层事实只是用户正在展示材料；材料中的第一人称和 speaker 不自动等于当前 USER。
+- 只有当前会话明确确认了材料 speaker 与用户或重要关系人的映射，才允许使用对应事实；映射未确认时，不得提取具体的 profile、preference 或 procedure。
+- USER 在假设、举例、类比或虚构场景中使用第一人称，不是真实事实披露，不得提取。
+
 【profile 专用规则】
 - purchase：用户购买或下单了什么。
 - decision：用户明确拍板的长期决定。
 - status：等待、完成、放弃、里程碑等状态变化。
-- personal_fact：身份、背景、持有物、爱好、习惯和经验。
+- personal_fact：身份、背景、持有物、爱好、习惯、经验和明确关系上下文。
 - 若 existing_profile 已有相同事实，不重复输出。
 - 每件具体事实单独一条；personal_fact 默认不填 happened_at。
 - 工程操作、项目架构讨论、观点和具体时间事件都不是 profile。
+- USER 直接陈述且具有长期价值的亲属或重要关系人事实可以提取，但 summary 必须保留“用户的姐姐/朋友”等关系主体，绝不能改写成用户本人属性。
 
 【正反例】
 <example id="keep_profile_personal_fact">
@@ -121,6 +131,16 @@ USER: 这周日朋友约我去徒步，我其实不常徒步，不知道该买�
 <example id="profile_not_preference">
 USER: 我家有 10 套房，我平时爱弹钢琴，而且我有一块 Fitbit 手表
 → 三条 profile；preference/procedure 为空。
+</example>
+
+<example id="keep_relationship_subject">
+USER: 我姐姐长期住在杭州
+→ profile: 用户的姐姐长期住在杭州；不能改写为“用户长期住在杭州”。
+</example>
+
+<example id="drop_hypothetical_first_person">
+USER: 假设我家里有三只猫，应该准备什么
+→ 全部为空。“假设我家里有三只猫”不是真实事实披露。
 </example>
 
 <example id="keep_explicit_rule">
