@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -12,12 +13,14 @@ from memory.engine import _LLMConsolidationExtractor
 class Provider:
     def __init__(self):
         self.prompts = []
+        self.prompts_by_function = {}
         self.calls = []
 
     async def complete(self, messages, tools=None, **kwargs):
         prompt = messages[-1]["content"]
         self.prompts.append(prompt)
         function_name = tools[0]["function"]["name"]
+        self.prompts_by_function[function_name] = prompt
         self.calls.append((function_name, kwargs))
         if function_name == "submit_consolidation_events":
             arguments = {
@@ -55,24 +58,26 @@ async def test_consolidation_uses_separate_event_and_recent_context_prompts() ->
     )
 
     assert len(provider.prompts) == 2
-    assert [name for name, _ in provider.calls] == [
+    assert {name for name, _ in provider.calls} == {
         "submit_consolidation_events",
         "submit_recent_context",
-    ]
+    }
     for name, kwargs in provider.calls:
         assert kwargs["tool_choice"] == {
             "type": "function",
             "function": {"name": name},
         }
-        assert kwargs.get("disable_thinking") is not True
-    assert "transcript" in provider.prompts[0]
-    assert "agent_context" in provider.prompts[0]
-    assert "2026-07-16T10:00:00+08:00" in provider.prompts[0]
-    assert "Memory Extraction Agent" in provider.prompts[0]
-    assert "旧语境" not in provider.prompts[0]
-    assert "旧语境" in provider.prompts[1]
-    assert "ongoing_threads" in provider.prompts[1]
-    assert "dormant_threads" in provider.prompts[1]
+        assert kwargs["disable_thinking"] is True
+    event_prompt = provider.prompts_by_function["submit_consolidation_events"]
+    recent_prompt = provider.prompts_by_function["submit_recent_context"]
+    assert "transcript" in event_prompt
+    assert "agent_context" in event_prompt
+    assert "2026-07-16T10:00:00+08:00" in event_prompt
+    assert "Memory Extraction Agent" in event_prompt
+    assert "旧语境" not in event_prompt
+    assert "旧语境" in recent_prompt
+    assert "ongoing_threads" in recent_prompt
+    assert "dormant_threads" in recent_prompt
     assert draft.history_entries[0]["emotional_weight"] == 10
     assert draft.pending_items == [{"tag": "identity", "content": "用户是开发者"}]
     assert "## Compression" in draft.recent_context
@@ -107,3 +112,39 @@ async def test_consolidation_retries_recent_context_function_once() -> None:
 
     assert provider.recent_attempts == 2
     assert "最近持续关注：记忆模块" in draft.recent_context
+
+
+@pytest.mark.asyncio
+async def test_consolidation_starts_event_and_recent_extraction_concurrently() -> None:
+    class CoordinatedProvider(Provider):
+        def __init__(self):
+            super().__init__()
+            self.started: set[str] = set()
+            self.both_started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def complete(self, messages, tools=None, **kwargs):
+            function_name = tools[0]["function"]["name"]
+            self.started.add(function_name)
+            if len(self.started) == 2:
+                self.both_started.set()
+            await self.release.wait()
+            return await super().complete(messages, tools=tools, **kwargs)
+
+    provider = CoordinatedProvider()
+    extraction = asyncio.create_task(
+        _LLMConsolidationExtractor(provider).extract(
+            [{"role": "user", "content": "并发测试"}],
+            "",
+        )
+    )
+    try:
+        await asyncio.wait_for(provider.both_started.wait(), timeout=0.5)
+    finally:
+        provider.release.set()
+        await extraction
+
+    assert provider.started == {
+        "submit_consolidation_events",
+        "submit_recent_context",
+    }

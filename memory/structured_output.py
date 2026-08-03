@@ -15,6 +15,7 @@ class ProviderApi(Protocol):
         tools: list[dict[str, Any]] | None = None,
         *,
         tool_choice: str | dict[str, Any] = "auto",
+        disable_thinking: bool = False,
     ) -> Any: ...
 
 
@@ -29,7 +30,7 @@ async def complete_forced_function(
     *,
     required_arrays: tuple[str, ...],
 ) -> dict[str, Any]:
-    """强制调用唯一 Function；格式失败时只补救一次。"""
+    """关闭后台 thinking 并强制调用唯一 Function；格式失败时补救一次。"""
 
     function = tool.get("function")
     if not isinstance(function, dict) or not str(function.get("name") or "").strip():
@@ -54,6 +55,9 @@ async def complete_forced_function(
                 [{"role": "user", "content": attempt_prompt}],
                 tools=[tool],
                 tool_choice=tool_choice,
+                # DeepSeek thinking 不支持命名 tool_choice；记忆提取属于后台
+                # 分类与总结任务，单次关闭推理以获得硬格式约束并减少等待成本。
+                disable_thinking=True,
             )
             arguments = _function_arguments(response, function_name)
             _require_array_fields(arguments, required_arrays)

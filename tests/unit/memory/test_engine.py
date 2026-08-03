@@ -935,6 +935,68 @@ async def test_implicit_memory_failure_keeps_outbox_for_recovery(tmp_path: Path)
     assert pending_after == []
 
 
+@pytest.mark.asyncio
+async def test_event_write_and_implicit_extraction_run_concurrently(tmp_path: Path) -> None:
+    import asyncio
+
+    from memory.events import ConsolidationCommitted
+
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    started: set[str] = set()
+
+    async def wait_for_peer(name: str) -> None:
+        started.add(name)
+        if len(started) == 2:
+            both_started.set()
+        await release.wait()
+
+    class CoordinatedMemorizer:
+        async def save_from_consolidation(self, *args, **kwargs):
+            await wait_for_peer("event_write")
+
+    class CoordinatedImplicitExtractor:
+        async def extract(self, conversation, existing_profile=""):
+            await wait_for_peer("implicit_extract")
+            return ImplicitMemoryDraft()
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path,
+        Embedder(),
+        Provider(),
+        sessions,
+        config=config,
+        implicit_extractor=CoordinatedImplicitExtractor(),
+    )
+    engine._memorizer = CoordinatedMemorizer()
+    event = ConsolidationCommitted(
+        history_entry_payloads=[("[2026-08-03 20:00] 用户测试并发归档", 0)],
+        source_ref="web:c@0-9",
+        scope_channel="web",
+        scope_chat_id="c",
+        conversation="[user] 测试并发归档",
+    )
+    engine._store.enqueue_consolidation(event.source_ref, {"source_ref": event.source_ref})
+    processing = asyncio.create_task(engine.on_consolidation_committed(event))
+    pending_after = None
+    try:
+        await asyncio.wait_for(both_started.wait(), timeout=0.5)
+        release.set()
+        await processing
+        pending_after = engine._store.list_pending_consolidations()
+    finally:
+        release.set()
+        await asyncio.gather(processing, return_exceptions=True)
+        await engine.close()
+        sessions.close()
+
+    assert started == {"event_write", "implicit_extract"}
+    assert pending_after == []
+
+
 async def _empty_implicit():
     return ImplicitMemoryDraft()
 

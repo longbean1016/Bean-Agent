@@ -49,7 +49,7 @@ async def test_extracts_profile_preference_and_procedure_fields() -> None:
         "type": "function",
         "function": {"name": "submit_implicit_memory"},
     }
-    assert kwargs.get("disable_thinking") is not True
+    assert kwargs["disable_thinking"] is True
     assert result.profile[0]["category"] == "personal_fact"
     assert result.preference[0]["summary"] == "用户偏好中文回答"
     assert result.procedure[0]["tool_requirement"] == "shell"

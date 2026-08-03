@@ -465,6 +465,26 @@ class MemoryEngine:
             return await self._run_consolidation(event)
 
     async def on_consolidation_committed(self, event: ConsolidationCommitted) -> None:
+        # 事件向量写入与隐式记忆提取只共享归档原文，彼此没有数据依赖。并发等待
+        # 两类外部 IO，随后才写 implicit 并清理 outbox，保持原有提交边界。
+        async with asyncio.TaskGroup() as group:
+            group.create_task(self._save_consolidation_events(event))
+            implicit_task = group.create_task(
+                self._implicit_extractor.extract(
+                    event.conversation,
+                    existing_profile="",
+                )
+            )
+        implicit = implicit_task.result()
+        await self._save_implicit_long_term(implicit, event)
+        self._store.complete_consolidation(event.source_ref)
+
+    async def _save_consolidation_events(
+        self,
+        event: ConsolidationCommitted,
+    ) -> None:
+        """顺序写入单个归档窗口的事件，控制 Embedding API 瞬时并发。"""
+
         for index, (summary, emotional_weight) in enumerate(event.history_entry_payloads):
             summary = str(summary or "").strip()
             if summary:
@@ -472,9 +492,6 @@ class MemoryEngine:
                     summary, [], f"{event.source_ref}#{index}", event.scope_channel, event.scope_chat_id,
                     emotional_weight=emotional_weight,
                 )
-        implicit = await self._implicit_extractor.extract(event.conversation, existing_profile="")
-        await self._save_implicit_long_term(implicit, event)
-        self._store.complete_consolidation(event.source_ref)
 
     async def replay_pending_consolidations(self) -> None:
         """重放未完成的向量事务；单条失败保留 outbox 并继续其它窗口。"""
@@ -656,29 +673,41 @@ class _LLMConsolidationExtractor:
 
     async def extract(self, messages: list[dict[str, object]], previous_recent_context: str, *, recent_turns: str = "", current_memory: str = "") -> ConsolidationDraft:
         conversation = render_consolidation_conversation(messages)
-        event_data = await complete_forced_function(
-            self._provider,
-            _event_extraction_prompt(conversation, current_memory=current_memory),
-            CONSOLIDATION_EVENTS_TOOL,
-            required_arrays=("history_entries", "pending_items"),
-        )
-        recent_data = await complete_forced_function(
-            self._provider,
-            _recent_context_prompt(
-                conversation,
-                previous_recent_context,
-                recent_turns=recent_turns,
-            ),
-            RECENT_CONTEXT_TOOL,
-            required_arrays=(
-                "active_topics",
-                "user_preferences",
-                "follow_ups",
-                "avoidances",
-                "dormant_threads",
-                "ongoing_threads",
-            ),
-        )
+        # 两个提取器只读取相同证据，不互相消费结果；并发执行可把两次 LLM
+        # 网络等待从相加改为取较慢者，任一失败时 TaskGroup 会取消另一分支。
+        async with asyncio.TaskGroup() as group:
+            event_task = group.create_task(
+                complete_forced_function(
+                    self._provider,
+                    _event_extraction_prompt(
+                        conversation,
+                        current_memory=current_memory,
+                    ),
+                    CONSOLIDATION_EVENTS_TOOL,
+                    required_arrays=("history_entries", "pending_items"),
+                )
+            )
+            recent_task = group.create_task(
+                complete_forced_function(
+                    self._provider,
+                    _recent_context_prompt(
+                        conversation,
+                        previous_recent_context,
+                        recent_turns=recent_turns,
+                    ),
+                    RECENT_CONTEXT_TOOL,
+                    required_arrays=(
+                        "active_topics",
+                        "user_preferences",
+                        "follow_ups",
+                        "avoidances",
+                        "dormant_threads",
+                        "ongoing_threads",
+                    ),
+                )
+            )
+        event_data = event_task.result()
+        recent_data = recent_task.result()
         history_entries = []
         for item in event_data.get("history_entries") or []:
             if not isinstance(item, dict) or not str(item.get("summary") or "").strip():

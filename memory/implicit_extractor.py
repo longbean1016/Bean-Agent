@@ -25,6 +25,7 @@ class ProviderApi(Protocol):
         tools: list[dict[str, Any]] | None = None,
         *,
         tool_choice: str | dict[str, Any] = "auto",
+        disable_thinking: bool = False,
     ) -> Any: ...
 
 
