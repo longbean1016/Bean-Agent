@@ -249,6 +249,12 @@ class AgentLoop:
             reasoning_content=result.thinking, tool_chain=result.tool_chain,
             tools_used=result.tools_used, status="ok",
             metadata={"context_retry": context_retry},
+            # 终答轮单独思考写入 message dict；SessionManager.append_messages
+            # 会把不在 fixed_fields 中的键自动归类到 extra，落库到
+            # ``extra.final_reasoning_content``。下次 Turn 重建历史时优先读
+            # 此字段还原到终答 assistant 的 reasoning_content，避免终答
+            # ``reasoning_content``（拼接版）里重复携带工具轮思考。
+            final_reasoning_content=result.final_reasoning,
         )
         # append_messages 依次写入同一批的两条消息并原地回填稳定 ID。只有它完整返回，
         # 后台记忆才能看到完整 Turn，因此 TurnCommitted 必须位于此调用之后。

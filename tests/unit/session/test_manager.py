@@ -136,6 +136,64 @@ async def test_completed_turn_persists_user_and_assistant_in_one_batch(
 
 
 @pytest.mark.asyncio
+async def test_final_reasoning_content_flows_through_session_manager(
+    manager: SessionManager,
+) -> None:
+    """模拟 AgentLoop 的持久化路径：通过 SessionManager.add_message 把
+    ``final_reasoning_content`` 写入 message dict，验证它经 append_messages
+    落库到 ``extra.final_reasoning_content``，并被 store.load_history 优先
+    读回为终答 assistant 的 ``reasoning_content``，而不使用拼接版。
+    """
+
+    session = await manager.get_or_create("web:chat-1")
+
+    # 复刻 AgentLoop 在 agent_loop.py 中的写法：reasoning_content 保留拼接版
+    # （前端回看用），final_reasoning_content 单独存（DeepSeek 协议用）。
+    user = session.add_message("user", "查询天气", turn_id="turn-1")
+    assistant = session.add_message(
+        "assistant",
+        "上海今天有雨。",
+        turn_id="turn-1",
+        reasoning_content="先查询天气\n\n根据工具结果回答",
+        tool_chain=[
+            {
+                "iteration": 1,
+                "text": "",
+                "provider_fields": {"reasoning_content": "先查询天气"},
+                "calls": [
+                    {
+                        "call_id": "call-1",
+                        "name": "weather",
+                        "arguments": {"city": "上海"},
+                        "result": "有雨，26 度",
+                        "status": "ok",
+                    }
+                ],
+            }
+        ],
+        tools_used=["weather"],
+        status="ok",
+        metadata={"context_retry": {}},
+        final_reasoning_content="根据工具结果回答",
+    )
+    await manager.append_messages(session, [user, assistant])
+
+    history = manager.store.load_history("web:chat-1", limit=40)
+
+    # 终答 assistant 的 reasoning_content 应来自 final_reasoning_content，
+    # 不再携带拼接版里的"先查询天气"。
+    assert history[-1] == {
+        "role": "assistant",
+        "content": "上海今天有雨。",
+        "reasoning_content": "根据工具结果回答",
+    }
+    # 工具轮 assistant 仍带 tool_chain.provider_fields.reasoning_content，
+    # 历史里仅此一份工具决策思考。
+    tool_round = history[1]
+    assert tool_round["reasoning_content"] == "先查询天气"
+
+
+@pytest.mark.asyncio
 async def test_append_first_user_message_keeps_default_title_in_cache(
     manager: SessionManager,
 ) -> None:

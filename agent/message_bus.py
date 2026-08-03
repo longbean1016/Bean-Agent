@@ -42,6 +42,13 @@ class OutboundMessage:
 class PipelineResult:
     content: str
     thinking: str = ""
+    # 终答那一轮 chat 返回的单独思考内容。``thinking`` 是整个 Turn 所有
+    # iteration 思考的拼接版（供前端展示完整链路），而 ``final_reasoning``
+    # 只对应终答轮，用于持久化到 ``extra.final_reasoning_content``，
+    # 下次 Turn 重建历史时还原到终答 assistant 消息的 ``reasoning_content``
+    # 字段。这样工具决策思考只在各自 ``tool_chain`` group 中保留一份，
+    # 避免历史里工具轮思考在终答 reasoning 中重复占 token。
+    final_reasoning: str = ""
     media: list[str] = field(default_factory=list)
     tool_chain: list[dict[str, Any]] = field(default_factory=list)
     tools_used: list[str] = field(default_factory=list)

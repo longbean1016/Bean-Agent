@@ -280,7 +280,7 @@ class Pipeline:
                         [*last_base_messages, *react_messages],
                         tools=[],
                         tool_choice="none",
-                    )
+)
                     if retry.content:
                         response = retry
                         append_turn_thinking(response.thinking)
@@ -290,6 +290,10 @@ class Pipeline:
                 return PipelineResult(
                     content=str(content or ""),
                     thinking=merged_turn_thinking(),
+                    # 终答轮思考：取当前 ``response.thinking``，可能来自原始终答 chat，
+                    # 也可能来自上面"空回复重试"分支成功后的 retry chat。无论哪种情况，
+                    # ``response`` 此刻都指向"最后一次 chat 调用"，其思考就是终答轮思考。
+                    final_reasoning=str(response.thinking or ""),
                     tool_chain=tool_chain,
                     tools_used=list(dict.fromkeys(tools_used)),
                     context_retry=context_retry,
@@ -390,6 +394,10 @@ class Pipeline:
         return PipelineResult(
             content=summary,
             thinking=merged_turn_thinking(),
+            # 达到最大迭代次数的 fallback 路径没有真正完成终答，没有单轮终答
+            # 思考可记录。留空时持久化为空字符串，下次重建历史走 fallback 机制
+            # 使用旧 ``reasoning_content`` 字段或 strategy 临场补齐 ``reasoning_content=""``。
+            final_reasoning="",
             tool_chain=tool_chain,
             tools_used=list(dict.fromkeys(tools_used)),
             context_retry=context_retry,

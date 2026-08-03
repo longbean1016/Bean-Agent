@@ -378,7 +378,11 @@ async def test_pipeline_runs_tool_loop_and_emits_lifecycle_events() -> None:
     result = await pipeline.process(InboundMessage(channel="web", sender="u", chat_id="c", content="执行"), turn_id="t1")
 
     assert result.content == "完成"
+    # result.thinking 是整个 Turn 拼接版（前端展示用），含两轮。
     assert result.thinking == "工具前思考\n\n推理"
+    # result.final_reasoning 只对应终答轮那一截思考，供下次历史重建使用，
+    # 不携带工具决策思考，避免历史里工具思考重复占 token。
+    assert result.final_reasoning == "推理"
     assert result.tools_used == ["echo"]
     assert result.tool_chain[0]["calls"][0]["result"] == "echo:hi:web:c"
     assert any(isinstance(event, ToolCallStarted) for event in seen)

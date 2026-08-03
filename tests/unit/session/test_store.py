@@ -157,6 +157,123 @@ async def test_load_history_expands_tool_chain_and_reasoning(
 
 
 @pytest.mark.asyncio
+async def test_load_history_prefers_final_reasoning_content_over_concatenated(
+    store: SessionStore,
+) -> None:
+    """新数据终答 assistant 的 reasoning_content 应来自 final_reasoning_content，不含工具思考。"""
+
+    store.add_message(
+        NewMessage(session_key="web:chat-1", role="user", content="查询天气")
+    )
+    store.add_message(
+        NewMessage(
+            session_key="web:chat-1",
+            role="assistant",
+            content="上海今天有雨。",
+            # reasoning_content 仍是整个 Turn 的拼接版，供前端回看完整链路使用。
+            reasoning_content="先查询天气\n\n根据工具结果回答",
+            tool_chain=[
+                {
+                    "iteration": 1,
+                    "text": "",
+                    "provider_fields": {"reasoning_content": "先查询天气"},
+                    "calls": [
+                        {
+                            "call_id": "call-1",
+                            "name": "weather",
+                            "arguments": {"city": "上海"},
+                            "result": "有雨，26 度",
+                            "status": "ok",
+                        }
+                    ],
+                }
+            ],
+            # 终答轮单独思考；写入 extra 后由 _row_to_message 自动挂回 message 顶层。
+            extra={"final_reasoning_content": "根据工具结果回答"},
+        )
+    )
+
+    history = store.load_history("web:chat-1", limit=40)
+
+    # 工具轮 assistant 自带 tool_chain.provider_fields.reasoning_content
+    # 终答 assistant 的 reasoning_content 应该只来自 final_reasoning_content，
+    # 不再包含拼接版里的"先查询天气"，避免历史里工具决策思考重复占 token。
+    assert history == [
+        {"role": "user", "content": "查询天气"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": '{"city": "上海"}',
+                    },
+                }
+            ],
+            "reasoning_content": "先查询天气",
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "有雨，26 度"},
+        {
+            "role": "assistant",
+            "content": "上海今天有雨。",
+            "reasoning_content": "根据工具结果回答",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_load_history_falls_back_to_reasoning_content_without_final_reasoning(
+    store: SessionStore,
+) -> None:
+    """旧数据没有 final_reasoning_content 时，终答 assistant 回退使用 reasoning_content。
+
+    落库前缺乏 ``extra.final_reasoning_content`` 的历史数据（改造前已落库的消息）
+    不需要迁移：fallback 路径保留原有行为，DeepSeek 协议依然合规。
+    """
+
+    store.add_message(
+        NewMessage(session_key="web:chat-1", role="user", content="查询天气")
+    )
+    store.add_message(
+        NewMessage(
+            session_key="web:chat-1",
+            role="assistant",
+            content="上海今天有雨。",
+            # 模拟旧数据：reasoning_content 是拼接版，extra 中没有 final_reasoning_content。
+            reasoning_content="先查询天气\n\n根据工具结果回答",
+            tool_chain=[
+                {
+                    "iteration": 1,
+                    "text": "",
+                    "provider_fields": {"reasoning_content": "先查询天气"},
+                    "calls": [
+                        {
+                            "call_id": "call-1",
+                            "name": "weather",
+                            "arguments": {"city": "上海"},
+                            "result": "有雨，26 度",
+                            "status": "ok",
+                        }
+                    ],
+                }
+            ],
+        )
+    )
+
+    history = store.load_history("web:chat-1", limit=40)
+
+    # 终答 assistant 的 reasoning_content 退回到拼接版（与改造前行为完全一致）。
+    assert history[-1] == {
+        "role": "assistant",
+        "content": "上海今天有雨。",
+        "reasoning_content": "先查询天气\n\n根据工具结果回答",
+    }
+
+
+@pytest.mark.asyncio
 async def test_load_history_keeps_finished_tools_from_interrupted_turn(
     store: SessionStore,
 ) -> None:

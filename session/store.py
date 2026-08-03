@@ -1439,8 +1439,17 @@ class SessionStore:
             "role": "assistant",
             "content": message["content"],
         }
-        if not interrupted and message["reasoning_content"]:
-            final_message["reasoning_content"] = message["reasoning_content"]
+        if not interrupted:
+            # 优先使用终答轮单独思考（``extra.final_reasoning_content``），
+            # 避免历史里工具决策思考在终答 ``reasoning_content``（拼接版）里
+            # 重复出现。旧数据没有此字段，fallback 到 ``reasoning_content``
+            # （拼接版），行为与改造前一致；DeepSeek 协议只要求字段存在即可。
+            final_reasoning = (
+                message.get("final_reasoning_content")
+                or message.get("reasoning_content", "")
+            )
+            if final_reasoning:
+                final_message["reasoning_content"] = final_reasoning
         result.append(final_message)
         return result
 
@@ -1474,6 +1483,8 @@ class SessionStore:
         }
         # akashic 的 Session 消息允许携带 media、llm_user_content 等扩展字段。
         # 固定字段由数据库列和上方兼容转换决定，extra 不能反向覆盖它们。
+        # 此处同时把 ``final_reasoning_content`` 等扩展字段从 extra 挂回 message
+        # 顶层，供下游 ``_message_to_history`` 直接 ``message.get(...)`` 使用。
         for key, value in extra.items():
             if key not in message and key != "metadata":
                 message[key] = value

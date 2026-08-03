@@ -91,6 +91,8 @@ async def test_web_concurrent_queue_cancel_and_promotion_closed_loop(
             return SimpleNamespace(
                 content=f"完成-{message.chat_id}",
                 thinking="",
+                # 与 PipelineResult 字段对齐：终答轮思考留空，agent_loop 持久化时写入空串。
+                final_reasoning="",
                 media=[],
                 tool_chain=[],
                 tools_used=[],
