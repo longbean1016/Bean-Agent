@@ -560,9 +560,9 @@ async def test_context_guard_skips_consolidation_below_threshold(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_default_context_guard_starts_at_36_pending_messages(tmp_path: Path) -> None:
+async def test_default_context_guard_starts_at_40_pending_messages(tmp_path: Path) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
-    for index in range(35):
+    for index in range(39):
         sessions.add_message(
             NewMessage(session_key="web:c", role="user", content=f"消息 {index}")
         )
@@ -572,7 +572,7 @@ async def test_default_context_guard_starts_at_36_pending_messages(tmp_path: Pat
     try:
         assert engine.needs_context_preparation("web:c") is False
         sessions.add_message(
-            NewMessage(session_key="web:c", role="user", content="第 36 条消息")
+            NewMessage(session_key="web:c", role="user", content="第 40 条消息")
         )
         assert engine.needs_context_preparation("web:c") is True
     finally:

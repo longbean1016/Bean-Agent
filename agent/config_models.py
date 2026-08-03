@@ -126,12 +126,9 @@ class MemoryConfig:
         """返回 Turn 前必须处理压缩积压的未归档消息阈值。"""
 
         background_threshold = self.keep_count + self.consolidation_min_new_messages
-        # 后台压缩达到软门槛后最多保留六条消息（约三轮）追赶时间，不能立即让
-        # 下一轮同步等待；同时在活动窗口末端保留四条消息余量用于异常兜底。
-        return max(
-            background_threshold,
-            min(background_threshold + 6, self.aligned_context_window - 4),
-        )
+        # 正常窗口达到配置上限后才同步等待；极小窗口若低于一次归档所需门槛，
+        # 仍以后者为准，避免尚无足够消息可压缩时提前阻塞 Turn。
+        return max(background_threshold, self.aligned_context_window)
 
 
 @dataclass
