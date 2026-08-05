@@ -100,6 +100,14 @@ async def test_retries_empty_function_response_and_uses_second_result() -> None:
 def test_prompt_contains_full_evidence_gates_and_counterexamples() -> None:
     prompt = _build_prompt("[USER] 对话", "用户住在上海")
 
+    assert "【三类记忆共同准入规则】" in prompt
+    assert "只有 USER 在当前对话中直接陈述，或明确确认的内容才允许提取" in prompt
+    assert "【类型判定顺序】" in prompt
+    assert "【类型判断的泛化约束】" in prompt
+    assert "不是固定关键词的机械匹配" in prompt
+    assert "即使句子中出现“以后”，也不能仅凭该词改判为 procedure" in prompt
+    assert "稳定偏好与临时例外同时出现时，分别处理" in prompt
+    assert "多个主体或多项事实时，每个主体和事实分别判断并保留关系归属" in prompt
     assert "检查 0 — 元讨论/举例说明" in prompt
     assert "检查 A — USER 原话锚点" in prompt
     assert "检查 B — 时效性" in prompt
