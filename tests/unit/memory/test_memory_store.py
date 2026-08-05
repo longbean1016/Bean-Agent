@@ -94,6 +94,29 @@ def test_soft_delete_removes_item_from_search_but_keeps_audit_row(store: MemoryS
     assert store.get_items_by_ids([item_id])[0]["status"] == "superseded"
 
 
+def test_atomic_replace_rolls_back_when_new_vector_write_fails(
+    store: MemoryStore2,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_id = store.upsert_item(
+        "preference", "用户喜欢简洁回答", [1.0, 0.0, 0.0], "web:c:0"
+    ).split(":", 1)[1]
+
+    def fail_vector_write(rowid: int, vector: list[float]) -> None:
+        raise RuntimeError("simulated vector failure")
+
+    monkeypatch.setattr(store, "_vec_insert", fail_vector_write)
+    with pytest.raises(RuntimeError, match="simulated vector failure"):
+        store.replace_item_atomic(
+            old_id, "preference", "用户喜欢详细回答", [0.0, 1.0, 0.0], "web:c:1"
+        )
+
+    old = store.get_items_by_ids([old_id])[0]
+    count = store._db.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0]
+    assert old["status"] == "active"
+    assert count == 1
+
+
 def test_consolidation_source_ref_is_idempotent(store: MemoryStore2) -> None:
     first = store.upsert_consolidation_event("web:c:turn-1", "完成发布", [0.0, 0.0, 1.0])
     second = store.upsert_consolidation_event("web:c:turn-1", "完成发布", [0.0, 0.0, 1.0])

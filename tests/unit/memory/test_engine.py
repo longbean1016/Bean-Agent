@@ -65,7 +65,7 @@ async def test_engine_remember_query_evidence_and_forget(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_explicit_remember_does_not_persist_session_scope(tmp_path: Path) -> None:
+async def test_explicit_remember_persists_scope_as_provenance(tmp_path: Path) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
     config = MemoryConfig(enabled=True)
     config.embedding.dimensions = 2
@@ -87,10 +87,36 @@ async def test_explicit_remember_does_not_persist_session_scope(tmp_path: Path) 
         await engine.close()
         sessions.close()
 
-    # 对齐 Akashic：显式记忆属于 workspace，source_ref 仍保留来源证据。
+    # scope 只记录来源；默认检索仍是 workspace 级，不强制 scope 匹配。
     assert item["source_ref"] == "web:session-a:0"
-    assert "scope_channel" not in item["extra_json"]
-    assert "scope_chat_id" not in item["extra_json"]
+    assert item["extra_json"]["scope_channel"] == "web"
+    assert item["extra_json"]["scope_chat_id"] == "session-a"
+
+
+@pytest.mark.asyncio
+async def test_explicit_procedure_without_tool_keeps_type_and_scope(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    try:
+        written = await engine.mutate(MemoryMutation(
+            kind="remember",
+            summary="迁移数据库时先列风险，再列回滚步骤",
+            memory_kind="procedure",
+            source_ref="web:session-a:procedure-1",
+            scope=MemoryScope(session_key="web:session-a", channel="web", chat_id="session-a"),
+            metadata={"scenario": "数据库迁移", "steps": ["列风险", "列回滚步骤"]},
+        ))
+        item = engine._store.get_items_by_ids([written.item_id])[0]
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert written.actual_kind == "procedure"
+    assert item["memory_type"] == "procedure"
+    assert item["extra_json"]["scope_channel"] == "web"
+    assert item["extra_json"]["scope_chat_id"] == "session-a"
 
 
 @pytest.mark.asyncio

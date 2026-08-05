@@ -370,6 +370,63 @@ class MemoryStore2:
             )
             self._db.commit()
 
+    def replace_item_atomic(
+        self,
+        old_item_id: str,
+        memory_type: str,
+        summary: str,
+        embedding: list[float],
+        source_ref: str,
+        *,
+        extra: dict[str, object] | None = None,
+        happened_at: str | None = None,
+        emotional_weight: int = 0,
+    ) -> str:
+        """在同一 SQLite 事务内插入新记忆并将旧记忆标记为 superseded。"""
+
+        vector = self._validate_vector(embedding)
+        digest = hashlib.sha256(summary.strip().encode("utf-8")).hexdigest()[:16]
+        now = datetime.now(timezone.utc).isoformat()
+        new_item_id = uuid.uuid4().hex
+        with self._lock:
+            self._ensure_open()
+            old = self._db.execute(
+                "SELECT rowid,status FROM memory_items WHERE id=?", (old_item_id,)
+            ).fetchone()
+            if old is None or old["status"] != "active":
+                raise KeyError(f"active 记忆不存在: {old_item_id}")
+            try:
+                self._db.execute("BEGIN")
+                cursor = self._db.execute(
+                    """INSERT INTO memory_items
+                    (id,memory_type,summary,content_hash,embedding,reinforcement,emotional_weight,
+                     extra_json,source_ref,happened_at,status,created_at,updated_at)
+                    VALUES (?,?,?,?,?,1,?,?,?,?, 'active',?,?)""",
+                    (new_item_id, memory_type, summary.strip(), digest, json.dumps(vector),
+                     max(0, min(int(emotional_weight), 10)), json.dumps(extra or {}, ensure_ascii=False),
+                     source_ref, happened_at, now, now),
+                )
+                self._vec_insert(int(cursor.lastrowid), vector)
+                self._db.execute(
+                    "UPDATE memory_items SET status='superseded',updated_at=? WHERE id=?",
+                    (now, old_item_id),
+                )
+                self._vec_delete([int(old["rowid"])])
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return f"new:{new_item_id}"
+
+    def record_consolidation_source_ref(self, source_ref: str, item_id: str) -> None:
+        with self._lock:
+            self._ensure_open()
+            self._db.execute(
+                "INSERT OR IGNORE INTO consolidation_events(source_ref,item_id,created_at) VALUES(?,?,?)",
+                (source_ref, item_id, datetime.now(timezone.utc).isoformat()),
+            )
+            self._db.commit()
+
     def merge_item_raw(self, item_id: str, new_summary: str, new_embedding: list[float], new_extra: dict[str, object]) -> None:
         """原子更新合并目标，并同步主表与 vec 索引。"""
 

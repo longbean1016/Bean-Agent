@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Protocol
+from typing import Any, Protocol
 
 from memory.store import MemoryStore2
-from memory.rule_schema import build_procedure_rule_schema
+from memory.rule_schema import build_procedure_rule_schema, procedure_rules_conflict, resolve_procedure_rule_schema
+from memory.write_decider import MemoryWriteDecider, MemoryWriteDecision
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +24,22 @@ class EmbeddingApi(Protocol):
 class Memorizer:
     """所有人工写入与 consolidation 写入共用的记忆变更边界。"""
 
-    def __init__(self, store: MemoryStore2, embedder: EmbeddingApi) -> None:
+    def __init__(
+        self,
+        store: MemoryStore2,
+        embedder: EmbeddingApi,
+        *,
+        provider: Any,
+        candidate_thresholds: dict[str, float] | None = None,
+        candidate_top_k: int = 5,
+    ) -> None:
         self._store = store
         self._embedder = embedder
+        self._decider = MemoryWriteDecider(provider)
+        self._candidate_thresholds = candidate_thresholds or {
+            "event": 0.75, "profile": 0.55, "preference": 0.55, "procedure": 0.50,
+        }
+        self._candidate_top_k = max(1, int(candidate_top_k))
 
     async def save_item(self, summary: str, memory_type: str, extra: dict[str, object], source_ref: str, happened_at: str | None = None, emotional_weight: int = 0) -> str:
         embedding = await self._embedder.embed(summary)
@@ -35,48 +49,33 @@ class Memorizer:
             emotional_weight=_emotional_weight(emotional_weight),
         )
 
-    async def save_item_with_supersede(self, summary: str, memory_type: str, extra: dict[str, object], source_ref: str, happened_at: str | None = None, emotional_weight: int = 0, merge_threshold: float = 0.70, supersede_threshold: float = 0.90) -> str:
+    async def save_item_with_supersede(self, summary: str, memory_type: str, extra: dict[str, object], source_ref: str, happened_at: str | None = None, emotional_weight: int = 0) -> str:
         embedding = await self._embedder.embed(summary)
-        if memory_type in {"procedure", "preference"}:
-            similar = self._store.vector_search(
-                embedding, top_k=5, memory_types=[memory_type],
-                score_threshold=min(merge_threshold, supersede_threshold),
-                hotness_alpha=0.0,
-            )
-            if memory_type == "procedure":
-                target = _merge_target(similar, extra, merge_threshold)
-                if target is not None:
-                    await self.merge_item(
-                        str(target["id"]),
-                        _merge_summary(str(target.get("summary", "")), summary),
-                        extra,
-                    )
-                    return f"merged:{target['id']}"
-            supersede_ids = [
-                str(item["id"]) for item in similar
-                if float(item.get("vector_score", item.get("score", 0))) >= supersede_threshold
-            ]
-            if supersede_ids:
-                self._store.mark_superseded_batch(supersede_ids)
-        elif memory_type == "profile" and str(extra.get("category", "")) in {"status", "purchase"}:
-            similar = self._store.vector_search(
-                embedding, top_k=5, memory_types=["profile"],
-                score_threshold=supersede_threshold, hotness_alpha=0.0,
-            )
-            category = str(extra["category"])
-            supersede_ids = [
-                str(item["id"]) for item in similar
-                if isinstance(item.get("extra_json"), dict)
-                and item["extra_json"].get("category") == category
-                and float(item.get("vector_score", item.get("score", 0))) >= supersede_threshold
-            ]
-            if supersede_ids:
-                self._store.mark_superseded_batch(supersede_ids)
-        return self._store.upsert_item(
-            memory_type, summary, embedding, source_ref,
-            extra=extra, happened_at=happened_at,
-            emotional_weight=_emotional_weight(emotional_weight),
+        return await self._save_semantic(
+            summary, memory_type, extra, source_ref, embedding,
+            happened_at=happened_at, emotional_weight=emotional_weight,
         )
+
+    async def save_items_batch(
+        self,
+        items: list[tuple[str, str, dict[str, object], str, str | None, int]],
+    ) -> list[str]:
+        """批量向量化后按输入顺序决策，供不同 memory_type 的任务并发调用。"""
+        if not items:
+            return []
+        embed_batch = getattr(self._embedder, "embed_batch", None)
+        if callable(embed_batch):
+            vectors = await embed_batch([item[0] for item in items])
+        else:
+            vectors = [await self._embedder.embed(item[0]) for item in items]
+        results: list[str] = []
+        for item, vector in zip(items, vectors):
+            summary, memory_type, extra, source_ref, happened_at, emotional_weight = item
+            results.append(await self._save_semantic(
+                summary, memory_type, extra, source_ref, vector,
+                happened_at=happened_at, emotional_weight=emotional_weight,
+            ))
+        return results
 
     async def merge_item(self, item_id: str, merged_summary: str, extra_patch: dict[str, object] | None = None) -> None:
         rows = self._store.get_items_by_ids([item_id])
@@ -88,8 +87,14 @@ class Memorizer:
         patch = extra_patch or {}
         if patch.get("tool_requirement"):
             new_extra["tool_requirement"] = patch["tool_requirement"]
+        if patch.get("scenario"):
+            new_extra["scenario"] = patch["scenario"]
         steps = [*(new_extra.get("steps") or []), *(patch.get("steps") or [])]
         new_extra["steps"] = list(dict.fromkeys(str(step).strip() for step in steps if str(step).strip()))
+        constraints = [*(new_extra.get("constraints") or []), *(patch.get("constraints") or [])]
+        new_extra["constraints"] = list(dict.fromkeys(
+            str(value).strip() for value in constraints if str(value).strip()
+        ))
         new_extra["rule_schema"] = build_procedure_rule_schema(
             merged_summary,
             tool_requirement=str(new_extra.get("tool_requirement") or "") or None,
@@ -107,23 +112,83 @@ class Memorizer:
             return
         try:
             embedding = await self._embedder.embed(text)
-            similar = self._store.find_similar_recent_events(embedding, threshold=0.92, days_back=7)
-            if similar:
-                # 语义重复不新增条目，只强化最相似记录，保留事件去重的可观测次数。
-                self._store.reinforce_items_batch(similar[:1], emotional_weight)
-                return
-            self._store.upsert_consolidation_event(
-                source_ref, text, embedding,
-                extra={"scope_channel": scope_channel, "scope_chat_id": scope_chat_id},
-                happened_at=parse_happened_at(text),
-                emotional_weight=_emotional_weight(emotional_weight),
+            result = await self._save_semantic(
+                text, "event",
+                {"scope_channel": scope_channel, "scope_chat_id": scope_chat_id},
+                source_ref, embedding,
+                happened_at=parse_happened_at(text), emotional_weight=emotional_weight,
             )
+            self._store.record_consolidation_source_ref(source_ref, result.split(":", 1)[1])
+            return
         except Exception as error:
             # consolidation 的单次向量写入失败由 cursor 机制重试，不能写半条事件。
             logger.warning("consolidation 记忆写入失败: %s", error)
             raise
         if behavior_updates:
             logger.info("behavior_updates 由响应后写入链路处理，跳过 %d 条", len(behavior_updates))
+
+    async def save_events_batch(
+        self,
+        events: list[tuple[str, str, str, str, int]],
+    ) -> None:
+        """批量生成 Event 向量，并按事件顺序完成语义决策和来源提交。"""
+        if not events:
+            return
+        embed_batch = getattr(self._embedder, "embed_batch", None)
+        vectors = (
+            await embed_batch([event[0] for event in events])
+            if callable(embed_batch)
+            else [await self._embedder.embed(event[0]) for event in events]
+        )
+        for (summary, source_ref, scope_channel, scope_chat_id, weight), vector in zip(events, vectors):
+            if self._store.has_consolidation_source_ref(source_ref):
+                continue
+            result = await self._save_semantic(
+                summary, "event", {"scope_channel": scope_channel, "scope_chat_id": scope_chat_id},
+                source_ref, vector, happened_at=parse_happened_at(summary), emotional_weight=weight,
+            )
+            self._store.record_consolidation_source_ref(source_ref, result.split(":", 1)[1])
+
+    async def _save_semantic(
+        self,
+        summary: str,
+        memory_type: str,
+        extra: dict[str, object],
+        source_ref: str,
+        embedding: list[float],
+        *,
+        happened_at: str | None = None,
+        emotional_weight: int = 0,
+    ) -> str:
+        candidates = self._store.vector_search(
+            embedding, top_k=3 if memory_type == "event" else self._candidate_top_k,
+            memory_types=[memory_type], score_threshold=self._candidate_thresholds.get(memory_type, 0.55),
+            hotness_alpha=0.0,
+        )
+        decision = await self._decider.decide(memory_type, summary, extra, candidates)
+        decision = _validate_decision(memory_type, summary, extra, happened_at, candidates, decision)
+        if decision.action == "reinforce":
+            self._store.reinforce_items_batch([decision.target_id], emotional_weight)
+            return f"reinforced:{decision.target_id}"
+        if decision.action == "no_change":
+            return f"unchanged:{decision.target_id}"
+        if decision.action == "merge":
+            merged_summary = decision.merged_summary or _merge_summary(
+                _candidate_summary(candidates, decision.target_id), summary
+            )
+            await self.merge_item(decision.target_id, merged_summary, extra)
+            return f"merged:{decision.target_id}"
+        if decision.action == "supersede":
+            return self._store.replace_item_atomic(
+                decision.target_id, memory_type, summary, embedding, source_ref,
+                extra=extra, happened_at=happened_at,
+                emotional_weight=_emotional_weight(emotional_weight),
+            )
+        return self._store.upsert_item(
+            memory_type, summary, embedding, source_ref,
+            extra=extra, happened_at=happened_at,
+            emotional_weight=_emotional_weight(emotional_weight),
+        )
 
     def supersede_batch(self, ids: list[str]) -> tuple[list[str], list[str]]:
         return self._store.mark_superseded_batch(ids)
@@ -146,18 +211,6 @@ def _emotional_weight(value: object) -> int:
         return 0
 
 
-def _merge_target(items: list[dict[str, object]], extra: dict[str, object], threshold: float) -> dict[str, object] | None:
-    tool = str(extra.get("tool_requirement") or "").strip()
-    if not tool:
-        return None
-    for item in items:
-        item_extra = item.get("extra_json")
-        score = float(item.get("vector_score", item.get("score", 0)))
-        if score >= threshold and isinstance(item_extra, dict) and str(item_extra.get("tool_requirement") or "").strip() == tool:
-            return item
-    return None
-
-
 def _merge_summary(old: str, new: str) -> str:
     old, new = old.strip(), new.strip()
     if new in old:
@@ -165,6 +218,50 @@ def _merge_summary(old: str, new: str) -> str:
     if old in new:
         return new
     return f"{old.rstrip('。；;，, ')}；{new}" if old else new
+
+
+def _candidate_summary(candidates: list[dict[str, object]], target_id: str) -> str:
+    return next((str(item.get("summary") or "") for item in candidates if str(item.get("id")) == target_id), "")
+
+
+def _validate_decision(
+    memory_type: str,
+    summary: str,
+    extra: dict[str, object],
+    happened_at: str | None,
+    candidates: list[dict[str, object]],
+    decision: MemoryWriteDecision,
+) -> MemoryWriteDecision:
+    if decision.action == "create":
+        return decision
+    target = next((item for item in candidates if str(item.get("id")) == decision.target_id), None)
+    if target is None:
+        return MemoryWriteDecision()
+    old_summary = str(target.get("summary") or "").strip()
+    if (
+        memory_type != "event"
+        and decision.action in {"merge", "reinforce"}
+        and summary.strip()
+        and summary.strip() in old_summary
+    ):
+        return MemoryWriteDecision(action="no_change", target_id=decision.target_id)
+    if memory_type == "event":
+        if decision.action == "merge":
+            return MemoryWriteDecision()
+        old_time = str(target.get("happened_at") or "")
+        correction = any(cue in summary for cue in ("纠正", "更正", "不是", "实际", "改为"))
+        if old_time and happened_at and old_time != happened_at and not correction:
+            return MemoryWriteDecision()
+        if decision.action == "supersede" and not correction:
+            return MemoryWriteDecision()
+    if memory_type == "procedure" and decision.action == "merge":
+        old_extra = target.get("extra_json")
+        old_schema = resolve_procedure_rule_schema(
+            str(target.get("summary") or ""), old_extra if isinstance(old_extra, dict) else {}
+        )
+        if procedure_rules_conflict(resolve_procedure_rule_schema(summary, extra), old_schema):
+            return MemoryWriteDecision()
+    return decision
 
 
 __all__ = ["Memorizer", "parse_happened_at"]

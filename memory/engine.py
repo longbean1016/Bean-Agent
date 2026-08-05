@@ -66,7 +66,19 @@ class MemoryEngine:
             hotness_alpha=self._config.retrieval.hotness_alpha,
             hotness_half_life_days=self._config.retrieval.half_life_days,
         )
-        self._memorizer = Memorizer(self._store, embedder)
+        dedup_config = self._config.dedup
+        self._memorizer = Memorizer(
+            self._store,
+            embedder,
+            provider=provider,
+            candidate_thresholds={
+                "event": dedup_config.event_candidate_threshold,
+                "profile": dedup_config.profile_candidate_threshold,
+                "preference": dedup_config.preference_candidate_threshold,
+                "procedure": dedup_config.procedure_candidate_threshold,
+            },
+            candidate_top_k=dedup_config.candidate_top_k,
+        )
         self._rewriter = QueryRewriter(provider)
         self._hyde = HyDEEnhancer(provider)
         retrieval_config = self._config.retrieval
@@ -276,9 +288,6 @@ class MemoryEngine:
             return MemoryMutationResult(status="ignored", actual_kind=mutation.memory_kind)
         metadata = dict(mutation.metadata)
         actual_kind = mutation.memory_kind.strip() or "preference"
-        if actual_kind == "procedure" and not str(metadata.get("tool_requirement") or "").strip():
-            # procedure 没有可执行工具约束时无法安全拦截，参考实现降级为 preference。
-            actual_kind = "preference"
         if actual_kind == "procedure":
             metadata["rule_schema"] = build_procedure_rule_schema(
                 summary,
@@ -286,14 +295,12 @@ class MemoryEngine:
                 steps=[str(step) for step in metadata.get("steps", [])] if isinstance(metadata.get("steps"), list) else [],
                 rule_schema=metadata.get("rule_schema") if isinstance(metadata.get("rule_schema"), dict) else None,
             )
-        # 对齐 Akashic：显式 memorize 是 workspace 级长期记忆。Turn scope 只参与调用
-        # 上下文，不持久化为条目过滤条件；原始来源仍由 source_ref 审计。
-        metadata.pop("scope_channel", None)
-        metadata.pop("scope_chat_id", None)
+        # scope 仅作为来源审计字段；默认检索仍是 workspace 级，不强制按会话过滤。
+        metadata["scope_channel"] = mutation.scope.channel
+        metadata["scope_chat_id"] = mutation.scope.chat_id
         result = await self._memorizer.save_item_with_supersede(
             summary, actual_kind, metadata, mutation.source_ref,
             emotional_weight=int(metadata.get("emotional_weight", 0) or 0),
-            supersede_threshold=self._config.dedup.supersede_threshold,
         )
         status, item_id = result.split(":", 1)
         return MemoryMutationResult(item_id=item_id, status=status, actual_kind=actual_kind)
@@ -485,6 +492,15 @@ class MemoryEngine:
     ) -> None:
         """顺序写入单个归档窗口的事件，控制 Embedding API 瞬时并发。"""
 
+        batch = [
+            (str(summary).strip(), f"{event.source_ref}#{index}", event.scope_channel, event.scope_chat_id, emotional_weight)
+            for index, (summary, emotional_weight) in enumerate(event.history_entry_payloads)
+            if str(summary or "").strip()
+        ]
+        save_batch = getattr(self._memorizer, "save_events_batch", None)
+        if callable(save_batch):
+            await save_batch(batch)
+            return
         for index, (summary, emotional_weight) in enumerate(event.history_entry_payloads):
             summary = str(summary or "").strip()
             if summary:
@@ -507,11 +523,13 @@ class MemoryEngine:
         draft: ImplicitMemoryDraft,
         event: ConsolidationCommitted,
     ) -> None:
+        batches: list[list[tuple[str, str, dict[str, object], str, str | None, int]]] = []
         for memory_type, items in (
             ("profile", draft.profile),
             ("preference", draft.preference),
             ("procedure", draft.procedure),
         ):
+            batch: list[tuple[str, str, dict[str, object], str, str | None, int]] = []
             for index, item in enumerate(items):
                 summary = str(item.get("summary") or "").strip()
                 if not summary:
@@ -525,17 +543,29 @@ class MemoryEngine:
                 else:
                     extra["tool_requirement"] = item.get("tool_requirement")
                     extra["steps"] = item.get("steps") if isinstance(item.get("steps"), list) else []
+                    if memory_type == "procedure":
+                        extra["scenario"] = str(item.get("scenario") or "")
+                        extra["constraints"] = item.get("constraints") if isinstance(item.get("constraints"), list) else []
                     if memory_type == "procedure" and isinstance(item.get("rule_schema"), dict):
                         extra["rule_schema"] = item["rule_schema"]
                 happened_at = item.get("happened_at") if isinstance(item.get("happened_at"), str) else None
+                batch.append((
+                    summary, memory_type, extra, f"{event.source_ref}#{memory_type}:{index}",
+                    happened_at, _emotional_weight(item.get("emotional_weight")),
+                ))
+            if batch:
+                batches.append(batch)
+        save_batch = getattr(self._memorizer, "save_items_batch", None)
+        if callable(save_batch):
+            async with asyncio.TaskGroup() as group:
+                for batch in batches:
+                    group.create_task(save_batch(batch))
+            return
+        for batch in batches:
+            for summary, memory_type, extra, source_ref, happened_at, emotional_weight in batch:
                 await self._memorizer.save_item_with_supersede(
-                    summary,
-                    memory_type,
-                    extra,
-                    f"{event.source_ref}#{memory_type}:{index}",
-                    happened_at=happened_at,
-                    emotional_weight=_emotional_weight(item.get("emotional_weight")),
-                    supersede_threshold=self._config.dedup.supersede_threshold,
+                    summary, memory_type, extra, source_ref,
+                    happened_at=happened_at, emotional_weight=emotional_weight,
                 )
 
     async def drain(self) -> None:

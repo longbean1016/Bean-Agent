@@ -253,9 +253,11 @@ IMPLICIT_MEMORY_TOOL: dict[str, Any] = {
                         "type": "object",
                         "properties": {
                             "summary": {"type": "string", "description": "可独立理解的长期执行规则。"},
+                            "scenario": {"type": "string", "description": "该流程适用的稳定场景。"},
                             "emotional_weight": {"type": "integer", "minimum": 0, "maximum": 10},
                             "tool_requirement": {"type": ["string", "null"], "description": "明确要求使用的工具；没有时为 null。"},
                             "steps": {"type": "array", "items": {"type": "string"}, "description": "用户明确要求的执行步骤。"},
+                            "constraints": {"type": "array", "items": {"type": "string"}, "description": "明确的必须、禁止或顺序约束。"},
                             "rule_schema": {
                                 "type": "object",
                                 "properties": {
@@ -267,7 +269,7 @@ IMPLICIT_MEMORY_TOOL: dict[str, Any] = {
                                 "additionalProperties": False,
                             },
                         },
-                        "required": ["summary", "emotional_weight", "tool_requirement", "steps", "rule_schema"],
+                        "required": ["summary", "scenario", "emotional_weight", "tool_requirement", "steps", "constraints", "rule_schema"],
                         "additionalProperties": False,
                     },
                 },
