@@ -48,9 +48,11 @@ keyword_rrf_weight = 0.5 # 关键词检索的融合权重
 max_forced_procedures = 3 # 带工具要求的强制流程单次注入上限
 
 [memory.dedup]
-supersede_threshold = 0.90 # 新事实替代旧事实的相似度阈值
-event_dedup_threshold = 0.92 # 重复事件的相似度阈值
-event_dedup_window_days = 7 # 事件去重的时间窗口天数
+event_candidate_threshold = 0.75 # Event 进入 LLM 语义判断的最低向量相似度
+profile_candidate_threshold = 0.72 # Profile 进入 LLM 语义判断的最低向量相似度
+preference_candidate_threshold = 0.65 # Preference 进入 LLM 语义判断的最低向量相似度
+procedure_candidate_threshold = 0.82 # Procedure 进入 LLM 语义判断的最低向量相似度
+candidate_top_k = 5 # 每条新记忆最多召回 5 条同类型旧记忆供 LLM 选择；Event 固定为 Top 3
 
 [agent]
 workdir = "." # 工具相对工作目录，实际根路径由 workspace 注入

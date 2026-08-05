@@ -225,15 +225,11 @@ def _load_memory_config(data: dict[str, Any]) -> MemoryConfig:
         ),
         # 去重阈值集中配置，避免记忆写入流程中出现散落的魔法数字。
         dedup=DedupConfig(
-            supersede_threshold=float(
-                dedup_raw.get("supersede_threshold", 0.90)
-            ),
-            event_dedup_threshold=float(
-                dedup_raw.get("event_dedup_threshold", 0.92)
-            ),
-            event_dedup_window_days=int(
-                dedup_raw.get("event_dedup_window_days", 7)
-            ),
+            event_candidate_threshold=float(dedup_raw.get("event_candidate_threshold", 0.75)),
+            profile_candidate_threshold=float(dedup_raw.get("profile_candidate_threshold", 0.72)),
+            preference_candidate_threshold=float(dedup_raw.get("preference_candidate_threshold", 0.65)),
+            procedure_candidate_threshold=float(dedup_raw.get("procedure_candidate_threshold", 0.82)),
+            candidate_top_k=int(dedup_raw.get("candidate_top_k", 5)),
         ),
     )
 

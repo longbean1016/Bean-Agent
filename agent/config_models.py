@@ -82,9 +82,11 @@ class RetrievalConfig:
 class DedupConfig:
     """记忆去重与替代阈值。"""
 
-    supersede_threshold: float = 0.90  # 新事实替代旧事实的相似度阈值
-    event_dedup_threshold: float = 0.92  # 相似事件判定为重复的阈值
-    event_dedup_window_days: int = 7  # 事件去重时向前检查的天数
+    event_candidate_threshold: float = 0.75  # Event 进入 LLM 语义判断的最低向量相似度
+    profile_candidate_threshold: float = 0.72  # Profile 进入 LLM 语义判断的最低向量相似度
+    preference_candidate_threshold: float = 0.65  # Preference 进入 LLM 语义判断的最低向量相似度
+    procedure_candidate_threshold: float = 0.82  # Procedure 进入 LLM 语义判断的最低向量相似度
+    candidate_top_k: int = 5  # 每条新记忆最多提供给 LLM 的同类型旧记忆候选数
 
 
 @dataclass

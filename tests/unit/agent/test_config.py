@@ -27,6 +27,7 @@ def test_config_defaults_and_nested_instances_are_independent() -> None:
     assert first.memory.retrieval.procedure_threshold == 0.66
     assert first.memory.retrieval.max_forced_procedures == 3
     assert first.memory.retrieval.max_event_profile == 4
+    assert first.memory.dedup.profile_candidate_threshold == 0.72
     assert first.memory.context_window == 40
     assert first.memory.aligned_context_window == 40
     assert first.memory.keep_count == 20
@@ -100,9 +101,11 @@ max_forced_procedures = 2
 max_event_profile = 2
 
 [memory.dedup]
-supersede_threshold = 0.8
-event_dedup_threshold = 0.85
-event_dedup_window_days = 5
+event_candidate_threshold = 0.74
+profile_candidate_threshold = 0.75
+preference_candidate_threshold = 0.64
+procedure_candidate_threshold = 0.81
+candidate_top_k = 4
 
 [agent]
 workdir = "runtime"
@@ -140,7 +143,11 @@ port = 8000
     assert config.memory.retrieval.max_procedure_preference == 3
     assert config.memory.retrieval.max_forced_procedures == 2
     assert config.memory.retrieval.max_event_profile == 2
-    assert config.memory.dedup.event_dedup_window_days == 5
+    assert config.memory.dedup.event_candidate_threshold == 0.74
+    assert config.memory.dedup.profile_candidate_threshold == 0.75
+    assert config.memory.dedup.preference_candidate_threshold == 0.64
+    assert config.memory.dedup.procedure_candidate_threshold == 0.81
+    assert config.memory.dedup.candidate_top_k == 4
     assert config.memory.context_window == 44
     assert config.memory.keep_count == 22
     assert config.memory.consolidation_min_new_messages == 11
