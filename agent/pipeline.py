@@ -11,7 +11,12 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from agent.attachment_content import build_current_user_content
-from agent.context_budget import DEFAULT_CONTEXT_RETRY_PLANS, slice_complete_turns
+from agent.context_budget import (
+    DEFAULT_CONTEXT_RETRY_PLANS,
+    estimate_payload_tokens,
+    should_compact,
+    slice_complete_turns,
+)
 from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted
 from agent.message_bus import InboundMessage, PipelineResult
 from agent.prompt_assembler import PromptAssembler
@@ -30,6 +35,7 @@ class ProviderApi(Protocol):
 
 
 HistoryLoader = Callable[[str, int | None], Awaitable[list[dict[str, Any]]]]
+ContextCompactor = Callable[..., Awaitable[bool]]
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,7 @@ class Pipeline:
         skills: SkillsLoader | None = None,
         prompt_cache_log: PromptCacheLogWriter | None = None,
         history_loader: HistoryLoader | None = None,
+        context_compactor: ContextCompactor | None = None,
         history_limit: int | None = None,
         max_iterations: int = 10,
         multimodal: bool = True,
@@ -75,6 +82,7 @@ class Pipeline:
         self._skills = skills
         self._prompt_cache_log = prompt_cache_log
         self._history_loader = history_loader
+        self._context_compactor = context_compactor
         # 兼容旧调用方保留参数形状，但默认和主链路都不再按消息数截断历史。
         self._history_limit = None if history_limit is None else max(0, int(history_limit))
         self._max_iterations = max(1, int(max_iterations))
@@ -168,6 +176,7 @@ class Pipeline:
         tools_used: list[str] = []
         thinking_parts: list[str] = []
         last_base_messages: list[dict[str, Any]] = []
+        forced_compaction_attempted = False
 
         def append_turn_thinking(value: str | None) -> None:
             text = str(value or "").strip()
@@ -195,7 +204,7 @@ class Pipeline:
             ))
 
         async def chat_with_context_retry() -> LLMResponse:
-            nonlocal retry_plan_index, last_base_messages
+            nonlocal retry_plan_index, last_base_messages, history, forced_compaction_attempted
             while True:
                 plan = DEFAULT_CONTEXT_RETRY_PLANS[retry_plan_index]
                 history_for_attempt = slice_complete_turns(history, plan.history_ratio)
@@ -214,17 +223,49 @@ class Pipeline:
                     message_timestamp=message_timestamp,
                     disabled_sections=disabled_sections,
                 )
+                tool_schemas = self._tools.get_schemas(
+                    visible_names=tool_view.visible_names,
+                    visible_order=tool_view.visible_order,
+                )
                 # ReAct 后缀可能包含已经执行过的工具结果。超限重试只重建基础
                 # Prompt，原样保留该后缀，避免重复执行有副作用的工具。
                 model_messages = [*assembled.messages, *react_messages]
                 last_base_messages = assembled.messages
+                estimate = (
+                    self._provider.estimate_context_tokens(model_messages, tool_schemas)
+                    if callable(getattr(self._provider, "estimate_context_tokens", None))
+                    else estimate_payload_tokens(model_messages, tool_schemas)
+                )
+                provider_window = int(getattr(self._provider, "context_window", 0) or 0)
+                provider_output = int(getattr(self._provider, "max_tokens", 0) or 0)
+                if (
+                    not react_messages
+                    and self._context_compactor is not None
+                    and should_compact(
+                        estimate,
+                        context_window=provider_window,
+                        max_output_tokens=provider_output,
+                    )
+                ):
+                    compacted = await self._context_compactor(
+                        message.session_key,
+                        estimated_tokens=estimate,
+                        force=False,
+                    )
+                    if compacted and self._history_loader is not None:
+                        history = await self._history_loader(message.session_key, None)
+                        read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
+                        if callable(read_checkpoint):
+                            context.checkpoint_summary = str(
+                                read_checkpoint(message.session_key) or ""
+                            )
+                        # checkpoint 改变了历史边界和动态摘要，必须重新组装完整 payload，
+                        # 不能只替换已生成的 history 列表，否则 system 顺序和 cache key 会漂移。
+                        continue
                 try:
                     response = await self._provider.chat(
                         model_messages,
-                        self._tools.get_schemas(
-                            visible_names=tool_view.visible_names,
-                            visible_order=tool_view.visible_order,
-                        ),
+                        tool_schemas,
                         tool_choice="auto",
                         on_content_delta=on_delta,
                     )
@@ -233,6 +274,26 @@ class Pipeline:
                     context_retry["disabled_sections"] = sorted(disabled_sections)
                     return response
                 except ContextLengthError:
+                    if (
+                        self._context_compactor is not None
+                        and not forced_compaction_attempted
+                        and not react_messages
+                    ):
+                        forced_compaction_attempted = True
+                        compacted = await self._context_compactor(
+                            message.session_key,
+                            estimated_tokens=estimate,
+                            force=True,
+                        )
+                        if compacted and self._history_loader is not None:
+                            history = await self._history_loader(message.session_key, None)
+                            read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
+                            if callable(read_checkpoint):
+                                context.checkpoint_summary = str(
+                                    read_checkpoint(message.session_key) or ""
+                                )
+                            retry_plan_index = 0
+                            continue
                     if retry_plan_index >= len(DEFAULT_CONTEXT_RETRY_PLANS) - 1:
                         raise
                     retry_plan_index += 1

@@ -6,6 +6,7 @@ import asyncio
 import copy
 import logging
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,12 @@ from memory.consolidator import (
     ConsolidationResult,
     Consolidator,
     render_consolidation_conversation,
+)
+from memory.checkpoint import (
+    flatten_units,
+    group_logical_units,
+    render_source_messages,
+    select_compaction_units,
 )
 from memory.contracts import (
     EvidenceRef, MemoryIngestRequest, MemoryIngestResult, MemoryMutation,
@@ -42,6 +49,12 @@ from memory.structured_output import (
 )
 from memory.sufficiency_checker import should_enhance_retrieval
 from session.store import SessionStore
+from session.compaction import (
+    canonical_digest,
+    compaction_scope_id,
+    compaction_source_ref,
+)
+from session.store import SessionCompaction, SessionCompactionPrepare
 
 if TYPE_CHECKING:
     from agent.event_bus import EventBus
@@ -112,9 +125,10 @@ class MemoryEngine:
             if keep_count is None and consolidation_threshold is None
             else derived_keep_count + derived_threshold
         )
+        self._consolidation_extractor = consolidation_extractor or _LLMConsolidationExtractor(provider)
         self._consolidator = Consolidator(
             sessions, self._markdown,
-            consolidation_extractor or _LLMConsolidationExtractor(provider),
+            self._consolidation_extractor,
             keep_count=derived_keep_count, threshold=derived_threshold,
         )
         self._implicit_extractor = implicit_extractor or ImplicitLongTermExtractor(provider)
@@ -332,6 +346,172 @@ class MemoryEngine:
             return ""
         checkpoint = self._sessions.get_active_compaction(key)
         return checkpoint.summary if checkpoint is not None else ""
+
+    async def compact_for_context(
+        self,
+        session_key: str,
+        *,
+        estimated_tokens: int = 0,
+        force: bool = False,
+    ) -> bool:
+        """按 token gate 归档完整 logical units，并提交可恢复 checkpoint。
+
+        该入口只处理已经落库的 closed Turns；当前正在推理的用户输入、ReAct
+        tool batch 和未完成内容不会进入 durable source plan。
+        """
+
+        key = str(session_key or "").strip()
+        if not key:
+            raise ValueError("session_key 不能为空")
+        meta = self._sessions.get_session_meta(key)
+        if meta is None:
+            return False
+        boundary = self._sessions.get_active_message_boundary(key)
+        raw_messages = [
+            item
+            for item in self._sessions.fetch_session_messages(key)
+            if int(item.get("seq", -1)) >= boundary
+        ]
+        units = group_logical_units(raw_messages)
+        if not units:
+            return False
+        context_window = max(0, int(getattr(self._provider, "context_window", 0) or 0))
+        if context_window > 0:
+            keep_recent_tokens = max(1, min(20_000, context_window // 5))
+        else:
+            # provider 容量未知时只有 force（通常来自实际超限）才尝试收敛，
+            # 并按当前估算保留较小尾部，避免重新引入固定消息窗口。
+            if not force:
+                return False
+            keep_recent_tokens = max(1, int(estimated_tokens or 1) // 5)
+        selected_units, retained_units = select_compaction_units(
+            units,
+            keep_recent_tokens=keep_recent_tokens,
+        )
+        if not selected_units:
+            return False
+
+        generation = self._sessions.next_compaction_generation(key)
+        scope_id = compaction_scope_id(key, str(meta["created_at"]))
+        source_ref = compaction_source_ref(scope_id, generation)
+        selected_messages = flatten_units(selected_units)
+        retained_tail = flatten_units(retained_units)
+        source_ids = [str(item["id"]) for item in selected_messages]
+        source_from_seq = int(selected_messages[0]["seq"])
+        consolidated_through_seq = int(selected_messages[-1]["seq"]) + 1
+        source_plan = {
+            "source_from_seq": source_from_seq,
+            "consolidated_through_seq": consolidated_through_seq,
+            "source_message_ids": source_ids,
+            "retained_message_ids": [str(item["id"]) for item in retained_tail],
+            "generation": generation,
+        }
+        source_plan_digest = canonical_digest(source_plan)
+        source_mutation_digest = canonical_digest(selected_messages)
+        previous_summary = self.read_checkpoint_summary(key)
+        conversation = render_source_messages(selected_units)
+        summary = await self._summarize_checkpoint(previous_summary, conversation)
+        now = _now_iso()
+        prepare = SessionCompactionPrepare(
+            session_key=key,
+            session_created_at=str(meta["created_at"]),
+            generation=generation,
+            parent_generation=max(0, generation - 1),
+            source_ref=source_ref,
+            source_plan_digest=source_plan_digest,
+            source_mutation_digest=source_mutation_digest,
+            source_from_seq=source_from_seq,
+            consolidated_through_seq=consolidated_through_seq,
+            source_message_ids=source_ids,
+            selected_source_messages=selected_messages,
+            retained_tail=retained_tail,
+            prepared_at=now,
+        )
+        self._sessions.prepare_compaction(prepare)
+        checkpoint = SessionCompaction(
+            session_key=key,
+            session_created_at=str(meta["created_at"]),
+            generation=generation,
+            parent_generation=max(0, generation - 1),
+            created_at=now,
+            trigger="context_overflow" if force else "soft_limit",
+            summary_format_version=1,
+            summary=summary,
+            source_ref=source_ref,
+            source_plan_digest=source_plan_digest,
+            source_mutation_digest=source_mutation_digest,
+            source_from_seq=source_from_seq,
+            consolidated_through_seq=consolidated_through_seq,
+            source_message_ids=source_ids,
+            selected_source_messages=selected_messages,
+            retained_tail=retained_tail,
+            model_runtime_id=str(getattr(self._provider, "model", "beanagent")),
+            model=str(getattr(self._provider, "model", "")),
+            context_window=context_window,
+            threshold_tokens=(int(context_window * 0.74) if context_window else 0),
+            hard_input_tokens=max(0, context_window - int(getattr(self._provider, "max_tokens", 0) or 0)),
+            keep_recent_tokens=keep_recent_tokens,
+            tokens_before=max(0, int(estimated_tokens)),
+            tokens_after=0,
+            summary_usage={},
+        )
+        # ledger 提交后才推进 active generation；之后的记忆副作用失败不能让
+        # 原文重新回到模型窗口，也不能生成另一代重复覆盖同一 source plan。
+        self._sessions.commit_compaction(checkpoint)
+
+        # summary、event、隐式记忆和 pending 使用同一 selected source；旧提取器
+        # 暂时保留 recent_context 输出，但它不再参与 checkpoint Prompt 注入。
+        draft = await self._consolidation_extractor.extract(
+            selected_messages,
+            previous_summary,
+            current_memory=self._markdown.read_long_term().strip(),
+        )
+        pending_lines = [
+            f"- [{str(item.get('tag') or 'key_info')}] {str(item.get('content') or '').strip()}"
+            for item in draft.pending_items
+            if str(item.get("content") or "").strip()
+        ]
+        if pending_lines:
+            self._markdown.append_pending_once("\n".join(pending_lines), source_ref=source_ref)
+        committed = ConsolidationCommitted(
+            history_entry_payloads=[
+                (str(entry.get("summary") or ""), _emotional_weight(entry.get("emotional_weight")))
+                for entry in draft.history_entries
+                if str(entry.get("summary") or "").strip()
+            ],
+            source_ref=source_ref,
+            scope_channel=key.partition(":")[0],
+            scope_chat_id=key.partition(":")[2],
+            conversation=conversation,
+        )
+        self._store.enqueue_consolidation(source_ref, _consolidation_payload(committed))
+        try:
+            await self.on_consolidation_committed(committed)
+        except Exception:
+            # checkpoint 已 durable commit；outbox 会在下一次维护恢复时重放，
+            # 这里向上抛出只代表副作用未完成，不代表需要重新压缩 source。
+            logger.exception("checkpoint 记忆副作用失败: source_ref=%s", source_ref)
+        return True
+
+    async def _summarize_checkpoint(self, previous_summary: str, conversation: str) -> str:
+        """用上一代 summary + 本轮归档 source 生成稳定 checkpoint 摘要。"""
+
+        prompt = _checkpoint_summary_prompt(previous_summary, conversation)
+        complete = getattr(self._provider, "complete", None)
+        if not callable(complete):
+            return conversation[-12_000:]
+        response = await complete(
+            [
+                {"role": "system", "content": "你是上下文压缩摘要器，只输出可持续的中文摘要。"},
+                {"role": "user", "content": prompt},
+            ],
+            tools=[],
+            max_tokens=min(8192, max(256, int(getattr(self._provider, "max_tokens", 8192) or 8192))),
+            tool_choice="none",
+            disable_thinking=True,
+        )
+        summary = str(getattr(response, "content", "") or "").strip()
+        return summary or conversation[-12_000:]
 
     async def retrieve_for_turn(self, message: Any) -> str:
         text = str(getattr(message, "content", getattr(message, "text", "")) or "")
@@ -1011,6 +1191,26 @@ def _emotional_weight(value: object) -> int:
         return max(0, min(int(value or 0), 10))
     except (TypeError, ValueError):
         return 0
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="microseconds")
+
+
+def _checkpoint_summary_prompt(previous_summary: str, conversation: str) -> str:
+    return f"""请更新上下文压缩摘要。
+
+只依据材料中出现的事实，不补充推测；摘要代表已经归档的旧历史，不能写入当前用户
+输入、未完成工具调用或尚未持久化的内容。保留目标、关键决定、已完成进展、阻塞点、
+下一步和仍需记住的技术细节。使用简洁中文 Markdown，上一代摘要为空时从本轮 source
+建立摘要；上一代摘要非空时要合并而不是机械复制。
+
+【上一代 checkpoint.summary】
+{previous_summary or "（空）"}
+
+【本轮 selected_source_messages】
+{conversation or "（空）"}
+"""
 
 
 def _consolidation_payload(event: ConsolidationCommitted) -> dict[str, object]:

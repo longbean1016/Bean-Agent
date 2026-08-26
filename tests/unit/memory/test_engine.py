@@ -39,6 +39,17 @@ class Provider:
         return type("Response", (), {"content": "<decision>RETRIEVE</decision><history_query>回答风格</history_query>"})()
 
 
+class BudgetProvider(Provider):
+    context_window = 40
+    max_tokens = 8
+    model = "test-budget-model"
+
+
+class EmptyImplicitExtractor:
+    async def extract(self, conversation, existing_profile=""):
+        return ImplicitMemoryDraft()
+
+
 class Extractor:
     async def extract(self, messages, previous_recent_context, *, recent_turns="", current_memory=""):
         return ConsolidationDraft(history_entries=[{"summary": "\u5b8c\u6210\u9879\u76ee", "emotional_weight": 1}], pending_items=[{"tag": "identity", "content": "\u7528\u6237\u662f\u5f00\u53d1\u8005"}], recent_context="# Recent Context\n- \u9879\u76ee\u5f00\u53d1")
@@ -523,6 +534,45 @@ async def test_turn_committed_consolidates_and_syncs_vector_event(tmp_path: Path
     assert any(record.summary == "完成项目" for record in recalled.records)
     assert engine.tool_profile().recall is not None
     assert engine.tool_profile().forget.parameters["required"] == ["ids"]
+
+
+@pytest.mark.asyncio
+async def test_compact_for_context_commits_generation_and_keeps_complete_tail(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(8):
+        sessions.add_message(
+            NewMessage(
+                session_key="web:c",
+                role="user" if index % 2 == 0 else "assistant",
+                content=f"消息 {index}",
+                turn_id=f"t{index // 2}",
+            )
+        )
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path,
+        Embedder(),
+        BudgetProvider(),
+        sessions,
+        config=config,
+        consolidation_extractor=Extractor(),
+        implicit_extractor=EmptyImplicitExtractor(),
+    )
+    try:
+        assert await engine.compact_for_context("web:c", estimated_tokens=35)
+        checkpoint = sessions.get_active_compaction("web:c")
+        assert checkpoint is not None
+        assert checkpoint.generation == 1
+        assert checkpoint.source_message_ids
+        assert checkpoint.source_message_ids[-1] != "web:c:7"
+        history = sessions.load_history("web:c")
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert "消息 0" not in " ".join(str(item.get("content") or "") for item in history)
+    assert "消息 7" in " ".join(str(item.get("content") or "") for item in history)
 
 
 @pytest.mark.asyncio
