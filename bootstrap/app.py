@@ -326,7 +326,6 @@ def build_core_runtime(
         events,
         pipeline,
         sessions,
-        context_guard=memory,
         max_concurrent_turns=config.agent.max_concurrent_turns,
         max_queued_turns=config.agent.max_queued_turns,
     )

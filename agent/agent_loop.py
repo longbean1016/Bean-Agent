@@ -14,7 +14,6 @@ from agent.event_bus import (
     TurnCommitted,
     TurnQueued,
     TurnQueueRejected,
-    TurnPreparing,
     TurnStarted,
 )
 from agent.message_bus import InboundMessage, MessageBus, OutboundMessage, PipelineResult
@@ -78,6 +77,8 @@ class AgentLoop:
         self._events = event_bus
         self._pipeline = pipeline
         self._sessions = sessions
+        # 兼容旧调用方保留引用形状；上下文准备不再由 AgentLoop 触发，token gate
+        # 统一在 Pipeline 组装完整 payload 后执行。
         self._context_guard = context_guard
         self._active_tasks: dict[str, asyncio.Task[None]] = {}
         self._active_turn_ids: dict[str, str] = {}
@@ -176,43 +177,6 @@ class AgentLoop:
         message.metadata["current_user_source_ref"] = (
             await self._sessions.peek_next_message_id(message.session_key)
         )
-        needs_preparation = getattr(self._context_guard, "needs_context_preparation", None)
-        if (
-            self._context_guard is not None
-            and not bool(message.metadata.get("skip_memory_context_guard"))
-            and callable(needs_preparation)
-            and needs_preparation(message.session_key)
-        ):
-            await self._events.emit(TurnPreparing(
-                message.session_key,
-                turn_id,
-                request_id,
-                message.content,
-                list(message.media),
-            ))
-        if (
-            self._context_guard is not None
-            and not bool(message.metadata.get("skip_memory_context_guard"))
-            and not await self._context_guard.ensure_context_ready(message.session_key)
-        ):
-            # 维护异常不写入用户 Session，否则错误文本会被后续记忆提取误当成
-            # 对话事实；前端仍通过本次 Turn 的 final 事件获得明确状态。
-            await self._bus.publish_outbound(
-                OutboundMessage(
-                    message.channel,
-                    message.chat_id,
-                    "记忆归档当前处于异常积压状态，本轮已暂停，请稍后重试。",
-                    metadata={
-                        "turn_id": turn_id,
-                        "request_id": request_id,
-                        "status": "error",
-                        "reason": "memory_context_guard",
-                    },
-                )
-            )
-            await self._sessions.delete_if_empty(message.session_key)
-            return
-
         await self._events.emit(TurnStarted(message.session_key, turn_id, request_id, message.content))
 
         # 首条消息进入运行阶段就生成默认标题，刷新会话列表时可以立即恢复标题。
