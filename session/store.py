@@ -198,7 +198,7 @@ class SessionStore:
     def load_history(
         self,
         session_key: str,
-        limit: int = 40,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """加载最近的持久化消息，并转换成模型可消费的标准消息。"""
 
@@ -1091,11 +1091,7 @@ class SessionStore:
         safe_recent = max(0, int(recent_count))
         with self._lock:
             self._ensure_open()
-            meta = self._conn.execute(
-                "SELECT last_consolidated FROM sessions WHERE key = ?",
-                (key,),
-            ).fetchone()
-            cursor = max(0, int(meta["last_consolidated"] or 0)) if meta else 0
+            cursor = self._active_message_boundary_locked(key)
             count_row = self._conn.execute(
                 """
                 SELECT COUNT(1) AS count
@@ -1190,30 +1186,37 @@ class SessionStore:
     def _load_history_sync(
         self,
         session_key: str,
-        limit: int,
+        limit: int | None,
     ) -> list[dict[str, Any]]:
         key = self._validate_session_key(session_key)
-        safe_limit = max(0, int(limit))
+        safe_limit = None if limit is None else max(0, int(limit))
         if safe_limit == 0:
             return []
 
         with self._lock:
             self._ensure_open()
-            meta = self._conn.execute(
-                "SELECT last_consolidated FROM sessions WHERE key = ?",
-                (key,),
-            ).fetchone()
-            cursor = max(0, int(meta["last_consolidated"] or 0)) if meta else 0
-            rows = self._conn.execute(
-                f"""
-                SELECT {_MESSAGE_COLUMNS}
-                FROM messages
-                WHERE session_key = ? AND seq >= ?
-                ORDER BY seq DESC
-                LIMIT ?
-                """,
-                (key, cursor, safe_limit),
-            ).fetchall()
+            cursor = self._active_message_boundary_locked(key)
+            if safe_limit is None:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT {_MESSAGE_COLUMNS}
+                    FROM messages
+                    WHERE session_key = ? AND seq >= ?
+                    ORDER BY seq DESC
+                    """,
+                    (key, cursor),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT {_MESSAGE_COLUMNS}
+                    FROM messages
+                    WHERE session_key = ? AND seq >= ?
+                    ORDER BY seq DESC
+                    LIMIT ?
+                    """,
+                    (key, cursor, safe_limit),
+                ).fetchall()
 
             # limit 只决定基础窗口大小。若窗口从 assistant 开始，继续向前
             # 补到最近的 user，避免把同一 Turn 的 user/assistant/tool_chain
@@ -1249,6 +1252,36 @@ class SessionStore:
         for message in persisted:
             history.extend(self._message_to_history(message))
         return history
+
+    def get_active_message_boundary(self, session_key: str) -> int:
+        """返回 active generation 覆盖到的消息 seq；无 ledger 时兼容旧 cursor。"""
+
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            return self._active_message_boundary_locked(key)
+
+    def _active_message_boundary_locked(self, key: str) -> int:
+        """在持有 SQLite 锁时解析 generation -> message seq 的唯一映射。"""
+
+        meta = self._conn.execute(
+            "SELECT last_consolidated FROM sessions WHERE key = ?",
+            (key,),
+        ).fetchone()
+        generation = max(0, int(meta["last_consolidated"] or 0)) if meta else 0
+        if generation <= 0:
+            return generation
+        checkpoint = self._conn.execute(
+            """
+            SELECT consolidated_through_seq
+            FROM session_compactions
+            WHERE session_key = ? AND generation = ? AND invalidated_at IS NULL
+            """,
+            (key, generation),
+        ).fetchone()
+        # 旧版本或人工修复可能只更新了 sessions；在对应 ledger 缺失时保留
+        # legacy cursor 行为，避免把已归档消息重新暴露给模型。
+        return int(checkpoint["consolidated_through_seq"]) if checkpoint else generation
 
     def _fetch_messages_sync(
         self,

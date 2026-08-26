@@ -29,7 +29,7 @@ class ProviderApi(Protocol):
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, **kwargs: Any) -> LLMResponse: ...
 
 
-HistoryLoader = Callable[[str, int], Awaitable[list[dict[str, Any]]]]
+HistoryLoader = Callable[[str, int | None], Awaitable[list[dict[str, Any]]]]
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ class Pipeline:
         skills: SkillsLoader | None = None,
         prompt_cache_log: PromptCacheLogWriter | None = None,
         history_loader: HistoryLoader | None = None,
-        history_limit: int = 40,
+        history_limit: int | None = None,
         max_iterations: int = 10,
         multimodal: bool = True,
         vl_available: bool = False,
@@ -75,7 +75,8 @@ class Pipeline:
         self._skills = skills
         self._prompt_cache_log = prompt_cache_log
         self._history_loader = history_loader
-        self._history_limit = max(0, int(history_limit))
+        # 兼容旧调用方保留参数形状，但默认和主链路都不再按消息数截断历史。
+        self._history_limit = None if history_limit is None else max(0, int(history_limit))
         self._max_iterations = max(1, int(max_iterations))
         # 图片能力在应用组装时确定，Turn 内只读取这份稳定快照。纯文本主模型不能
         # 接收 image_url；独立 VL 可用时则由现有 ReAct 工具链负责真正读图。
@@ -118,7 +119,7 @@ class Pipeline:
         skip_memory = bool(message.metadata.get("skip_memory_retrieval"))
         suppress_stream = bool(message.metadata.get("suppress_stream_events"))
         history = (
-            await self._history_loader(message.session_key, self._history_limit)
+            await self._history_loader(message.session_key, None)
             if self._history_loader and not skip_history
             else []
         )

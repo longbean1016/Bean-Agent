@@ -368,12 +368,16 @@ class SessionManager:
         """
 
         session = await self.get_or_create(session_key)
-        actual_limit = self._history_window if limit is None else max(0, int(limit))
-        # MemoryEngine 直接持有同一个 Store 并在后台推进 cursor；缓存 Session
-        # 不会自动收到该变更，因此每次模型加载前以 SQLite 元数据为权威同步。
-        persisted_cursor = self._store.get_cursor(session.key)
-        cursor = max(0, min(int(persisted_cursor), len(session.messages)))
-        session.last_consolidated = cursor
+        actual_limit = len(session.messages) if limit is None else max(0, int(limit))
+        # MemoryEngine 直接持有同一个 Store 并在后台推进 generation；缓存 Session
+        # 不会自动收到该变更，因此每次模型加载前以 ledger 的消息边界为权威。
+        # Session 快照仍回写 generation 指针，供旧的 UI/测试观察；真正的消息边界
+        # 单独从 active checkpoint 读取，不能再把这两个数混作一个 cursor。
+        session.last_consolidated = self._store.get_cursor(session.key)
+        cursor = max(
+            0,
+            min(self._store.get_active_message_boundary(session.key), len(session.messages)),
+        )
         start = max(cursor, len(session.messages) - actual_limit)
         return session.get_history(
             max_messages=actual_limit,
