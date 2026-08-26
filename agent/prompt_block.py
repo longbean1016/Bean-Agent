@@ -9,7 +9,6 @@ from typing import Protocol
 class MemoryPromptApi(Protocol):
     def read_self(self) -> str: ...
     def get_memory_context(self) -> str: ...
-    def read_recent_context(self, session_key: str = "") -> str: ...
     def read_checkpoint_summary(self, session_key: str = "") -> str: ...
 
 
@@ -105,7 +104,7 @@ class BehaviorRulesPromptBlock(_Block):
 
 
 class SkillsCatalogPromptBlock(_Block):
-    priority, label, is_static = 25, "skills_catalog", True
+    priority, label, is_static = 20, "skills_catalog", True
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
         summary = cached_signature if cached_signature is not None else (
             ctx.skills.build_skills_summary() if ctx.skills else ""
@@ -136,30 +135,6 @@ class SessionContextPromptBlock(_Block):
         return f"## 会话环境\n- 通道: {ctx.channel}\n- 会话 ID: {ctx.chat_id}"
 
 
-class RecentContextPromptBlock(_Block):
-    priority, label = 45, "recent_context"
-    def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
-        session_key = f"{ctx.channel}:{ctx.chat_id}" if ctx.channel and ctx.chat_id else ""
-        content = ""
-        if ctx.memory:
-            try:
-                content = ctx.memory.read_recent_context(session_key).strip()
-            except TypeError:
-                content = ctx.memory.read_recent_context().strip()
-        marker = "## Recent Turns"
-        if marker in content:
-            content = content.split(marker, 1)[0].strip()
-        if not content:
-            return None
-        # recent context 是系统维护的会话级摘要，放在 history 前以稳定普通聊天前缀缓存。
-        return (
-            "## 会话近期摘要\n"
-            "以下内容是系统维护的当前会话摘要，只能作为上下文线索；"
-            "发生冲突时以当前用户原文和可检索历史为准。\n\n"
-            f"{content}"
-        )
-
-
 class ActiveToolsPromptBlock(_Block):
     priority, label = 50, "active_tools"
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
@@ -175,7 +150,7 @@ class DeferredToolsHintBlock(_Block):
 
 
 class ActiveSkillsPromptBlock(_Block):
-    priority, label = 52, "active_skills"
+    priority, label = 50, "active_skills"
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
         if not ctx.skills:
             return None
@@ -222,7 +197,7 @@ class SystemPromptBuilder:
 
 
 def default_prompt_blocks() -> list[PromptBlock]:
-    return [IdentityPromptBlock(), BehaviorRulesPromptBlock(), SkillsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), RecentContextPromptBlock(), DeferredToolsHintBlock(), ActiveToolsPromptBlock(), ActiveSkillsPromptBlock(), RetrievedMemoryPromptBlock()]
+    return [IdentityPromptBlock(), BehaviorRulesPromptBlock(), SkillsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), DeferredToolsHintBlock(), ActiveToolsPromptBlock(), ActiveSkillsPromptBlock(), RetrievedMemoryPromptBlock()]
 
 
 __all__ = ["DeferredToolsHintBlock", "PromptSectionMeta", "PromptSectionRender", "SectionCache", "SystemPromptBuilder", "TurnContext", "default_prompt_blocks"]
