@@ -28,11 +28,7 @@ def test_config_defaults_and_nested_instances_are_independent() -> None:
     assert first.memory.retrieval.max_forced_procedures == 3
     assert first.memory.retrieval.max_event_profile == 4
     assert first.memory.dedup.profile_candidate_threshold == 0.72
-    assert first.memory.context_window == 40
-    assert first.memory.aligned_context_window == 40
-    assert first.memory.keep_count == 20
-    assert first.memory.consolidation_min_new_messages == 10
-    assert first.memory.context_guard_threshold == 40
+    assert first.memory.context_window == 0
     assert first.agent.max_concurrent_turns == 5
     assert first.agent.max_queued_turns == 20
     assert first.channels.chat.port == 6322
@@ -149,9 +145,6 @@ port = 8000
     assert config.memory.dedup.procedure_candidate_threshold == 0.81
     assert config.memory.dedup.candidate_top_k == 4
     assert config.memory.context_window == 44
-    assert config.memory.keep_count == 22
-    assert config.memory.consolidation_min_new_messages == 11
-    assert config.memory.context_guard_threshold == 44
     assert config.agent.workdir == "runtime"
     assert config.agent.max_concurrent_turns == 3
     assert config.agent.max_queued_turns == 12
@@ -160,7 +153,7 @@ port = 8000
     assert config.channels.chat.channel_name == "web"
 
 
-def test_session_history_window_does_not_override_memory_default(
+def test_legacy_session_history_window_does_not_configure_token_gate(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "legacy.toml"
@@ -171,12 +164,11 @@ def test_session_history_window_does_not_override_memory_default(
 
     config = load_config(config_path)
 
-    assert config.memory.context_window == 40
-    assert config.memory.keep_count == 20
+    assert config.memory.context_window == 0
     assert not hasattr(config, "session")
 
 
-def test_memory_context_window_rounds_up_to_message_boundary(tmp_path: Path) -> None:
+def test_legacy_memory_context_window_is_not_a_message_strategy(tmp_path: Path) -> None:
     config_path = tmp_path / "rounding.toml"
     config_path.write_text(
         "[memory]\ncontext_window = 41\n",
@@ -185,20 +177,14 @@ def test_memory_context_window_rounds_up_to_message_boundary(tmp_path: Path) -> 
 
     memory = load_config(config_path).memory
 
-    assert memory.aligned_context_window == 44
-    assert memory.keep_count == 22
-    assert memory.consolidation_min_new_messages == 11
-    assert memory.context_guard_threshold == 44
+    assert memory.context_window == 41
 
 
-def test_memory_context_guard_never_precedes_background_threshold() -> None:
+def test_memory_context_window_does_not_control_context_guard() -> None:
     memory = Config().memory
     memory.context_window = 4
 
-    assert memory.aligned_context_window == 4
-    assert memory.keep_count == 2
-    assert memory.consolidation_min_new_messages == 5
-    assert memory.context_guard_threshold == 7
+    assert memory.context_window == 4
 
 
 def test_explicit_base_url_overrides_provider_preset(tmp_path: Path) -> None:

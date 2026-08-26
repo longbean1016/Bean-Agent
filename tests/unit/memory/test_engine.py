@@ -514,7 +514,7 @@ async def test_context_query_can_explicitly_require_session_scope(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_turn_committed_consolidates_and_syncs_vector_event(tmp_path: Path) -> None:
+async def test_turn_committed_does_not_trigger_checkpoint_compression(tmp_path: Path) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
     for index in range(6):
         sessions.add_message(NewMessage(session_key="web:c", role="user" if index % 2 == 0 else "assistant", content=f"消息 {index}"))
@@ -524,14 +524,14 @@ async def test_turn_committed_consolidates_and_syncs_vector_event(tmp_path: Path
     try:
         await engine.on_turn_committed(type("Event", (), {"session_key": "web:c", "channel": "web", "chat_id": "c", "input_message": "消息 4", "assistant_response": "消息 5", "tool_chain_raw": []})())
         await engine.drain()
-        recalled = await engine.query(MemoryQuery("完成项目"))
         cursor = sessions.get_cursor("web:c")
+        checkpoint = sessions.get_active_compaction("web:c")
     finally:
         await engine.close()
         sessions.close()
 
-    assert cursor == 4
-    assert any(record.summary == "完成项目" for record in recalled.records)
+    assert cursor == 0
+    assert checkpoint is None
     assert engine.tool_profile().recall is not None
     assert engine.tool_profile().forget.parameters["required"] == ["ids"]
 
@@ -576,7 +576,54 @@ async def test_compact_for_context_commits_generation_and_keeps_complete_tail(tm
 
 
 @pytest.mark.asyncio
-async def test_turn_committed_only_enqueues_background_memory_work(tmp_path: Path) -> None:
+async def test_checkpoint_side_effect_failure_replays_saved_candidates(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(6):
+        sessions.add_message(
+            NewMessage(
+                session_key="web:c",
+                role="user" if index % 2 == 0 else "assistant",
+                content=f"消息 {index}",
+                turn_id=f"t{index // 2}",
+            )
+        )
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path,
+        Embedder(),
+        BudgetProvider(),
+        sessions,
+        config=config,
+        consolidation_extractor=Extractor(),
+        implicit_extractor=EmptyImplicitExtractor(),
+    )
+    original = engine._save_implicit_long_term
+    failed = False
+
+    async def fail_once(draft, event):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("模拟副作用失败")
+        await original(draft, event)
+
+    engine._save_implicit_long_term = fail_once
+    try:
+        assert await engine.compact_for_context("web:c", estimated_tokens=35)
+        checkpoint = sessions.get_active_compaction("web:c")
+        assert checkpoint is not None
+        assert len(engine._store.list_pending_consolidations()) == 1
+        engine._save_implicit_long_term = original
+        await engine.replay_pending_consolidations()
+        assert engine._store.list_pending_consolidations() == []
+    finally:
+        await engine.close()
+        sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_committed_does_not_wait_for_checkpoint_extractor(tmp_path: Path) -> None:
     import asyncio
 
     class SlowExtractor:
@@ -597,7 +644,7 @@ async def test_turn_committed_only_enqueues_background_memory_work(tmp_path: Pat
         )
         assert sessions.get_cursor("web:c") == 0
         await engine.drain()
-        assert sessions.get_cursor("web:c") == 3
+        assert sessions.get_cursor("web:c") == 0
     finally:
         await engine.close()
         sessions.close()
@@ -636,7 +683,7 @@ async def test_context_guard_skips_consolidation_below_threshold(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_default_context_guard_starts_at_40_pending_messages(tmp_path: Path) -> None:
+async def test_context_guard_never_uses_message_count(tmp_path: Path) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
     for index in range(39):
         sessions.add_message(
@@ -650,14 +697,14 @@ async def test_default_context_guard_starts_at_40_pending_messages(tmp_path: Pat
         sessions.add_message(
             NewMessage(session_key="web:c", role="user", content="第 40 条消息")
         )
-        assert engine.needs_context_preparation("web:c") is True
+        assert engine.needs_context_preparation("web:c") is False
     finally:
         await engine.close()
         sessions.close()
 
 
 @pytest.mark.asyncio
-async def test_context_guard_consolidates_and_requires_cursor_progress(
+async def test_context_guard_does_not_consolidate_or_move_cursor(
     tmp_path: Path,
 ) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
@@ -685,11 +732,11 @@ async def test_context_guard_consolidates_and_requires_cursor_progress(
         sessions.close()
 
     assert ready is True
-    assert cursor == 3
+    assert cursor == 0
 
 
 @pytest.mark.asyncio
-async def test_context_guard_blocks_when_consolidation_fails(tmp_path: Path) -> None:
+async def test_context_guard_ignores_consolidation_failures(tmp_path: Path) -> None:
     class FailingExtractor:
         async def extract(self, messages, previous_recent_context):
             raise RuntimeError("压缩失败")
@@ -718,12 +765,12 @@ async def test_context_guard_blocks_when_consolidation_fails(tmp_path: Path) -> 
         await engine.close()
         sessions.close()
 
-    assert ready is False
+    assert ready is True
     assert cursor == 0
 
 
 @pytest.mark.asyncio
-async def test_context_guard_does_not_advance_cursor_when_outbox_fails(
+async def test_context_guard_does_not_write_outbox(
     tmp_path: Path,
 ) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
@@ -755,7 +802,7 @@ async def test_context_guard_does_not_advance_cursor_when_outbox_fails(
         await engine.close()
         sessions.close()
 
-    assert ready is False
+    assert ready is True
     assert cursor == 0
 
 
@@ -814,7 +861,7 @@ async def test_turn_snapshot_can_be_rebuilt_from_persisted_message_ids(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_post_response_failure_does_not_block_consolidation(tmp_path: Path) -> None:
+async def test_post_response_failure_does_not_trigger_consolidation(tmp_path: Path) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
     for index in range(4):
         sessions.add_message(NewMessage(session_key="web:c", role="user", content=f"消息 {index}"))
@@ -838,14 +885,14 @@ async def test_post_response_failure_does_not_block_consolidation(tmp_path: Path
     try:
         await engine.on_turn_committed({"session_key": "web:c", "channel": "web", "chat_id": "c"})
         await engine.drain()
-        assert sessions.get_cursor("web:c") == 3
+        assert sessions.get_cursor("web:c") == 0
     finally:
         await engine.close()
         sessions.close()
 
 
 @pytest.mark.asyncio
-async def test_close_drains_pending_work_and_is_idempotent(tmp_path: Path) -> None:
+async def test_close_drains_post_response_work_and_is_idempotent(tmp_path: Path) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
     for index in range(4):
         sessions.add_message(NewMessage(session_key="web:c", role="user", content=f"消息 {index}"))
@@ -866,7 +913,7 @@ async def test_close_drains_pending_work_and_is_idempotent(tmp_path: Path) -> No
     await engine.close()
     await engine.close()
 
-    assert sessions.get_cursor("web:c") == 3
+    assert sessions.get_cursor("web:c") == 0
     sessions.close()
 
 
@@ -914,70 +961,24 @@ async def test_committed_turn_invalidates_old_preference_through_engine_queue(tm
 
 
 @pytest.mark.asyncio
-async def test_consolidation_maintenance_runs_different_sessions_concurrently(tmp_path: Path) -> None:
-    import asyncio
-
+async def test_turn_committed_does_not_start_maintenance_tasks(tmp_path: Path) -> None:
     sessions = SessionStore(tmp_path / "sessions.db")
     config = MemoryConfig(enabled=True)
     config.embedding.dimensions = 2
     engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
-    both_started = asyncio.Event()
-    release = asyncio.Event()
-    started: set[str] = set()
-
-    async def slow(event):
-        started.add(event.session_key)
-        if len(started) == 2:
-            both_started.set()
-        await release.wait()
-
-    engine._run_consolidation = slow
     try:
         await engine.on_turn_committed({"session_key": "web:a"})
         await engine.on_turn_committed({"session_key": "web:b"})
-        await asyncio.wait_for(both_started.wait(), timeout=0.05)
-        release.set()
-        await engine.drain()
-    finally:
-        release.set()
-        await engine.close()
-        sessions.close()
-
-    assert started == {"web:a", "web:b"}
-
-
-@pytest.mark.asyncio
-async def test_consolidation_maintenance_serializes_same_session(tmp_path: Path) -> None:
-    import asyncio
-
-    sessions = SessionStore(tmp_path / "sessions.db")
-    config = MemoryConfig(enabled=True)
-    config.embedding.dimensions = 2
-    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
-    active = 0
-    max_active = 0
-
-    async def observe(_event):
-        nonlocal active, max_active
-        active += 1
-        max_active = max(max_active, active)
-        await asyncio.sleep(0.01)
-        active -= 1
-
-    engine._run_consolidation = observe
-    try:
-        await engine.on_turn_committed({"session_key": "web:a"})
-        await engine.on_turn_committed({"session_key": "web:a"})
         await engine.drain()
     finally:
         await engine.close()
         sessions.close()
 
-    assert max_active == 1
+    assert not hasattr(engine, "_maintenance_tasks")
 
 
 @pytest.mark.asyncio
-async def test_implicit_memory_failure_keeps_outbox_for_recovery(tmp_path: Path) -> None:
+async def test_implicit_memory_failure_does_not_commit_checkpoint(tmp_path: Path) -> None:
     class FailingImplicitExtractor:
         async def extract(self, conversation, existing_profile=""):
             raise RuntimeError("隐式提取失败")
@@ -993,22 +994,16 @@ async def test_implicit_memory_failure_keeps_outbox_for_recovery(tmp_path: Path)
         keep_count=1, consolidation_threshold=3,
     )
     try:
-        await engine.on_turn_committed({"session_key": "web:c", "channel": "web", "chat_id": "c"})
-        await engine.drain()
-        cursor = sessions.get_cursor("web:c")
-        pending_before = engine._store.list_pending_consolidations()
-        engine._implicit_extractor = type("Recovered", (), {
-            "extract": lambda self, conversation, existing_profile="": _empty_implicit()
-        })()
-        await engine.replay_pending_consolidations()
-        pending_after = engine._store.list_pending_consolidations()
+        with pytest.raises(RuntimeError, match="隐式提取失败"):
+            await engine.compact_for_context("web:c", estimated_tokens=35, force=True)
+        checkpoint = sessions.get_active_compaction("web:c")
+        pending = engine._store.list_pending_consolidations()
     finally:
         await engine.close()
         sessions.close()
 
-    assert cursor == 3
-    assert len(pending_before) == 1
-    assert pending_after == []
+    assert checkpoint is None
+    assert pending == []
 
 
 @pytest.mark.asyncio
@@ -1098,10 +1093,9 @@ async def test_consolidation_saves_all_implicit_memory_types(tmp_path: Path) -> 
         keep_count=1, consolidation_threshold=3,
     )
     try:
-        await engine.on_turn_committed({"session_key": "web:c", "channel": "web", "chat_id": "c"})
-        await engine.drain()
+        assert await engine.compact_for_context("web:c", estimated_tokens=35, force=True)
         items = engine._store.get_items_by_ids([str(row["id"]) for row in engine._store._active_rows(None)])
-        cursor = sessions.get_cursor("web:c")
+        checkpoint = sessions.get_active_compaction("web:c")
     finally:
         await engine.close()
         sessions.close()
@@ -1110,4 +1104,4 @@ async def test_consolidation_saves_all_implicit_memory_types(tmp_path: Path) -> 
     procedure = next(item for item in items if item["memory_type"] == "procedure")
     assert procedure["extra_json"]["tool_requirement"] == "shell"
     assert procedure["extra_json"]["steps"] == ["运行测试"]
-    assert cursor == 3
+    assert checkpoint is not None

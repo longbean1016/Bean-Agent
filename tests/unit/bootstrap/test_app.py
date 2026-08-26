@@ -35,12 +35,9 @@ def test_build_core_runtime_wires_singletons_and_all_tools(tmp_path: Path) -> No
 
     runtime = build_core_runtime(config, tmp_path / "workspace", provider=provider, embedder=embedder)
 
-    assert runtime.sessions._history_window == config.memory.context_window
-    assert runtime.pipeline._history_limit == config.memory.context_window
     assert runtime.memory is not None
-    assert runtime.memory._consolidator._keep_count == config.memory.keep_count
-    assert runtime.memory._consolidator._threshold == config.memory.consolidation_min_new_messages
-    assert runtime.memory._context_guard_threshold == config.memory.context_guard_threshold
+    assert not hasattr(runtime.pipeline, "_history_limit")
+    assert not hasattr(runtime.memory, "_consolidator")
 
     assert runtime.provider is provider
     assert runtime.embedder is embedder
@@ -136,7 +133,7 @@ def test_fastapi_exposes_real_websocket_route(tmp_path: Path) -> None:
             assert runtime.sessions.store.get_session_meta(session_key)["next_seq"] == 0
 
 
-def test_chat_session_route_returns_spa_index(tmp_path: Path) -> None:
+def test_chat_session_route_returns_spa_index_or_build_hint(tmp_path: Path) -> None:
     config = Config()
     config.memory.enabled = False
     runtime = build_core_runtime(config, tmp_path / "workspace", provider=Provider())
@@ -146,7 +143,9 @@ def test_chat_session_route_returns_spa_index(tmp_path: Path) -> None:
         response = client.get("/chat/example-session")
 
     assert response.status_code == 200
-    assert "text/html" in response.headers["content-type"]
+    assert response.headers["content-type"].split(";", 1)[0] in {
+        "text/html", "application/json"
+    }
 
 
 @pytest.mark.asyncio

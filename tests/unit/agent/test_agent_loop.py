@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent.agent_loop import AgentLoop
-from agent.event_bus import EventBus, SessionUpdated, TurnCommitted, TurnPreparing, TurnStarted
+from agent.event_bus import EventBus, SessionUpdated, TurnCommitted, TurnStarted
 from agent.message_bus import InboundMessage, MessageBus, PipelineResult
 from agent.config_models import MemoryConfig
 from memory.consolidator import ConsolidationDraft
@@ -37,7 +37,7 @@ class PreparingContextGuard(BlockingContextGuard):
 
 
 @pytest.mark.asyncio
-async def test_context_guard_emits_preparing_before_ensuring_context(tmp_path: Path) -> None:
+async def test_context_guard_is_not_called_before_pipeline(tmp_path: Path) -> None:
     class OrderedGuard(PreparingContextGuard):
         def __init__(self) -> None:
             super().__init__(True)
@@ -56,15 +56,14 @@ async def test_context_guard_emits_preparing_before_ensuring_context(tmp_path: P
     sessions = SessionManager(tmp_path)
     guard = OrderedGuard()
     received: list[object] = []
-    events.on(TurnPreparing, lambda event: received.append(event))
     events.on(TurnStarted, lambda event: received.append(event))
     loop = AgentLoop(bus, events, Pipeline(), sessions, context_guard=guard)
     await bus.publish_inbound(InboundMessage("web", "u", "c", "question", metadata={"request_id": "r1"}))
 
     await loop.run_once()
 
-    assert [type(event) for event in received] == [TurnPreparing, TurnStarted]
-    assert guard.order == ["preflight", "ensure"]
+    assert [type(event) for event in received] == [TurnStarted]
+    assert guard.order == []
     await sessions.close()
 
 
@@ -210,20 +209,16 @@ async def test_agent_loop_persists_and_dispatches_context_retry_trace(
 
 
 @pytest.mark.asyncio
-async def test_context_guard_blocks_pipeline_without_persisting_error_turn(
+async def test_context_guard_does_not_block_pipeline(
     tmp_path: Path,
 ) -> None:
-    class ForbiddenPipeline:
-        async def process(self, message, *, turn_id):
-            raise AssertionError("积压保护失败时不应进入 Pipeline")
-
     bus = MessageBus()
     sessions = SessionManager(tmp_path)
     guard = BlockingContextGuard(False)
     loop = AgentLoop(
         bus,
         EventBus(),
-        ForbiddenPipeline(),
+        Pipeline(),
         sessions,
         context_guard=guard,
     )
@@ -234,9 +229,11 @@ async def test_context_guard_blocks_pipeline_without_persisting_error_turn(
     await loop.run_once()
 
     outbound = await bus.consume_outbound()
-    assert guard.calls == ["web:c"]
-    assert "记忆归档" in outbound.content
-    assert sessions.store.fetch_session_messages("web:c") == []
+    assert guard.calls == []
+    assert outbound.content == "回答"
+    assert [row["role"] for row in sessions.store.fetch_session_messages("web:c")] == [
+        "user", "assistant"
+    ]
     await sessions.close()
 
 
