@@ -736,7 +736,7 @@ def _assembler(tmp_path: Path) -> PromptAssembler:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_trims_history_by_complete_turn_after_prompt_sections(
+async def test_pipeline_does_not_trim_history_after_prompt_overflow(
     tmp_path: Path,
 ) -> None:
     class OverflowProvider:
@@ -779,36 +779,19 @@ async def test_pipeline_trims_history_by_complete_turn_after_prompt_sections(
         history_loader=history,
     )
 
-    result = await pipeline.process(
-        InboundMessage(channel="web", sender="u", chat_id="c", content="当前问题"),
-        turn_id="trim-history",
-    )
+    with pytest.raises(ContextLengthError, match="maximum context length exceeded"):
+        await pipeline.process(
+            InboundMessage(channel="web", sender="u", chat_id="c", content="当前问题"),
+            turn_id="trim-history",
+        )
 
-    assert result.content == "裁剪成功"
-    assert [item["role"] for item in provider.messages[5][1:5]] == [
-        "user",
-        "assistant",
-        "tool",
-        "assistant",
-    ]
-    assert "历史工具结果" in str(provider.messages[5])
-    assert "最近问题" in str(provider.messages[5])
-    assert "当前问题" in str(provider.messages[5])
-    assert "必须保留的长期记忆" not in str(provider.messages[5][0]["content"])
-    assert "用户偏好简洁" not in str(provider.messages[5])
-    assert result.context_retry["selected_plan"] == "half_history"
-    assert [item["name"] for item in result.context_retry["attempts"]] == [
-        "full",
-        "trim_skills_catalog",
-        "trim_auxiliary_context",
-        "trim_retrieved_memory",
-        "trim_long_term_memory",
-        "half_history",
-    ]
+    assert len(provider.messages) == 1
+    assert "历史工具结果" in str(provider.messages[0])
+    assert "当前问题" in str(provider.messages[0])
 
 
 @pytest.mark.asyncio
-async def test_pipeline_disables_low_priority_sections_after_latest_turn(
+async def test_pipeline_does_not_disable_prompt_sections_after_overflow(
     tmp_path: Path,
 ) -> None:
     class SectionProvider:
@@ -845,21 +828,16 @@ async def test_pipeline_disables_low_priority_sections_after_latest_turn(
         history_loader=history,
     )
 
-    await pipeline.process(
-        InboundMessage(channel="web", sender="u", chat_id="c", content="当前问题"),
-        turn_id="trim-sections",
-    )
+    with pytest.raises(ContextLengthError, match="too many tokens"):
+        await pipeline.process(
+            InboundMessage(channel="web", sender="u", chat_id="c", content="当前问题"),
+            turn_id="trim-sections",
+        )
 
-    final_payload = str(provider.messages[-1])
-    assert "最近问题" in final_payload
-    assert "最近回答" in final_payload
-    assert "当前问题" in final_payload
+    assert len(provider.messages) == 1
+    final_payload = str(provider.messages[0])
     assert "关键长期记忆" in final_payload
-    assert "用户偏好简洁" not in final_payload
-    assert "当前活跃工具" not in final_payload
-    assert "可裁剪的近期上下文" in final_payload
-    assert "会话环境" not in final_payload
-    assert "可裁剪的自我认知" not in final_payload
+    assert "可裁剪的自我认知" in final_payload
 
 
 @pytest.mark.asyncio
@@ -889,7 +867,7 @@ async def test_pipeline_context_trimming_is_finite_and_reraises_original_error(
             turn_id="trim-bottom",
         )
 
-    assert provider.calls == 7
+    assert provider.calls == 1
 
 
 @pytest.mark.asyncio
@@ -928,11 +906,11 @@ async def test_pipeline_context_retry_after_tool_does_not_execute_tool_twice(
         workspace=str(tmp_path),
     )
 
-    result = await pipeline.process(
-        InboundMessage(channel="web", sender="u", chat_id="c", content="调用一次工具"),
-        turn_id="trim-tool",
-    )
+    with pytest.raises(ContextLengthError, match="tool continuation overflow"):
+        await pipeline.process(
+            InboundMessage(channel="web", sender="u", chat_id="c", content="调用一次工具"),
+            turn_id="trim-tool",
+        )
 
-    assert result.content == "工具续轮成功"
     assert tool.calls == 1
-    assert result.context_retry["selected_plan"] == "trim_skills_catalog"
+    assert provider.calls == 2

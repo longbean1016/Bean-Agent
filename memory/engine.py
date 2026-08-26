@@ -544,7 +544,7 @@ class MemoryEngine:
         return MemoryIngestResult(accepted=True, summary="Turn 已进入记忆后台处理队列")
 
     async def on_turn_committed(self, event: Any) -> None:
-        """将已持久化 Turn 快照投递给两条独立后台处理链。"""
+        """将已持久化 Turn 快照投递给每轮记忆链；checkpoint 由 token gate 触发。"""
 
         status = event.get("status") if isinstance(event, dict) else getattr(event, "status", "ok")
         if str(status or "ok") != "ok":
@@ -556,7 +556,6 @@ class MemoryEngine:
         # put_nowait 是 Turn 提交边界的关键：回复发送与 Session 提交不等待 LLM 提取、
         # 向量化或 Markdown IO，后台失败也不会回滚已经落库的对话。
         self._post_response_queue.put_nowait(snapshot)
-        self._enqueue_maintenance(snapshot)
 
     def bind_events(self, event_bus: EventBus) -> None:
         """订阅正式 TurnCommitted；重复绑定同一总线保持幂等。"""
@@ -608,47 +607,18 @@ class MemoryEngine:
         return result
 
     async def ensure_context_ready(self, session_key: str) -> bool:
-        """在普通 Turn 前确保未归档历史没有越过安全阈值。
+        """兼容旧 ContextGuard API；token gate 已在 Pipeline 组装完整 payload 时执行。"""
 
-        正常压缩仍由 TurnCommitted 后台触发；这里只处理后台尚未完成或曾经
-        失败的积压。cursor 必须真实推进才算恢复，避免压缩器静默跳过后继续
-        把过量原文送入模型。
-        """
-
-        key = str(session_key or "").strip()
-        if not key:
+        if not str(session_key or "").strip():
             raise ValueError("session_key 不能为空")
-        messages = self._sessions.fetch_session_messages(key)
-        before = max(0, min(self._sessions.get_cursor(key), len(messages)))
-        if len(messages) - before < self._context_guard_threshold:
-            return True
-
-        channel, _, chat_id = key.partition(":")
-        event = TurnIngested(
-            session_key=key,
-            channel=channel,
-            chat_id=chat_id,
-            user_message="",
-            assistant_response="",
-            tool_chain=[],
-            source_ref=key,
-        )
-        try:
-            await self._run_consolidation_serialized(event)
-        except Exception:
-            logger.exception("Turn 前记忆归档失败: session_key=%s", key)
-            return False
-        return self._sessions.get_cursor(key) > before
+        return True
 
     def needs_context_preparation(self, session_key: str) -> bool:
-        """只判断下一轮是否需要同步归档，不触发任何维护任务。"""
+        """旧 guard 保留为兼容探针，但不再根据消息数触发压缩。"""
 
-        key = str(session_key or "").strip()
-        if not key:
+        if not str(session_key or "").strip():
             raise ValueError("session_key 不能为空")
-        messages = self._sessions.fetch_session_messages(key)
-        cursor = max(0, min(self._sessions.get_cursor(key), len(messages)))
-        return len(messages) - cursor >= self._context_guard_threshold
+        return False
 
     async def _run_consolidation_serialized(
         self,

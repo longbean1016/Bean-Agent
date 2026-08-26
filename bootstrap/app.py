@@ -315,7 +315,6 @@ def build_core_runtime(
         prompt_cache_log=prompt_cache_log,
         history_loader=sessions.load_history,
         context_compactor=(memory.compact_for_context if memory is not None else None),
-        history_limit=config.memory.context_window,
         max_iterations=config.llm.max_iterations or 10,
         # 主模型和独立视觉模型是两条互斥的图片消费路径：前者直接接收图片块，
         # 后者只通过 read_image_vision 工具读取本地上传路径。

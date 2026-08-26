@@ -12,10 +12,8 @@ from zoneinfo import ZoneInfo
 
 from agent.attachment_content import build_current_user_content
 from agent.context_budget import (
-    DEFAULT_CONTEXT_RETRY_PLANS,
     estimate_payload_tokens,
     should_compact,
-    slice_complete_turns,
 )
 from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted
 from agent.message_bus import InboundMessage, PipelineResult
@@ -68,7 +66,6 @@ class Pipeline:
         prompt_cache_log: PromptCacheLogWriter | None = None,
         history_loader: HistoryLoader | None = None,
         context_compactor: ContextCompactor | None = None,
-        history_limit: int | None = None,
         max_iterations: int = 10,
         multimodal: bool = True,
         vl_available: bool = False,
@@ -83,8 +80,6 @@ class Pipeline:
         self._prompt_cache_log = prompt_cache_log
         self._history_loader = history_loader
         self._context_compactor = context_compactor
-        # 兼容旧调用方保留参数形状，但默认和主链路都不再按消息数截断历史。
-        self._history_limit = None if history_limit is None else max(0, int(history_limit))
         self._max_iterations = max(1, int(max_iterations))
         # 图片能力在应用组装时确定，Turn 内只读取这份稳定快照。纯文本主模型不能
         # 接收 image_url；独立 VL 可用时则由现有 ReAct 工具链负责真正读图。
@@ -164,11 +159,11 @@ class Pipeline:
             vl_available=self._vl_available,
         )
         message_timestamp = datetime.now(_LOCAL_TZ)
-        retry_plan_index = 0
         context_retry: dict[str, Any] = {
             "attempts": [],
-            "selected_plan": None,
+            "selected_plan": "token_gate",
             "history_messages": len(history),
+            # 保留诊断字段供旧观测端读取；新链路永远不按 section 退避。
             "disabled_sections": [],
         }
         react_messages: list[dict[str, Any]] = []
@@ -204,16 +199,14 @@ class Pipeline:
             ))
 
         async def chat_with_context_retry() -> LLMResponse:
-            nonlocal retry_plan_index, last_base_messages, history, forced_compaction_attempted
+            nonlocal last_base_messages, history, forced_compaction_attempted
             while True:
-                plan = DEFAULT_CONTEXT_RETRY_PLANS[retry_plan_index]
-                history_for_attempt = slice_complete_turns(history, plan.history_ratio)
-                disabled_sections = set(plan.drop_sections)
+                history_for_attempt = history
+                disabled_sections: set[str] = set()
                 context_retry["attempts"].append(
                     {
-                        "name": plan.name,
+                        "name": "token_gate",
                         "history_messages": len(history_for_attempt),
-                        "disabled_sections": sorted(disabled_sections),
                     }
                 )
                 assembled = self._assembler.assemble(
@@ -269,7 +262,6 @@ class Pipeline:
                         tool_choice="auto",
                         on_content_delta=on_delta,
                     )
-                    context_retry["selected_plan"] = plan.name
                     context_retry["history_messages"] = len(history_for_attempt)
                     context_retry["disabled_sections"] = sorted(disabled_sections)
                     return response
@@ -292,17 +284,8 @@ class Pipeline:
                                 context.checkpoint_summary = str(
                                     read_checkpoint(message.session_key) or ""
                                 )
-                            retry_plan_index = 0
                             continue
-                    if retry_plan_index >= len(DEFAULT_CONTEXT_RETRY_PLANS) - 1:
-                        raise
-                    retry_plan_index += 1
-                    next_plan = DEFAULT_CONTEXT_RETRY_PLANS[retry_plan_index]
-                    logger.info(
-                        "上下文超限，切换退避计划: session=%s plan=%s",
-                        message.session_key,
-                        next_plan.name,
-                    )
+                    raise
 
         for iteration in range(1, self._max_iterations + 1):
             response = await chat_with_context_retry()
