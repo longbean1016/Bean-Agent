@@ -106,6 +106,20 @@ def test_envelope_order_is_system_history_reminder_current_message() -> None:
     )
 
 
+def test_checkpoint_summary_is_dynamic_system_message_before_history() -> None:
+    envelope = MessageEnvelopeBuilder().build(
+        history=[{"role": "user", "content": "保留的原文"}],
+        current_message="当前问题",
+        system_prompt="稳定系统提示",
+        checkpoint_summary="## Progress\n已完成第一步",
+        context_frame="",
+    )
+
+    assert [item["role"] for item in envelope] == ["system", "system", "user", "user"]
+    assert "已完成第一步" in str(envelope[1]["content"])
+    assert envelope[2]["content"] == "保留的原文"
+
+
 def test_recent_context_is_in_system_before_history() -> None:
     assembler = PromptAssembler(
         SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),

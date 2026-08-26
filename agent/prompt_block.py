@@ -10,6 +10,7 @@ class MemoryPromptApi(Protocol):
     def read_self(self) -> str: ...
     def get_memory_context(self) -> str: ...
     def read_recent_context(self, session_key: str = "") -> str: ...
+    def read_checkpoint_summary(self, session_key: str = "") -> str: ...
 
 
 class SkillsPromptApi(Protocol):
@@ -27,6 +28,7 @@ class TurnContext:
     chat_id: str
     memory: MemoryPromptApi | None = None
     retrieved_memory_block: str = ""
+    checkpoint_summary: str = ""
     active_tool_names: list[str] = field(default_factory=list)
     skills: SkillsPromptApi | None = None
     active_skill_names: list[str] = field(default_factory=list)

@@ -131,12 +131,18 @@ class Pipeline:
         )
         active_skills = collect_skill_mentions(message.content, available_skills)
         deferred_hint = _build_deferred_tools_hint(self._tools, tool_view.visible_names)
+        checkpoint_summary = ""
+        if self._memory and not skip_memory:
+            read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
+            if callable(read_checkpoint):
+                checkpoint_summary = str(read_checkpoint(message.session_key) or "")
         context = TurnContext(
             workspace=self._workspace,
             channel=message.channel,
             chat_id=message.chat_id,
             memory=None if skip_memory else self._memory,
             retrieved_memory_block=retrieved,
+            checkpoint_summary=checkpoint_summary,
             active_tool_names=names,
             skills=self._skills,
             active_skill_names=active_skills,

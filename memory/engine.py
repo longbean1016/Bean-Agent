@@ -324,6 +324,15 @@ class MemoryEngine:
         key = str(session_key or "").strip()
         return self._sessions.get_recent_context(key) if key else ""
 
+    def read_checkpoint_summary(self, session_key: str = "") -> str:
+        """读取 active generation 摘要，作为下一轮的动态 system context。"""
+
+        key = str(session_key or "").strip()
+        if not key:
+            return ""
+        checkpoint = self._sessions.get_active_compaction(key)
+        return checkpoint.summary if checkpoint is not None else ""
+
     async def retrieve_for_turn(self, message: Any) -> str:
         text = str(getattr(message, "content", getattr(message, "text", "")) or "")
         channel = str(getattr(message, "channel", "") or "")
