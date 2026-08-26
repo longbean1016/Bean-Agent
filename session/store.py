@@ -67,6 +67,58 @@ class ConsolidationMessageWindow:
     recent_messages: list[dict[str, Any]]
 
 
+@dataclass(frozen=True, slots=True)
+class SessionCompactionPrepare:
+    """压缩提交前的不可变 prepare 快照。"""
+
+    session_key: str
+    session_created_at: str
+    generation: int
+    parent_generation: int
+    source_ref: str
+    source_plan_digest: str
+    source_mutation_digest: str
+    source_from_seq: int
+    consolidated_through_seq: int
+    source_message_ids: list[str]
+    selected_source_messages: list[dict[str, Any]]
+    retained_tail: list[dict[str, Any]]
+    prepared_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCompaction:
+    """已经提交并可注入下一轮 Prompt 的 checkpoint ledger 行。"""
+
+    session_key: str
+    session_created_at: str
+    generation: int
+    parent_generation: int
+    created_at: str
+    trigger: str
+    summary_format_version: int
+    summary: str
+    source_ref: str
+    source_plan_digest: str
+    source_mutation_digest: str
+    source_from_seq: int
+    consolidated_through_seq: int
+    source_message_ids: list[str]
+    selected_source_messages: list[dict[str, Any]]
+    retained_tail: list[dict[str, Any]]
+    model_runtime_id: str
+    model: str
+    context_window: int
+    threshold_tokens: int
+    hard_input_tokens: int
+    keep_recent_tokens: int
+    tokens_before: int
+    tokens_after: int
+    summary_usage: dict[str, Any]
+    invalidated_at: str | None = None
+    invalidated_reason: str | None = None
+
+
 class SessionStore:
     """为 SessionManager、消息工具和记忆归档提供持久化接口。"""
 
@@ -654,6 +706,31 @@ class SessionStore:
 
         self._set_recent_context_sync(session_key, content, source_ref=source_ref)
 
+    def get_active_compaction(self, session_key: str) -> SessionCompaction | None:
+        """读取当前 generation；消息边界由 ledger 的 seq 字段决定。"""
+
+        return self._get_active_compaction_sync(session_key)
+
+    def get_compaction(self, session_key: str, generation: int) -> SessionCompaction | None:
+        """按 generation 读取 checkpoint，供重试和恢复校验使用。"""
+
+        return self._get_compaction_sync(session_key, generation)
+
+    def next_compaction_generation(self, session_key: str) -> int:
+        """返回该 session 下一代 generation，不把消息 seq 当作 generation。"""
+
+        return self._next_compaction_generation_sync(session_key)
+
+    def prepare_compaction(self, prepare: SessionCompactionPrepare) -> SessionCompactionPrepare:
+        """持久化 prepare；同一 generation 已存在时只允许完全相同的快照重试。"""
+
+        return self._prepare_compaction_sync(prepare)
+
+    def commit_compaction(self, checkpoint: SessionCompaction) -> SessionCompaction:
+        """原子写入 ledger 并推进 sessions.last_consolidated generation 指针。"""
+
+        return self._commit_compaction_sync(checkpoint)
+
     def close(self) -> None:
         """幂等关闭 SQLite 连接。"""
 
@@ -699,6 +776,63 @@ class SessionStore:
                     FOREIGN KEY (session_key) REFERENCES sessions(key)
                         ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS session_compaction_prepares (
+                    session_key                  TEXT NOT NULL,
+                    session_created_at           TEXT NOT NULL,
+                    generation                   INTEGER NOT NULL,
+                    parent_generation            INTEGER NOT NULL,
+                    source_ref                   TEXT NOT NULL,
+                    source_plan_digest           TEXT NOT NULL,
+                    source_mutation_digest       TEXT NOT NULL,
+                    source_from_seq              INTEGER NOT NULL,
+                    consolidated_through_seq     INTEGER NOT NULL,
+                    source_message_ids_json      TEXT NOT NULL,
+                    selected_source_messages_json TEXT NOT NULL,
+                    retained_tail_json           TEXT NOT NULL,
+                    prepared_at                  TEXT NOT NULL,
+                    PRIMARY KEY (session_key, generation),
+                    UNIQUE (session_key, source_ref),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS session_compactions (
+                    session_key                  TEXT NOT NULL,
+                    session_created_at           TEXT NOT NULL,
+                    generation                   INTEGER NOT NULL,
+                    parent_generation            INTEGER NOT NULL DEFAULT 0,
+                    created_at                   TEXT NOT NULL,
+                    trigger                      TEXT NOT NULL,
+                    summary_format_version      INTEGER NOT NULL,
+                    summary                     TEXT NOT NULL,
+                    source_ref                   TEXT NOT NULL,
+                    source_plan_digest           TEXT NOT NULL,
+                    source_mutation_digest       TEXT NOT NULL,
+                    source_from_seq              INTEGER NOT NULL,
+                    consolidated_through_seq     INTEGER NOT NULL,
+                    source_message_ids_json      TEXT NOT NULL,
+                    selected_source_messages_json TEXT NOT NULL,
+                    retained_tail_json           TEXT NOT NULL,
+                    model_runtime_id             TEXT NOT NULL,
+                    model                       TEXT NOT NULL,
+                    context_window              INTEGER NOT NULL,
+                    threshold_tokens            INTEGER NOT NULL,
+                    hard_input_tokens           INTEGER NOT NULL,
+                    keep_recent_tokens          INTEGER NOT NULL,
+                    tokens_before               INTEGER NOT NULL,
+                    tokens_after                INTEGER NOT NULL,
+                    summary_usage_json          TEXT NOT NULL,
+                    invalidated_at              TEXT,
+                    invalidated_reason          TEXT,
+                    PRIMARY KEY (session_key, generation),
+                    UNIQUE (session_key, source_ref),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_compactions_active
+                    ON session_compactions(session_key, invalidated_at, generation);
                 """
             )
             try:
@@ -1359,6 +1493,211 @@ class SessionStore:
             )
             self._conn.commit()
 
+    def _get_active_compaction_sync(self, session_key: str) -> SessionCompaction | None:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                """
+                SELECT c.*
+                FROM sessions s
+                JOIN session_compactions c
+                  ON c.session_key = s.key
+                 AND c.generation = s.last_consolidated
+                WHERE s.key = ? AND c.invalidated_at IS NULL
+                """,
+                (key,),
+            ).fetchone()
+        return self._row_to_compaction(row) if row is not None else None
+
+    def _get_compaction_sync(
+        self,
+        session_key: str,
+        generation: int,
+    ) -> SessionCompaction | None:
+        key = self._validate_session_key(session_key)
+        safe_generation = int(generation)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT * FROM session_compactions WHERE session_key = ? AND generation = ?",
+                (key, safe_generation),
+            ).fetchone()
+        return self._row_to_compaction(row) if row is not None else None
+
+    def _next_compaction_generation_sync(self, session_key: str) -> int:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(generation), 0) AS generation FROM session_compactions WHERE session_key = ?",
+                (key,),
+            ).fetchone()
+        return int((row["generation"] if row else 0) or 0) + 1
+
+    def _prepare_compaction_sync(
+        self,
+        prepare: SessionCompactionPrepare,
+    ) -> SessionCompactionPrepare:
+        key = self._validate_session_key(prepare.session_key)
+        if prepare.generation < 1:
+            raise ValueError("compaction generation 必须是正整数")
+        if prepare.consolidated_through_seq < prepare.source_from_seq:
+            raise ValueError("compaction seq 边界无效")
+        payload = (
+            json.dumps(prepare.source_message_ids, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(prepare.selected_source_messages, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(prepare.retained_tail, ensure_ascii=False, separators=(",", ":")),
+        )
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    "SELECT * FROM session_compaction_prepares WHERE session_key = ? AND generation = ?",
+                    (key, prepare.generation),
+                ).fetchone()
+                if existing is not None:
+                    stored = self._row_to_prepare(existing)
+                    if stored != prepare:
+                        raise ValueError(
+                            "同一 compaction generation 的 prepare 不可变字段发生漂移"
+                        )
+                    self._conn.commit()
+                    return stored
+                session = self._conn.execute(
+                    "SELECT created_at FROM sessions WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                if session is None:
+                    raise ValueError(f"compaction session 不存在: {key}")
+                if str(session["created_at"]) != str(prepare.session_created_at):
+                    raise ValueError("compaction session incarnation 不匹配")
+                self._conn.execute(
+                    """
+                    INSERT INTO session_compaction_prepares(
+                        session_key, session_created_at, generation, parent_generation,
+                        source_ref, source_plan_digest, source_mutation_digest,
+                        source_from_seq, consolidated_through_seq,
+                        source_message_ids_json, selected_source_messages_json,
+                        retained_tail_json, prepared_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        prepare.session_created_at,
+                        prepare.generation,
+                        prepare.parent_generation,
+                        prepare.source_ref,
+                        prepare.source_plan_digest,
+                        prepare.source_mutation_digest,
+                        prepare.source_from_seq,
+                        prepare.consolidated_through_seq,
+                        *payload,
+                        prepare.prepared_at,
+                    ),
+                )
+                self._conn.commit()
+                return prepare
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _commit_compaction_sync(
+        self,
+        checkpoint: SessionCompaction,
+    ) -> SessionCompaction:
+        key = self._validate_session_key(checkpoint.session_key)
+        if checkpoint.generation < 1:
+            raise ValueError("compaction generation 必须是正整数")
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                session = self._conn.execute(
+                    "SELECT created_at, last_consolidated FROM sessions WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                if session is None:
+                    raise ValueError(f"compaction session 不存在: {key}")
+                if str(session["created_at"]) != str(checkpoint.session_created_at):
+                    raise ValueError("compaction session incarnation 不匹配")
+                current_generation = int(session["last_consolidated"] or 0)
+                if current_generation > checkpoint.generation:
+                    raise ValueError("compaction generation 不能回退")
+                prepare_row = self._conn.execute(
+                    "SELECT * FROM session_compaction_prepares WHERE session_key = ? AND generation = ?",
+                    (key, checkpoint.generation),
+                ).fetchone()
+                if prepare_row is None:
+                    raise ValueError("提交 checkpoint 前必须先写入 prepare")
+                prepare = self._row_to_prepare(prepare_row)
+                if not _prepare_matches_checkpoint(prepare, checkpoint):
+                    raise ValueError("checkpoint 与 prepare 的来源契约不一致")
+                existing_row = self._conn.execute(
+                    "SELECT * FROM session_compactions WHERE session_key = ? AND generation = ?",
+                    (key, checkpoint.generation),
+                ).fetchone()
+                if existing_row is not None:
+                    existing = self._row_to_compaction(existing_row)
+                    if existing != checkpoint:
+                        raise ValueError("同一 compaction generation 的 checkpoint 不可变字段发生漂移")
+                    self._conn.commit()
+                    return existing
+                self._conn.execute(
+                    """
+                    INSERT INTO session_compactions(
+                        session_key, session_created_at, generation, parent_generation,
+                        created_at, trigger, summary_format_version, summary,
+                        source_ref, source_plan_digest, source_mutation_digest,
+                        source_from_seq, consolidated_through_seq,
+                        source_message_ids_json, selected_source_messages_json,
+                        retained_tail_json, model_runtime_id, model, context_window,
+                        threshold_tokens, hard_input_tokens, keep_recent_tokens,
+                        tokens_before, tokens_after, summary_usage_json,
+                        invalidated_at, invalidated_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        checkpoint.session_created_at,
+                        checkpoint.generation,
+                        checkpoint.parent_generation,
+                        checkpoint.created_at,
+                        checkpoint.trigger,
+                        checkpoint.summary_format_version,
+                        checkpoint.summary,
+                        checkpoint.source_ref,
+                        checkpoint.source_plan_digest,
+                        checkpoint.source_mutation_digest,
+                        checkpoint.source_from_seq,
+                        checkpoint.consolidated_through_seq,
+                        json.dumps(checkpoint.source_message_ids, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(checkpoint.selected_source_messages, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(checkpoint.retained_tail, ensure_ascii=False, separators=(",", ":")),
+                        checkpoint.model_runtime_id,
+                        checkpoint.model,
+                        checkpoint.context_window,
+                        checkpoint.threshold_tokens,
+                        checkpoint.hard_input_tokens,
+                        checkpoint.keep_recent_tokens,
+                        checkpoint.tokens_before,
+                        checkpoint.tokens_after,
+                        json.dumps(checkpoint.summary_usage, ensure_ascii=False, separators=(",", ":")),
+                        checkpoint.invalidated_at,
+                        checkpoint.invalidated_reason,
+                    ),
+                )
+                self._conn.execute(
+                    "UPDATE sessions SET last_consolidated = ?, updated_at = ? WHERE key = ?",
+                    (checkpoint.generation, checkpoint.created_at, key),
+                )
+                self._conn.commit()
+                return checkpoint
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def _close_sync(self) -> None:
         with self._lock:
             if self._closed:
@@ -1491,6 +1830,56 @@ class SessionStore:
         return message
 
     @staticmethod
+    def _row_to_prepare(row: sqlite3.Row) -> SessionCompactionPrepare:
+        return SessionCompactionPrepare(
+            session_key=str(row["session_key"]),
+            session_created_at=str(row["session_created_at"]),
+            generation=int(row["generation"]),
+            parent_generation=int(row["parent_generation"]),
+            source_ref=str(row["source_ref"]),
+            source_plan_digest=str(row["source_plan_digest"]),
+            source_mutation_digest=str(row["source_mutation_digest"]),
+            source_from_seq=int(row["source_from_seq"]),
+            consolidated_through_seq=int(row["consolidated_through_seq"]),
+            source_message_ids=_load_json_string_list(row["source_message_ids_json"]),
+            selected_source_messages=_load_json_dict_list(row["selected_source_messages_json"]),
+            retained_tail=_load_json_dict_list(row["retained_tail_json"]),
+            prepared_at=str(row["prepared_at"]),
+        )
+
+    @staticmethod
+    def _row_to_compaction(row: sqlite3.Row) -> SessionCompaction:
+        return SessionCompaction(
+            session_key=str(row["session_key"]),
+            session_created_at=str(row["session_created_at"]),
+            generation=int(row["generation"]),
+            parent_generation=int(row["parent_generation"]),
+            created_at=str(row["created_at"]),
+            trigger=str(row["trigger"]),
+            summary_format_version=int(row["summary_format_version"]),
+            summary=str(row["summary"]),
+            source_ref=str(row["source_ref"]),
+            source_plan_digest=str(row["source_plan_digest"]),
+            source_mutation_digest=str(row["source_mutation_digest"]),
+            source_from_seq=int(row["source_from_seq"]),
+            consolidated_through_seq=int(row["consolidated_through_seq"]),
+            source_message_ids=_load_json_string_list(row["source_message_ids_json"]),
+            selected_source_messages=_load_json_dict_list(row["selected_source_messages_json"]),
+            retained_tail=_load_json_dict_list(row["retained_tail_json"]),
+            model_runtime_id=str(row["model_runtime_id"]),
+            model=str(row["model"]),
+            context_window=int(row["context_window"]),
+            threshold_tokens=int(row["threshold_tokens"]),
+            hard_input_tokens=int(row["hard_input_tokens"]),
+            keep_recent_tokens=int(row["keep_recent_tokens"]),
+            tokens_before=int(row["tokens_before"]),
+            tokens_after=int(row["tokens_after"]),
+            summary_usage=_load_json_object(row["summary_usage_json"]),
+            invalidated_at=(str(row["invalidated_at"]) if row["invalidated_at"] else None),
+            invalidated_reason=(str(row["invalidated_reason"]) if row["invalidated_reason"] else None),
+        )
+
+    @staticmethod
     def _validate_session_key(session_key: str) -> str:
         key = str(session_key).strip()
         if not key:
@@ -1534,4 +1923,52 @@ def _load_json_list(value: object) -> list[dict[str, Any]]:
     return [item for item in loaded if isinstance(item, dict)]
 
 
-__all__ = ["ConsolidationMessageWindow", "NewMessage", "SessionStore"]
+def _load_json_string_list(value: object) -> list[str]:
+    if not value:
+        return []
+    try:
+        loaded = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [str(item) for item in loaded] if isinstance(loaded, list) else []
+
+
+def _load_json_dict_list(value: object) -> list[dict[str, Any]]:
+    if not value:
+        return []
+    try:
+        loaded = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [dict(item) for item in loaded if isinstance(item, dict)] if isinstance(loaded, list) else []
+
+
+def _prepare_matches_checkpoint(
+    prepare: SessionCompactionPrepare,
+    checkpoint: SessionCompaction,
+) -> bool:
+    """提交前只比较来源契约，允许 checkpoint 增加模型和 token 审计字段。"""
+
+    return (
+        prepare.session_key == checkpoint.session_key
+        and prepare.session_created_at == checkpoint.session_created_at
+        and prepare.generation == checkpoint.generation
+        and prepare.parent_generation == checkpoint.parent_generation
+        and prepare.source_ref == checkpoint.source_ref
+        and prepare.source_plan_digest == checkpoint.source_plan_digest
+        and prepare.source_mutation_digest == checkpoint.source_mutation_digest
+        and prepare.source_from_seq == checkpoint.source_from_seq
+        and prepare.consolidated_through_seq == checkpoint.consolidated_through_seq
+        and prepare.source_message_ids == checkpoint.source_message_ids
+        and prepare.selected_source_messages == checkpoint.selected_source_messages
+        and prepare.retained_tail == checkpoint.retained_tail
+    )
+
+
+__all__ = [
+    "ConsolidationMessageWindow",
+    "NewMessage",
+    "SessionCompaction",
+    "SessionCompactionPrepare",
+    "SessionStore",
+]
