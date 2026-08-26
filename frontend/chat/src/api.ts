@@ -1,5 +1,6 @@
 import type { MessagePage, MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile } from "./types";
 
+// 仅控制聊天页面的滚动分页，不参与模型上下文 token gate 或 checkpoint 边界。
 const MESSAGE_WINDOW_LIMIT = 60;
 
 export async function fetchSessions(): Promise<SessionSummary[]> {

@@ -21,7 +21,6 @@ export interface ChatMessage {
   turnId?: string;
   streaming?: boolean;
   thinkingStatus?: ThinkingStatus;
-  preparing?: boolean;
   status?: string;
   timestamp?: string;
   proactive?: boolean;
@@ -39,7 +38,7 @@ export interface ChatState {
 }
 
 export interface TurnRuntimeState {
-  status: "idle" | "submitting" | "queued" | "preparing" | "running";
+  status: "idle" | "submitting" | "queued" | "running";
   queuePosition: number | null;
   turnId: string;
   requestId: string;
@@ -140,7 +139,6 @@ export type ChatFrame =
   | { type: "session.subscribed"; request_id: string; session_id: string }
   | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message: string; user_media: string[]; content: string; thinking: string; tools: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments: unknown; result_preview: string }>; status: "running" }
   | { type: "turn.queued"; request_id: string; session_id: string; position: number }
-  | { type: "turn.preparing"; request_id: string; session_id: string; turn_id: string; user_message: string; user_media: string[] }
   | { type: "turn.started"; request_id?: string; session_id: string; turn_id: string }
   | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.thinking.delta"; session_id: string; turn_id: string; delta: string }

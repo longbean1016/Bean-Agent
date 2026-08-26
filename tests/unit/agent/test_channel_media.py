@@ -8,7 +8,7 @@ import pytest
 
 from agent.agent_loop import InterruptResult
 from agent.channel import WebChannel
-from agent.event_bus import EventBus, TurnPreparing, TurnQueued, TurnQueueRejected
+from agent.event_bus import EventBus, TurnQueued, TurnQueueRejected
 from agent.message_bus import MessageBus
 
 
@@ -187,23 +187,4 @@ async def test_web_channel_maps_turn_queue_events_to_websocket_frames() -> None:
     assert socket.frames[-1]["type"] == "error"
     assert socket.frames[-1]["code"] == "queue_full"
     assert socket.frames[-1]["message"] == "当前任务较多，请稍后再试"
-    await channel.close()
-
-
-@pytest.mark.asyncio
-async def test_web_channel_maps_turn_preparing_to_websocket_frame() -> None:
-    bus = MessageBus()
-    events = EventBus()
-    channel = WebChannel(bus, events, Interrupt())
-    socket = Socket()
-    await channel.handle_frame(socket, {
-        "type": "session.subscribe", "request_id": "subscribe", "session_id": "web:chat",
-    })
-
-    await events.emit(TurnPreparing("web:chat", "turn-1", "r1", "question", ["image.png"]))
-
-    assert socket.frames[-1] == {
-        "type": "turn.preparing", "request_id": "r1", "session_id": "web:chat", "turn_id": "turn-1",
-        "user_message": "question", "user_media": ["image.png"],
-    }
     await channel.close()

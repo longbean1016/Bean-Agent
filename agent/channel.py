@@ -19,7 +19,6 @@ from agent.event_bus import (
     ToolCallStarted,
     TurnQueued,
     TurnQueueRejected,
-    TurnPreparing,
     TurnStarted,
 )
 from agent.message_bus import InboundMessage, MessageBus, OutboundMessage
@@ -65,7 +64,6 @@ class WebChannel:
         self._lock = asyncio.Lock()
         bus.subscribe_outbound(self.name, self._on_response)
         event_bus.on(TurnStarted, self._on_turn_started)
-        event_bus.on(TurnPreparing, self._on_turn_preparing)
         event_bus.on(SessionUpdated, self._on_session_updated)
         event_bus.on(TurnQueued, self._on_turn_queued)
         event_bus.on(TurnQueueRejected, self._on_turn_queue_rejected)
@@ -212,16 +210,6 @@ class WebChannel:
     async def _on_turn_started(self, event: TurnStarted) -> None:
         await self._broadcast(event.session_key, {"type": "turn.started", "request_id": event.request_id, "session_id": event.session_key, "turn_id": event.turn_id})
 
-    async def _on_turn_preparing(self, event: TurnPreparing) -> None:
-        await self._broadcast(event.session_key, {
-            "type": "turn.preparing",
-            "request_id": event.request_id,
-            "session_id": event.session_key,
-            "turn_id": event.turn_id,
-            "user_message": event.content,
-            "user_media": list(event.media),
-        })
-
     async def _on_session_updated(self, event: SessionUpdated) -> None:
         await self._broadcast(event.session_key, {
             "type": "session.updated",
@@ -309,7 +297,6 @@ class WebChannel:
     async def close(self) -> None:
         self._bus.unsubscribe_outbound(self.name, self._on_response)
         self._events.off(TurnStarted, self._on_turn_started)
-        self._events.off(TurnPreparing, self._on_turn_preparing)
         self._events.off(SessionUpdated, self._on_session_updated)
         self._events.off(TurnQueued, self._on_turn_queued)
         self._events.off(TurnQueueRejected, self._on_turn_queue_rejected)

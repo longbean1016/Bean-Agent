@@ -3,29 +3,6 @@ import { describe, expect, it } from "vitest";
 import { initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
 
 describe("reduceChatFrame", () => {
-  it("marks a turn as preparing until it starts running", () => {
-    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
-      type: "turn.preparing", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
-      user_message: "question", user_media: [],
-    });
-
-    expect(state.turnStates["web:one"]).toMatchObject({ status: "preparing", turnId: "turn-1" });
-    expect(state.messages).toMatchObject([
-      { role: "user", content: "question", turnId: "turn-1" },
-      { role: "assistant", turnId: "turn-1", preparing: true, streaming: true },
-    ]);
-
-    state = reduceChatFrame(state, {
-      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
-    });
-
-    expect(state.turnStates["web:one"].status).toBe("running");
-    expect(state.messages).toMatchObject([
-      { role: "user", content: "question", turnId: "turn-1" },
-      { role: "assistant", turnId: "turn-1", preparing: false, streaming: true },
-    ]);
-  });
-
   it("maps interrupted display snapshots without exposing placeholder content", () => {
     const [message] = rowsToMessages([{
       id: "web:one:1", seq: 1, role: "assistant", content: "[用户已停止生成]",
@@ -162,12 +139,8 @@ describe("reduceChatFrame", () => {
     });
   });
 
-  it("renders the next turn after a context-preparing turn completes", () => {
+  it("renders the next turn after a completed turn", () => {
     let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
-      type: "turn.preparing", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
-      user_message: "first", user_media: [],
-    });
-    state = reduceChatFrame(state, {
       type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
     });
     state = reduceChatFrame(state, {
@@ -187,7 +160,7 @@ describe("reduceChatFrame", () => {
 
     expect(state.turnStates["web:one"].status).toBe("running");
     expect(state.messages.find((message) => message.turnId === "turn-2" && message.role === "assistant"))
-      .toMatchObject({ content: "second answer", streaming: true, preparing: false });
+      .toMatchObject({ content: "second answer", streaming: true });
   });
   it("提交确认后会从提交中切换到排队状态", () => {
     let state = { ...initialChatState, sessionId: "web:one" };
