@@ -52,7 +52,7 @@ class EmptyImplicitExtractor:
 
 class Extractor:
     async def extract(self, messages, previous_recent_context, *, recent_turns="", current_memory=""):
-        return ConsolidationDraft(history_entries=[{"summary": "\u5b8c\u6210\u9879\u76ee", "emotional_weight": 1}], pending_items=[{"tag": "identity", "content": "\u7528\u6237\u662f\u5f00\u53d1\u8005"}], recent_context="# Recent Context\n- \u9879\u76ee\u5f00\u53d1")
+        return ConsolidationDraft(history_entries=[{"summary": "\u5b8c\u6210\u9879\u76ee", "emotional_weight": 1}], pending_items=[{"tag": "identity", "content": "\u7528\u6237\u662f\u5f00\u53d1\u8005"}])
 
 
 @pytest.mark.asyncio

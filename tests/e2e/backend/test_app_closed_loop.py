@@ -127,18 +127,6 @@ class CompressionProvider:
                 "submit_consolidation_events",
                 {"history_entries": [], "pending_items": []},
             )
-        if "近期语境压缩代理" in prompt:
-            return _structured_memory_response(
-                "submit_recent_context",
-                {
-                    "active_topics": ["第一阶段"],
-                    "user_preferences": [],
-                    "follow_ups": [],
-                    "avoidances": [],
-                    "dormant_threads": [],
-                    "ongoing_threads": [],
-                },
-            )
         if "记忆检索决策器" in prompt:
             return SimpleNamespace(content="<decision>SKIP</decision>")
         if "长期记忆提取专家" in prompt:

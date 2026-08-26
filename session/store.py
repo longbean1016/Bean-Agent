@@ -57,17 +57,6 @@ class NewMessage:
 
 
 @dataclass(frozen=True, slots=True)
-class ConsolidationMessageWindow:
-    """一次归档判断所需的活动消息快照。"""
-
-    cursor: int
-    next_cursor: int
-    active_count: int
-    messages: list[dict[str, Any]]
-    recent_messages: list[dict[str, Any]]
-
-
-@dataclass(frozen=True, slots=True)
 class SessionCompactionPrepare:
     """压缩提交前的不可变 prepare 快照。"""
 
@@ -158,23 +147,6 @@ class SessionStore:
         """按 seq 升序读取会话的全部持久化消息。"""
 
         return self._fetch_session_messages_sync(session_key)
-
-    def fetch_consolidation_window(
-        self,
-        session_key: str,
-        *,
-        keep_count: int,
-        threshold: int,
-        recent_count: int,
-    ) -> ConsolidationMessageWindow | None:
-        """只读取 cursor 后达到归档门槛的消息窗口。"""
-
-        return self._fetch_consolidation_window_sync(
-            session_key,
-            keep_count=keep_count,
-            threshold=threshold,
-            recent_count=recent_count,
-        )
 
     def upsert_session(
         self,
@@ -690,22 +662,6 @@ class SessionStore:
 
         return self._get_cursor_sync(session_key)
 
-    def get_recent_context(self, session_key: str) -> str:
-        """读取当前会话的近期压缩上下文；未生成时返回空字符串。"""
-
-        return self._get_recent_context_sync(session_key)
-
-    def set_recent_context(
-        self,
-        session_key: str,
-        content: str,
-        *,
-        source_ref: str = "",
-    ) -> None:
-        """写入当前会话的近期压缩上下文，与消息 cursor 使用同一个 Session DB。"""
-
-        self._set_recent_context_sync(session_key, content, source_ref=source_ref)
-
     def get_active_compaction(self, session_key: str) -> SessionCompaction | None:
         """读取当前 generation；消息边界由 ledger 的 seq 字段决定。"""
 
@@ -767,15 +723,6 @@ class SessionStore:
 
                 CREATE INDEX IF NOT EXISTS idx_messages_session_seq
                     ON messages(session_key, seq);
-
-                CREATE TABLE IF NOT EXISTS session_recent_context (
-                    session_key TEXT PRIMARY KEY,
-                    content     TEXT NOT NULL DEFAULT '',
-                    source_ref  TEXT NOT NULL DEFAULT '',
-                    updated_at  TEXT NOT NULL,
-                    FOREIGN KEY (session_key) REFERENCES sessions(key)
-                        ON DELETE CASCADE
-                );
 
                 CREATE TABLE IF NOT EXISTS session_compaction_prepares (
                     session_key                  TEXT NOT NULL,
@@ -1076,72 +1023,6 @@ class SessionStore:
                 (key,),
             ).fetchall()
         return [self._row_to_message(row) for row in rows]
-
-    def _fetch_consolidation_window_sync(
-        self,
-        session_key: str,
-        *,
-        keep_count: int,
-        threshold: int,
-        recent_count: int,
-    ) -> ConsolidationMessageWindow | None:
-        key = self._validate_session_key(session_key)
-        safe_keep = max(0, int(keep_count))
-        safe_threshold = max(1, int(threshold))
-        safe_recent = max(0, int(recent_count))
-        with self._lock:
-            self._ensure_open()
-            cursor = self._active_message_boundary_locked(key)
-            count_row = self._conn.execute(
-                """
-                SELECT COUNT(1) AS count
-                FROM messages
-                WHERE session_key = ? AND seq >= ?
-                """,
-                (key, cursor),
-            ).fetchone()
-            active_count = int((count_row["count"] if count_row else 0) or 0)
-            archive_count = max(0, active_count - safe_keep)
-            if archive_count < safe_threshold:
-                # 未到门槛时只读取索引计数，不构建正文、tool_chain 或 extra 对象。
-                return None
-
-            rows = self._conn.execute(
-                f"""
-                SELECT {_MESSAGE_COLUMNS}
-                FROM messages
-                WHERE session_key = ? AND seq >= ?
-                ORDER BY seq ASC
-                LIMIT ?
-                """,
-                (key, cursor, archive_count),
-            ).fetchall()
-            recent_rows = []
-            if safe_recent:
-                recent_rows = self._conn.execute(
-                    f"""
-                    SELECT {_MESSAGE_COLUMNS}
-                    FROM messages
-                    WHERE session_key = ? AND seq >= ?
-                    ORDER BY seq DESC
-                    LIMIT ?
-                    """,
-                    (key, cursor, safe_recent),
-                ).fetchall()
-
-        messages = [self._row_to_message(row) for row in rows]
-        recent_messages = [
-            self._row_to_message(row) for row in reversed(recent_rows)
-        ]
-        if not messages:
-            return None
-        return ConsolidationMessageWindow(
-            cursor=cursor,
-            next_cursor=int(messages[-1]["seq"]) + 1,
-            active_count=active_count,
-            messages=messages,
-            recent_messages=recent_messages,
-        )
 
     def _upsert_session_sync(
         self,
@@ -1478,53 +1359,6 @@ class SessionStore:
                 (key,),
             ).fetchone()
         return int((row["last_consolidated"] if row else 0) or 0)
-
-    def _get_recent_context_sync(self, session_key: str) -> str:
-        key = self._validate_session_key(session_key)
-        with self._lock:
-            self._ensure_open()
-            row = self._conn.execute(
-                "SELECT content FROM session_recent_context WHERE session_key = ?",
-                (key,),
-            ).fetchone()
-        return str(row["content"] or "") if row else ""
-
-    def _set_recent_context_sync(
-        self,
-        session_key: str,
-        content: str,
-        *,
-        source_ref: str = "",
-    ) -> None:
-        key = self._validate_session_key(session_key)
-        now = _now_iso()
-        with self._lock:
-            self._ensure_open()
-            # recent context 是会话 cursor 的伴生状态；缺失会话先幂等创建，避免孤儿摘要。
-            self._conn.execute(
-                """
-                INSERT OR IGNORE INTO sessions(
-                    key, created_at, updated_at, last_consolidated,
-                    next_seq, metadata
-                )
-                VALUES (?, ?, ?, 0, 0, '{}')
-                """,
-                (key, now, now),
-            )
-            self._conn.execute(
-                """
-                INSERT INTO session_recent_context(
-                    session_key, content, source_ref, updated_at
-                )
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(session_key) DO UPDATE SET
-                    content = excluded.content,
-                    source_ref = excluded.source_ref,
-                    updated_at = excluded.updated_at
-                """,
-                (key, str(content), str(source_ref or ""), now),
-            )
-            self._conn.commit()
 
     def _get_active_compaction_sync(self, session_key: str) -> SessionCompaction | None:
         key = self._validate_session_key(session_key)
@@ -1999,7 +1833,6 @@ def _prepare_matches_checkpoint(
 
 
 __all__ = [
-    "ConsolidationMessageWindow",
     "NewMessage",
     "SessionCompaction",
     "SessionCompactionPrepare",

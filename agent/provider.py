@@ -448,7 +448,7 @@ class LLMProvider:
     ) -> LLMResponse:
         """执行一次明确的非流式调用。
 
-        这是 QueryRewriter、Consolidator 等后台任务的便捷入口，内部仍复用
+        这是 QueryRewriter、记忆提取等后台任务的便捷入口，内部仍复用
         ``chat()`` 的请求组装逻辑，避免两条路径产生不同的默认参数。
         """
 

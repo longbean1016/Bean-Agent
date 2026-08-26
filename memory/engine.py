@@ -41,7 +41,6 @@ from memory.rule_schema import build_procedure_rule_schema
 from memory.store import MemoryStore2
 from memory.structured_output import (
     CONSOLIDATION_EVENTS_TOOL,
-    RECENT_CONTEXT_TOOL,
     complete_forced_function,
 )
 from memory.sufficiency_checker import should_enhance_retrieval
@@ -307,12 +306,6 @@ class MemoryEngine:
         """返回可直接注入稳定 Prompt 前缀的 Markdown 长期记忆。"""
 
         return self._markdown.get_memory_context()
-
-    def read_recent_context(self, session_key: str = "") -> str:
-        """读取当前会话的近期压缩上下文；普通 Prompt 不再读取全局 RECENT_CONTEXT.md。"""
-
-        key = str(session_key or "").strip()
-        return self._sessions.get_recent_context(key) if key else ""
 
     def read_checkpoint_summary(self, session_key: str = "") -> str:
         """读取 active generation 摘要，作为下一轮的动态 system context。"""
@@ -788,43 +781,19 @@ class _LLMConsolidationExtractor:
     def __init__(self, provider: Any) -> None:
         self._provider = provider
 
-    async def extract(self, messages: list[dict[str, object]], previous_recent_context: str, *, recent_turns: str = "", current_memory: str = "") -> ConsolidationDraft:
+    async def extract(self, messages: list[dict[str, object]], previous_summary: str = "", *, current_memory: str = "") -> ConsolidationDraft:
         conversation = render_consolidation_conversation(messages)
-        # 两个提取器只读取相同证据，不互相消费结果；并发执行可把两次 LLM
-        # 网络等待从相加改为取较慢者，任一失败时 TaskGroup 会取消另一分支。
-        async with asyncio.TaskGroup() as group:
-            event_task = group.create_task(
-                complete_forced_function(
-                    self._provider,
-                    _event_extraction_prompt(
-                        conversation,
-                        current_memory=current_memory,
-                    ),
-                    CONSOLIDATION_EVENTS_TOOL,
-                    required_arrays=("history_entries", "pending_items"),
-                )
-            )
-            recent_task = group.create_task(
-                complete_forced_function(
-                    self._provider,
-                    _recent_context_prompt(
-                        conversation,
-                        previous_recent_context,
-                        recent_turns=recent_turns,
-                    ),
-                    RECENT_CONTEXT_TOOL,
-                    required_arrays=(
-                        "active_topics",
-                        "user_preferences",
-                        "follow_ups",
-                        "avoidances",
-                        "dormant_threads",
-                        "ongoing_threads",
-                    ),
-                )
-            )
-        event_data = event_task.result()
-        recent_data = recent_task.result()
+        # 事件摘要与 PENDING 候选必须由同一个函数调用生成；profile、preference、
+        # procedure 则在 checkpoint 中使用同一 conversation 进入隐式提取器。
+        event_data = await complete_forced_function(
+            self._provider,
+            _event_extraction_prompt(
+                conversation,
+                current_memory=current_memory,
+            ),
+            CONSOLIDATION_EVENTS_TOOL,
+            required_arrays=("history_entries", "pending_items"),
+        )
         history_entries = []
         for item in event_data.get("history_entries") or []:
             if not isinstance(item, dict) or not str(item.get("summary") or "").strip():
@@ -844,7 +813,6 @@ class _LLMConsolidationExtractor:
         return ConsolidationDraft(
             history_entries=history_entries,
             pending_items=pending_items,
-            recent_context=_render_recent_context(recent_data),
         )
 
 def _event_extraction_prompt(conversation: str, *, current_memory: str = "") -> str:
@@ -947,115 +915,6 @@ history_entries.emotional_weight 规则：
 
 完成判断后必须且只能调用 submit_consolidation_events；不得通过普通正文返回结果。
 没有符合条件的内容时也必须调用，并将 history_entries 和 pending_items 设为空数组。"""
-
-
-def _recent_context_prompt(conversation: str, old_context: str, *, recent_turns: str = "") -> str:
-    return f"""你是近期语境压缩代理。你的任务不是自由总结，而是为后续上下文中保守地抽取近期语境。
-
-目标：
-1. 提取用户最近持续关注的话题
-2. 提取最近新暴露、但尚未沉淀为长期记忆的显式偏好
-3. 提取最近适合自然续接的话题
-4. 提取最近应避免打扰、应避免推荐、或明显不想聊的方向
-5. 提取跨窗口持续存在的重要现实线索（ongoing_threads）
-6. 提取已经离开最新主线但仍可能被用户回头追问的会话内旧话题（dormant_threads）
-
-规则：
-- 只允许依据 USER 明确表达过的内容输出；ASSISTANT 的建议、解释、命名、延伸，一律不得当作证据
-- recent_topics 可以总结“用户最近在讨论什么”，但必须贴近 USER 原话，不得升级成长期偏好
-- active_topics 和 follow_ups 要优先写“话题层级”的概括，不要写 JSON Schema、函数名、字段名、具体术语翻译这类实现细节，除非用户明确把该细节当作核心关注点反复强调
-- user_preferences 只允许在 USER 出现明确偏好/要求/禁忌表达时输出，例如：喜欢、偏好、希望、别、不要、避免、不想
-- 不要把技术方案讨论、架构设想、问题求证、头脑风暴自动写成“用户偏好”
-- 对技术讨论场景，只有当 USER 明确表达“以后都这样做 / 我就是偏好这种方式 / 我不要另一种方式 / 以后统一按这个来”时，才允许写 user_preferences；否则一律视为 active_topics 或 follow_ups
-- 用户用“为什么不……”“能不能……”“是不是可以……”“只要不是最后一轮就……”这类方式提出方案设想或追问时，默认视为设计提议，不视为稳定偏好
-- avoidances 只允许在 USER 明确表达“不要/别/避免/不想”时输出；没有明确否定表达就留空
-- 如果最新 recent turns 显示话题已经明显切换，不要把较早窗口的技术讨论升级成当前偏好或避免事项
-- 只保留未来几轮仍会影响辅助决策的信息
-- 不要记录工具细节、推理过程、普通寒暄
-- active_topics、user_preferences、follow_ups、avoidances 和 ongoing_threads 最多 3 条，每条尽量 1 句
-- dormant_threads 最多 5 条；最新话题切换时，旧的普通会话话题优先降级到 dormant_threads，而不是直接删除
-- 没有把握就留空；宁可漏掉，也不要脑补
-
-ongoing_threads 严格限制：
-- 只记录用户正在经历、推进或承受的重要事情
-- 必须是对用户当前生活、情绪、工作、学习、关系或健康有持续影响的线索
-- 普通提问、技术讨论、方案脑暴、一次性 ask、知识求证，一律不得写入 ongoing_threads
-- 若旧的 ongoing_threads 中已有某条重要线索，而当前窗口没有明确终结它，默认保留
-- 只有当用户明确表示这件事已解决、结束、过去了、不再关心，才允许删除
-- ongoing_threads 的写入门槛高于 active_topics；宁可少写，也不要把普通话题升级进去
-
-专项禁令：
-- 用户讨论“某个设计有没有依据/有没有实践/是否可行/为什么不这样做”，这是方案讨论，不是偏好；默认只能进入 active_topics 或 follow_ups，不能进入 user_preferences
-- 用户说“为什么不让前台……只要不是最后一轮就……”是在提出一种实现设想，不等于“用户偏好以后统一这样做”
-- 用户说“这样也不会引入额外延迟”“有没有这样的设计”，这是在分析方案目标，不等于稳定偏好
-- 用户讨论“零延迟”“预加载”“流式预取”“前瞻性检索”这类设计目标时，默认视为当前方案讨论，不得直接提炼成 user_preferences
-- 对方案讨论里的具体实现细节，优先上收一层概括，例如写“下一轮检索规划”“流式预取方案”，不要写“JSON Schema”“结构化预取指令”这类细碎实现点
-- 用户说“睡觉了”“头有点疼”“身体不适”，这只是当前状态；除非用户明确说“别再聊这个”“不要继续”“我不想讨论”，否则不得生成 avoidances
-- assistant 说“今晚先别想架构和代码了”“先休息”，这是 assistant 建议，不是用户 avoidances
-- 如果较早窗口是技术方案讨论，而最新 recent turns 已切到睡眠/头痛/身体状态，则 user_preferences 和 avoidances 默认应为空；技术方案最多保留在 active_topics / follow_ups
-- “最近在讨论前瞻性检索/流式预取方案”只能进入 active_topics / follow_ups，不能进入 ongoing_threads
-- “用户最近几天反复因面试失败而情绪低落”“用户近期持续受睡眠紊乱影响”这类重要现实线索，才允许进入 ongoing_threads
-
-反例：
-- 错误：把“在 React 过程中同时输出下一轮检索内容”写成“用户偏好在对话中实时生成下一轮检索指令”
-- 错误：把“这样也不会引入额外延迟”写成“用户偏好零延迟预加载”
-- 错误：把“为什么不让前台在进行时同时输出自己想要什么”写成“用户偏好实时生成下一轮检索指令”
-- 错误：把“睡觉了，吃了褪黑素头有点疼”写成“避免在身体不适时继续讨论技术架构”
-- 错误：把“最近在讨论 React / 流式预取方案”写成 ongoing_threads
-- 正确：active_topics 可写“用户最近在讨论前瞻性检索/流式预取方案”
-- 正确：ongoing_threads 可写“用户最近几天反复提到面试受挫，持续影响情绪”
-- 正确：如果用户没有明确说“希望/不要/避免/不想”，user_preferences 和 avoidances 可以为空
-
-输出前自检：
-1. 检查 user_preferences 中每一条，是否都能在 USER 原话里找到明确偏好/要求词（如“希望/不要/避免/不想/偏好/喜欢”）
-2. 若找不到明确偏好/要求词，删除该条
-3. 检查 avoidances 中每一条，是否都能在 USER 原话里找到明确否定/回避表达
-4. 若找不到明确否定/回避表达，删除该条
-5. 如果删除后为空，返回空数组，不要为了“信息完整”硬填
-
-【上一版 recent context（仅供延续，不要机械复述）】
-{old_context or '（空）'}
-
-【较早窗口（本次待压缩）】
-{conversation or '（空）'}
-
-【最新 Recent Turns（仅用于判断话题是否切换）】
-- `[user]` 表示近期用户消息，只用于判断近期正在讨论什么，以及话题是否已经切换
-- `[a-preview]` 表示 ASSISTANT 回复的截断预览，内容可能不完整，也不代表用户立场
-- Recent Turns 中的任何内容都不能替代待压缩窗口中的 USER 原文
-- 严禁将 `[a-preview]` 作为用户身份、事实、偏好、关系、回避事项或 ongoing thread 的证据
-{recent_turns or '（空）'}
-
-完成判断后必须且只能调用 submit_recent_context；不得通过普通正文返回结果。
-没有符合条件的内容时也必须调用，参数为：
-{{"active_topics": [], "user_preferences": [], "follow_ups": [], "avoidances": [], "dormant_threads": [], "ongoing_threads": []}}"""
-
-
-def _render_recent_context(data: dict[str, object]) -> str:
-    labels = (
-        ("active_topics", "最近持续关注"),
-        ("user_preferences", "最近明确偏好"),
-        ("follow_ups", "最近待延续话题"),
-        ("avoidances", "最近避免事项"),
-    )
-    lines = ["# Recent Context", "", "## Compression"]
-    for key, label in labels:
-        values = data.get(key)
-        items = [str(item).strip() for item in values if str(item).strip()][:3] if isinstance(values, list) else []
-        lines.append(f"- {label}：{'；'.join(items) if items else 'none'}")
-    lines.extend(["", "## Dormant Threads"])
-    dormant = data.get("dormant_threads")
-    items = [str(item).strip() for item in dormant if str(item).strip()][:5] if isinstance(dormant, list) else []
-    lines.extend(f"- {item}" for item in items)
-    if not items:
-        lines.append("- none")
-    lines.extend(["", "## Ongoing Threads"])
-    ongoing = data.get("ongoing_threads")
-    items = [str(item).strip() for item in ongoing if str(item).strip()][:3] if isinstance(ongoing, list) else []
-    lines.extend(f"- {item}" for item in items)
-    if not items:
-        lines.append("- none")
-    return "\n".join(lines) + "\n"
 
 
 def _scope(channel: str, chat_id: str):
