@@ -77,6 +77,11 @@ class MemoryStore2:
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS consolidation_writes (
+                    source_ref TEXT PRIMARY KEY,
+                    digest TEXT NOT NULL,
+                    completed_at TEXT NOT NULL
+                );
             """)
             if self._vec_available:
                 self._db.execute(
@@ -166,6 +171,25 @@ class MemoryStore2:
         with self._lock:
             self._ensure_open()
             self._db.execute("DELETE FROM consolidation_outbox WHERE source_ref=?", (source_ref,))
+            self._db.commit()
+
+    def has_consolidation_write(self, source_ref: str) -> bool:
+        """判断单个 checkpoint 副作用是否已完成，支持重放跳过已写条目。"""
+
+        with self._lock:
+            self._ensure_open()
+            return self._db.execute(
+                "SELECT 1 FROM consolidation_writes WHERE source_ref=?",
+                (str(source_ref),),
+            ).fetchone() is not None
+
+    def record_consolidation_write(self, source_ref: str, digest: str) -> None:
+        with self._lock:
+            self._ensure_open()
+            self._db.execute(
+                "INSERT OR IGNORE INTO consolidation_writes(source_ref,digest,completed_at) VALUES(?,?,?)",
+                (str(source_ref), str(digest), datetime.now(timezone.utc).isoformat()),
+            )
             self._db.commit()
 
     def vector_search(self, query_vec: list[float], top_k: int = 8, memory_types: list[str] | None = None, score_threshold: float = 0.0, scope_channel: str | None = None, scope_chat_id: str | None = None, require_scope_match: bool = False, hotness_alpha: float = 0.20, hotness_half_life_days: float = 14.0, time_start: datetime | None = None, time_end: datetime | None = None) -> list[dict[str, object]]:

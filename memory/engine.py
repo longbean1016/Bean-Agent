@@ -61,7 +61,10 @@ logger = logging.getLogger(__name__)
 class MemoryEngine:
     """组装记忆读写、归档和工具能力，不持有共享 LLMProvider 的所有权。"""
 
-    def __init__(self, workspace: Path, embedder: Any, provider: Any, sessions: SessionStore, *, config: MemoryConfig | None = None, consolidation_extractor: ConsolidationExtractor | None = None, implicit_extractor: Any | None = None) -> None:
+    def __init__(self, workspace: Path, embedder: Any, provider: Any, sessions: SessionStore, *, config: MemoryConfig | None = None, consolidation_extractor: ConsolidationExtractor | None = None, implicit_extractor: Any | None = None, keep_count: int | None = None, consolidation_threshold: int | None = None) -> None:
+        # 旧参数只保留调用兼容性，明确不参与 checkpoint 选择或 token gate；压缩
+        # 的唯一触发入口是 Pipeline 根据 Provider token 预算调用 compact_for_context。
+        del keep_count, consolidation_threshold
         self._config = config or MemoryConfig()
         self._embedder = embedder
         self._provider = provider
@@ -427,24 +430,19 @@ class MemoryEngine:
             tokens_after=0,
             summary_usage={},
         )
-        # ledger 提交后才推进 active generation；之后的记忆副作用失败不能让
-        # 原文重新回到模型窗口，也不能生成另一代重复覆盖同一 source plan。
-        self._sessions.commit_compaction(checkpoint)
-
-        # summary、event、隐式记忆和 pending 使用同一 selected source；旧提取器
-        # 暂时保留 recent_context 输出，但它不再参与 checkpoint Prompt 注入。
-        draft = await self._consolidation_extractor.extract(
-            selected_messages,
-            previous_summary,
-            current_memory=self._markdown.read_long_term().strip(),
+        # summary、event、PENDING 和隐式 profile/preference/procedure 必须读取同一
+        # source_ref；先完成提取再落 checkpoint，避免摘要已经推进边界而记忆候选丢失。
+        draft, implicit = await asyncio.gather(
+            self._consolidation_extractor.extract(
+                selected_messages,
+                previous_summary,
+                current_memory=self._markdown.read_long_term().strip(),
+            ),
+            self._implicit_extractor.extract(
+                conversation,
+                existing_profile="",
+            ),
         )
-        pending_lines = [
-            f"- [{str(item.get('tag') or 'key_info')}] {str(item.get('content') or '').strip()}"
-            for item in draft.pending_items
-            if str(item.get("content") or "").strip()
-        ]
-        if pending_lines:
-            self._markdown.append_pending_once("\n".join(pending_lines), source_ref=source_ref)
         committed = ConsolidationCommitted(
             history_entry_payloads=[
                 (str(entry.get("summary") or ""), _emotional_weight(entry.get("emotional_weight")))
@@ -455,8 +453,17 @@ class MemoryEngine:
             scope_channel=key.partition(":")[0],
             scope_chat_id=key.partition(":")[2],
             conversation=conversation,
+            session_key=key,
+            generation=generation,
+            pending_items=[dict(item) for item in draft.pending_items if isinstance(item, dict)],
+            implicit_memory=_implicit_payload(implicit),
         )
+        # outbox 先于 checkpoint 提交：若 commit 之前进程退出，replay 会因 active
+        # generation 不匹配而跳过；若 commit 之后副作用失败，则可安全重放。
         self._store.enqueue_consolidation(source_ref, _consolidation_payload(committed))
+        # 这里才推进 active generation；之后的记忆副作用失败不能让原文重新回到
+        # 模型窗口，也不能生成另一代重复覆盖同一 source plan。
+        self._sessions.commit_compaction(checkpoint)
         try:
             await self.on_consolidation_committed(committed)
         except Exception:
@@ -567,17 +574,29 @@ class MemoryEngine:
         return False
 
     async def on_consolidation_committed(self, event: ConsolidationCommitted) -> None:
-        # 事件向量写入与隐式记忆提取只共享归档原文，彼此没有数据依赖。并发等待
-        # 两类外部 IO，随后才写 implicit 并清理 outbox，保持原有提交边界。
+        pending_lines = [
+            f"- [{str(item.get('tag') or 'key_info')}] {str(item.get('content') or '').strip()}"
+            for item in event.pending_items
+            if isinstance(item, dict) and str(item.get("content") or "").strip()
+        ]
+        if pending_lines:
+            self._markdown.append_pending_once(
+                "\n".join(pending_lines),
+                source_ref=event.source_ref,
+            )
+        # 新 checkpoint 把隐式候选随 outbox 一并保存，重放时不再重新调用 LLM；
+        # 旧格式 outbox 没有该字段时才走兼容提取路径。
+        implicit = _implicit_from_payload(event.implicit_memory)
+        implicit_task = (
+            asyncio.sleep(0, result=implicit)
+            if event.implicit_memory
+            else self._implicit_extractor.extract(event.conversation, existing_profile="")
+        )
+        # 事件向量写入与隐式记忆保存没有数据依赖，允许并发等待，完成后再清理 outbox。
         async with asyncio.TaskGroup() as group:
             group.create_task(self._save_consolidation_events(event))
-            implicit_task = group.create_task(
-                self._implicit_extractor.extract(
-                    event.conversation,
-                    existing_profile="",
-                )
-            )
-        implicit = implicit_task.result()
+            implicit_task_group = group.create_task(implicit_task)
+        implicit = implicit_task_group.result()
         await self._save_implicit_long_term(implicit, event)
         self._store.complete_consolidation(event.source_ref)
 
@@ -609,7 +628,14 @@ class MemoryEngine:
 
         for payload in self._store.list_pending_consolidations():
             try:
-                await self.on_consolidation_committed(_consolidation_from_payload(payload))
+                event = _consolidation_from_payload(payload)
+                if event.session_key and event.generation:
+                    checkpoint = self._sessions.get_compaction(event.session_key, event.generation)
+                    # outbox 可能在 checkpoint commit 前落盘；未成为 active generation
+                    # 前不能把候选写入长期记忆，等待下一次 checkpoint 重试。
+                    if checkpoint is None or checkpoint.source_ref != event.source_ref:
+                        continue
+                await self.on_consolidation_committed(event)
             except Exception:
                 logger.exception("Consolidation 向量同步重放失败: source_ref=%s", payload.get("source_ref"))
 
@@ -1091,6 +1117,14 @@ def _consolidation_payload(event: ConsolidationCommitted) -> dict[str, object]:
         "scope_channel": event.scope_channel,
         "scope_chat_id": event.scope_chat_id,
         "conversation": event.conversation,
+        "session_key": event.session_key,
+        "generation": event.generation,
+        "pending_items": [dict(item) for item in event.pending_items],
+        "implicit_memory": {
+            str(kind): [dict(item) for item in items]
+            for kind, items in event.implicit_memory.items()
+            if isinstance(items, list)
+        },
     }
 
 
@@ -1107,6 +1141,36 @@ def _consolidation_from_payload(payload: dict[str, object]) -> ConsolidationComm
         scope_channel=str(payload.get("scope_channel") or ""),
         scope_chat_id=str(payload.get("scope_chat_id") or ""),
         conversation=str(payload.get("conversation") or ""),
+        session_key=str(payload.get("session_key") or ""),
+        generation=max(0, int(payload.get("generation") or 0)),
+        pending_items=[dict(item) for item in payload.get("pending_items", []) if isinstance(item, dict)]
+        if isinstance(payload.get("pending_items"), list)
+        else [],
+        implicit_memory={
+            str(kind): [dict(item) for item in items if isinstance(item, dict)]
+            for kind, items in payload.get("implicit_memory", {}).items()
+            if isinstance(items, list)
+        }
+        if isinstance(payload.get("implicit_memory"), dict)
+        else {},
+    )
+
+
+def _implicit_payload(draft: ImplicitMemoryDraft) -> dict[str, list[dict[str, object]]]:
+    """把统一提取结果转为可 JSON 化 outbox，重放时不重新请求模型。"""
+
+    return {
+        "profile": [dict(item) for item in draft.profile],
+        "preference": [dict(item) for item in draft.preference],
+        "procedure": [dict(item) for item in draft.procedure],
+    }
+
+
+def _implicit_from_payload(payload: dict[str, list[dict[str, object]]]) -> ImplicitMemoryDraft:
+    return ImplicitMemoryDraft(
+        profile=[dict(item) for item in payload.get("profile", []) if isinstance(item, dict)],
+        preference=[dict(item) for item in payload.get("preference", []) if isinstance(item, dict)],
+        procedure=[dict(item) for item in payload.get("procedure", []) if isinstance(item, dict)],
     )
 
 
