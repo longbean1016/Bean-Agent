@@ -100,6 +100,23 @@ def test_constructor_injects_llm_config_into_openai_client(
     }
 
 
+def test_provider_exposes_context_budget_and_estimator() -> None:
+    provider = _provider(
+        _Client(),
+        model="budget-model",
+        max_tokens=200,
+        context_window=1000,
+    )
+
+    assert provider.model == "budget-model"
+    assert provider.max_tokens == 200
+    assert provider.context_window == 1000
+    assert provider.estimate_context_tokens(
+        [{"role": "user", "content": "问题"}],
+        [{"type": "function", "function": {"name": "tool"}}],
+    ) > 0
+
+
 def test_create_vision_provider_builds_independent_configured_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

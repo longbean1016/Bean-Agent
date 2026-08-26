@@ -30,6 +30,7 @@ class LLMConfig:
     api_key: str = ""  # 服务商密钥，推荐通过环境变量注入
     base_url: str | None = None  # 自定义兼容接口地址，空值时按 provider 推断
     max_tokens: int = 8192  # 单次模型回复允许生成的最大 token 数
+    context_window: int = 0  # Provider 输入上下文上限；0 表示模型容量未知
     max_iterations: int = 10  # 单轮 ReAct 最大迭代次数，0 表示不限制
     system_prompt: str = ""  # 额外系统提示词，空值时由 PromptBlock 组装
     request_timeout_s: float = 90.0  # 单次模型请求超时秒数

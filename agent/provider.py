@@ -23,6 +23,7 @@ from urllib.parse import urlsplit, urlunsplit
 from openai import AsyncOpenAI
 
 from agent.config_models import LLMConfig, VisionConfig
+from agent.context_budget import estimate_payload_tokens, estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +315,7 @@ class LLMProvider:
         self._provider_name = config.provider
         self._model = config.model
         self._max_tokens = config.max_tokens
+        self._context_window = max(0, int(config.context_window))
         self._system_prompt = config.system_prompt
         self._extra_body = dict(config.extra_body)
 
@@ -337,6 +339,37 @@ class LLMProvider:
             else bool(payload_snapshot_enabled)
         )
         self._closed = False
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @property
+    def max_tokens(self) -> int:
+        return self._max_tokens
+
+    @property
+    def context_window(self) -> int:
+        """返回模型上下文窗口；0 表示配置未提供可靠容量。"""
+
+        return self._context_window
+
+    def estimate_context_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> int:
+        """估算完整输入 payload，供 compaction gate 在请求前使用。"""
+
+        return estimate_payload_tokens(messages, tools)
+
+    def estimate_appended_message_tokens(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> int:
+        """估算追加消息的 token，供未来 usage delta 校准复用。"""
+
+        return estimate_tokens(messages) + len(messages) * 4
 
     async def chat(
         self,

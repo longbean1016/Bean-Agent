@@ -62,6 +62,7 @@ def load_config(path: str | Path = "config.toml") -> Config:
         api_key=_resolve(str(llm_raw.get("api_key", ""))),
         base_url=str(base_url_value) if base_url_value else None,
         max_tokens=int(llm_raw.get("max_tokens", 8192)),
+        context_window=int(llm_raw.get("context_window", 0)),
         max_iterations=int(llm_raw.get("max_iterations", 10)),
         system_prompt=str(llm_raw.get("system_prompt", "") or ""),
         request_timeout_s=float(llm_raw.get("request_timeout_s", 90.0)),
