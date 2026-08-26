@@ -252,10 +252,11 @@ class SessionManager:
 
     _METADATA_REFRESH_EVERY = 10
 
-    def __init__(self, workspace: Path, history_window: int = 40) -> None:
-        if history_window <= 0:
+    def __init__(self, workspace: Path, history_window: int | None = None) -> None:
+        # 兼容旧调用方的参数形状，但它不再参与历史加载；活动边界只由
+        # checkpoint.consolidated_through_seq 决定，limit=None 才是主链路语义。
+        if history_window is not None and int(history_window) <= 0:
             raise ValueError("history_window 必须大于 0")
-
         # 对齐 akashic 的目录布局：sessions/ 为后续会话附件或导出能力预留，
         # 结构化会话和消息统一写入 workspace 根目录下的 sessions.db。
         self.workspace = Path(workspace)
@@ -263,8 +264,6 @@ class SessionManager:
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.workspace / "sessions.db"
         self._store = SessionStore(self.db_path)
-        self._history_window = int(history_window)
-
         # cache 保存完整 Session 而非只保存元数据。命中缓存时历史生成不访问
         # SQLite；invalidate 后才从数据库重新构建完整消息快照。
         self._cache: dict[str, Session] = {}

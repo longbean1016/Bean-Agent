@@ -96,42 +96,13 @@ class MemoryConfig:
 
     enabled: bool = False  # 是否启用长期记忆闭环
     engine_name: str = "default"  # 记忆引擎名称，当前最小版本仅支持 default
-    context_window: int = 40  # 活动历史窗口；压缩批次与积压阈值均从此值派生
+    # 旧配置字段仅为反序列化兼容保留；历史范围和压缩触发均由 Session
+    # checkpoint 边界及 LLM token gate 决定，不能再从这里派生消息数窗口。
+    context_window: int = 0
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)  # 向量配置
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)  # 整理配置
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)  # 检索配置
     dedup: DedupConfig = field(default_factory=DedupConfig)  # 去重配置
-
-    def __post_init__(self) -> None:
-        if self.context_window < 1:
-            raise ValueError("context_window 必须大于等于 1")
-
-    @property
-    def aligned_context_window(self) -> int:
-        """将活动窗口向上对齐到四消息边界。"""
-
-        return max(4, ((self.context_window + 3) // 4) * 4)
-
-    @property
-    def keep_count(self) -> int:
-        """返回 consolidation 后保留的热历史消息数。"""
-
-        return self.aligned_context_window // 2
-
-    @property
-    def consolidation_min_new_messages(self) -> int:
-        """返回触发一次增量归档所需的最少新消息数。"""
-
-        return max(5, self.keep_count // 2)
-
-    @property
-    def context_guard_threshold(self) -> int:
-        """返回 Turn 前必须处理压缩积压的未归档消息阈值。"""
-
-        background_threshold = self.keep_count + self.consolidation_min_new_messages
-        # 正常窗口达到配置上限后才同步等待；极小窗口若低于一次归档所需门槛，
-        # 仍以后者为准，避免尚无足够消息可压缩时提前阻塞 Turn。
-        return max(background_threshold, self.aligned_context_window)
 
 
 @dataclass

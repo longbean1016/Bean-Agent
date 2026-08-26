@@ -250,7 +250,7 @@ def build_core_runtime(
     # 主 Provider 是应用级共享资源，由 Runtime 最终关闭；MemoryEngine 只借用它执行
     # QueryRewriter/Consolidation，不拥有其生命周期。
     main_provider = provider or LLMProvider(config.llm)
-    sessions = SessionManager(root, history_window=config.memory.context_window)
+    sessions = SessionManager(root)
     events = EventBus()
     messages = MessageBus()
     proactive_store = ProactiveStore(root / "proactive.db")

@@ -25,7 +25,7 @@ enable_thinking = true # 开启 DeepSeek 推理模式，Provider 会转换为 th
 [memory]
 enabled = true # 是否启用长期记忆
 engine_name = "default" # 当前最小版本使用的记忆引擎
-context_window = 40 # 上下文基准窗口，热历史与压缩阈值由此派生
+# 上下文 token 上限配置在 [llm].context_window；此处不再配置消息窗口。
 
 [memory.embedding]
 model = "text-embedding-v3"

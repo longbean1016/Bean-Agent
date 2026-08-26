@@ -185,8 +185,9 @@ def _load_memory_config(data: dict[str, Any]) -> MemoryConfig:
         # enabled=False 时，后续 bootstrap 会跳过整个记忆引擎的创建。
         enabled=bool(raw.get("enabled", False)),
         engine_name=str(raw.get("engine_name", "default")),
-        # 历史加载和记忆压缩共用同一窗口，避免两套阈值产生分歧。
-        context_window=int(raw.get("context_window", 40)),
+        # 旧的 memory.context_window 仅保留在 dataclass 中兼容读取；这里不再
+        # 将它解释为历史窗口或压缩阈值，真正的 token 上限属于 [llm] 配置。
+        context_window=int(raw.get("context_window", 0)),
         # Embedding 密钥支持环境变量；若配置为空，后续组装层可复用 LLM 密钥。
         embedding=EmbeddingConfig(
             model=str(embedding_raw.get("model", "text-embedding-v3")),
