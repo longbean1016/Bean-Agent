@@ -13,6 +13,7 @@ from agent.config_models import MemoryConfig
 from memory.consolidator import (
     ConsolidationDraft,
     ConsolidationExtractor,
+    render_consolidation_conversation,
 )
 from memory.checkpoint import (
     flatten_units,
