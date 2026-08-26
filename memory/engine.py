@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -14,9 +13,6 @@ from agent.config_models import MemoryConfig
 from memory.consolidator import (
     ConsolidationDraft,
     ConsolidationExtractor,
-    ConsolidationResult,
-    Consolidator,
-    render_consolidation_conversation,
 )
 from memory.checkpoint import (
     flatten_units,
@@ -65,7 +61,7 @@ logger = logging.getLogger(__name__)
 class MemoryEngine:
     """组装记忆读写、归档和工具能力，不持有共享 LLMProvider 的所有权。"""
 
-    def __init__(self, workspace: Path, embedder: Any, provider: Any, sessions: SessionStore, *, config: MemoryConfig | None = None, consolidation_extractor: ConsolidationExtractor | None = None, implicit_extractor: Any | None = None, keep_count: int | None = None, consolidation_threshold: int | None = None) -> None:
+    def __init__(self, workspace: Path, embedder: Any, provider: Any, sessions: SessionStore, *, config: MemoryConfig | None = None, consolidation_extractor: ConsolidationExtractor | None = None, implicit_extractor: Any | None = None) -> None:
         self._config = config or MemoryConfig()
         self._embedder = embedder
         self._provider = provider
@@ -111,26 +107,7 @@ class MemoryEngine:
             provider,
             step_delay_seconds=self._config.optimizer.step_delay_seconds,
         )
-        # 生产运行只配置 context_window；显式覆盖仅用于小窗口确定性测试。
-        derived_keep_count = self._config.keep_count if keep_count is None else keep_count
-        derived_threshold = (
-            self._config.consolidation_min_new_messages
-            if consolidation_threshold is None
-            else consolidation_threshold
-        )
-        # 生产环境将后台压缩软门槛与 Turn 前积压保护分开：默认在 30 条启动后台
-        # 压缩，只有继续积压到 36 条才同步等待。显式覆盖继续服务小窗口测试。
-        self._context_guard_threshold = (
-            self._config.context_guard_threshold
-            if keep_count is None and consolidation_threshold is None
-            else derived_keep_count + derived_threshold
-        )
         self._consolidation_extractor = consolidation_extractor or _LLMConsolidationExtractor(provider)
-        self._consolidator = Consolidator(
-            sessions, self._markdown,
-            self._consolidation_extractor,
-            keep_count=derived_keep_count, threshold=derived_threshold,
-        )
         self._implicit_extractor = implicit_extractor or ImplicitLongTermExtractor(provider)
         self._post_response = PostResponseMemoryWorker(
             self._memorizer,
@@ -141,11 +118,6 @@ class MemoryEngine:
         # 第一次摄入 Turn 时启动，避免初始化阶段错误捕获不存在的 event loop。
         self._post_response_queue: asyncio.Queue[TurnIngested] = asyncio.Queue()
         self._post_response_task: asyncio.Task[None] | None = None
-        # 参考实现按 session_key 隔离维护队列：同一会话严格串行，不同会话各自拥有
-        # asyncio Task，可以并行等待 LLM/IO，避免慢会话阻塞全部用户。
-        self._maintenance_queues: dict[str, deque[TurnIngested]] = {}
-        self._maintenance_locks: dict[str, asyncio.Lock] = {}
-        self._maintenance_tasks: dict[str, asyncio.Task[None]] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._accepting = True
         self._closed = False
@@ -580,32 +552,6 @@ class MemoryEngine:
         self._event_bus.off(ConsolidationCommitted, self.on_consolidation_committed)
         self._event_bus = None
 
-    async def _run_consolidation(self, event: TurnIngested) -> ConsolidationResult | None:
-        await self.replay_pending_consolidations()
-        result = await self._consolidator.consolidate(event.session_key)
-        if result is None:
-            return None
-        committed = ConsolidationCommitted(
-            history_entry_payloads=[
-                (str(entry.get("summary") or ""), int(entry.get("emotional_weight", 0) or 0))
-                for entry in result.history_entries if str(entry.get("summary") or "").strip()
-            ],
-            source_ref=result.source_ref,
-            scope_channel=event.channel,
-            scope_chat_id=event.chat_id,
-            conversation=result.conversation,
-        )
-        # outbox 必须先于 cursor 和事件派发持久化；若进程在派发前崩溃，
-        # 下次 Turn 仍能从 SQLite 重放向量同步，而不会丢失已归档窗口的派生任务。
-        self._store.enqueue_consolidation(result.source_ref, _consolidation_payload(committed))
-        # cursor 是模型历史的排除边界，只有 Markdown 和 outbox 都可恢复后才能推进。
-        self._sessions.set_cursor(event.session_key, result.cursor)
-        if self._event_bus is not None:
-            await self._event_bus.emit(committed)
-        else:
-            await self.on_consolidation_committed(committed)
-        return result
-
     async def ensure_context_ready(self, session_key: str) -> bool:
         """兼容旧 ContextGuard API；token gate 已在 Pipeline 组装完整 payload 时执行。"""
 
@@ -619,16 +565,6 @@ class MemoryEngine:
         if not str(session_key or "").strip():
             raise ValueError("session_key 不能为空")
         return False
-
-    async def _run_consolidation_serialized(
-        self,
-        event: TurnIngested,
-    ) -> ConsolidationResult | None:
-        """让后台维护与 Turn 前保护共享同一 Session 的压缩临界区。"""
-
-        lock = self._maintenance_locks.setdefault(event.session_key, asyncio.Lock())
-        async with lock:
-            return await self._run_consolidation(event)
 
     async def on_consolidation_committed(self, event: ConsolidationCommitted) -> None:
         # 事件向量写入与隐式记忆提取只共享归档原文，彼此没有数据依赖。并发等待
@@ -728,12 +664,9 @@ class MemoryEngine:
                 )
 
     async def drain(self) -> None:
-        """等待当前已接收的两类后台任务全部完成，主要用于关闭和确定性测试。"""
+        """等待每轮记忆失效队列清空，checkpoint 只在 Pipeline token gate 中执行。"""
 
         await self._post_response_queue.join()
-        # 新任务可能在一次 gather 快照完成前被追加，因此循环到任务表真正为空。
-        while self._maintenance_tasks:
-            await asyncio.gather(*list(self._maintenance_tasks.values()), return_exceptions=True)
 
     async def _ensure_workers(self) -> None:
         async with self._lifecycle_lock:
@@ -753,37 +686,6 @@ class MemoryEngine:
                 logger.exception("每轮记忆失效处理失败")
             finally:
                 self._post_response_queue.task_done()
-
-    def _enqueue_maintenance(self, event: TurnIngested) -> None:
-        queue = self._maintenance_queues.setdefault(event.session_key, deque())
-        queue.append(event)
-        if event.session_key in self._maintenance_tasks:
-            return
-        task = asyncio.create_task(
-            self._run_maintenance_queue(event.session_key),
-            name=f"memory-maintenance:{event.session_key}",
-        )
-        self._maintenance_tasks[event.session_key] = task
-
-    async def _run_maintenance_queue(self, session_key: str) -> None:
-        try:
-            while True:
-                queue = self._maintenance_queues.get(session_key)
-                if not queue:
-                    return
-                event = queue.popleft()
-                try:
-                    await self._run_consolidation_serialized(event)
-                except Exception:
-                    # Session 已提交，维护失败只保留 cursor 供后续重试，不能终止其它
-                    # Session 的独立任务，也不能回滚正常回复。
-                    logger.exception("会话记忆归档失败: session_key=%s", session_key)
-        finally:
-            current = asyncio.current_task()
-            if self._maintenance_tasks.get(session_key) is current:
-                self._maintenance_tasks.pop(session_key, None)
-            if not self._maintenance_queues.get(session_key):
-                self._maintenance_queues.pop(session_key, None)
 
     def _build_turn_snapshot(self, event: Any) -> TurnIngested:
         def value(name: str, default: Any = "") -> Any:
@@ -846,7 +748,6 @@ class MemoryEngine:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self._maintenance_locks.clear()
         # 最后关闭本地数据库和 Embedder HTTP 客户端；Provider 由应用组装层共享。
         self._store.close()
         self._markdown.close()
