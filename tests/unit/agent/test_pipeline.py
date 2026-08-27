@@ -16,6 +16,7 @@ from agent.event_bus import (
     ContextCompactionCompleted,
     ContextCompactionFailed,
     ContextCompactionStarted,
+    ContextUsageUpdated,
     EventBus,
     StreamDeltaReady,
     ToolCallCompleted,
@@ -788,6 +789,43 @@ async def test_pipeline_emits_compaction_lifecycle_events(tmp_path: Path) -> Non
 
     assert result.content == "完成"
     assert lifecycle == ["started", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_emits_complete_context_usage_breakdown(tmp_path: Path) -> None:
+    class UsageProvider:
+        context_window = 1000
+        context_window_source = "explicit"
+        max_tokens = 200
+
+        async def chat(self, messages, tools=None, **kwargs):
+            return LLMResponse("完成")
+
+    events: list[ContextUsageUpdated] = []
+    event_bus = EventBus()
+    event_bus.on(ContextUsageUpdated, events.append)
+    pipeline = Pipeline(
+        UsageProvider(),
+        ToolRegistry(),
+        event_bus,
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+    )
+
+    await pipeline.process(
+        InboundMessage("web", "u", "c", "当前问题"),
+        turn_id="usage-turn",
+    )
+
+    assert len(events) == 1
+    usage = events[0]
+    assert usage.context_window == 1000
+    assert usage.context_window_source == "explicit"
+    assert usage.used_tokens > 0
+    assert usage.soft_limit_tokens == 740
+    assert usage.hard_input_tokens == 800
+    assert sum(usage.breakdown.values()) == usage.used_tokens
+    assert any(item["name"] == "identity" for item in usage.sections)
 
 
 @pytest.mark.asyncio

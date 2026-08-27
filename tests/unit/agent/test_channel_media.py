@@ -8,7 +8,7 @@ import pytest
 
 from agent.agent_loop import InterruptResult
 from agent.channel import WebChannel
-from agent.event_bus import EventBus, TurnQueued, TurnQueueRejected
+from agent.event_bus import ContextUsageUpdated, EventBus, TurnQueued, TurnQueueRejected
 from agent.message_bus import MessageBus
 
 
@@ -187,4 +187,55 @@ async def test_web_channel_maps_turn_queue_events_to_websocket_frames() -> None:
     assert socket.frames[-1]["type"] == "error"
     assert socket.frames[-1]["code"] == "queue_full"
     assert socket.frames[-1]["message"] == "当前任务较多，请稍后再试"
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_web_channel_maps_context_usage_event_to_websocket_frame() -> None:
+    bus = MessageBus()
+    events = EventBus()
+    channel = WebChannel(bus, events, Interrupt())
+    socket = Socket()
+    await channel.handle_frame(socket, {
+        "type": "session.subscribe",
+        "request_id": "subscribe",
+        "session_id": "web:chat",
+    })
+
+    await events.emit(ContextUsageUpdated(
+        session_key="web:chat",
+        turn_id="turn-1",
+        used_tokens=65500,
+        context_window=1_000_000,
+        soft_limit_tokens=740_000,
+        hard_input_tokens=991_808,
+        context_window_source="provider_catalog",
+        estimate_source="heuristic",
+        breakdown={
+            "system_prompt_tokens": 1600,
+            "tools_tokens": 6900,
+            "conversation_tokens": 49700,
+            "overhead_tokens": 7300,
+        },
+        sections=({"name": "identity", "estimated_tokens": 120, "static": True, "cache_hit": True},),
+    ))
+
+    assert socket.frames[-1] == {
+        "type": "context.usage.updated",
+        "session_id": "web:chat",
+        "turn_id": "turn-1",
+        "used_tokens": 65500,
+        "context_window": 1_000_000,
+        "soft_limit_tokens": 740_000,
+        "hard_input_tokens": 991_808,
+        "context_window_source": "provider_catalog",
+        "estimate_source": "heuristic",
+        "breakdown": {
+            "system_prompt_tokens": 1600,
+            "tools_tokens": 6900,
+            "conversation_tokens": 49700,
+            "overhead_tokens": 7300,
+        },
+        "sections": [{"name": "identity", "estimated_tokens": 120, "static": True, "cache_hit": True}],
+    }
     await channel.close()

@@ -38,8 +38,31 @@ def estimate_payload_tokens(
     return max(1, estimate_tokens(message_list) + estimate_tokens(tool_list) + len(message_list) * 4 + len(tool_list) * 8)
 
 
+def estimate_payload_breakdown(
+    messages: Iterable[dict[str, Any]],
+    tools: Iterable[dict[str, Any]] | None = None,
+) -> dict[str, int]:
+    """按前端可读的四类拆分完整 payload，并保证各项可相加到总估算。"""
+
+    message_list = list(messages)
+    tool_list = list(tools or [])
+    message_tokens = estimate_tokens(message_list)
+    system_tokens = estimate_tokens([message_list[0]]) if message_list else 0
+    # 把消息协议开销单独列为 overhead；conversation 是除首条 system 外的
+    # checkpoint、历史、动态 frame、ReAct 和当前用户消息的估算总量。
+    conversation_tokens = max(0, message_tokens - system_tokens)
+    tools_tokens = estimate_tokens(tool_list)
+    protocol_tokens = len(message_list) * 4 + len(tool_list) * 8
+    return {
+        "system_prompt_tokens": system_tokens,
+        "tools_tokens": tools_tokens,
+        "conversation_tokens": conversation_tokens,
+        "overhead_tokens": protocol_tokens,
+    }
+
+
 def soft_limit_tokens(context_window: int) -> int:
-    """返回 Akashic 式 74% 软阈值。"""
+    """返回 74% 软阈值。"""
 
     return math.floor(max(0, int(context_window)) * SOFT_LIMIT_RATIO)
 
@@ -73,6 +96,7 @@ def should_compact(
 __all__ = [
     "SOFT_LIMIT_RATIO",
     "estimate_payload_tokens",
+    "estimate_payload_breakdown",
     "estimate_tokens",
     "hard_input_limit",
     "should_compact",

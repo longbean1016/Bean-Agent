@@ -13,13 +13,17 @@ from zoneinfo import ZoneInfo
 
 from agent.attachment_content import build_current_user_content
 from agent.context_budget import (
+    estimate_payload_breakdown,
     estimate_payload_tokens,
+    hard_input_limit,
     should_compact,
+    soft_limit_tokens,
 )
 from agent.event_bus import (
     ContextCompactionCompleted,
     ContextCompactionFailed,
     ContextCompactionStarted,
+    ContextUsageUpdated,
     EventBus,
     StreamDeltaReady,
     ToolCallCompleted,
@@ -276,6 +280,37 @@ class Pipeline:
                 )
                 provider_window = int(getattr(self._provider, "context_window", 0) or 0)
                 provider_output = int(getattr(self._provider, "max_tokens", 0) or 0)
+                soft_limit = soft_limit_tokens(provider_window) if provider_window > 0 else 0
+                hard_limit = (
+                    hard_input_limit(provider_window, provider_output)
+                    if provider_window > 0 and 0 <= provider_output < provider_window
+                    else 0
+                )
+                context_sections = tuple(
+                    {
+                        "name": item.name,
+                        "estimated_tokens": item.est_tokens,
+                        "static": item.is_static,
+                        "cache_hit": item.cache_hit,
+                    }
+                    for item in assembled.debug_breakdown
+                )
+                # 这是近似值，目的是让界面展示趋势并解释 gate；真实供应商 usage
+                # 仍只用于日志校准，不能反过来改变已经开始的请求。
+                await self._events.emit(ContextUsageUpdated(
+                    session_key=message.session_key,
+                    turn_id=turn_id,
+                    used_tokens=estimate,
+                    context_window=provider_window,
+                    soft_limit_tokens=soft_limit,
+                    hard_input_tokens=hard_limit,
+                    context_window_source=str(
+                        getattr(self._provider, "context_window_source", "unknown") or "unknown"
+                    ),
+                    estimate_source="heuristic",
+                    breakdown=estimate_payload_breakdown(model_messages, tool_schemas),
+                    sections=context_sections,
+                ))
                 if (
                     not react_messages
                     and self._context_compactor is not None

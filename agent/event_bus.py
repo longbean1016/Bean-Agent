@@ -55,6 +55,22 @@ class ContextCompactionFailed:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextUsageUpdated:
+    """完整 Prompt 组装后的近似上下文占用，供通道和界面观察。"""
+
+    session_key: str
+    turn_id: str
+    used_tokens: int
+    context_window: int
+    soft_limit_tokens: int
+    hard_input_tokens: int
+    context_window_source: str
+    estimate_source: str
+    breakdown: dict[str, int]
+    sections: tuple[dict[str, object], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class TurnQueued:
     """普通 Turn 已进入全局等待队列，position 从 1 开始。"""
 
@@ -165,6 +181,7 @@ __all__ = [
     "ContextCompactionCompleted",
     "ContextCompactionFailed",
     "ContextCompactionStarted",
+    "ContextUsageUpdated",
     "EventBus",
     "EventHandler",
     "SessionUpdated",
