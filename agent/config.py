@@ -24,6 +24,7 @@ from agent.config_models import (
     WebChatConfig,
     VisionConfig,
 )
+from agent.model_capabilities import resolve_context_window
 
 _PRESETS: dict[str, str] = {
     "deepseek": "https://api.deepseek.com/v1",
@@ -56,13 +57,21 @@ def load_config(path: str | Path = "config.toml") -> Config:
 
     # TOML 不会依据 dataclass 注解自动转换类型，因此在边界处显式转换。
     # 这样下游拿到 LLMConfig 后，无需再判断字符串数字等原始输入形式。
+    configured_context_window = int(llm_raw.get("context_window", 0) or 0)
+    context_resolution = resolve_context_window(
+        provider=provider,
+        model=str(llm_raw.get("model", "deepseek-v4-flash")),
+        configured=configured_context_window,
+        configured_source=str(llm_raw.get("context_window_source", "") or ""),
+    )
     llm = LLMConfig(
         provider=provider,
         model=str(llm_raw.get("model", "deepseek-v4-flash")),
         api_key=_resolve(str(llm_raw.get("api_key", ""))),
         base_url=str(base_url_value) if base_url_value else None,
         max_tokens=int(llm_raw.get("max_tokens", 8192)),
-        context_window=int(llm_raw.get("context_window", 0)),
+        context_window=context_resolution.context_window,
+        context_window_source=context_resolution.source,
         max_iterations=int(llm_raw.get("max_iterations", 10)),
         system_prompt=str(llm_raw.get("system_prompt", "") or ""),
         request_timeout_s=float(llm_raw.get("request_timeout_s", 90.0)),

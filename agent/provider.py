@@ -24,6 +24,7 @@ from openai import AsyncOpenAI
 
 from agent.config_models import LLMConfig, VisionConfig
 from agent.context_budget import estimate_payload_tokens, estimate_tokens
+from agent.model_capabilities import resolve_context_window
 
 logger = logging.getLogger(__name__)
 
@@ -315,7 +316,14 @@ class LLMProvider:
         self._provider_name = config.provider
         self._model = config.model
         self._max_tokens = config.max_tokens
-        self._context_window = max(0, int(config.context_window))
+        context_resolution = resolve_context_window(
+            provider=config.provider,
+            model=config.model,
+            configured=config.context_window,
+            configured_source=config.context_window_source,
+        )
+        self._context_window = context_resolution.context_window
+        self._context_window_source = context_resolution.source
         self._system_prompt = config.system_prompt
         self._extra_body = dict(config.extra_body)
 
@@ -353,6 +361,12 @@ class LLMProvider:
         """返回模型上下文窗口；0 表示配置未提供可靠容量。"""
 
         return self._context_window
+
+    @property
+    def context_window_source(self) -> str:
+        """返回上下文容量来源，供 gate 诊断和前端提示使用。"""
+
+        return self._context_window_source
 
     def estimate_context_tokens(
         self,

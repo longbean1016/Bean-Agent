@@ -1,0 +1,82 @@
+"""模型能力解析，统一提供上下文窗口及其来源。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, Mapping
+
+
+@dataclass(frozen=True, slots=True)
+class ContextWindowResolution:
+    """一次启动期能力解析的稳定结果。"""
+
+    context_window: int
+    source: str
+
+
+def resolve_context_window(
+    *,
+    provider: str,
+    model: str,
+    configured: int = 0,
+    configured_source: str = "",
+) -> ContextWindowResolution:
+    """按显式配置、模型快照、未知的顺序解析上下文窗口。
+
+    上下文容量属于模型能力而不是请求参数；启动时解析并冻结结果，避免每轮
+    访问外部目录或让同一会话在能力变化时出现不一致的压缩边界。
+    """
+
+    explicit = _positive_int(configured)
+    if explicit:
+        source = str(configured_source or "explicit").strip() or "explicit"
+        return ContextWindowResolution(explicit, source)
+
+    entry = _find_model_entry(provider, model)
+    if entry is not None:
+        max_input = _positive_int(entry.get("max_input_tokens"))
+        max_output = _positive_int(entry.get("max_output_tokens") or entry.get("max_tokens"))
+        # 输入和输出都声明时取总窗口；只有输入上限时保持输入上限，避免拿
+        # 不完整的元数据扩大本地 gate，导致 provider 请求必然超限。
+        context_window = max_input + max_output if max_input and max_output else max_input
+        if context_window:
+            return ContextWindowResolution(context_window, "litellm")
+
+    return ContextWindowResolution(0, "unknown")
+
+
+@lru_cache(maxsize=1)
+def _model_registry() -> Mapping[str, Mapping[str, Any]]:
+    """读取随运行环境安装的本地能力快照；依赖缺失时按未知能力运行。"""
+
+    try:
+        import litellm  # type: ignore[import-not-found]
+    except Exception:
+        return {}
+    registry = getattr(litellm, "model_cost", {})
+    return registry if isinstance(registry, Mapping) else {}
+
+
+def _find_model_entry(provider: str, model: str) -> Mapping[str, Any] | None:
+    normalized_model = str(model or "").strip()
+    if not normalized_model:
+        return None
+    normalized_provider = str(provider or "").strip().lower()
+    candidates: list[str] = []
+    if normalized_provider and "/" not in normalized_model:
+        candidates.append(f"{normalized_provider}/{normalized_model}")
+    candidates.append(normalized_model)
+    registry = _model_registry()
+    for candidate in candidates:
+        entry = registry.get(candidate)
+        if isinstance(entry, Mapping):
+            return entry
+    return None
+
+
+def _positive_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+__all__ = ["ContextWindowResolution", "resolve_context_window"]
