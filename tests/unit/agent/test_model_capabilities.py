@@ -28,7 +28,7 @@ def test_explicit_context_window_has_priority_over_snapshot(monkeypatch) -> None
 
 
 def test_snapshot_combines_input_and_output_capabilities(monkeypatch) -> None:
-    _set_registry(monkeypatch, {"qwen/qwen-plus": {"max_input_tokens": 128000, "max_output_tokens": 8192}})
+    _set_registry(monkeypatch, {"dashscope/qwen-plus": {"max_input_tokens": 128000, "max_output_tokens": 8192}})
 
     result = resolve_context_window(provider="qwen", model="qwen-plus")
 

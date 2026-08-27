@@ -8,6 +8,12 @@ from functools import lru_cache
 from typing import Any, Mapping
 
 
+_PROVIDER_ALIASES = {
+    # 配置使用兼容接口的常用简称，能力快照沿用供应商的标准标识。
+    "qwen": "dashscope",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ContextWindowResolution:
     """一次启动期能力解析的稳定结果。"""
@@ -65,7 +71,10 @@ def _find_model_entry(provider: str, model: str) -> Mapping[str, Any] | None:
     normalized_model = str(model or "").strip()
     if not normalized_model:
         return None
-    normalized_provider = str(provider or "").strip().lower()
+    normalized_provider = _PROVIDER_ALIASES.get(
+        str(provider or "").strip().lower(),
+        str(provider or "").strip().lower(),
+    )
     candidates: list[str] = []
     if normalized_provider and "/" not in normalized_model:
         candidates.append(f"{normalized_provider}/{normalized_model}")
