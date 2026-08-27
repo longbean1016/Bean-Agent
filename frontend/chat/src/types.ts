@@ -38,7 +38,7 @@ export interface ChatState {
 }
 
 export interface TurnRuntimeState {
-  status: "idle" | "submitting" | "queued" | "running";
+  status: "idle" | "submitting" | "queued" | "running" | "compacting";
   queuePosition: number | null;
   turnId: string;
   requestId: string;
@@ -140,6 +140,9 @@ export type ChatFrame =
   | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message: string; user_media: string[]; content: string; thinking: string; tools: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments: unknown; result_preview: string }>; status: "running" }
   | { type: "turn.queued"; request_id: string; session_id: string; position: number }
   | { type: "turn.started"; request_id?: string; session_id: string; turn_id: string }
+  | { type: "context.compaction.started"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number }
+  | { type: "context.compaction.completed"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number; compacted: boolean }
+  | { type: "context.compaction.failed"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number; message: string }
   | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.thinking.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.tool.started"; session_id: string; turn_id: string; call_id: string; tool_name: string; arguments: unknown }

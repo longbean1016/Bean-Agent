@@ -425,6 +425,7 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .attach-button input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .composer-hint { margin-left: 2px; color: var(--text-faint); font-size: 11px; }
 .queue-status { margin-left: 2px; color: var(--warning); font-size: 12px; font-weight: 600; }
+.compaction-status { color: var(--primary-active); }
 .composer-tool-button { width: 38px; height: 38px; border-radius: 50%; color: #18211e; background: #f2f4f3; }
 .composer-tool-button:hover { background: #e8eeeb; color: var(--primary-active); }
 .composer-tool-button:disabled { color: #a1aaa6; background: #eef2f0; cursor: default; }

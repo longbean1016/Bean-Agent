@@ -208,7 +208,7 @@ export function App() {
   messageWindowsRef.current = messageWindows;
   routeSessionRef.current = routeSession;
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
-  const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running";
+  const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running" || currentTurn.status === "compacting";
   const restoringSession = Boolean(chat.sessionId && loadingSessionId === chat.sessionId && chat.messages.length === 0);
   const displayMessages = useMemo(() => composeTimeline(
     messageWindows[chat.sessionId]?.hasTailWindow === false
@@ -1432,7 +1432,7 @@ function AttachmentGallery({ paths }: { paths: string[] }) {
 }
 
 function Composer(props: {
-  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running"; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string;
+  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running" | "compacting"; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string;
   onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
@@ -1728,6 +1728,11 @@ function Composer(props: {
           {props.turnStatus === "queued" ? (
             <span className="queue-status" role="status">
               {props.queuePosition === 1 ? "排队中 · 即将开始" : `排队中 · 前面还有 ${(props.queuePosition ?? 1) - 1} 个会话`}
+            </span>
+          ) : null}
+          {props.turnStatus === "compacting" ? (
+            <span className="queue-status compaction-status" role="status" aria-live="polite">
+              正在压缩上下文
             </span>
           ) : null}
           {props.active ? (

@@ -12,6 +12,9 @@ from uuid import uuid4
 
 from agent.agent_loop import InterruptResult
 from agent.event_bus import (
+    ContextCompactionCompleted,
+    ContextCompactionFailed,
+    ContextCompactionStarted,
     EventBus,
     SessionUpdated,
     StreamDeltaReady,
@@ -64,6 +67,9 @@ class WebChannel:
         self._lock = asyncio.Lock()
         bus.subscribe_outbound(self.name, self._on_response)
         event_bus.on(TurnStarted, self._on_turn_started)
+        event_bus.on(ContextCompactionStarted, self._on_context_compaction_started)
+        event_bus.on(ContextCompactionCompleted, self._on_context_compaction_completed)
+        event_bus.on(ContextCompactionFailed, self._on_context_compaction_failed)
         event_bus.on(SessionUpdated, self._on_session_updated)
         event_bus.on(TurnQueued, self._on_turn_queued)
         event_bus.on(TurnQueueRejected, self._on_turn_queue_rejected)
@@ -210,6 +216,35 @@ class WebChannel:
     async def _on_turn_started(self, event: TurnStarted) -> None:
         await self._broadcast(event.session_key, {"type": "turn.started", "request_id": event.request_id, "session_id": event.session_key, "turn_id": event.turn_id})
 
+    async def _on_context_compaction_started(self, event: ContextCompactionStarted) -> None:
+        await self._broadcast(event.session_key, {
+            "type": "context.compaction.started",
+            "session_id": event.session_key,
+            "turn_id": event.turn_id,
+            "trigger": event.trigger,
+            "estimated_tokens": event.estimated_tokens,
+        })
+
+    async def _on_context_compaction_completed(self, event: ContextCompactionCompleted) -> None:
+        await self._broadcast(event.session_key, {
+            "type": "context.compaction.completed",
+            "session_id": event.session_key,
+            "turn_id": event.turn_id,
+            "trigger": event.trigger,
+            "estimated_tokens": event.estimated_tokens,
+            "compacted": event.compacted,
+        })
+
+    async def _on_context_compaction_failed(self, event: ContextCompactionFailed) -> None:
+        await self._broadcast(event.session_key, {
+            "type": "context.compaction.failed",
+            "session_id": event.session_key,
+            "turn_id": event.turn_id,
+            "trigger": event.trigger,
+            "estimated_tokens": event.estimated_tokens,
+            "message": event.error,
+        })
+
     async def _on_session_updated(self, event: SessionUpdated) -> None:
         await self._broadcast(event.session_key, {
             "type": "session.updated",
@@ -297,6 +332,9 @@ class WebChannel:
     async def close(self) -> None:
         self._bus.unsubscribe_outbound(self.name, self._on_response)
         self._events.off(TurnStarted, self._on_turn_started)
+        self._events.off(ContextCompactionStarted, self._on_context_compaction_started)
+        self._events.off(ContextCompactionCompleted, self._on_context_compaction_completed)
+        self._events.off(ContextCompactionFailed, self._on_context_compaction_failed)
         self._events.off(SessionUpdated, self._on_session_updated)
         self._events.off(TurnQueued, self._on_turn_queued)
         self._events.off(TurnQueueRejected, self._on_turn_queue_rejected)

@@ -17,10 +17,17 @@ export const initialChatState: ChatState = {
   turnStates: {},
 };
 
+function isTurnActive(status: TurnRuntimeState["status"]): boolean {
+  return status === "submitting"
+    || status === "queued"
+    || status === "running"
+    || status === "compacting";
+}
+
 export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState {
   if (action.type === "ui.session.select") {
     const turn = state.turnStates[action.sessionId] ?? idleTurnState;
-    const active = turn.status === "submitting" || turn.status === "queued" || turn.status === "running";
+    const active = isTurnActive(turn.status);
     const cached = state.sessionMessages[action.sessionId];
     // HTTP 历史可能在发送确认前返回空结果；只要本地有快照，就不能用空历史覆盖它。
     let messages = action.messages;
@@ -29,7 +36,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
         ? reconcileMessages([...action.messages, ...cached])
         : action.messages.length === 0 ? cached : action.messages;
     }
-    if (!action.replace && turn.status === "running" && turn.turnId
+    if (!action.replace && isTurnActive(turn.status) && turn.turnId
       && !messages.some((message) => message.turnId === turn.turnId)) {
       messages = [...messages, createDraft(turn.turnId)];
     }
@@ -37,7 +44,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     return {
       ...state,
       sessionId: action.sessionId,
-      activeTurnId: turn.status === "running" ? turn.turnId : "",
+      activeTurnId: isTurnActive(turn.status) ? turn.turnId : "",
       messages,
       sessionMessages: setSessionMessages(state, action.sessionId, messages),
       error: "",
@@ -147,6 +154,41 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       error: "",
     };
   }
+  if (action.type === "context.compaction.started") {
+    const current = state.turnStates[action.session_id] ?? idleTurnState;
+    if (current.turnId && current.turnId !== action.turn_id) return state;
+    const turnStates = setTurnState(state, action.session_id, {
+      status: "compacting",
+      queuePosition: null,
+      turnId: action.turn_id,
+      requestId: current.requestId,
+    });
+    return {
+      ...state,
+      activeTurnId: action.session_id === state.sessionId ? action.turn_id : state.activeTurnId,
+      turnStates,
+    };
+  }
+  if (action.type === "context.compaction.completed") {
+    const current = state.turnStates[action.session_id] ?? idleTurnState;
+    if (current.turnId !== action.turn_id) return state;
+    return {
+      ...state,
+      turnStates: setTurnState(state, action.session_id, {
+        ...current,
+        status: "running",
+      }),
+    };
+  }
+  if (action.type === "context.compaction.failed") {
+    const current = state.turnStates[action.session_id] ?? idleTurnState;
+    if (current.turnId !== action.turn_id) return state;
+    return {
+      ...state,
+      activeTurnId: action.session_id === state.sessionId ? "" : state.activeTurnId,
+      turnStates: setTurnState(state, action.session_id, idleTurnState),
+    };
+  }
   if (action.type === "message.final" && action.turn_id) {
     const nextState = {
       ...state,
@@ -184,8 +226,13 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
   if (action.type === "turn.snapshot") {
     const snapshotTimestamp = new Date().toISOString();
     const current = action.session_id === state.sessionId;
+    const previousTurn = state.turnStates[action.session_id];
     const turnStates = setTurnState(state, action.session_id, {
-      status: "running",
+      // 重连快照可能紧跟在压缩 started 帧之后到达；同一 Turn 仍处于
+      // checkpoint 等待时，不能让普通 running 快照覆盖前端状态提示。
+      status: previousTurn?.turnId === action.turn_id && previousTurn.status === "compacting"
+        ? "compacting"
+        : "running",
       queuePosition: null,
       turnId: action.turn_id,
       requestId: action.request_id ?? "",
