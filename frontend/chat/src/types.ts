@@ -35,6 +35,29 @@ export interface ChatState {
   sessionMessages: Record<string, ChatMessage[]>;
   error: string;
   turnStates: Record<string, TurnRuntimeState>;
+  contextUsage: Record<string, ContextUsage>;
+}
+
+export interface ContextUsage {
+  turnId: string;
+  usedTokens: number;
+  contextWindow: number;
+  softLimitTokens: number;
+  hardInputTokens: number;
+  contextWindowSource: string;
+  estimateSource: string;
+  breakdown: {
+    system_prompt_tokens: number;
+    tools_tokens: number;
+    conversation_tokens: number;
+    overhead_tokens: number;
+  };
+  sections: Array<{
+    name: string;
+    estimated_tokens: number;
+    static: boolean;
+    cache_hit: boolean;
+  }>;
 }
 
 export interface TurnRuntimeState {
@@ -143,6 +166,7 @@ export type ChatFrame =
   | { type: "context.compaction.started"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number }
   | { type: "context.compaction.completed"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number; compacted: boolean }
   | { type: "context.compaction.failed"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number; message: string }
+  | { type: "context.usage.updated"; session_id: string; turn_id: string; used_tokens: number; context_window: number; soft_limit_tokens: number; hard_input_tokens: number; context_window_source: string; estimate_source: string; breakdown: Record<string, number>; sections: Array<{ name: string; estimated_tokens: number; static: boolean; cache_hit: boolean }> }
   | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.thinking.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.tool.started"; session_id: string; turn_id: string; call_id: string; tool_name: string; arguments: unknown }

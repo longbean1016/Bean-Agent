@@ -31,7 +31,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { ComponentPropsWithoutRef, ReactNode } from "react";
+import type { ComponentPropsWithoutRef, CSSProperties, ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import type { StickToBottomContext } from "use-stick-to-bottom";
@@ -44,7 +44,7 @@ import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
 import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupSessionsByUpdatedAt } from "./sessionGroups";
-import type { ChatFrame, ChatMessage, ConnectionStatus, MessageRow, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity, TurnNavigationEntry } from "./types";
+import type { ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity, TurnNavigationEntry } from "./types";
 import { groupMessagesIntoNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
 
@@ -208,6 +208,7 @@ export function App() {
   messageWindowsRef.current = messageWindows;
   routeSessionRef.current = routeSession;
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
+  const currentContextUsage = chat.contextUsage[chat.sessionId];
   const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running" || currentTurn.status === "compacting";
   const restoringSession = Boolean(chat.sessionId && loadingSessionId === chat.sessionId && chat.messages.length === 0);
   const displayMessages = useMemo(() => composeTimeline(
@@ -831,6 +832,7 @@ export function App() {
           files={files}
           input={input}
           sessionId={chat.sessionId}
+          contextUsage={currentContextUsage}
           sending={sending}
           onFiles={(next) => {
             setFiles(next);
@@ -1432,7 +1434,7 @@ function AttachmentGallery({ paths }: { paths: string[] }) {
 }
 
 function Composer(props: {
-  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running" | "compacting"; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string;
+  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running" | "compacting"; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string; contextUsage?: ContextUsage;
   onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
@@ -1706,6 +1708,7 @@ function Composer(props: {
           rows={2}
         />
         <div className="composer-actions">
+          <ContextUsageIndicator usage={props.contextUsage} compacting={props.turnStatus === "compacting"} />
           <label className="icon-button composer-tool-button attach-button" title="添加文本或图片">
             <Paperclip size={18} /><span className="sr-only">添加附件</span>
             <input type="file" multiple accept={ATTACHMENT_ACCEPT} onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />
@@ -1745,6 +1748,80 @@ function Composer(props: {
       </footer>
     </>
   );
+}
+
+export function ContextUsageIndicator({ usage, compacting }: { usage?: ContextUsage; compacting: boolean }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointerDown = (event: PointerEvent) => {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const contextWindow = usage?.contextWindow ?? 0;
+  const usedTokens = usage?.usedTokens ?? 0;
+  const known = contextWindow > 0;
+  const percent = known ? Math.min(100, Math.max(0, Math.round((usedTokens / contextWindow) * 100))) : 0;
+  const level = !known ? "unknown" : percent >= 90 ? "danger" : percent >= 74 ? "warning" : "normal";
+  const label = known ? `上下文已用 ${percent}%` : "上下文容量未知";
+  const style = { "--usage-progress": `${percent}%` } as CSSProperties;
+  const breakdown = usage?.breakdown;
+
+  return (
+    <div ref={rootRef} className={`context-usage-indicator ${level}${compacting ? " compacting" : ""}${open ? " open" : ""}`}>
+      <button
+        type="button"
+        className="context-usage-button"
+        style={style}
+        aria-label={label}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className="context-usage-ring" aria-hidden="true"><span /></span>
+      </button>
+      <span className="context-usage-tooltip" role="tooltip">{label}</span>
+      {open ? (
+        <div className="context-usage-popover" role="dialog" aria-label="上下文占用详情">
+          <div className="context-usage-popover-header">
+            <strong>上下文占用</strong>
+            <span>{known ? `~${formatTokenCount(usedTokens)} / ${formatTokenCount(contextWindow)}` : "容量未知"}</span>
+          </div>
+          <div className="context-usage-meter" aria-label={label}>
+            <span style={{ width: `${percent}%` }} />
+          </div>
+          {compacting ? <p className="context-usage-state">正在压缩上下文，当前数值保持不变</p> : null}
+          {breakdown ? (
+            <dl className="context-usage-breakdown">
+              <div><dt>系统提示词</dt><dd>{formatTokenCount(breakdown.system_prompt_tokens)}</dd></div>
+              <div><dt>工具</dt><dd>{formatTokenCount(breakdown.tools_tokens)}</dd></div>
+              <div><dt>对话消息</dt><dd>{formatTokenCount(breakdown.conversation_tokens)}</dd></div>
+              <div><dt>协议开销</dt><dd>{formatTokenCount(breakdown.overhead_tokens)}</dd></div>
+            </dl>
+          ) : <p className="context-usage-empty">等待本轮上下文估算</p>}
+          <small className="context-usage-source">估算值 · {usage?.contextWindowSource || "unknown"}</small>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function formatTokenCount(value: number): string {
+  const count = Math.max(0, Math.round(value));
+  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(count >= 10_000_000 ? 0 : 1).replace(/\.0$/, "")}M`;
+  if (count >= 1_000) return `${(count / 1_000).toFixed(count >= 100_000 ? 0 : 1).replace(/\.0$/, "")}K`;
+  return String(count);
 }
 
 function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositioned }: {

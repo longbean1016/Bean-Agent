@@ -1,4 +1,4 @@
-import type { ChatAction, ChatMessage, ChatState, MessageRow, ProactiveNotificationRow, ToolActivity, TurnRuntimeState } from "./types";
+import type { ChatAction, ChatMessage, ChatState, ContextUsage, MessageRow, ProactiveNotificationRow, ToolActivity, TurnRuntimeState } from "./types";
 import { reconcileMessages } from "./timeline";
 
 export const idleTurnState: TurnRuntimeState = {
@@ -15,6 +15,7 @@ export const initialChatState: ChatState = {
   sessionMessages: {},
   error: "",
   turnStates: {},
+  contextUsage: {},
 };
 
 function isTurnActive(status: TurnRuntimeState["status"]): boolean {
@@ -187,6 +188,36 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       ...state,
       activeTurnId: action.session_id === state.sessionId ? "" : state.activeTurnId,
       turnStates: setTurnState(state, action.session_id, idleTurnState),
+    };
+  }
+  if (action.type === "context.usage.updated") {
+    const currentTurn = state.turnStates[action.session_id];
+    // 同一会话只能有一个运行中的 Turn；旧 Turn 的迟到估算不能覆盖新 Turn 的占用。
+    if (currentTurn?.turnId && currentTurn.turnId !== action.turn_id) return state;
+    const usage: ContextUsage = {
+      turnId: action.turn_id,
+      usedTokens: Math.max(0, Number(action.used_tokens) || 0),
+      contextWindow: Math.max(0, Number(action.context_window) || 0),
+      softLimitTokens: Math.max(0, Number(action.soft_limit_tokens) || 0),
+      hardInputTokens: Math.max(0, Number(action.hard_input_tokens) || 0),
+      contextWindowSource: String(action.context_window_source || "unknown"),
+      estimateSource: String(action.estimate_source || "heuristic"),
+      breakdown: {
+        system_prompt_tokens: Math.max(0, Number(action.breakdown.system_prompt_tokens) || 0),
+        tools_tokens: Math.max(0, Number(action.breakdown.tools_tokens) || 0),
+        conversation_tokens: Math.max(0, Number(action.breakdown.conversation_tokens) || 0),
+        overhead_tokens: Math.max(0, Number(action.breakdown.overhead_tokens) || 0),
+      },
+      sections: Array.isArray(action.sections) ? action.sections.map((section) => ({
+        name: String(section.name || ""),
+        estimated_tokens: Math.max(0, Number(section.estimated_tokens) || 0),
+        static: Boolean(section.static),
+        cache_hit: Boolean(section.cache_hit),
+      })) : [],
+    };
+    return {
+      ...state,
+      contextUsage: { ...state.contextUsage, [action.session_id]: usage },
     };
   }
   if (action.type === "message.final" && action.turn_id) {

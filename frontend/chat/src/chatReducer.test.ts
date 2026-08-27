@@ -191,6 +191,30 @@ describe("reduceChatFrame", () => {
     expect(state.turnStates["web:one"]).toMatchObject({ status: "running", turnId: "turn-1" });
   });
 
+  it("按会话保存完整上下文用量并拒绝旧 Turn 的迟到估算", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+    state = reduceChatFrame(state, {
+      type: "context.usage.updated", session_id: "web:one", turn_id: "turn-1",
+      used_tokens: 65500, context_window: 1000000, soft_limit_tokens: 740000,
+      hard_input_tokens: 991808, context_window_source: "provider_catalog", estimate_source: "heuristic",
+      breakdown: { system_prompt_tokens: 1600, tools_tokens: 6900, conversation_tokens: 49700, overhead_tokens: 7300 },
+      sections: [{ name: "identity", estimated_tokens: 120, static: true, cache_hit: true }],
+    });
+    expect(state.contextUsage["web:one"]).toMatchObject({
+      usedTokens: 65500, contextWindow: 1000000, contextWindowSource: "provider_catalog",
+    });
+
+    const unchanged = reduceChatFrame(state, {
+      type: "context.usage.updated", session_id: "web:one", turn_id: "turn-old",
+      used_tokens: 1, context_window: 2, soft_limit_tokens: 1, hard_input_tokens: 1,
+      context_window_source: "unknown", estimate_source: "heuristic",
+      breakdown: {}, sections: [],
+    });
+    expect(unchanged).toBe(state);
+  });
+
   it("压缩失败会清理当前 Turn 状态", () => {
     let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
       type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
