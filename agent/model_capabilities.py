@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Mapping
@@ -50,6 +51,8 @@ def resolve_context_window(
 def _model_registry() -> Mapping[str, Mapping[str, Any]]:
     """读取随运行环境安装的本地能力快照；依赖缺失时按未知能力运行。"""
 
+    # 能力解析不能因联网刷新价格表而改变运行中的上下文边界，因此只使用安装包内快照。
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     try:
         import litellm  # type: ignore[import-not-found]
     except Exception:
