@@ -12,7 +12,15 @@ import pytest
 from PIL import Image
 
 from agent.attachment_content import build_current_user_content
-from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted
+from agent.event_bus import (
+    ContextCompactionCompleted,
+    ContextCompactionFailed,
+    ContextCompactionStarted,
+    EventBus,
+    StreamDeltaReady,
+    ToolCallCompleted,
+    ToolCallStarted,
+)
 from agent.message_bus import InboundMessage
 from agent.pipeline import Pipeline
 from agent.prompt_cache_log import PromptCacheLogWriter
@@ -733,6 +741,90 @@ def _assembler(tmp_path: Path) -> PromptAssembler:
         SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
         MessageEnvelopeBuilder(),
     )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_emits_compaction_lifecycle_events(tmp_path: Path) -> None:
+    class GateProvider:
+        context_window = 100
+        max_tokens = 10
+
+        def __init__(self) -> None:
+            self.compacted = False
+
+        def estimate_context_tokens(self, messages, tools):
+            return 10 if self.compacted else 80
+
+        async def chat(self, messages, tools=None, **kwargs):
+            return LLMResponse("完成")
+
+    provider = GateProvider()
+    event_bus = EventBus()
+    lifecycle: list[str] = []
+    event_bus.on(ContextCompactionStarted, lambda _event: lifecycle.append("started"))
+    event_bus.on(ContextCompactionCompleted, lambda _event: lifecycle.append("completed"))
+
+    async def compact(_session_key: str, **kwargs) -> bool:
+        provider.compacted = True
+        return True
+
+    async def history(_session_key: str, _limit: int | None) -> list[dict[str, object]]:
+        return []
+
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        event_bus,
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        history_loader=history,
+        context_compactor=compact,
+    )
+
+    result = await pipeline.process(
+        InboundMessage("web", "u", "c", "当前问题"),
+        turn_id="compaction-events",
+    )
+
+    assert result.content == "完成"
+    assert lifecycle == ["started", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_emits_compaction_failed_event(tmp_path: Path) -> None:
+    class GateProvider:
+        context_window = 100
+        max_tokens = 10
+
+        def estimate_context_tokens(self, messages, tools):
+            return 80
+
+        async def chat(self, messages, tools=None, **kwargs):
+            raise AssertionError("压缩失败后不应调用业务模型")
+
+    event_bus = EventBus()
+    errors: list[str] = []
+    event_bus.on(ContextCompactionFailed, lambda event: errors.append(event.error))
+
+    async def compact(_session_key: str, **kwargs) -> bool:
+        raise RuntimeError("checkpoint 失败")
+
+    pipeline = Pipeline(
+        GateProvider(),
+        ToolRegistry(),
+        event_bus,
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        context_compactor=compact,
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint 失败"):
+        await pipeline.process(
+            InboundMessage("web", "u", "c", "当前问题"),
+            turn_id="compaction-failed",
+        )
+
+    assert errors == ["checkpoint 失败"]
 
 
 @pytest.mark.asyncio

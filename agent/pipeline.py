@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from copy import deepcopy
@@ -15,7 +16,15 @@ from agent.context_budget import (
     estimate_payload_tokens,
     should_compact,
 )
-from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted
+from agent.event_bus import (
+    ContextCompactionCompleted,
+    ContextCompactionFailed,
+    ContextCompactionStarted,
+    EventBus,
+    StreamDeltaReady,
+    ToolCallCompleted,
+    ToolCallStarted,
+)
 from agent.message_bus import InboundMessage, PipelineResult
 from agent.prompt_assembler import PromptAssembler
 from agent.prompt_block import TurnContext
@@ -173,6 +182,42 @@ class Pipeline:
         last_base_messages: list[dict[str, Any]] = []
         forced_compaction_attempted = False
 
+        async def compact_with_status(*, estimated_tokens: int, force: bool) -> bool:
+            """等待当前 Turn 所需的 summary，同时把压缩阶段明确广播给前端。"""
+
+            trigger = "context_overflow" if force else "soft_limit"
+            await self._events.emit(ContextCompactionStarted(
+                session_key=message.session_key,
+                turn_id=turn_id,
+                trigger=trigger,
+                estimated_tokens=estimated_tokens,
+            ))
+            try:
+                compacted = await self._context_compactor(
+                    message.session_key,
+                    estimated_tokens=estimated_tokens,
+                    force=force,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                await self._events.emit(ContextCompactionFailed(
+                    session_key=message.session_key,
+                    turn_id=turn_id,
+                    trigger=trigger,
+                    estimated_tokens=estimated_tokens,
+                    error=str(error),
+                ))
+                raise
+            await self._events.emit(ContextCompactionCompleted(
+                session_key=message.session_key,
+                turn_id=turn_id,
+                trigger=trigger,
+                estimated_tokens=estimated_tokens,
+                compacted=bool(compacted),
+            ))
+            return bool(compacted)
+
         def append_turn_thinking(value: str | None) -> None:
             text = str(value or "").strip()
             if not text:
@@ -240,8 +285,7 @@ class Pipeline:
                         max_output_tokens=provider_output,
                     )
                 ):
-                    compacted = await self._context_compactor(
-                        message.session_key,
+                    compacted = await compact_with_status(
                         estimated_tokens=estimate,
                         force=False,
                     )
@@ -272,8 +316,7 @@ class Pipeline:
                         and not react_messages
                     ):
                         forced_compaction_attempted = True
-                        compacted = await self._context_compactor(
-                            message.session_key,
+                        compacted = await compact_with_status(
                             estimated_tokens=estimate,
                             force=True,
                         )

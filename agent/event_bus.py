@@ -23,6 +23,38 @@ class TurnStarted:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextCompactionStarted:
+    """当前 Turn 已命中 token gate，正在等待 checkpoint 摘要。"""
+
+    session_key: str
+    turn_id: str
+    trigger: str
+    estimated_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCompactionCompleted:
+    """checkpoint 摘要和 ledger 提交完成，当前 Turn 可以继续请求业务模型。"""
+
+    session_key: str
+    turn_id: str
+    trigger: str
+    estimated_tokens: int
+    compacted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCompactionFailed:
+    """checkpoint 压缩失败；当前 Turn 会沿用既有错误处理。"""
+
+    session_key: str
+    turn_id: str
+    trigger: str
+    estimated_tokens: int
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
 class TurnQueued:
     """普通 Turn 已进入全局等待队列，position 从 1 开始。"""
 
@@ -130,6 +162,9 @@ def _handler_name(handler: EventHandler[object]) -> str:
 
 
 __all__ = [
+    "ContextCompactionCompleted",
+    "ContextCompactionFailed",
+    "ContextCompactionStarted",
     "EventBus",
     "EventHandler",
     "SessionUpdated",
