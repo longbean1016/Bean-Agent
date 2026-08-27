@@ -994,16 +994,91 @@ async def test_implicit_memory_failure_does_not_commit_checkpoint(tmp_path: Path
         keep_count=1, consolidation_threshold=3,
     )
     try:
-        with pytest.raises(RuntimeError, match="隐式提取失败"):
-            await engine.compact_for_context("web:c", estimated_tokens=35, force=True)
+        assert await engine.compact_for_context("web:c", estimated_tokens=35, force=True)
+        await engine.drain()
         checkpoint = sessions.get_active_compaction("web:c")
         pending = engine._store.list_pending_consolidations()
     finally:
         await engine.close()
         sessions.close()
 
-    assert checkpoint is None
-    assert pending == []
+    assert checkpoint is not None
+    assert len(pending) == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_turn_does_not_wait_for_slow_memory_extraction(tmp_path: Path) -> None:
+    import asyncio
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowImplicitExtractor:
+        async def extract(self, conversation, existing_profile=""):
+            started.set()
+            await release.wait()
+            return ImplicitMemoryDraft()
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(6):
+        sessions.add_message(
+            NewMessage(
+                session_key="web:c",
+                role="user" if index % 2 == 0 else "assistant",
+                content=f"消息 {index}",
+                turn_id=f"t{index // 2}",
+            )
+        )
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path,
+        Embedder(),
+        BudgetProvider(),
+        sessions,
+        config=config,
+        consolidation_extractor=Extractor(),
+        implicit_extractor=SlowImplicitExtractor(),
+    )
+    compaction = None
+    try:
+        compaction = asyncio.create_task(
+            engine.compact_for_context("web:c", estimated_tokens=35)
+        )
+        # 等后台 job 确实进入慢速提取后，当前请求仍应已经完成 checkpoint。
+        await asyncio.wait_for(started.wait(), timeout=0.5)
+        assert await asyncio.wait_for(compaction, timeout=0.1)
+        assert sessions.get_active_compaction("web:c") is not None
+    finally:
+        release.set()
+        if compaction is not None:
+            await asyncio.gather(compaction, return_exceptions=True)
+        await engine.close()
+        sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_discards_outbox_without_active_checkpoint(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    sessions.create_session("web:c")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), BudgetProvider(), sessions, config=config)
+    engine._store.enqueue_consolidation(
+        "orphan-source",
+        {
+            "kind": "checkpoint_memory",
+            "source_ref": "orphan-source",
+            "session_key": "web:c",
+            "generation": 1,
+        },
+    )
+    try:
+        await engine.replay_pending_consolidations()
+        assert engine._store.list_pending_consolidations() == []
+    finally:
+        await engine.close()
+        sessions.close()
 
 
 @pytest.mark.asyncio
@@ -1094,6 +1169,7 @@ async def test_consolidation_saves_all_implicit_memory_types(tmp_path: Path) -> 
     )
     try:
         assert await engine.compact_for_context("web:c", estimated_tokens=35, force=True)
+        await engine.drain()
         items = engine._store.get_items_by_ids([str(row["id"]) for row in engine._store._active_rows(None)])
         checkpoint = sessions.get_active_compaction("web:c")
     finally:

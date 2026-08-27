@@ -24,6 +24,20 @@ def test_group_keeps_user_and_assistant_tool_batch_together() -> None:
     ]
 
 
+def test_group_splits_legacy_messages_without_turn_id_by_user_boundary() -> None:
+    units = group_logical_units([
+        {"id": "s:0", "seq": 0, "role": "user", "content": "第一问"},
+        {"id": "s:1", "seq": 1, "role": "assistant", "content": "第一答"},
+        {"id": "s:2", "seq": 2, "role": "user", "content": "第二问"},
+        {"id": "s:3", "seq": 3, "role": "assistant", "content": "第二答"},
+    ])
+
+    assert [[item["id"] for item in unit.messages] for unit in units] == [
+        ["s:0", "s:1"],
+        ["s:2", "s:3"],
+    ]
+
+
 def test_selection_returns_complete_prefix_and_tail() -> None:
     units = group_logical_units(_messages())
 

@@ -40,8 +40,16 @@ def group_logical_units(messages: list[dict[str, Any]]) -> list[LogicalUnit]:
     for message in messages:
         role = str(message.get("role") or "").lower()
         turn_id = str(message.get("turn_id") or "")
-        starts_unit = current is None or role == "user" and (
-            not current.messages or (turn_id and turn_id != current_turn_id)
+        starts_unit = current is None or (
+            role == "user"
+            and (
+                not current.messages
+                # 旧消息可能没有 turn_id；每个新的 user 都是新的逻辑单元，
+                # 只有明确相同的非空 turn_id 才允许继续合并。
+                or not turn_id
+                or not current_turn_id
+                or turn_id != current_turn_id
+            )
         )
         if starts_unit:
             if current and current.messages:

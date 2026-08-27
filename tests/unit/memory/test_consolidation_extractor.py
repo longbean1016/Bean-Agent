@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from memory.consolidator import render_consolidation_conversation
 from memory.engine import _LLMConsolidationExtractor
 
 
@@ -131,3 +132,22 @@ async def test_consolidation_does_not_start_recent_context_extraction() -> None:
         await extraction
 
     assert provider.started == {"submit_consolidation_events"}
+
+
+def test_consolidation_conversation_filters_non_user_evidence_frames() -> None:
+    rendered = render_consolidation_conversation([
+        {"role": "system", "content": "<system-reminder>内部提示</system-reminder>"},
+        {"role": "tool", "content": "工具原始输出"},
+        {"role": "assistant", "content": "主动提醒", "proactive": True},
+        {"role": "user", "content": "用户明确说的话"},
+        {"role": "assistant", "content": "正常回答"},
+        {"role": "assistant", "content": "<session-context-compaction>旧摘要</session-context-compaction>"},
+        {"role": "user", "content": "   "},
+    ])
+
+    assert "用户明确说的话" in rendered
+    assert "正常回答" in rendered
+    assert "工具原始输出" not in rendered
+    assert "内部提示" not in rendered
+    assert "主动提醒" not in rendered
+    assert "旧摘要" not in rendered

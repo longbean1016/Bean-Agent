@@ -30,13 +30,26 @@ class ConsolidationExtractor(Protocol):
 
 
 def render_consolidation_conversation(messages: list[dict[str, object]]) -> str:
-    """按稳定时间和角色渲染同一批 source，供不同记忆提取器共同读取。"""
+    """生成记忆投影，不把系统帧、独立 tool 或主动消息当成用户证据。"""
 
-    return "\n".join(
-        f"[{str(item.get('timestamp') or 'unknown')}][{str(item.get('role') or 'unknown')}] "
-        f"{str(item.get('content') or '')}"
-        for item in messages
-    )
+    lines: list[str] = []
+    for item in messages:
+        role = str(item.get("role") or "").lower()
+        content = str(item.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        if content.startswith("<system-reminder") or content.startswith("<session-context-compaction"):
+            continue
+        metadata = item.get("metadata")
+        if role == "assistant" and (
+            bool(item.get("proactive"))
+            or (isinstance(metadata, dict) and bool(metadata.get("proactive")))
+        ):
+            continue
+        lines.append(
+            f"[{str(item.get('timestamp') or 'unknown')}][{role}] {content}"
+        )
+    return "\n".join(lines)
 
 
 __all__ = [

@@ -15,6 +15,7 @@ from memory.consolidator import (
     ConsolidationExtractor,
     render_consolidation_conversation,
 )
+from memory.compaction_worker import CompactionOutboxWorker
 from memory.checkpoint import (
     flatten_units,
     group_logical_units,
@@ -121,6 +122,12 @@ class MemoryEngine:
         # 第一次摄入 Turn 时启动，避免初始化阶段错误捕获不存在的 event loop。
         self._post_response_queue: asyncio.Queue[TurnIngested] = asyncio.Queue()
         self._post_response_task: asyncio.Task[None] | None = None
+        # checkpoint 副作用使用独立 worker；当前 Turn 只等待 summary 与 ledger commit，
+        # 记忆提取和向量/Markdown 写入不会占住当前请求的等待链。
+        self._compaction_worker = CompactionOutboxWorker(
+            self._process_compaction_payload,
+            max_concurrency=2,
+        )
         self._lifecycle_lock = asyncio.Lock()
         self._accepting = True
         self._closed = False
@@ -424,46 +431,28 @@ class MemoryEngine:
             tokens_after=0,
             summary_usage={},
         )
-        # summary、event、PENDING 和隐式 profile/preference/procedure 必须读取同一
-        # source_ref；先完成提取再落 checkpoint，避免摘要已经推进边界而记忆候选丢失。
-        draft, implicit = await asyncio.gather(
-            self._consolidation_extractor.extract(
-                selected_messages,
-                previous_summary,
-                current_memory=self._markdown.read_long_term().strip(),
-            ),
-            self._implicit_extractor.extract(
-                conversation,
-                existing_profile="",
-            ),
-        )
-        committed = ConsolidationCommitted(
-            history_entry_payloads=[
-                (str(entry.get("summary") or ""), _emotional_weight(entry.get("emotional_weight")))
-                for entry in draft.history_entries
-                if str(entry.get("summary") or "").strip()
-            ],
-            source_ref=source_ref,
-            scope_channel=key.partition(":")[0],
-            scope_chat_id=key.partition(":")[2],
-            conversation=conversation,
-            session_key=key,
-            generation=generation,
-            pending_items=[dict(item) for item in draft.pending_items if isinstance(item, dict)],
-            implicit_memory=_implicit_payload(implicit),
-        )
-        # outbox 先于 checkpoint 提交：若 commit 之前进程退出，replay 会因 active
-        # generation 不匹配而跳过；若 commit 之后副作用失败，则可安全重放。
-        self._store.enqueue_consolidation(source_ref, _consolidation_payload(committed))
+        # 先把不可变 source plan 写入 durable outbox，再推进 checkpoint；worker 只在
+        # ledger 成为 active generation 后消费，崩溃时不会丢失统一记忆提取任务。
+        job_payload: dict[str, object] = {
+            "kind": "checkpoint_memory",
+            "source_ref": source_ref,
+            "session_key": key,
+            "generation": generation,
+            "scope_channel": key.partition(":")[0],
+            "scope_chat_id": key.partition(":")[2],
+            "previous_summary": previous_summary,
+            "selected_source_messages": [dict(item) for item in selected_messages],
+        }
+        self._store.enqueue_consolidation(source_ref, job_payload)
         # 这里才推进 active generation；之后的记忆副作用失败不能让原文重新回到
         # 模型窗口，也不能生成另一代重复覆盖同一 source plan。
         self._sessions.commit_compaction(checkpoint)
         try:
-            await self.on_consolidation_committed(committed)
+            # submit 只把 durable job 放入内存队列，不等待 LLM/Embedding/Markdown。
+            await self._compaction_worker.submit(job_payload)
         except Exception:
-            # checkpoint 已 durable commit；outbox 会在下一次维护恢复时重放，
-            # 这里向上抛出只代表副作用未完成，不代表需要重新压缩 source。
-            logger.exception("checkpoint 记忆副作用失败: source_ref=%s", source_ref)
+            # checkpoint 已 durable commit；outbox 仍可在启动恢复阶段重放。
+            logger.exception("checkpoint outbox 调度失败: source_ref=%s", source_ref)
         return True
 
     async def _summarize_checkpoint(self, previous_summary: str, conversation: str) -> str:
@@ -531,7 +520,7 @@ class MemoryEngine:
         self._post_response_queue.put_nowait(snapshot)
 
     def bind_events(self, event_bus: EventBus) -> None:
-        """订阅正式 TurnCommitted；重复绑定同一总线保持幂等。"""
+        """只订阅正式 TurnCommitted；checkpoint 副作用统一由 outbox worker 调度。"""
 
         from agent.event_bus import TurnCommitted
 
@@ -539,7 +528,6 @@ class MemoryEngine:
             return
         self.unbind_events()
         event_bus.on(TurnCommitted, self.on_turn_committed)
-        event_bus.on(ConsolidationCommitted, self.on_consolidation_committed)
         self._event_bus = event_bus
 
     def unbind_events(self) -> None:
@@ -550,7 +538,6 @@ class MemoryEngine:
         from agent.event_bus import TurnCommitted
 
         self._event_bus.off(TurnCommitted, self.on_turn_committed)
-        self._event_bus.off(ConsolidationCommitted, self.on_consolidation_committed)
         self._event_bus = None
 
     async def ensure_context_ready(self, session_key: str) -> bool:
@@ -594,6 +581,81 @@ class MemoryEngine:
         await self._save_implicit_long_term(implicit, event)
         self._store.complete_consolidation(event.source_ref)
 
+    async def _process_compaction_payload(self, payload: dict[str, object]) -> bool:
+        """消费一个 checkpoint source；提取失败时保留 outbox 供后续重放。"""
+
+        if payload.get("kind") != "checkpoint_memory":
+            # 兼容重构前已落盘的完整提取 payload；新任务不会走这条路径。
+            event = _consolidation_from_payload(payload)
+            if event.session_key and event.generation:
+                checkpoint = self._sessions.get_compaction(
+                    event.session_key,
+                    event.generation,
+                )
+                if checkpoint is None or checkpoint.source_ref != event.source_ref:
+                    # 没有对应 active checkpoint 的旧 payload 无法安全重建来源；它通常
+                    # 来自 outbox 落盘后进程在 ledger commit 前退出，清理后等待新的
+                    # token gate 重新生成合法 generation，不能把孤儿来源写入记忆。
+                    self._store.complete_consolidation(event.source_ref)
+                    return False
+            await self.on_consolidation_committed(event)
+            return True
+
+        session_key = str(payload.get("session_key") or "").strip()
+        source_ref = str(payload.get("source_ref") or "").strip()
+        generation = max(0, int(payload.get("generation") or 0))
+        if not session_key or not source_ref or generation <= 0:
+            raise ValueError("checkpoint outbox payload identity 无效")
+        checkpoint = self._sessions.get_compaction(session_key, generation)
+        if checkpoint is None or checkpoint.source_ref != source_ref:
+            # outbox 可能在 ledger commit 前落盘；不能把未激活 source 写入长期记忆。
+            self._store.complete_consolidation(source_ref)
+            return False
+
+        selected_messages = [dict(item) for item in checkpoint.selected_source_messages]
+        if not selected_messages:
+            raise ValueError("checkpoint source plan 不能为空")
+        conversation = render_consolidation_conversation(selected_messages)
+        previous_summary = str(payload.get("previous_summary") or "")
+        current_memory = await asyncio.to_thread(self._markdown.read_long_term)
+        # 三种记忆提取共享同一份已提交 source；并发只发生在后台 worker 内，
+        # 不再延长触发压缩的当前 Turn。
+        draft, implicit = await asyncio.gather(
+            self._consolidation_extractor.extract(
+                selected_messages,
+                previous_summary,
+                current_memory=current_memory.strip(),
+            ),
+            self._implicit_extractor.extract(
+                conversation,
+                existing_profile="",
+            ),
+        )
+        event = ConsolidationCommitted(
+            history_entry_payloads=[
+                (
+                    str(entry.get("summary") or ""),
+                    _emotional_weight(entry.get("emotional_weight")),
+                )
+                for entry in draft.history_entries
+                if str(entry.get("summary") or "").strip()
+            ],
+            source_ref=source_ref,
+            scope_channel=str(payload.get("scope_channel") or ""),
+            scope_chat_id=str(payload.get("scope_chat_id") or ""),
+            conversation=conversation,
+            session_key=session_key,
+            generation=generation,
+            pending_items=[
+                dict(item)
+                for item in draft.pending_items
+                if isinstance(item, dict)
+            ],
+            implicit_memory=_implicit_payload(implicit),
+        )
+        await self.on_consolidation_committed(event)
+        return True
+
     async def _save_consolidation_events(
         self,
         event: ConsolidationCommitted,
@@ -618,20 +680,11 @@ class MemoryEngine:
                 )
 
     async def replay_pending_consolidations(self) -> None:
-        """重放未完成的向量事务；单条失败保留 outbox 并继续其它窗口。"""
+        """启动后台 worker 重放 durable outbox；启动阶段等待已有任务收敛。"""
 
-        for payload in self._store.list_pending_consolidations():
-            try:
-                event = _consolidation_from_payload(payload)
-                if event.session_key and event.generation:
-                    checkpoint = self._sessions.get_compaction(event.session_key, event.generation)
-                    # outbox 可能在 checkpoint commit 前落盘；未成为 active generation
-                    # 前不能把候选写入长期记忆，等待下一次 checkpoint 重试。
-                    if checkpoint is None or checkpoint.source_ref != event.source_ref:
-                        continue
-                await self.on_consolidation_committed(event)
-            except Exception:
-                logger.exception("Consolidation 向量同步重放失败: source_ref=%s", payload.get("source_ref"))
+        payloads = self._store.list_pending_consolidations()
+        await self._compaction_worker.submit_many(payloads)
+        await self._compaction_worker.drain()
 
     async def _save_implicit_long_term(
         self,
@@ -684,9 +737,10 @@ class MemoryEngine:
                 )
 
     async def drain(self) -> None:
-        """等待每轮记忆失效队列清空，checkpoint 只在 Pipeline token gate 中执行。"""
+        """等待 Turn 后台任务和 checkpoint outbox 任务清空。"""
 
         await self._post_response_queue.join()
+        await self._compaction_worker.drain()
 
     async def _ensure_workers(self) -> None:
         async with self._lifecycle_lock:
@@ -763,6 +817,7 @@ class MemoryEngine:
         # 先完成已接收任务，再取消等待新消息的常驻消费者；否则 SQLite/Markdown
         # 可能先关闭，造成尾部 Turn 丢失。取消仅发生在队列清空之后。
         await self.drain()
+        await self._compaction_worker.close(drain=False)
         tasks = [task for task in (self._post_response_task,) if task is not None]
         for task in tasks:
             task.cancel()
