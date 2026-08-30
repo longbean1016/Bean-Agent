@@ -82,6 +82,59 @@ describe("timeline", () => {
     ]);
   });
 
+  it("keeps a recovered turn before the next optimistic turn", () => {
+    const result = composeTimeline([
+      message({
+        id: "persisted-user",
+        seq: 40,
+        role: "user",
+        turnId: "persisted-turn",
+        timestamp: "2026-08-01T09:00:00+08:00",
+      }),
+      message({
+        id: "persisted-assistant",
+        seq: 41,
+        turnId: "persisted-turn",
+        timestamp: "2026-08-01T09:01:00+08:00",
+      }),
+      message({
+        id: "running:user:recovered-turn",
+        seq: -2,
+        role: "user",
+        turnId: "recovered-turn",
+        timestamp: "2026-08-01T10:00:00+08:00",
+      }),
+      message({
+        id: "running:assistant:recovered-turn",
+        seq: -1,
+        turnId: "recovered-turn",
+        streaming: false,
+        timestamp: "2026-08-01T10:00:00+08:00",
+      }),
+      message({
+        id: "user-next-request",
+        role: "user",
+        turnId: "next-turn",
+        timestamp: "2026-08-01T10:01:00+08:00",
+      }),
+      message({
+        id: "next-turn",
+        turnId: "next-turn",
+        streaming: true,
+        timestamp: "2026-08-01T10:01:00+08:00",
+      }),
+    ], [], true);
+
+    expect(result.map((item) => item.id)).toEqual([
+      "persisted-user",
+      "persisted-assistant",
+      "running:user:recovered-turn",
+      "running:assistant:recovered-turn",
+      "user-next-request",
+      "next-turn",
+    ]);
+  });
+
   it("derives reminders without adding them to persisted messages", () => {
     const persisted = [
       message({ id: "m1", seq: 1, role: "user", timestamp: "2026-07-31T08:00:00+08:00" }),

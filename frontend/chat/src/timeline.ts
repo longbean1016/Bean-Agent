@@ -124,7 +124,18 @@ function compareTimelineItems(left: ChatMessage, right: ChatMessage): number {
   }
   const leftRuntime = hasRuntimeSequence(left);
   const rightRuntime = hasRuntimeSequence(right);
-  if (leftRuntime !== rightRuntime) return leftRuntime ? 1 : -1;
+  if (leftRuntime !== rightRuntime) {
+    const regular = leftRuntime ? right : left;
+    if (!hasPersistedSequence(regular) && !isStandaloneNotification(regular)) {
+      const leftTime = Date.parse(left.timestamp || "");
+      const rightTime = Date.parse(right.timestamp || "");
+      if (!Number.isNaN(leftTime) && !Number.isNaN(rightTime) && leftTime !== rightTime) {
+        return leftTime - rightTime;
+      }
+      return leftRuntime ? -1 : 1;
+    }
+    return leftRuntime ? 1 : -1;
+  }
   if (leftRuntime && rightRuntime && left.seq !== right.seq) {
     return Number(left.seq) - Number(right.seq);
   }
