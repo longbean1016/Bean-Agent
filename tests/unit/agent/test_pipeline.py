@@ -825,7 +825,7 @@ async def test_pipeline_emits_complete_context_usage_breakdown(tmp_path: Path) -
     assert usage.soft_limit_tokens == 740
     assert usage.hard_input_tokens == 800
     assert sum(usage.breakdown.values()) == usage.used_tokens
-    assert any(item["name"] == "identity" for item in usage.sections)
+    assert any(item["name"] == "behavior_rules" for item in usage.sections)
 
 
 @pytest.mark.asyncio

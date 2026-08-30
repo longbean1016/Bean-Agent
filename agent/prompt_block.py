@@ -100,13 +100,6 @@ class BeanPromptBlock(_Block):
         return content or None
 
 
-class IdentityPromptBlock(_Block):
-    priority, label, is_static = 10, "identity", True
-    def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str:
-        return "你是 BeanAgent，一个直接、高效的 AI 协作伙伴。优先给出结论，再补充必要细节。"
-    def cache_signature(self, ctx: TurnContext) -> str: return ctx.workspace
-
-
 class BehaviorRulesPromptBlock(_Block):
     priority, label, is_static = 15, "behavior_rules", True
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str:
@@ -220,7 +213,7 @@ class SystemPromptBuilder:
 
 
 def default_prompt_blocks() -> list[PromptBlock]:
-    return [BeanPromptBlock(), IdentityPromptBlock(), BehaviorRulesPromptBlock(), SkillsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), DeferredToolsHintBlock(), ActiveToolsPromptBlock(), ActiveSkillsPromptBlock(), RetrievedMemoryPromptBlock()]
+    return [BeanPromptBlock(), BehaviorRulesPromptBlock(), SkillsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), DeferredToolsHintBlock(), ActiveToolsPromptBlock(), ActiveSkillsPromptBlock(), RetrievedMemoryPromptBlock()]
 
 
 __all__ = ["BeanPromptBlock", "DeferredToolsHintBlock", "PromptSectionMeta", "PromptSectionRender", "SectionCache", "SystemPromptBuilder", "TurnContext", "default_prompt_blocks"]

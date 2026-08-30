@@ -43,7 +43,7 @@ def test_static_prefix_cache_and_dynamic_context_frame_are_separated() -> None:
     assert "你是 BeanAgent" in str(first.messages[0]["content"])
     assert "会话近期摘要" not in str(first.messages[0]["content"])
     assert {item.name for item in second.debug_breakdown if item.cache_hit} == {
-        "identity", "behavior_rules"
+        "behavior_rules"
     }
     reminder = first.messages[-2]["content"]
     assert reminder.startswith('<system-reminder data-system-context-frame="true">')
