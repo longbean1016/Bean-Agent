@@ -1085,8 +1085,33 @@ def _tool_profile() -> MemoryToolProfile:
         {"type": "object", "properties": {"query": {"type": "string", "description": "写成脱离当前对话也能理解的检索主题，保留关键人物、时间、型号和事件。"}, "intent": {"type": "string", "enum": ["answer", "timeline"], "default": "answer", "description": "answer=深度主题检索；timeline=按 time_filter 回顾历史事件。"}, "memory_kind": {"type": "string"}, "time_filter": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}, "required": ["query"]},
     )
     memorize = MemoryToolSpec(
-        "记住用户明确要求长期保留的信息、稳定偏好或可复用流程；不要记录普通闲聊。",
-        {"type": "object", "properties": {"summary": {"type": "string"}, "memory_kind": {"type": "string", "enum": ["event", "profile", "preference", "procedure"]}, "tool_requirement": {"type": "string"}, "steps": {"type": "array", "items": {"type": "string"}}}, "required": ["summary"]},
+        "仅当用户明确要求记住，或当前 USER 原话明确表达稳定且跨会话有价值的信息时调用。"
+        "summary 只能包含 USER 原话直接支持的内容；不得写入 ASSISTANT 的解释、建议、工具结果、历史摘要或推断。"
+        "不确定是否应记住时，不要调用。",
+        {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": (
+                        "生成脱离对话也能成立的完整摘要。只能写当前 USER 原话直接支持的内容，"
+                        "不得补充推断或引用 ASSISTANT 内容；profile 每条只表达一个事实。"
+                    ),
+                },
+                "memory_kind": {
+                    "type": "string",
+                    "enum": ["event", "profile", "preference", "procedure"],
+                    "description": (
+                        "类型定义：event=一次性事件或短期状态；profile=用户稳定的个人事实、身份或关系；"
+                        "preference=用户稳定的喜欢、厌恶或服务偏好；"
+                        "procedure=用户明确要求未来长期遵守的规则、步骤或工具要求。"
+                    ),
+                },
+                "tool_requirement": {"type": "string"},
+                "steps": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["summary"],
+        },
     )
     forget = MemoryToolSpec(
         "按 recall_memory 返回的记忆 ID 软删除错误、过时或用户要求遗忘的条目。",

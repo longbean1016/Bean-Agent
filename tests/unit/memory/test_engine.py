@@ -15,9 +15,24 @@ from memory.contracts import (
     MemoryIngestRequest, MemoryMutation, MemoryQuery, MemoryQueryFilters,
     MemoryScope,
 )
-from memory.engine import MemoryEngine
+from memory.engine import MemoryEngine, _tool_profile
 from memory.implicit_extractor import ImplicitMemoryDraft
 from session.store import NewMessage, SessionStore
+
+
+def test_memorize_tool_profile_explains_evidence_and_memory_kinds() -> None:
+    spec = _tool_profile().memorize
+    assert spec is not None
+
+    assert "USER 原话" in spec.description
+    assert "ASSISTANT" in spec.description
+    kind_description = spec.parameters["properties"]["memory_kind"]["description"]
+    assert "event=一次性事件或短期状态" in kind_description
+    assert "profile=用户稳定的个人事实" in kind_description
+    assert "preference=用户稳定的喜欢、厌恶或服务偏好" in kind_description
+    assert "procedure=用户明确要求未来长期遵守的规则" in kind_description
+    summary_description = spec.parameters["properties"]["summary"]["description"]
+    assert "只能写当前 USER 原话直接支持的内容" in summary_description
 
 
 class Embedder:

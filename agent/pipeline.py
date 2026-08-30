@@ -529,7 +529,9 @@ def _build_deferred_tools_hint(tools: Any, visible: set[str] | None = None) -> s
     lines = ["【未加载工具目录（知道名字但 schema 未暴露）】"]
     lines.append(f"内置: {', '.join(deferred)}")
     lines.append(
-        f"\n共 {len(deferred)} 个。加载方式：\n"
+        f"\n共 {len(deferred)} 个。优先使用当前活跃工具；只有当任务需要工具但当前活跃工具无法完成、且未加载目录中可能存在合适工具时，才调用 tool_search。\n"
+        "如果当前工具已足够或任务无需工具，则不要调用 tool_search。\n"
+        "加载方式：\n"
         "- 已知工具名 → tool_search(query=\"select:工具名\")，支持逗号分隔多个\n"
         "- 描述功能   → tool_search(query=\"关键词\") 搜索匹配"
     )
