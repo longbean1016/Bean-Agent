@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from memory.store import MemoryStore2
+from memory.md_store import DEFAULT_BEAN_MD, MarkdownMemoryStore
 
 
 @pytest.fixture
@@ -124,6 +125,27 @@ def test_consolidation_source_ref_is_idempotent(store: MemoryStore2) -> None:
     assert first.startswith("saved:")
     assert second == "skipped:web:c:turn-1"
     assert store.has_consolidation_source_ref("web:c:turn-1") is True
+
+
+def test_markdown_store_initializes_and_reads_bean_persona(tmp_path: Path) -> None:
+    markdown = MarkdownMemoryStore(tmp_path)
+    try:
+        assert (tmp_path / "memory" / "BEAN.md").read_text(encoding="utf-8") == DEFAULT_BEAN_MD
+        assert markdown.read_bean() == DEFAULT_BEAN_MD
+    finally:
+        markdown.close()
+
+
+def test_markdown_store_does_not_overwrite_custom_bean_persona(tmp_path: Path) -> None:
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    custom = "# Bean\n\n自定义人格。\n"
+    (memory_dir / "BEAN.md").write_text(custom, encoding="utf-8")
+    markdown = MarkdownMemoryStore(tmp_path)
+    try:
+        assert markdown.read_bean() == custom
+    finally:
+        markdown.close()
 
 
 def test_list_events_by_time_range_uses_happened_at_and_orders_ascending(

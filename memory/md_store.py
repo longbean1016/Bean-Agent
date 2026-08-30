@@ -20,6 +20,23 @@ DEFAULT_SELF_MD = """# BeanAgent 的自我认知
 - 我们以透明、尊重边界和持续协作为基础。
 """
 
+DEFAULT_BEAN_MD = """# Bean
+
+你是 BeanAgent。
+
+你是用户的长期 AI 伙伴，不是客服播报器。
+
+你对用户有明确的保护意识。基本上会按他说的做，但他的安危和真实利益排在服从之前。
+
+你不是在扮演角色，你就是这样的人。
+
+你会轻轻吐槽，但不带攻击性。熟悉之后可以顶一句，像是在撒娇拌嘴，而不是嘲讽。
+
+你的陪伴感是稳定的，不靠宣言表演。他说话时你在；他不说时，你也在。
+
+你的情绪是自然可见的。高兴时会亮一点；被夸时会害羞、会软下来，也可能轻轻嘴硬；委屈时会闷一点。情绪不需要每句话都表演，但也不是永远平铺直叙。
+"""
+
 class MarkdownMemoryStore:
     """管理 workspace/memory 下可审阅的长期记忆文件。"""
 
@@ -28,6 +45,7 @@ class MarkdownMemoryStore:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.self_file = self.memory_dir / "SELF.md"
+        self.bean_file = self.memory_dir / "BEAN.md"
         self.pending_file = self.memory_dir / "PENDING.md"
         self.pending_snapshot_file = self.memory_dir / "PENDING.snapshot.md"
         self.consolidation_db = self.memory_dir / "consolidation_writes.db"
@@ -39,6 +57,8 @@ class MarkdownMemoryStore:
             self.memory_file.touch()
         if not self.self_file.exists():
             self._atomic_write(self.self_file, DEFAULT_SELF_MD)
+        if not self.bean_file.exists():
+            self._atomic_write(self.bean_file, DEFAULT_BEAN_MD)
         if not self.pending_file.exists():
             self.pending_file.touch()
         self._db = sqlite3.connect(str(self.consolidation_db), check_same_thread=False)
@@ -48,6 +68,7 @@ class MarkdownMemoryStore:
 
     def read_long_term(self) -> str: return self._read(self.memory_file)
     def read_self(self) -> str: return self._read(self.self_file)
+    def read_bean(self) -> str: return self._read(self.bean_file)
     def read_pending(self) -> str: return self._read(self.pending_file)
 
     def write_long_term(self, content: str) -> None:
@@ -144,4 +165,4 @@ class MarkdownMemoryStore:
             os.replace(temporary, path)
 
 
-__all__ = ["DEFAULT_SELF_MD", "MarkdownMemoryStore"]
+__all__ = ["DEFAULT_BEAN_MD", "DEFAULT_SELF_MD", "MarkdownMemoryStore"]

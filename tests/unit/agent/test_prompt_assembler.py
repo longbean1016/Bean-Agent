@@ -9,6 +9,7 @@ from agent.prompt_block import SectionCache, SystemPromptBuilder, TurnContext, d
 
 
 class Memory:
+    def read_bean(self) -> str: return "# Bean\n你是 BeanAgent。"
     def read_self(self) -> str: return "保持直接"
     def get_memory_context(self) -> str: return "用户是开发者"
 
@@ -39,6 +40,7 @@ def test_static_prefix_cache_and_dynamic_context_frame_are_separated() -> None:
 
     assert first.messages[0]["role"] == "system"
     assert first.messages[0]["content"] == second.messages[0]["content"]
+    assert "你是 BeanAgent" in str(first.messages[0]["content"])
     assert "会话近期摘要" not in str(first.messages[0]["content"])
     assert {item.name for item in second.debug_breakdown if item.cache_hit} == {
         "identity", "behavior_rules"

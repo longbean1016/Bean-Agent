@@ -309,6 +309,11 @@ class MemoryEngine:
 
         return self._markdown.read_self()
 
+    def read_bean(self) -> str:
+        """供 PromptBlock 读取 workspace 人格真源。"""
+
+        return self._markdown.read_bean()
+
     def get_memory_context(self) -> str:
         """返回可直接注入稳定 Prompt 前缀的 Markdown 长期记忆。"""
 
