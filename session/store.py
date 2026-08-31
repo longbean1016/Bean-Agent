@@ -687,6 +687,16 @@ class SessionStore:
 
         return self._commit_compaction_sync(checkpoint)
 
+    def save_context_usage(self, session_key: str, snapshot: dict[str, Any]) -> None:
+        """保存会话最近一次上下文计量快照，不混入会话业务 metadata。"""
+
+        self._save_context_usage_sync(session_key, snapshot)
+
+    def get_context_usage(self, session_key: str) -> dict[str, Any] | None:
+        """读取上下文计量快照；没有真实 usage 时仍可返回不完整快照。"""
+
+        return self._get_context_usage_sync(session_key)
+
     def close(self) -> None:
         """幂等关闭 SQLite 连接。"""
 
@@ -1033,9 +1043,18 @@ class SessionStore:
         metadata: dict[str, Any],
     ) -> None:
         key = self._validate_session_key(session_key)
-        payload = json.dumps(metadata or {}, ensure_ascii=False)
         with self._lock:
             self._ensure_open()
+            incoming = dict(metadata or {})
+            existing_row = self._conn.execute(
+                "SELECT metadata FROM sessions WHERE key = ?", (key,)
+            ).fetchone()
+            existing = _load_json_object(existing_row["metadata"]) if existing_row else {}
+            # 计量快照由独立 writer 更新，Session 缓存可能尚未感知；普通
+            # metadata 保存不得用旧快照覆盖这个保留键。
+            if "context_usage" not in incoming and "context_usage" in existing:
+                incoming["context_usage"] = existing["context_usage"]
+            payload = json.dumps(incoming, ensure_ascii=False)
             # Consolidation 在后台直接推进 cursor，而 Session 缓存可能仍持有旧值；普通
             # metadata upsert 只允许 cursor 单调前进，显式重置仍由 set_cursor() 负责。
             # next_seq 由 add_message 的事务独立维护；元数据刷新绝不能把它
@@ -1571,6 +1590,41 @@ class SessionStore:
                 return
             self._conn.close()
             self._closed = True
+
+    def _save_context_usage_sync(self, session_key: str, snapshot: dict[str, Any]) -> None:
+        key = self._validate_session_key(session_key)
+        if not isinstance(snapshot, dict):
+            raise TypeError("context usage snapshot 必须是对象")
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT metadata FROM sessions WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"context usage session 不存在: {key}")
+            metadata = _load_json_object(row["metadata"])
+            # 只更新保留键，标题和其他业务 metadata 由各自调用方继续拥有。
+            metadata["context_usage"] = dict(snapshot)
+            self._conn.execute(
+                """
+                UPDATE sessions SET metadata = ?, updated_at = ? WHERE key = ?
+                """,
+                (json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), default=str), _now_iso(), key),
+            )
+            self._conn.commit()
+
+    def _get_context_usage_sync(self, session_key: str) -> dict[str, Any] | None:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT metadata FROM sessions WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = _load_json_object(row["metadata"]).get("context_usage")
+        return dict(value) if isinstance(value, dict) else None
 
     def _message_to_history(
         self,

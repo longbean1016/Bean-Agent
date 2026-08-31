@@ -35,6 +35,32 @@ async def test_create_session_is_idempotent(store: SessionStore) -> None:
     assert first["created_at"].endswith("+08:00")
 
 
+def test_context_usage_snapshot_is_persisted_without_overwriting_metadata(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "context-usage.db"
+    first = SessionStore(db_path)
+    first.create_session("web:usage")
+    snapshot = {
+        "pressure_tokens": 120,
+        "projected_tokens": 135,
+        "context_window": 1_000_000,
+        "model_runtime_id": "deepseek:deepseek-v4-flash:1000000",
+    }
+    first.save_context_usage("web:usage", snapshot)
+    first.update_chat_session_title("web:usage", "计量会话")
+    first.close()
+
+    second = SessionStore(db_path)
+    try:
+        assert second.get_context_usage("web:usage") == snapshot
+        meta = second.get_session_meta("web:usage")
+        assert meta is not None
+        assert meta["metadata"]["title"] == "计量会话"
+    finally:
+        second.close()
+
+
 @pytest.mark.asyncio
 async def test_add_message_allocates_seq_and_preserves_turn_fields(
     store: SessionStore,

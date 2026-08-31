@@ -1771,7 +1771,13 @@ export function ContextUsageIndicator({ usage, compacting }: { usage?: ContextUs
 
   const contextWindow = usage?.contextWindow ?? 0;
   const usedTokens = usage?.usedTokens ?? 0;
-  const known = contextWindow > 0;
+  const legacyPressure = Boolean(usage && !usage.modelRuntimeId && usage.pressureTokens === undefined && contextWindow > 0);
+  const hasProviderPressure = usage?.pressureTokens !== undefined || legacyPressure;
+  // 旧事件帧没有 model_runtime_id，只保留其未知态兼容；新协议在
+  // pressure 缺失时由 reducer 丢弃，因此真实新会话不会渲染这个圆圈。
+  const legacyUnknown = Boolean(usage && !usage.modelRuntimeId && !hasProviderPressure);
+  const known = contextWindow > 0 && hasProviderPressure;
+  if (!usage || (!known && !legacyUnknown)) return null;
   const percent = known ? Math.min(100, Math.max(0, Math.round((usedTokens / contextWindow) * 100))) : 0;
   const level = !known ? "unknown" : percent >= 90 ? "danger" : percent >= 74 ? "warning" : "normal";
   const label = known ? `上下文已用 ${percent}%` : "上下文容量未知";
@@ -1807,10 +1813,12 @@ export function ContextUsageIndicator({ usage, compacting }: { usage?: ContextUs
               <div><dt>系统提示词</dt><dd>{formatTokenCount(breakdown.system_prompt_tokens)}</dd></div>
               <div><dt>工具</dt><dd>{formatTokenCount(breakdown.tools_tokens)}</dd></div>
               <div><dt>对话消息</dt><dd>{formatTokenCount(breakdown.conversation_tokens)}</dd></div>
-              <div><dt>协议开销</dt><dd>{formatTokenCount(breakdown.overhead_tokens)}</dd></div>
             </dl>
           ) : <p className="context-usage-empty">等待本轮上下文估算</p>}
-          <small className="context-usage-source">估算值 · {usage?.contextWindowSource || "unknown"}</small>
+          <small className="context-usage-source">
+            {usage?.estimateSource === "provider_usage" ? "Provider usage" : usage?.estimateSource === "provider_projected" ? "投影值" : "估算值"}
+            {" · "}{usage?.contextWindowSource || "unknown"}
+          </small>
         </div>
       ) : null}
     </div>

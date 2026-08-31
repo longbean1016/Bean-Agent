@@ -54,6 +54,8 @@ class WebChannel:
         media_root: Path | None = None,
         proactive_store: ProactiveStore | None = None,
         ensure_session: Callable[[str], Awaitable[object]] | None = None,
+        context_usage_loader: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
+        context_runtime_id: str = "",
     ) -> None:
         self._bus = bus
         self._events = event_bus
@@ -61,6 +63,8 @@ class WebChannel:
         self._media_root = media_root.resolve() if media_root is not None else None
         self._proactive_store = proactive_store
         self._ensure_session = ensure_session
+        self._context_usage_loader = context_usage_loader
+        self._context_runtime_id = str(context_runtime_id or "")
         self._connections: dict[str, set[WebSocketApi]] = {}
         self._socket_send_locks: weakref.WeakKeyDictionary[WebSocketApi, asyncio.Lock] = (
             weakref.WeakKeyDictionary()
@@ -110,6 +114,7 @@ class WebChannel:
                 "request_id": request_id,
                 "session_id": session_key,
             })
+            await self._send_context_usage_snapshot(session_key, websocket)
             # 订阅确认后只给当前连接补发运行中快照，用于刷新/重连恢复流式草稿。
             await self._send_active_turn_snapshot(session_key, websocket)
             await self._replay_pending_notifications(session_key, websocket)
@@ -215,6 +220,47 @@ class WebChannel:
             return
         await self._send_json(websocket, {"type": "turn.snapshot", **dict(snapshot)})
 
+    async def _send_context_usage_snapshot(self, session_key: str, websocket: WebSocketApi) -> None:
+        """订阅时恢复与当前模型身份匹配的计量快照。"""
+
+        if self._context_usage_loader is None:
+            return
+        try:
+            snapshot = await self._context_usage_loader(session_key)
+        except Exception as error:
+            logger.warning("读取 Web 上下文计量快照失败 session=%s error=%s", session_key, error)
+            await self._send_json(websocket, {
+                "type": "context.usage.reset",
+                "session_id": session_key,
+            })
+            return
+        if not isinstance(snapshot, dict):
+            await self._send_json(websocket, {
+                "type": "context.usage.reset",
+                "session_id": session_key,
+            })
+            return
+        runtime_id = str(snapshot.get("model_runtime_id") or "")
+        if self._context_runtime_id and runtime_id and runtime_id != self._context_runtime_id:
+            # 模型切换后的旧 pressure 不得与新容量合并；等新模型返回 usage。
+            await self._send_json(websocket, {
+                "type": "context.usage.reset",
+                "session_id": session_key,
+            })
+            return
+        if snapshot.get("pressure_tokens") is None:
+            await self._send_json(websocket, {
+                "type": "context.usage.reset",
+                "session_id": session_key,
+            })
+            return
+        await self._send_json(websocket, {
+            "type": "context.usage.updated",
+            "session_id": session_key,
+            "turn_id": "",
+            **_context_usage_frame(snapshot),
+        })
+
     async def _on_turn_started(self, event: TurnStarted) -> None:
         await self._broadcast(event.session_key, {"type": "turn.started", "request_id": event.request_id, "session_id": event.session_key, "turn_id": event.turn_id})
 
@@ -248,7 +294,7 @@ class WebChannel:
         })
 
     async def _on_context_usage_updated(self, event: ContextUsageUpdated) -> None:
-        await self._broadcast(event.session_key, {
+        frame = {
             "type": "context.usage.updated",
             "session_id": event.session_key,
             "turn_id": event.turn_id,
@@ -260,7 +306,20 @@ class WebChannel:
             "estimate_source": event.estimate_source,
             "breakdown": dict(event.breakdown),
             "sections": [dict(section) for section in event.sections],
-        })
+        }
+        optional = {
+            "pressure_tokens": event.pressure_tokens,
+            "projected_tokens": event.projected_tokens,
+            "surface_tokens": event.surface_tokens,
+            "system_tokens": event.system_tokens,
+            "tools_tokens": event.tools_tokens,
+            "message_tokens": event.message_tokens,
+            "as_of_seq": event.as_of_seq,
+            "model_runtime_id": event.model_runtime_id,
+            "model": event.model,
+        }
+        frame.update({key: value for key, value in optional.items() if value is not None})
+        await self._broadcast(event.session_key, frame)
 
     async def _on_session_updated(self, event: SessionUpdated) -> None:
         await self._broadcast(event.session_key, {
@@ -362,6 +421,33 @@ class WebChannel:
         async with self._lock:
             self._connections.clear()
             self._socket_send_locks.clear()
+
+
+def _context_usage_frame(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """把持久化快照转成兼容实时事件的 WebSocket 帧。"""
+
+    pressure = snapshot.get("pressure_tokens")
+    projected = snapshot.get("projected_tokens")
+    used = projected if projected is not None else pressure
+    breakdown = {
+        "system_prompt_tokens": int(snapshot.get("system_tokens") or 0),
+        "tools_tokens": int(snapshot.get("tools_tokens") or 0),
+        "conversation_tokens": int(snapshot.get("message_tokens") or 0),
+    }
+    return {
+        "used_tokens": int(used or 0),
+        "context_window": int(snapshot.get("context_window") or 0),
+        "soft_limit_tokens": int(snapshot.get("soft_limit_tokens") or 0),
+        "hard_input_tokens": int(snapshot.get("hard_input_tokens") or 0),
+        "context_window_source": str(snapshot.get("context_window_source") or "unknown"),
+        "estimate_source": "provider_projected" if projected is not None else "unknown",
+        "breakdown": breakdown,
+        "sections": [],
+        **{key: snapshot[key] for key in (
+            "pressure_tokens", "projected_tokens", "surface_tokens", "system_tokens",
+            "tools_tokens", "message_tokens", "as_of_seq", "model_runtime_id", "model",
+        ) if snapshot.get(key) is not None},
+    }
 
 
 def normalize_web_session_id(value: object) -> str | None:

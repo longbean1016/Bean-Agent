@@ -47,6 +47,8 @@ class ProviderApi(Protocol):
 
 HistoryLoader = Callable[[str, int | None], Awaitable[list[dict[str, Any]]]]
 ContextCompactor = Callable[..., Awaitable[bool]]
+ContextUsageLoader = Callable[[str], Awaitable[dict[str, Any] | None]]
+ContextUsageWriter = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,8 @@ class Pipeline:
         prompt_cache_log: PromptCacheLogWriter | None = None,
         history_loader: HistoryLoader | None = None,
         context_compactor: ContextCompactor | None = None,
+        context_usage_loader: ContextUsageLoader | None = None,
+        context_usage_writer: ContextUsageWriter | None = None,
         max_iterations: int = 10,
         multimodal: bool = True,
         vl_available: bool = False,
@@ -93,6 +97,8 @@ class Pipeline:
         self._prompt_cache_log = prompt_cache_log
         self._history_loader = history_loader
         self._context_compactor = context_compactor
+        self._context_usage_loader = context_usage_loader
+        self._context_usage_writer = context_usage_writer
         self._max_iterations = max(1, int(max_iterations))
         # 图片能力在应用组装时确定，Turn 内只读取这份稳定快照。纯文本主模型不能
         # 接收 image_url；独立 VL 可用时则由现有 ReAct 工具链负责真正读图。
@@ -100,6 +106,9 @@ class Pipeline:
         self._vl_available = bool(vl_available)
         # 中断快照只服务于当前进程内的停止/续跑语义，不进入 Session 或长期记忆。
         self._interrupt_snapshots: dict[str, dict[str, Any]] = {}
+        # 只保存每个会话最近一次供应商 usage 锚点；完整快照由 SessionStore
+        # 持久化，进程重启或 WebSocket 重连都不会依赖这份内存缓存。
+        self._context_measurements: dict[str, dict[str, Any]] = {}
 
     async def process(self, message: InboundMessage, *, turn_id: str) -> PipelineResult:
         self._interrupt_snapshots[turn_id] = {
@@ -139,6 +148,7 @@ class Pipeline:
             if self._history_loader and not skip_history
             else []
         )
+        measurement = await self._load_context_measurement(message.session_key)
         retrieved = await self._memory.retrieve_for_turn(message) if self._memory and not skip_memory else ""
         names = list(tool_view.visible_order)
         available_skills = (
@@ -248,7 +258,7 @@ class Pipeline:
             ))
 
         async def chat_with_context_retry() -> LLMResponse:
-            nonlocal last_base_messages, history, forced_compaction_attempted
+            nonlocal last_base_messages, history, forced_compaction_attempted, measurement
             while True:
                 history_for_attempt = history
                 disabled_sections: set[str] = set()
@@ -280,6 +290,11 @@ class Pipeline:
                 )
                 provider_window = int(getattr(self._provider, "context_window", 0) or 0)
                 provider_output = int(getattr(self._provider, "max_tokens", 0) or 0)
+                provider_model = str(getattr(self._provider, "model", "") or "")
+                provider_runtime_id = str(
+                    getattr(self._provider, "runtime_id", "")
+                    or f"{getattr(self._provider, 'provider_name', '')}:{provider_model}:{provider_window}"
+                )
                 soft_limit = soft_limit_tokens(provider_window) if provider_window > 0 else 0
                 hard_limit = (
                     hard_input_limit(provider_window, provider_output)
@@ -295,21 +310,73 @@ class Pipeline:
                     }
                     for item in assembled.debug_breakdown
                 )
-                # 这是近似值，目的是让界面展示趋势并解释 gate；真实供应商 usage
-                # 仍只用于日志校准，不能反过来改变已经开始的请求。
+                breakdown = estimate_payload_breakdown(model_messages, tool_schemas)
+                surface_tokens = int(breakdown.get("conversation_tokens", 0))
+                active_measurement = measurement
+                if active_measurement and active_measurement.get("model_runtime_id") != provider_runtime_id:
+                    # 模型切换后旧模型的 pressure 不能与新容量拼接，等新模型
+                    # 首次返回 usage 后再建立新的锚点。
+                    active_measurement = None
+                    measurement = None
+                pressure_tokens = (
+                    int(active_measurement["pressure_tokens"])
+                    if active_measurement and active_measurement.get("pressure_tokens") is not None
+                    else None
+                )
+                anchor_tokens = (
+                    int(active_measurement["anchor_tokens"])
+                    if active_measurement and active_measurement.get("anchor_tokens") is not None
+                    else None
+                )
+                projected_tokens = (
+                    max(0, pressure_tokens + estimate - anchor_tokens)
+                    if pressure_tokens is not None and anchor_tokens is not None
+                    else None
+                )
+                # 圆圈主指标只接受供应商 pressure；没有 usage 时 used_tokens
+                # 仅作为旧观测端的 gate 估算，不得让界面误认为精确值。
+                display_tokens = projected_tokens if projected_tokens is not None else estimate
+                snapshot = {
+                    "pressure_tokens": pressure_tokens,
+                    "projected_tokens": projected_tokens,
+                    "surface_tokens": surface_tokens,
+                    "system_tokens": int(breakdown.get("system_prompt_tokens", 0)),
+                    "tools_tokens": int(breakdown.get("tools_tokens", 0)),
+                    "message_tokens": surface_tokens,
+                    "as_of_seq": _context_as_of_seq(message),
+                    "model_runtime_id": provider_runtime_id,
+                    "model": provider_model,
+                    "context_window": provider_window,
+                    "context_window_source": str(
+                        getattr(self._provider, "context_window_source", "unknown") or "unknown"
+                    ),
+                    "soft_limit_tokens": soft_limit,
+                    "hard_input_tokens": hard_limit,
+                    "anchor_tokens": anchor_tokens,
+                }
+                await self._persist_context_measurement(message.session_key, snapshot)
                 await self._events.emit(ContextUsageUpdated(
                     session_key=message.session_key,
                     turn_id=turn_id,
-                    used_tokens=estimate,
+                    used_tokens=display_tokens,
                     context_window=provider_window,
                     soft_limit_tokens=soft_limit,
                     hard_input_tokens=hard_limit,
                     context_window_source=str(
                         getattr(self._provider, "context_window_source", "unknown") or "unknown"
                     ),
-                    estimate_source="heuristic",
-                    breakdown=estimate_payload_breakdown(model_messages, tool_schemas),
+                    estimate_source="provider_projected" if projected_tokens is not None else "heuristic",
+                    breakdown=breakdown,
                     sections=context_sections,
+                    pressure_tokens=pressure_tokens,
+                    projected_tokens=projected_tokens,
+                    surface_tokens=surface_tokens,
+                    system_tokens=snapshot["system_tokens"],
+                    tools_tokens=snapshot["tools_tokens"],
+                    message_tokens=surface_tokens,
+                    as_of_seq=snapshot["as_of_seq"],
+                    model_runtime_id=provider_runtime_id,
+                    model=provider_model,
                 ))
                 if (
                     not react_messages
@@ -341,6 +408,40 @@ class Pipeline:
                         tool_choice="auto",
                         on_content_delta=on_delta,
                     )
+                    provider_pressure = _provider_pressure_tokens(response)
+                    if provider_pressure is not None:
+                        measurement = {
+                            **snapshot,
+                            "pressure_tokens": provider_pressure,
+                            "projected_tokens": provider_pressure,
+                            "anchor_tokens": estimate,
+                        }
+                        await self._persist_context_measurement(
+                            message.session_key, measurement
+                        )
+                        await self._events.emit(ContextUsageUpdated(
+                            session_key=message.session_key,
+                            turn_id=turn_id,
+                            used_tokens=provider_pressure,
+                            context_window=provider_window,
+                            soft_limit_tokens=soft_limit,
+                            hard_input_tokens=hard_limit,
+                            context_window_source=str(
+                                getattr(self._provider, "context_window_source", "unknown") or "unknown"
+                            ),
+                            estimate_source="provider_usage",
+                            breakdown=breakdown,
+                            sections=context_sections,
+                            pressure_tokens=provider_pressure,
+                            projected_tokens=provider_pressure,
+                            surface_tokens=surface_tokens,
+                            system_tokens=snapshot["system_tokens"],
+                            tools_tokens=snapshot["tools_tokens"],
+                            message_tokens=surface_tokens,
+                            as_of_seq=snapshot["as_of_seq"],
+                            model_runtime_id=provider_runtime_id,
+                            model=provider_model,
+                        ))
                     context_retry["history_messages"] = len(history_for_attempt)
                     context_retry["disabled_sections"] = sorted(disabled_sections)
                     return response
@@ -571,6 +672,38 @@ class Pipeline:
 
         self._interrupt_snapshots.pop(turn_id, None)
 
+    async def _load_context_measurement(self, session_key: str) -> dict[str, Any] | None:
+        cached = self._context_measurements.get(session_key)
+        if cached is not None:
+            return dict(cached)
+        if self._context_usage_loader is None:
+            return None
+        try:
+            loaded = await self._context_usage_loader(session_key)
+        except Exception as error:
+            logger.warning("读取上下文计量快照失败 session=%s error=%s", session_key, error)
+            return None
+        if not isinstance(loaded, dict):
+            return None
+        snapshot = dict(loaded)
+        self._context_measurements[session_key] = snapshot
+        return dict(snapshot)
+
+    async def _persist_context_measurement(
+        self,
+        session_key: str,
+        snapshot: dict[str, Any],
+    ) -> None:
+        self._context_measurements[session_key] = dict(snapshot)
+        if self._context_usage_writer is None:
+            return
+        try:
+            await self._context_usage_writer(session_key, dict(snapshot))
+        except Exception as error:
+            # 计量快照是观察面，写入失败不能让当前模型请求失败；下次请求
+            # 仍会用内存锚点继续投影，后台日志保留故障定位线索。
+            logger.warning("写入上下文计量快照失败 session=%s error=%s", session_key, error)
+
     async def _summarize_incomplete_progress(
         self,
         base_messages: list[dict[str, Any]],
@@ -630,6 +763,25 @@ def _log_prompt_cache_usage(
         prompt_tokens,
         rate,
     )
+
+
+def _provider_pressure_tokens(response: LLMResponse) -> int | None:
+    """提取供应商 prompt-side usage；输出 token 不参与上下文压力。"""
+
+    value = response.cache_prompt_tokens
+    if value is None:
+        return None
+    return max(0, int(value))
+
+
+def _context_as_of_seq(message: InboundMessage) -> int | None:
+    """从受控的当前用户 source_ref 推导快照所在消息序号。"""
+
+    source_ref = str(message.metadata.get("current_user_source_ref") or "")
+    try:
+        return max(0, int(source_ref.rsplit(":", 1)[1]) - 1)
+    except (IndexError, ValueError):
+        return None
 
 
 def _build_deferred_tools_hint(tools: Any, visible: set[str] | None = None) -> str:

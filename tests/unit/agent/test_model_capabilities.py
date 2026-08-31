@@ -43,3 +43,17 @@ def test_unknown_model_keeps_local_gate_disabled(monkeypatch) -> None:
 
     assert result.context_window == 0
     assert result.source == "unknown"
+
+
+def test_deepseek_flash_uses_stable_provider_catalog_capacity(monkeypatch) -> None:
+    _set_registry(monkeypatch, {
+        "deepseek/deepseek-v4-flash": {
+            "max_input_tokens": 1_008_192,
+            "max_output_tokens": 0,
+        },
+    })
+
+    result = resolve_context_window(provider="deepseek", model="deepseek-v4-flash")
+
+    assert result.context_window == 1_000_000
+    assert result.source == "provider_catalog"

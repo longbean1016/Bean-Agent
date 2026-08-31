@@ -13,6 +13,13 @@ _PROVIDER_ALIASES = {
     "qwen": "dashscope",
 }
 
+# 关键模型的能力在本地固定，避免 LiteLLM 快照把输入上限和输出上限
+# 误合并成一个并不存在的总窗口。未知模型仍然允许显式配置覆盖。
+_MODEL_CAPABILITIES: dict[tuple[str, str], int] = {
+    ("deepseek", "deepseek-v4-flash"): 1_000_000,
+    ("", "deepseek-v4-flash"): 1_000_000,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ContextWindowResolution:
@@ -40,6 +47,10 @@ def resolve_context_window(
         source = str(configured_source or "explicit").strip() or "explicit"
         return ContextWindowResolution(explicit, source)
 
+    catalog_window = _find_catalog_window(provider, model)
+    if catalog_window:
+        return ContextWindowResolution(catalog_window, "provider_catalog")
+
     entry = _find_model_entry(provider, model)
     if entry is not None:
         max_input = _positive_int(entry.get("max_input_tokens"))
@@ -51,6 +62,22 @@ def resolve_context_window(
             return ContextWindowResolution(context_window, "litellm")
 
     return ContextWindowResolution(0, "unknown")
+
+
+def _find_catalog_window(provider: str, model: str) -> int:
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_model = str(model or "").strip().lower()
+    if "/" in normalized_model:
+        normalized_model = normalized_model.rsplit("/", 1)[-1]
+    aliases = [normalized_provider]
+    canonical = _PROVIDER_ALIASES.get(normalized_provider)
+    if canonical and canonical not in aliases:
+        aliases.append(canonical)
+    for alias in aliases:
+        value = _MODEL_CAPABILITIES.get((alias, normalized_model))
+        if value:
+            return value
+    return _MODEL_CAPABILITIES.get(("", normalized_model), 0)
 
 
 @lru_cache(maxsize=1)

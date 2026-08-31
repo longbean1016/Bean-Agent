@@ -829,6 +829,47 @@ async def test_pipeline_emits_complete_context_usage_breakdown(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_pipeline_anchors_provider_pressure_and_persists_snapshot(tmp_path: Path) -> None:
+    class UsageProvider:
+        context_window = 1000
+        context_window_source = "explicit"
+        max_tokens = 200
+        model = "meter-model"
+        provider_name = "test"
+
+        async def chat(self, messages, tools=None, **kwargs):
+            return LLMResponse("完成", cache_prompt_tokens=120, cache_hit_tokens=80)
+
+    events: list[ContextUsageUpdated] = []
+    snapshots: list[dict[str, object]] = []
+    event_bus = EventBus()
+    event_bus.on(ContextUsageUpdated, events.append)
+
+    async def write(_session_key: str, snapshot: dict[str, object]) -> None:
+        snapshots.append(snapshot)
+
+    pipeline = Pipeline(
+        UsageProvider(),
+        ToolRegistry(),
+        event_bus,
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        context_usage_writer=write,
+    )
+
+    await pipeline.process(
+        InboundMessage("web", "u", "c", "当前问题"),
+        turn_id="provider-pressure",
+    )
+
+    assert events[-1].estimate_source == "provider_usage"
+    assert events[-1].pressure_tokens == 120
+    assert events[-1].projected_tokens == 120
+    assert snapshots[-1]["pressure_tokens"] == 120
+    assert snapshots[-1]["model_runtime_id"] == "test:meter-model:1000"
+
+
+@pytest.mark.asyncio
 async def test_pipeline_emits_compaction_failed_event(tmp_path: Path) -> None:
     class GateProvider:
         context_window = 100

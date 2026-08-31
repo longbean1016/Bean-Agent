@@ -41,6 +41,15 @@ export interface ChatState {
 export interface ContextUsage {
   turnId: string;
   usedTokens: number;
+  pressureTokens?: number;
+  projectedTokens?: number;
+  surfaceTokens?: number;
+  systemTokens?: number;
+  toolsTokens?: number;
+  messageTokens?: number;
+  asOfSeq?: number;
+  modelRuntimeId?: string;
+  model?: string;
   contextWindow: number;
   softLimitTokens: number;
   hardInputTokens: number;
@@ -50,7 +59,7 @@ export interface ContextUsage {
     system_prompt_tokens: number;
     tools_tokens: number;
     conversation_tokens: number;
-    overhead_tokens: number;
+    overhead_tokens?: number;
   };
   sections: Array<{
     name: string;
@@ -166,7 +175,8 @@ export type ChatFrame =
   | { type: "context.compaction.started"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number }
   | { type: "context.compaction.completed"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number; compacted: boolean }
   | { type: "context.compaction.failed"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number; message: string }
-  | { type: "context.usage.updated"; session_id: string; turn_id: string; used_tokens: number; context_window: number; soft_limit_tokens: number; hard_input_tokens: number; context_window_source: string; estimate_source: string; breakdown: Record<string, number>; sections: Array<{ name: string; estimated_tokens: number; static: boolean; cache_hit: boolean }> }
+  | { type: "context.usage.reset"; session_id: string }
+  | { type: "context.usage.updated"; session_id: string; turn_id: string; used_tokens: number; context_window: number; soft_limit_tokens: number; hard_input_tokens: number; context_window_source: string; estimate_source: string; breakdown: Record<string, number>; sections: Array<{ name: string; estimated_tokens: number; static: boolean; cache_hit: boolean }>; pressure_tokens?: number; projected_tokens?: number; surface_tokens?: number; system_tokens?: number; tools_tokens?: number; message_tokens?: number; as_of_seq?: number; model_runtime_id?: string; model?: string }
   | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.thinking.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.tool.started"; session_id: string; turn_id: string; call_id: string; tool_name: string; arguments: unknown }

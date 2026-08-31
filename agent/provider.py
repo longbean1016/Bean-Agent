@@ -353,6 +353,18 @@ class LLMProvider:
         return self._model
 
     @property
+    def provider_name(self) -> str:
+        """返回启动时冻结的服务商标识，供会话计量隔离模型路由。"""
+
+        return self._provider_name
+
+    @property
+    def runtime_id(self) -> str:
+        """返回模型、服务商和容量组成的稳定计量身份。"""
+
+        return f"{self._provider_name}:{self._model}:{self._context_window}"
+
+    @property
     def max_tokens(self) -> int:
         return self._max_tokens
 
@@ -1024,6 +1036,23 @@ def _extract_cache_usage(usage: Any) -> tuple[int | None, int | None]:
     if usage is None:
         return None, None
 
+    # 部分 OpenAI 兼容层直接使用 DSH 风格的 input/cache 字段；这些字段
+    # 已经按不重叠桶表达，合计后即可作为 prompt-side pressure。
+    input_tokens = _coerce_int(_get_field(usage, "input_tokens"))
+    cache_read_tokens = _coerce_int(
+        _get_field(usage, "cache_read_input_tokens")
+        if _get_field(usage, "cache_read_input_tokens") is not None
+        else _get_field(usage, "cache_read_tokens")
+    )
+    cache_write_tokens = _coerce_int(
+        _get_field(usage, "cache_write_input_tokens")
+        if _get_field(usage, "cache_write_input_tokens") is not None
+        else _get_field(usage, "cache_write_tokens")
+    )
+    if input_tokens is not None or cache_read_tokens is not None or cache_write_tokens is not None:
+        total = (input_tokens or 0) + (cache_read_tokens or 0) + (cache_write_tokens or 0)
+        return total, (cache_read_tokens or 0) + (cache_write_tokens or 0)
+
     # 第一种格式直接提供缓存命中与未命中量，总 Prompt token 由两者相加。
     hit_tokens = _coerce_int(_get_field(usage, "prompt_cache_hit_tokens"))
     miss_tokens = _coerce_int(_get_field(usage, "prompt_cache_miss_tokens"))
@@ -1033,12 +1062,14 @@ def _extract_cache_usage(usage: Any) -> tuple[int | None, int | None]:
         return hit + miss, hit
 
     # 第二种是 OpenAI 格式：总量在 prompt_tokens，命中量位于 details。
+    # details 缺失不代表没有 prompt usage；命中量按 0 处理，pressure 仍可
+    # 使用供应商给出的总输入量。
     prompt_tokens = _coerce_int(_get_field(usage, "prompt_tokens"))
     details = _get_field(usage, "prompt_tokens_details")
     cached_tokens = _coerce_int(_get_field(details, "cached_tokens"))
-    if prompt_tokens is None or cached_tokens is None:
+    if prompt_tokens is None:
         return None, None
-    return prompt_tokens, cached_tokens
+    return prompt_tokens, cached_tokens or 0
 
 
 def create_vision_provider(config: VisionConfig | None) -> LLMProvider | None:

@@ -190,13 +190,37 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       turnStates: setTurnState(state, action.session_id, idleTurnState),
     };
   }
+  if (action.type === "context.usage.reset") {
+    if (!Object.prototype.hasOwnProperty.call(state.contextUsage, action.session_id)) return state;
+    const contextUsage = { ...state.contextUsage };
+    delete contextUsage[action.session_id];
+    return { ...state, contextUsage };
+  }
   if (action.type === "context.usage.updated") {
     const currentTurn = state.turnStates[action.session_id];
     // 同一会话只能有一个运行中的 Turn；旧 Turn 的迟到估算不能覆盖新 Turn 的占用。
-    if (currentTurn?.turnId && currentTurn.turnId !== action.turn_id) return state;
+    if (action.turn_id && currentTurn?.turnId && currentTurn.turnId !== action.turn_id) return state;
+    // 新协议的 heuristic 事件只用于 gate 和明细，不代表 Provider 已报告
+    // pressure；没有它时不创建圆圈状态，避免新会话打开就显示假占用。
+    if (action.model_runtime_id && action.pressure_tokens === undefined) return state;
+    const pressureTokens = action.pressure_tokens === undefined
+      ? undefined
+      : Math.max(0, Number(action.pressure_tokens) || 0);
+    const projectedTokens = action.projected_tokens === undefined
+      ? undefined
+      : Math.max(0, Number(action.projected_tokens) || 0);
     const usage: ContextUsage = {
       turnId: action.turn_id,
-      usedTokens: Math.max(0, Number(action.used_tokens) || 0),
+      usedTokens: projectedTokens ?? pressureTokens ?? Math.max(0, Number(action.used_tokens) || 0),
+      pressureTokens,
+      projectedTokens,
+      surfaceTokens: action.surface_tokens === undefined ? undefined : Math.max(0, Number(action.surface_tokens) || 0),
+      systemTokens: action.system_tokens === undefined ? undefined : Math.max(0, Number(action.system_tokens) || 0),
+      toolsTokens: action.tools_tokens === undefined ? undefined : Math.max(0, Number(action.tools_tokens) || 0),
+      messageTokens: action.message_tokens === undefined ? undefined : Math.max(0, Number(action.message_tokens) || 0),
+      asOfSeq: action.as_of_seq === undefined ? undefined : Math.max(0, Number(action.as_of_seq) || 0),
+      modelRuntimeId: action.model_runtime_id,
+      model: action.model,
       contextWindow: Math.max(0, Number(action.context_window) || 0),
       softLimitTokens: Math.max(0, Number(action.soft_limit_tokens) || 0),
       hardInputTokens: Math.max(0, Number(action.hard_input_tokens) || 0),

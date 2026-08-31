@@ -56,7 +56,7 @@ class ContextCompactionFailed:
 
 @dataclass(frozen=True, slots=True)
 class ContextUsageUpdated:
-    """完整 Prompt 组装后的近似上下文占用，供通道和界面观察。"""
+    """上下文压力、投影和组成明细的观测快照。"""
 
     session_key: str
     turn_id: str
@@ -68,6 +68,17 @@ class ContextUsageUpdated:
     estimate_source: str
     breakdown: dict[str, int]
     sections: tuple[dict[str, object], ...] = ()
+    # pressure 只接受供应商输入 usage；projected 是其相对当前 Prompt 表面的
+    # 估算投影。两者分开，避免近似明细被误当成圆圈的精确主指标。
+    pressure_tokens: int | None = None
+    projected_tokens: int | None = None
+    surface_tokens: int | None = None
+    system_tokens: int | None = None
+    tools_tokens: int | None = None
+    message_tokens: int | None = None
+    as_of_seq: int | None = None
+    model_runtime_id: str | None = None
+    model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
