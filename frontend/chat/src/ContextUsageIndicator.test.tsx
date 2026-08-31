@@ -7,6 +7,7 @@ import type { ContextUsage } from "./types";
 const usage: ContextUsage = {
   turnId: "turn-1",
   usedTokens: 65500,
+  pressureTokens: 65500,
   contextWindow: 1_000_000,
   softLimitTokens: 740_000,
   hardInputTokens: 991_808,
@@ -37,11 +38,9 @@ describe("ContextUsageIndicator", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("未知窗口显示未知状态并保留压缩提示", () => {
-    render(<ContextUsageIndicator compacting usage={{ ...usage, contextWindow: 0 }} />);
+  it("未知窗口不显示圆圈", () => {
+    const result = render(<ContextUsageIndicator compacting usage={{ ...usage, contextWindow: 0 }} />);
 
-    expect(screen.getByRole("button", { name: "上下文容量未知" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "上下文容量未知" }));
-    expect(screen.getByRole("dialog")).toHaveTextContent("正在压缩上下文");
+    expect(result.container).toBeEmptyDOMElement();
   });
 });

@@ -25,6 +25,7 @@ from agent.event_bus import (
     ContextCompactionStarted,
     ContextUsageUpdated,
     EventBus,
+    SessionUsageUpdated,
     StreamDeltaReady,
     ToolCallCompleted,
     ToolCallStarted,
@@ -49,6 +50,7 @@ HistoryLoader = Callable[[str, int | None], Awaitable[list[dict[str, Any]]]]
 ContextCompactor = Callable[..., Awaitable[bool]]
 ContextUsageLoader = Callable[[str], Awaitable[dict[str, Any] | None]]
 ContextUsageWriter = Callable[[str, dict[str, Any]], Awaitable[None]]
+SessionUsageWriter = Callable[[str, str, int, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,7 @@ class Pipeline:
         context_compactor: ContextCompactor | None = None,
         context_usage_loader: ContextUsageLoader | None = None,
         context_usage_writer: ContextUsageWriter | None = None,
+        session_usage_writer: SessionUsageWriter | None = None,
         max_iterations: int = 10,
         multimodal: bool = True,
         vl_available: bool = False,
@@ -99,6 +102,7 @@ class Pipeline:
         self._context_compactor = context_compactor
         self._context_usage_loader = context_usage_loader
         self._context_usage_writer = context_usage_writer
+        self._session_usage_writer = session_usage_writer
         self._max_iterations = max(1, int(max_iterations))
         # 图片能力在应用组装时确定，Turn 内只读取这份稳定快照。纯文本主模型不能
         # 接收 image_url；独立 VL 可用时则由现有 ReAct 工具链负责真正读图。
@@ -469,6 +473,12 @@ class Pipeline:
         for iteration in range(1, self._max_iterations + 1):
             response = await chat_with_context_retry()
             append_turn_thinking(response.thinking)
+            await self._record_session_usage(
+                message.session_key,
+                turn_id,
+                iteration,
+                response,
+            )
             _log_prompt_cache_usage(
                 session_key=message.session_key,
                 iteration=iteration,
@@ -672,6 +682,49 @@ class Pipeline:
 
         self._interrupt_snapshots.pop(turn_id, None)
 
+    async def _record_session_usage(
+        self,
+        session_key: str,
+        turn_id: str,
+        iteration: int,
+        response: LLMResponse,
+    ) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None or self._session_usage_writer is None:
+            return
+        values = {
+            "uncached_input_tokens": max(0, int(usage.uncached_input_tokens)),
+            "cache_read_tokens": max(0, int(usage.cache_read_tokens)),
+            "cache_write_tokens": max(0, int(usage.cache_write_tokens)),
+            "output_tokens": max(0, int(usage.output_tokens)),
+        }
+        try:
+            aggregate = await self._session_usage_writer(
+                session_key, turn_id, iteration, values
+            )
+        except Exception as error:
+            # 用量是观测面，持久化故障不能让已经成功的模型响应失败。
+            logger.warning("写入会话模型用量失败 session=%s error=%s", session_key, error)
+            return
+        if not isinstance(aggregate, dict):
+            return
+        try:
+            await self._events.emit(SessionUsageUpdated(
+                session_key=session_key,
+                turn_id=turn_id,
+                total_uncached_input_tokens=int(aggregate.get("total_uncached_input_tokens") or 0),
+                total_cache_read_tokens=int(aggregate.get("total_cache_read_tokens") or 0),
+                total_cache_write_tokens=int(aggregate.get("total_cache_write_tokens") or 0),
+                total_input_tokens=int(aggregate.get("total_input_tokens") or 0),
+                cache_hit_rate=(
+                    float(aggregate["cache_hit_rate"])
+                    if aggregate.get("cache_hit_rate") is not None else None
+                ),
+                total_output_tokens=int(aggregate.get("total_output_tokens") or 0),
+            ))
+        except Exception:
+            logger.exception("广播会话模型用量失败 session=%s", session_key)
+
     async def _load_context_measurement(self, session_key: str) -> dict[str, Any] | None:
         cached = self._context_measurements.get(session_key)
         if cached is not None:
@@ -768,6 +821,9 @@ def _log_prompt_cache_usage(
 def _provider_pressure_tokens(response: LLMResponse) -> int | None:
     """提取供应商 prompt-side usage；输出 token 不参与上下文压力。"""
 
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        return max(0, int(usage.pressure_tokens))
     value = response.cache_prompt_tokens
     if value is None:
         return None

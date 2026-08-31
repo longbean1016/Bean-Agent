@@ -697,6 +697,22 @@ class SessionStore:
 
         return self._get_context_usage_sync(session_key)
 
+    def save_session_usage(
+        self,
+        session_key: str,
+        turn_id: str,
+        iteration: int,
+        usage: dict[str, Any],
+    ) -> dict[str, Any]:
+        """幂等保存一次模型调用用量并返回当前会话累计值。"""
+
+        return self._save_session_usage_sync(session_key, turn_id, iteration, usage)
+
+    def get_session_usage(self, session_key: str) -> dict[str, Any] | None:
+        """读取会话累计用量；没有真实 Provider usage 时返回 None。"""
+
+        return self._get_session_usage_sync(session_key)
+
     def close(self) -> None:
         """幂等关闭 SQLite 连接。"""
 
@@ -790,6 +806,23 @@ class SessionStore:
 
                 CREATE INDEX IF NOT EXISTS idx_session_compactions_active
                     ON session_compactions(session_key, invalidated_at, generation);
+
+                CREATE TABLE IF NOT EXISTS session_usage (
+                    session_key                  TEXT NOT NULL,
+                    turn_id                     TEXT NOT NULL,
+                    iteration                   INTEGER NOT NULL,
+                    uncached_input_tokens      INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens          INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens         INTEGER NOT NULL DEFAULT 0,
+                    output_tokens              INTEGER NOT NULL DEFAULT 0,
+                    updated_at                 TEXT NOT NULL,
+                    PRIMARY KEY (session_key, turn_id, iteration),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_usage_session
+                    ON session_usage(session_key);
                 """
             )
             try:
@@ -1625,6 +1658,100 @@ class SessionStore:
             return None
         value = _load_json_object(row["metadata"]).get("context_usage")
         return dict(value) if isinstance(value, dict) else None
+
+    def _save_session_usage_sync(
+        self,
+        session_key: str,
+        turn_id: str,
+        iteration: int,
+        usage: dict[str, Any],
+    ) -> dict[str, Any]:
+        key = self._validate_session_key(session_key)
+        clean_turn = str(turn_id or "").strip()
+        if not clean_turn:
+            raise ValueError("session usage turn_id 不能为空")
+        if not isinstance(usage, dict):
+            raise TypeError("session usage 必须是对象")
+        values = {
+            name: max(0, int(usage.get(name) or 0))
+            for name in (
+                "uncached_input_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "output_tokens",
+            )
+        }
+        safe_iteration = max(1, int(iteration))
+        with self._lock:
+            self._ensure_open()
+            if self._conn.execute("SELECT 1 FROM sessions WHERE key = ?", (key,)).fetchone() is None:
+                raise ValueError(f"session usage session 不存在: {key}")
+            self._conn.execute(
+                """
+                INSERT INTO session_usage(
+                    session_key, turn_id, iteration, uncached_input_tokens,
+                    cache_read_tokens, cache_write_tokens, output_tokens, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_key, turn_id, iteration) DO UPDATE SET
+                    uncached_input_tokens = excluded.uncached_input_tokens,
+                    cache_read_tokens = excluded.cache_read_tokens,
+                    cache_write_tokens = excluded.cache_write_tokens,
+                    output_tokens = excluded.output_tokens,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    key,
+                    clean_turn,
+                    safe_iteration,
+                    values["uncached_input_tokens"],
+                    values["cache_read_tokens"],
+                    values["cache_write_tokens"],
+                    values["output_tokens"],
+                    _now_iso(),
+                ),
+            )
+            self._conn.commit()
+            return self._aggregate_session_usage_locked(key)
+
+    def _get_session_usage_sync(self, session_key: str) -> dict[str, Any] | None:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            if self._conn.execute("SELECT 1 FROM sessions WHERE key = ?", (key,)).fetchone() is None:
+                return None
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS count FROM session_usage WHERE session_key = ?", (key,)
+            ).fetchone()
+            if row is None or int(row["count"] or 0) == 0:
+                return None
+            return self._aggregate_session_usage_locked(key)
+
+    def _aggregate_session_usage_locked(self, key: str) -> dict[str, Any]:
+        row = self._conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(uncached_input_tokens), 0) AS uncached,
+                COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
+                COALESCE(SUM(cache_write_tokens), 0) AS cache_write,
+                COALESCE(SUM(output_tokens), 0) AS output
+            FROM session_usage WHERE session_key = ?
+            """,
+            (key,),
+        ).fetchone()
+        uncached = int(row["uncached"] or 0)
+        cache_read = int(row["cache_read"] or 0)
+        cache_write = int(row["cache_write"] or 0)
+        output = int(row["output"] or 0)
+        total_input = uncached + cache_read + cache_write
+        # 输入总量包含缓存读写；命中率只有存在输入时才有定义。
+        return {
+            "total_uncached_input_tokens": uncached,
+            "total_cache_read_tokens": cache_read,
+            "total_cache_write_tokens": cache_write,
+            "total_input_tokens": total_input,
+            "cache_hit_rate": (cache_read / total_input if total_input else None),
+            "total_output_tokens": output,
+        }
 
     def _message_to_history(
         self,

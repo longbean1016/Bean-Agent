@@ -1,4 +1,4 @@
-import type { ChatAction, ChatMessage, ChatState, ContextUsage, MessageRow, ProactiveNotificationRow, ToolActivity, TurnRuntimeState } from "./types";
+import type { ChatAction, ChatMessage, ChatState, ContextUsage, MessageRow, ProactiveNotificationRow, SessionUsage, ToolActivity, TurnRuntimeState } from "./types";
 import { reconcileMessages } from "./timeline";
 
 export const idleTurnState: TurnRuntimeState = {
@@ -16,6 +16,7 @@ export const initialChatState: ChatState = {
   error: "",
   turnStates: {},
   contextUsage: {},
+  sessionUsage: {},
 };
 
 function isTurnActive(status: TurnRuntimeState["status"]): boolean {
@@ -242,6 +243,21 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     return {
       ...state,
       contextUsage: { ...state.contextUsage, [action.session_id]: usage },
+    };
+  }
+  if (action.type === "session.usage.updated") {
+    const clean = (value: number) => Math.max(0, Number(value) || 0);
+    const sessionUsage: SessionUsage = {
+      totalUncachedInputTokens: clean(action.total_uncached_input_tokens),
+      totalCacheReadTokens: clean(action.total_cache_read_tokens),
+      totalCacheWriteTokens: clean(action.total_cache_write_tokens),
+      totalInputTokens: clean(action.total_input_tokens),
+      cacheHitRate: action.cache_hit_rate === null ? null : Math.max(0, Number(action.cache_hit_rate) || 0),
+      totalOutputTokens: clean(action.total_output_tokens),
+    };
+    return {
+      ...state,
+      sessionUsage: { ...state.sessionUsage, [action.session_id]: sessionUsage },
     };
   }
   if (action.type === "message.final" && action.turn_id) {

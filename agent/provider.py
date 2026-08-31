@@ -96,6 +96,32 @@ class LLMResponse:
     # DeepSeek 工具续轮必须把 reasoning_content 原样放回 assistant 消息。
     # 该字典让未来 Pipeline 无需了解供应商字段，也不会把它混入用户正文。
     provider_fields: dict[str, Any] = field(default_factory=dict)
+    usage: "ProviderUsage | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderUsage:
+    """供应商一次模型调用的非重叠用量桶。
+
+    Provider 原始字段只在适配层解析；Pipeline 只消费这些明确含义的字段，
+    避免把历史 ``cache_prompt_tokens`` 误当成缓存命中量或累计用量。
+    """
+
+    uncached_input_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    output_tokens: int
+    prompt_tokens_total: int
+
+    @property
+    def pressure_tokens(self) -> int:
+        """输入上下文压力包含未命中、命中和写入缓存的 token。"""
+
+        return (
+            self.uncached_input_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+        )
 
 
 class ContextLengthError(Exception):
@@ -526,15 +552,14 @@ class LLMProvider:
             provider_fields = strategy.provider_fields_for_tool_call(
                 provider_fields, request
             )
-        prompt_tokens, hit_tokens = _extract_cache_usage(
-            _get_field(response, "usage")
-        )
+        usage = _extract_provider_usage(_get_field(response, "usage"))
         return LLMResponse(
             content=content,
             tool_calls=tool_calls,
             thinking=thinking,
-            cache_prompt_tokens=prompt_tokens,
-            cache_hit_tokens=hit_tokens,
+            cache_prompt_tokens=(usage.prompt_tokens_total if usage else None),
+            cache_hit_tokens=(usage.cache_read_tokens if usage else None),
+            usage=usage,
             provider_fields=provider_fields,
         )
 
@@ -559,8 +584,7 @@ class LLMProvider:
         # 一个 chunk 可包含多个工具，每个工具也可能跨多个 chunk。
         tool_call_chunks: dict[int, dict[str, str]] = {}
         tool_call_seen = False
-        cache_prompt_tokens: int | None = None
-        cache_hit_tokens: int | None = None
+        usage: ProviderUsage | None = None
 
         while True:
             try:
@@ -573,12 +597,11 @@ class LLMProvider:
 
             # 开启 include_usage 后，最后一个 chunk 往往只有 usage、choices=[]。
             # 因此必须先提取 usage，再判断 choices，否则会丢失缓存指标。
-            prompt_tokens, hit_tokens = _extract_cache_usage(
-                _get_field(chunk, "usage")
-            )
-            if prompt_tokens is not None:
-                cache_prompt_tokens = prompt_tokens
-                cache_hit_tokens = hit_tokens
+            chunk_usage = _extract_provider_usage(_get_field(chunk, "usage"))
+            if chunk_usage is not None:
+                # 结束 chunk / usage-only chunk 才是本次调用的完整事实，
+                # 后到的完整值覆盖前一份，避免流式重复累计。
+                usage = chunk_usage
 
             choices = _get_field(chunk, "choices") or []
             if not choices:
@@ -642,8 +665,9 @@ class LLMProvider:
             content=content,
             tool_calls=tool_calls,
             thinking=thinking,
-            cache_prompt_tokens=cache_prompt_tokens,
-            cache_hit_tokens=cache_hit_tokens,
+            cache_prompt_tokens=(usage.prompt_tokens_total if usage else None),
+            cache_hit_tokens=(usage.cache_read_tokens if usage else None),
+            usage=usage,
             provider_fields=provider_fields,
         )
 
@@ -1025,16 +1049,11 @@ def _save_llm_payload_snapshot(
         return None
 
 
-def _extract_cache_usage(usage: Any) -> tuple[int | None, int | None]:
-    """提取总 Prompt token 与缓存命中 token。
-
-    DeepSeek/DashScope 兼容接口可能直接给出 hit/miss；OpenAI 则把命中量
-    放在 ``prompt_tokens_details.cached_tokens``。两种格式统一后，Pipeline
-    才能用同一组指标判断 Prompt 稳定前缀是否真正命中缓存。
-    """
+def _extract_provider_usage(usage: Any) -> ProviderUsage | None:
+    """把不同兼容接口的 usage 归一化为四个非重叠桶。"""
 
     if usage is None:
-        return None, None
+        return None
 
     # 部分 OpenAI 兼容层直接使用 DSH 风格的 input/cache 字段；这些字段
     # 已经按不重叠桶表达，合计后即可作为 prompt-side pressure。
@@ -1049,9 +1068,16 @@ def _extract_cache_usage(usage: Any) -> tuple[int | None, int | None]:
         if _get_field(usage, "cache_write_input_tokens") is not None
         else _get_field(usage, "cache_write_tokens")
     )
+    output_tokens = _coerce_int(
+        _get_field(usage, "output_tokens")
+        if _get_field(usage, "output_tokens") is not None
+        else _get_field(usage, "completion_tokens")
+    )
     if input_tokens is not None or cache_read_tokens is not None or cache_write_tokens is not None:
-        total = (input_tokens or 0) + (cache_read_tokens or 0) + (cache_write_tokens or 0)
-        return total, (cache_read_tokens or 0) + (cache_write_tokens or 0)
+        uncached = max(0, input_tokens or 0)
+        read = max(0, cache_read_tokens or 0)
+        write = max(0, cache_write_tokens or 0)
+        return ProviderUsage(uncached, read, write, max(0, output_tokens or 0), uncached + read + write)
 
     # 第一种格式直接提供缓存命中与未命中量，总 Prompt token 由两者相加。
     hit_tokens = _coerce_int(_get_field(usage, "prompt_cache_hit_tokens"))
@@ -1059,7 +1085,8 @@ def _extract_cache_usage(usage: Any) -> tuple[int | None, int | None]:
     if hit_tokens is not None or miss_tokens is not None:
         hit = hit_tokens or 0
         miss = miss_tokens or 0
-        return hit + miss, hit
+        output = max(0, output_tokens or 0)
+        return ProviderUsage(max(0, miss), max(0, hit), 0, output, max(0, hit + miss))
 
     # 第二种是 OpenAI 格式：总量在 prompt_tokens，命中量位于 details。
     # details 缺失不代表没有 prompt usage；命中量按 0 处理，pressure 仍可
@@ -1068,8 +1095,20 @@ def _extract_cache_usage(usage: Any) -> tuple[int | None, int | None]:
     details = _get_field(usage, "prompt_tokens_details")
     cached_tokens = _coerce_int(_get_field(details, "cached_tokens"))
     if prompt_tokens is None:
+        return None
+    cached = max(0, cached_tokens or 0)
+    total = max(0, prompt_tokens)
+    output = max(0, output_tokens or 0)
+    return ProviderUsage(max(0, total - cached), cached, 0, output, total)
+
+
+def _extract_cache_usage(usage: Any) -> tuple[int | None, int | None]:
+    """兼容旧诊断日志的总 Prompt 与缓存读取量返回值。"""
+
+    normalized = _extract_provider_usage(usage)
+    if normalized is None:
         return None, None
-    return prompt_tokens, cached_tokens or 0
+    return normalized.prompt_tokens_total, normalized.cache_read_tokens
 
 
 def create_vision_provider(config: VisionConfig | None) -> LLMProvider | None:

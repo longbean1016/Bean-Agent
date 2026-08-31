@@ -44,7 +44,7 @@ import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
 import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupSessionsByUpdatedAt } from "./sessionGroups";
-import type { ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity, TurnNavigationEntry } from "./types";
+import type { ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ProactiveSettings, ScheduledReminder, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry } from "./types";
 import { groupMessagesIntoNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
 
@@ -209,6 +209,7 @@ export function App() {
   routeSessionRef.current = routeSession;
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
   const currentContextUsage = chat.contextUsage[chat.sessionId];
+  const currentSessionUsage = chat.sessionUsage[chat.sessionId];
   const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running" || currentTurn.status === "compacting";
   const restoringSession = Boolean(chat.sessionId && loadingSessionId === chat.sessionId && chat.messages.length === 0);
   const displayMessages = useMemo(() => composeTimeline(
@@ -833,6 +834,7 @@ export function App() {
           input={input}
           sessionId={chat.sessionId}
           contextUsage={currentContextUsage}
+          sessionUsage={currentSessionUsage}
           sending={sending}
           onFiles={(next) => {
             setFiles(next);
@@ -1434,7 +1436,7 @@ function AttachmentGallery({ paths }: { paths: string[] }) {
 }
 
 function Composer(props: {
-  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running" | "compacting"; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string; contextUsage?: ContextUsage;
+  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running" | "compacting"; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string; contextUsage?: ContextUsage; sessionUsage?: SessionUsage;
   onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
@@ -1745,8 +1747,24 @@ function Composer(props: {
           )}
         </div>
       </div>
+      <SessionUsageStats usage={props.sessionUsage} />
       </footer>
     </>
+  );
+}
+
+function SessionUsageStats({ usage }: { usage?: SessionUsage }) {
+  if (!usage || (usage.totalInputTokens <= 0 && usage.totalOutputTokens <= 0)) return null;
+  const hitRate = usage.totalInputTokens > 0 && usage.cacheHitRate !== null
+    ? `${Math.round(usage.cacheHitRate * 100)}%`
+    : "-";
+  const detail = `累计输入 ${usage.totalInputTokens.toLocaleString()} tok（未缓存 ${usage.totalUncachedInputTokens.toLocaleString()}，缓存读取 ${usage.totalCacheReadTokens.toLocaleString()}，缓存写入 ${usage.totalCacheWriteTokens.toLocaleString()}）\n累计输出 ${usage.totalOutputTokens.toLocaleString()} tok`;
+  return (
+    <div className="session-usage-stats" title={detail} aria-label={detail}>
+      <span>缓存命中 {hitRate}</span><span aria-hidden="true">|</span>
+      <span>输入 {formatTokenCount(usage.totalInputTokens)} tok</span><span aria-hidden="true">·</span>
+      <span>输出 {formatTokenCount(usage.totalOutputTokens)} tok</span>
+    </div>
   );
 }
 
@@ -1771,16 +1789,12 @@ export function ContextUsageIndicator({ usage, compacting }: { usage?: ContextUs
 
   const contextWindow = usage?.contextWindow ?? 0;
   const usedTokens = usage?.usedTokens ?? 0;
-  const legacyPressure = Boolean(usage && !usage.modelRuntimeId && usage.pressureTokens === undefined && contextWindow > 0);
-  const hasProviderPressure = usage?.pressureTokens !== undefined || legacyPressure;
-  // 旧事件帧没有 model_runtime_id，只保留其未知态兼容；新协议在
-  // pressure 缺失时由 reducer 丢弃，因此真实新会话不会渲染这个圆圈。
-  const legacyUnknown = Boolean(usage && !usage.modelRuntimeId && !hasProviderPressure);
-  const known = contextWindow > 0 && hasProviderPressure;
-  if (!usage || (!known && !legacyUnknown)) return null;
-  const percent = known ? Math.min(100, Math.max(0, Math.round((usedTokens / contextWindow) * 100))) : 0;
-  const level = !known ? "unknown" : percent >= 90 ? "danger" : percent >= 74 ? "warning" : "normal";
-  const label = known ? `上下文已用 ${percent}%` : "上下文容量未知";
+  const known = Boolean(usage && contextWindow > 0 && usage.pressureTokens !== undefined);
+  // DSH 只在真实 pressure 与模型容量同时存在时显示圆圈，避免估算值伪装成供应商用量。
+  if (!known) return null;
+  const percent = Math.min(100, Math.max(0, Math.round((usedTokens / contextWindow) * 100)));
+  const level = percent >= 90 ? "danger" : percent >= 74 ? "warning" : "normal";
+  const label = `上下文已用 ${percent}%`;
   const style = { "--usage-progress": `${percent}%` } as CSSProperties;
   const breakdown = usage?.breakdown;
 
@@ -1802,7 +1816,7 @@ export function ContextUsageIndicator({ usage, compacting }: { usage?: ContextUs
         <div className="context-usage-popover" role="dialog" aria-label="上下文占用详情">
           <div className="context-usage-popover-header">
             <strong>上下文占用</strong>
-            <span>{known ? `~${formatTokenCount(usedTokens)} / ${formatTokenCount(contextWindow)}` : "容量未知"}</span>
+            <span>~{formatTokenCount(usedTokens)} / {formatTokenCount(contextWindow)}</span>
           </div>
           <div className="context-usage-meter" aria-label={label}>
             <span style={{ width: `${percent}%` }} />

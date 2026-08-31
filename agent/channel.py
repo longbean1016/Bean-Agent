@@ -17,6 +17,7 @@ from agent.event_bus import (
     ContextCompactionStarted,
     ContextUsageUpdated,
     EventBus,
+    SessionUsageUpdated,
     SessionUpdated,
     StreamDeltaReady,
     ToolCallCompleted,
@@ -55,6 +56,7 @@ class WebChannel:
         proactive_store: ProactiveStore | None = None,
         ensure_session: Callable[[str], Awaitable[object]] | None = None,
         context_usage_loader: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
+        session_usage_loader: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
         context_runtime_id: str = "",
     ) -> None:
         self._bus = bus
@@ -64,6 +66,7 @@ class WebChannel:
         self._proactive_store = proactive_store
         self._ensure_session = ensure_session
         self._context_usage_loader = context_usage_loader
+        self._session_usage_loader = session_usage_loader
         self._context_runtime_id = str(context_runtime_id or "")
         self._connections: dict[str, set[WebSocketApi]] = {}
         self._socket_send_locks: weakref.WeakKeyDictionary[WebSocketApi, asyncio.Lock] = (
@@ -76,6 +79,7 @@ class WebChannel:
         event_bus.on(ContextCompactionCompleted, self._on_context_compaction_completed)
         event_bus.on(ContextCompactionFailed, self._on_context_compaction_failed)
         event_bus.on(ContextUsageUpdated, self._on_context_usage_updated)
+        event_bus.on(SessionUsageUpdated, self._on_session_usage_updated)
         event_bus.on(SessionUpdated, self._on_session_updated)
         event_bus.on(TurnQueued, self._on_turn_queued)
         event_bus.on(TurnQueueRejected, self._on_turn_queue_rejected)
@@ -115,6 +119,7 @@ class WebChannel:
                 "session_id": session_key,
             })
             await self._send_context_usage_snapshot(session_key, websocket)
+            await self._send_session_usage_snapshot(session_key, websocket)
             # 订阅确认后只给当前连接补发运行中快照，用于刷新/重连恢复流式草稿。
             await self._send_active_turn_snapshot(session_key, websocket)
             await self._replay_pending_notifications(session_key, websocket)
@@ -261,6 +266,24 @@ class WebChannel:
             **_context_usage_frame(snapshot),
         })
 
+    async def _send_session_usage_snapshot(self, session_key: str, websocket: WebSocketApi) -> None:
+        """订阅时恢复底栏累计用量；没有真实调用记录则保持隐藏。"""
+
+        if self._session_usage_loader is None:
+            return
+        try:
+            usage = await self._session_usage_loader(session_key)
+        except Exception as error:
+            logger.warning("读取会话累计用量失败 session=%s error=%s", session_key, error)
+            return
+        if isinstance(usage, dict):
+            await self._send_json(websocket, {
+                "type": "session.usage.updated",
+                "session_id": session_key,
+                "turn_id": "",
+                **_session_usage_frame(usage),
+            })
+
     async def _on_turn_started(self, event: TurnStarted) -> None:
         await self._broadcast(event.session_key, {"type": "turn.started", "request_id": event.request_id, "session_id": event.session_key, "turn_id": event.turn_id})
 
@@ -320,6 +343,19 @@ class WebChannel:
         }
         frame.update({key: value for key, value in optional.items() if value is not None})
         await self._broadcast(event.session_key, frame)
+
+    async def _on_session_usage_updated(self, event: SessionUsageUpdated) -> None:
+        await self._broadcast(event.session_key, {
+            "type": "session.usage.updated",
+            "session_id": event.session_key,
+            "turn_id": event.turn_id,
+            "total_uncached_input_tokens": event.total_uncached_input_tokens,
+            "total_cache_read_tokens": event.total_cache_read_tokens,
+            "total_cache_write_tokens": event.total_cache_write_tokens,
+            "total_input_tokens": event.total_input_tokens,
+            "cache_hit_rate": event.cache_hit_rate,
+            "total_output_tokens": event.total_output_tokens,
+        })
 
     async def _on_session_updated(self, event: SessionUpdated) -> None:
         await self._broadcast(event.session_key, {
@@ -412,6 +448,7 @@ class WebChannel:
         self._events.off(ContextCompactionCompleted, self._on_context_compaction_completed)
         self._events.off(ContextCompactionFailed, self._on_context_compaction_failed)
         self._events.off(ContextUsageUpdated, self._on_context_usage_updated)
+        self._events.off(SessionUsageUpdated, self._on_session_usage_updated)
         self._events.off(SessionUpdated, self._on_session_updated)
         self._events.off(TurnQueued, self._on_turn_queued)
         self._events.off(TurnQueueRejected, self._on_turn_queue_rejected)
@@ -434,6 +471,23 @@ def _context_usage_frame(snapshot: dict[str, Any]) -> dict[str, Any]:
         "tools_tokens": int(snapshot.get("tools_tokens") or 0),
         "conversation_tokens": int(snapshot.get("message_tokens") or 0),
     }
+
+
+def _session_usage_frame(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """把累计字段限制在前端协议的明确命名和非负范围内。"""
+
+    values = {
+        "total_uncached_input_tokens": max(0, int(snapshot.get("total_uncached_input_tokens") or 0)),
+        "total_cache_read_tokens": max(0, int(snapshot.get("total_cache_read_tokens") or 0)),
+        "total_cache_write_tokens": max(0, int(snapshot.get("total_cache_write_tokens") or 0)),
+        "total_input_tokens": max(0, int(snapshot.get("total_input_tokens") or 0)),
+        "total_output_tokens": max(0, int(snapshot.get("total_output_tokens") or 0)),
+    }
+    values["cache_hit_rate"] = (
+        float(snapshot["cache_hit_rate"])
+        if snapshot.get("cache_hit_rate") is not None else None
+    )
+    return values
     return {
         "used_tokens": int(used or 0),
         "context_window": int(snapshot.get("context_window") or 0),

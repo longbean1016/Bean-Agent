@@ -82,6 +82,20 @@ class ContextUsageUpdated:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionUsageUpdated:
+    """一次真实 Provider usage 去重后，会话累计用量发生变化。"""
+
+    session_key: str
+    turn_id: str
+    total_uncached_input_tokens: int
+    total_cache_read_tokens: int
+    total_cache_write_tokens: int
+    total_input_tokens: int
+    cache_hit_rate: float | None
+    total_output_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
 class TurnQueued:
     """普通 Turn 已进入全局等待队列，position 从 1 开始。"""
 
@@ -193,6 +207,7 @@ __all__ = [
     "ContextCompactionFailed",
     "ContextCompactionStarted",
     "ContextUsageUpdated",
+    "SessionUsageUpdated",
     "EventBus",
     "EventHandler",
     "SessionUpdated",

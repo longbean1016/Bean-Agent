@@ -772,3 +772,39 @@ async def test_reopen_keeps_messages_and_close_is_idempotent(tmp_path: Path) -> 
 
     assert history == [{"role": "user", "content": "持久化消息"}]
     assert added["seq"] == 1
+
+
+def test_session_usage_is_idempotent_and_aggregated(store: SessionStore) -> None:
+    store.create_session("web:usage")
+    first = store.save_session_usage(
+        "web:usage", "turn-1", 1,
+        {
+            "uncached_input_tokens": 100,
+            "cache_read_tokens": 900,
+            "cache_write_tokens": 0,
+            "output_tokens": 40,
+        },
+    )
+    repeated = store.save_session_usage(
+        "web:usage", "turn-1", 1,
+        {
+            "uncached_input_tokens": 100,
+            "cache_read_tokens": 900,
+            "cache_write_tokens": 0,
+            "output_tokens": 40,
+        },
+    )
+    second = store.save_session_usage(
+        "web:usage", "turn-1", 2,
+        {
+            "uncached_input_tokens": 50,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 10,
+            "output_tokens": 5,
+        },
+    )
+
+    assert first == repeated
+    assert second["total_input_tokens"] == 1_060
+    assert second["total_output_tokens"] == 45
+    assert second["cache_hit_rate"] == pytest.approx(900 / 1060)

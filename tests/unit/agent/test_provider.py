@@ -876,3 +876,32 @@ async def test_stream_stops_forwarding_temporary_deltas_after_tool_call() -> Non
     assert result.thinking == "先想不应转发"
     assert result.content == "临时文本"
     assert result.provider_fields == {"reasoning_content": "先想不应转发"}
+
+
+def test_extract_provider_usage_normalizes_deepseek_fields() -> None:
+    usage = provider_module._extract_provider_usage(_ns(
+        prompt_tokens=1_000,
+        prompt_cache_hit_tokens=700,
+        prompt_cache_miss_tokens=300,
+        completion_tokens=42,
+    ))
+
+    assert usage is not None
+    assert usage.uncached_input_tokens == 300
+    assert usage.cache_read_tokens == 700
+    assert usage.cache_write_tokens == 0
+    assert usage.output_tokens == 42
+    assert usage.pressure_tokens == 1_000
+
+
+def test_extract_provider_usage_normalizes_openai_cached_details() -> None:
+    usage = provider_module._extract_provider_usage(_ns(
+        prompt_tokens=900,
+        prompt_tokens_details=_ns(cached_tokens=600),
+        completion_tokens=18,
+    ))
+
+    assert usage is not None
+    assert usage.uncached_input_tokens == 300
+    assert usage.cache_read_tokens == 600
+    assert usage.output_tokens == 18

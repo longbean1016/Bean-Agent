@@ -144,6 +144,9 @@ class AppRuntime:
             context_usage_loader=lambda session_key: asyncio.to_thread(
                 core.sessions.store.get_context_usage, session_key
             ),
+            session_usage_loader=lambda session_key: asyncio.to_thread(
+                core.sessions.store.get_session_usage, session_key
+            ),
             context_runtime_id=str(getattr(core.provider, "runtime_id", "") or ""),
         )
         self.maintenance = (
@@ -324,6 +327,9 @@ def build_core_runtime(
         ),
         context_usage_writer=lambda session_key, snapshot: asyncio.to_thread(
             sessions.store.save_context_usage, session_key, snapshot
+        ),
+        session_usage_writer=lambda session_key, turn_id, iteration, usage: asyncio.to_thread(
+            sessions.store.save_session_usage, session_key, turn_id, iteration, usage
         ),
         max_iterations=config.llm.max_iterations or 10,
         # 主模型和独立视觉模型是两条互斥的图片消费路径：前者直接接收图片块，
