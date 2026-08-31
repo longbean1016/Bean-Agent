@@ -1758,12 +1758,12 @@ function SessionUsageStats({ usage }: { usage?: SessionUsage }) {
   const hitRate = usage.totalInputTokens > 0 && usage.cacheHitRate !== null
     ? `${Math.round(usage.cacheHitRate * 100)}%`
     : "-";
-  const detail = `累计输入 ${usage.totalInputTokens.toLocaleString()} tok（未缓存 ${usage.totalUncachedInputTokens.toLocaleString()}，缓存读取 ${usage.totalCacheReadTokens.toLocaleString()}，缓存写入 ${usage.totalCacheWriteTokens.toLocaleString()}）\n累计输出 ${usage.totalOutputTokens.toLocaleString()} tok`;
+  const detail = `累计输入 ${usage.totalInputTokens.toLocaleString()} token（未缓存 ${usage.totalUncachedInputTokens.toLocaleString()}，缓存读取 ${usage.totalCacheReadTokens.toLocaleString()}）\n累计输出 ${usage.totalOutputTokens.toLocaleString()} token`;
   return (
     <div className="session-usage-stats" title={detail} aria-label={detail}>
       <span>缓存命中 {hitRate}</span><span aria-hidden="true">|</span>
-      <span>输入 {formatTokenCount(usage.totalInputTokens)} tok</span><span aria-hidden="true">·</span>
-      <span>输出 {formatTokenCount(usage.totalOutputTokens)} tok</span>
+      <span>输入 {formatTokenCount(usage.totalInputTokens)} token</span><span aria-hidden="true">·</span>
+      <span>输出 {formatTokenCount(usage.totalOutputTokens)} token</span>
     </div>
   );
 }
