@@ -470,6 +470,21 @@ def _context_usage_frame(snapshot: dict[str, Any]) -> dict[str, Any]:
         "system_prompt_tokens": int(snapshot.get("system_tokens") or 0),
         "tools_tokens": int(snapshot.get("tools_tokens") or 0),
         "conversation_tokens": int(snapshot.get("message_tokens") or 0),
+        "overhead_tokens": 0,
+    }
+    return {
+        "used_tokens": int(used or 0),
+        "context_window": int(snapshot.get("context_window") or 0),
+        "soft_limit_tokens": int(snapshot.get("soft_limit_tokens") or 0),
+        "hard_input_tokens": int(snapshot.get("hard_input_tokens") or 0),
+        "context_window_source": str(snapshot.get("context_window_source") or "unknown"),
+        "estimate_source": "provider_projected" if projected is not None else "unknown",
+        "breakdown": breakdown,
+        "sections": [],
+        **{key: snapshot[key] for key in (
+            "pressure_tokens", "projected_tokens", "surface_tokens", "system_tokens",
+            "tools_tokens", "message_tokens", "as_of_seq", "model_runtime_id", "model",
+        ) if snapshot.get(key) is not None},
     }
 
 
@@ -488,20 +503,6 @@ def _session_usage_frame(snapshot: dict[str, Any]) -> dict[str, Any]:
         if snapshot.get("cache_hit_rate") is not None else None
     )
     return values
-    return {
-        "used_tokens": int(used or 0),
-        "context_window": int(snapshot.get("context_window") or 0),
-        "soft_limit_tokens": int(snapshot.get("soft_limit_tokens") or 0),
-        "hard_input_tokens": int(snapshot.get("hard_input_tokens") or 0),
-        "context_window_source": str(snapshot.get("context_window_source") or "unknown"),
-        "estimate_source": "provider_projected" if projected is not None else "unknown",
-        "breakdown": breakdown,
-        "sections": [],
-        **{key: snapshot[key] for key in (
-            "pressure_tokens", "projected_tokens", "surface_tokens", "system_tokens",
-            "tools_tokens", "message_tokens", "as_of_seq", "model_runtime_id", "model",
-        ) if snapshot.get(key) is not None},
-    }
 
 
 def normalize_web_session_id(value: object) -> str | None:
