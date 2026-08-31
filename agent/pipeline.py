@@ -34,7 +34,7 @@ from agent.message_bus import InboundMessage, PipelineResult
 from agent.prompt_assembler import PromptAssembler
 from agent.prompt_block import TurnContext
 from agent.prompt_cache_log import PromptCacheLogWriter
-from agent.provider import ContextLengthError, LLMResponse
+from agent.provider import ContextLengthError, LLMResponse, ProviderUsage
 from agent.skills import SkillsLoader, collect_skill_mentions
 from agent.tool_runtime import ToolRuntimeView
 from tools.base import normalize_tool_result
@@ -406,11 +406,22 @@ class Pipeline:
                         # 不能只替换已生成的 history 列表，否则 system 顺序和 cache key 会漂移。
                         continue
                 try:
+                    async def on_usage(usage: ProviderUsage) -> None:
+                        # 同一 iteration 的所有 usage 样本都写入同一幂等键；存储层
+                        # 用最终样本覆盖早到样本，流中断时也保留已经收到的事实。
+                        await self._record_session_usage_values(
+                            message.session_key,
+                            turn_id,
+                            iteration,
+                            usage,
+                        )
+
                     response = await self._provider.chat(
                         model_messages,
                         tool_schemas,
                         tool_choice="auto",
                         on_content_delta=on_delta,
+                        on_usage=on_usage,
                     )
                     provider_pressure = _provider_pressure_tokens(response)
                     if provider_pressure is not None:
@@ -690,7 +701,20 @@ class Pipeline:
         response: LLMResponse,
     ) -> None:
         usage = getattr(response, "usage", None)
-        if usage is None or self._session_usage_writer is None:
+        if not isinstance(usage, ProviderUsage):
+            return
+        await self._record_session_usage_values(session_key, turn_id, iteration, usage)
+
+    async def _record_session_usage_values(
+        self,
+        session_key: str,
+        turn_id: str,
+        iteration: int,
+        usage: ProviderUsage,
+    ) -> None:
+        """持久化一次模型调用的最新归一化 usage 样本。"""
+
+        if self._session_usage_writer is None:
             return
         values = {
             "uncached_input_tokens": max(0, int(usage.uncached_input_tokens)),

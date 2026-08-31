@@ -788,10 +788,10 @@ def test_session_usage_is_idempotent_and_aggregated(store: SessionStore) -> None
     repeated = store.save_session_usage(
         "web:usage", "turn-1", 1,
         {
-            "uncached_input_tokens": 100,
-            "cache_read_tokens": 900,
+            "uncached_input_tokens": 120,
+            "cache_read_tokens": 880,
             "cache_write_tokens": 0,
-            "output_tokens": 40,
+            "output_tokens": 45,
         },
     )
     second = store.save_session_usage(
@@ -804,7 +804,8 @@ def test_session_usage_is_idempotent_and_aggregated(store: SessionStore) -> None
         },
     )
 
-    assert first == repeated
+    assert first["total_input_tokens"] == repeated["total_input_tokens"] == 1_000
+    assert repeated["total_output_tokens"] == 45
     assert second["total_input_tokens"] == 1_060
-    assert second["total_output_tokens"] == 45
-    assert second["cache_hit_rate"] == pytest.approx(900 / 1060)
+    assert second["total_output_tokens"] == 50
+    assert second["cache_hit_rate"] == pytest.approx(880 / 1060)

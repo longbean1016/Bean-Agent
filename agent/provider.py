@@ -36,6 +36,7 @@ _PAYLOAD_SNAPSHOT_SEQ = itertools.count(1)
 
 StreamDelta = dict[str, str]
 StreamCallback = Callable[[StreamDelta], Awaitable[None]]
+UsageCallback = Callable[["ProviderUsage"], Awaitable[None]]
 
 # 不同 OpenAI 兼容服务返回的错误类型并不统一，因此上下文超限不能只看
 # status_code。这里集中维护已知文本特征，后续 Pipeline 可据此触发历史裁剪。
@@ -434,6 +435,7 @@ class LLMProvider:
         extra_body: dict[str, Any] | None = None,
         disable_thinking: bool = False,
         on_content_delta: StreamCallback | None = None,
+        on_usage: UsageCallback | None = None,
     ) -> LLMResponse:
         """调用模型；传入增量回调时使用流式接口，否则返回普通响应。
 
@@ -484,8 +486,8 @@ class LLMProvider:
         )
 
         if on_content_delta is not None:
-            return await self._chat_streaming(request, on_content_delta, strategy)
-        return await self._chat_non_streaming(request, strategy)
+            return await self._chat_streaming(request, on_content_delta, strategy, on_usage)
+        return await self._chat_non_streaming(request, strategy, on_usage)
 
     async def complete(
         self,
@@ -530,10 +532,15 @@ class LLMProvider:
         self,
         request: dict[str, Any],
         strategy: ProviderStrategy,
+        on_usage: UsageCallback | None = None,
     ) -> LLMResponse:
         """请求并解析单个 Chat Completion 响应。"""
 
         response = await self._create_with_retry(request)
+        # 先读取 usage 再校验 choices；即使网关返回带 usage 的异常响应，
+        # 已确认的输入事实也应交给累计投影，而不是随结构校验一起丢失。
+        usage = _extract_provider_usage(_get_field(response, "usage"))
+        await self._notify_usage(on_usage, usage)
 
         choices = _get_field(response, "choices") or []
         if not choices:
@@ -552,7 +559,6 @@ class LLMProvider:
             provider_fields = strategy.provider_fields_for_tool_call(
                 provider_fields, request
             )
-        usage = _extract_provider_usage(_get_field(response, "usage"))
         return LLMResponse(
             content=content,
             tool_calls=tool_calls,
@@ -568,6 +574,7 @@ class LLMProvider:
         request: dict[str, Any],
         on_content_delta: StreamCallback,
         strategy: ProviderStrategy,
+        on_usage: UsageCallback | None = None,
     ) -> LLMResponse:
         """消费流式 chunk，并聚合为与非流式路径一致的结果。"""
 
@@ -602,6 +609,9 @@ class LLMProvider:
                 # 结束 chunk / usage-only chunk 才是本次调用的完整事实，
                 # 后到的完整值覆盖前一份，避免流式重复累计。
                 usage = chunk_usage
+                # 观察回调使用同一 turn + iteration 的稳定键持久化；即使流随后
+                # 因空闲超时中断，已经收到的真实 usage 也不会被整次请求吞掉。
+                await self._notify_usage(on_usage, chunk_usage)
 
             choices = _get_field(chunk, "choices") or []
             if not choices:
@@ -670,6 +680,20 @@ class LLMProvider:
             usage=usage,
             provider_fields=provider_fields,
         )
+
+    @staticmethod
+    async def _notify_usage(
+        callback: UsageCallback | None,
+        usage: ProviderUsage | None,
+    ) -> None:
+        """通知 usage 观察者；观测失败不能改变模型请求结果。"""
+
+        if callback is None or usage is None:
+            return
+        try:
+            await callback(usage)
+        except Exception as error:
+            logger.warning("Provider usage 观察回调失败 error=%s", error)
 
     async def _create_with_retry(self, request: dict[str, Any]) -> Any:
         """执行请求，只重试临时网络、限流和服务端错误。
