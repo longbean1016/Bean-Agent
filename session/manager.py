@@ -14,7 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
-from session.store import NewMessage, SessionStore
+from session.store import NewMessage, NewSurfaceEvent, SessionStore
 from tools.base import ToolResult
 from tools.runtime import serialize_tool_result_messages
 
@@ -380,6 +380,66 @@ class SessionManager:
             await self._persist_messages(session, copied)
             await self._save_metadata(session)
             self._cache[session.key] = session
+
+    async def append_surface(self, event: NewSurfaceEvent) -> dict[str, Any]:
+        """在会话锁内追加模型侧 surface，并保证序号和幂等键隔离。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(event.session_key)
+        async with self._lock_for(key):
+            self._ensure_not_deleted(key)
+            return await asyncio.to_thread(self._store.append_surface, event)
+
+    async def load_surface(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """读取当前会话的模型消息投影，不触碰语义消息缓存。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(
+                self._store.load_surface,
+                key,
+                epoch_id=epoch_id,
+            )
+
+    async def fetch_surface_events(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """读取 surface 原始事件，供诊断和恢复流程使用。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(
+                self._store.fetch_surface_events,
+                key,
+                epoch_id=epoch_id,
+            )
+
+    async def replace_surface(self, event: NewSurfaceEvent) -> dict[str, Any]:
+        """在会话锁内提交一个带边界的模型侧 surface replace。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(event.session_key)
+        async with self._lock_for(key):
+            self._ensure_not_deleted(key)
+            return await asyncio.to_thread(self._store.replace_surface, event)
+
+    async def recover_surface(self, session_key: str) -> list[dict[str, Any]]:
+        """读取当前会话待恢复的 surface 事件。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(self._store.recover_surface, key)
 
     async def load_history(
         self,

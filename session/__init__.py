@@ -3,6 +3,6 @@
 from __future__ import annotations
 
 from session.manager import Session, SessionManager
-from session.store import NewMessage, SessionStore
+from session.store import NewMessage, NewSurfaceEvent, SessionStore
 
-__all__ = ["NewMessage", "Session", "SessionManager", "SessionStore"]
+__all__ = ["NewMessage", "NewSurfaceEvent", "Session", "SessionManager", "SessionStore"]

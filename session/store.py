@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 _MESSAGE_ROLES = {"user", "assistant", "tool"}
+_SURFACE_ROLES = {"system", "user", "assistant", "tool"}
+_SURFACE_OPS = {"append", "replace"}
 _MESSAGE_COLUMNS = "id, session_key, seq, role, content, tool_chain, extra, ts"
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 _DEFAULT_TITLE_LIMIT = 80
@@ -56,6 +58,25 @@ class NewMessage:
     timestamp: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class NewSurfaceEvent:
+    """写入模型侧 durable surface 的完整事件。"""
+
+    session_key: str
+    epoch_id: str
+    turn_id: str
+    iteration: int
+    role: str
+    content: dict[str, Any]
+    source_kind: str
+    operation_key: str
+    status: str = "committed"
+    projection_version: int = 1
+    surface_op: str = "append"
+    replace_start: int | None = None
+    replace_end: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +157,47 @@ class SessionStore:
         """原子分配 seq、写入消息并推进会话 next_seq。"""
 
         return self._add_message_sync(message)
+
+    def append_surface(self, event: NewSurfaceEvent) -> dict[str, Any]:
+        """在同一事务内幂等追加一条模型侧 surface 事件。"""
+
+        return self._append_surface_sync(event)
+
+    def load_surface(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """按事件顺序折叠会话的当前模型消息投影。"""
+
+        return self._load_surface_sync(session_key, epoch_id=epoch_id)
+
+    def fetch_surface_events(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """读取 surface 原始事件，供恢复和诊断使用。"""
+
+        return self._fetch_surface_events_sync(session_key, epoch_id=epoch_id)
+
+    def replace_surface(self, event: NewSurfaceEvent) -> dict[str, Any]:
+        """追加一条带明确起止边界的 surface 替换事件。"""
+
+        if event.surface_op != "replace":
+            raise ValueError("replace_surface 只能接收 surface_op='replace'")
+        return self._append_surface_sync(event)
+
+    def recover_surface(self, session_key: str) -> list[dict[str, Any]]:
+        """返回尚未完成的 surface 事件，恢复器据此决定继续或终止。"""
+
+        return [
+            event
+            for event in self.fetch_surface_events(session_key)
+            if str(event.get("status") or "") == "pending"
+        ]
 
     def get_session_meta(self, session_key: str) -> dict[str, Any] | None:
         """读取会话元数据；不存在时返回 None。"""
@@ -752,6 +814,34 @@ class SessionStore:
                 CREATE INDEX IF NOT EXISTS idx_messages_session_seq
                     ON messages(session_key, seq);
 
+                CREATE TABLE IF NOT EXISTS surface_events (
+                    session_key        TEXT NOT NULL,
+                    epoch_id           TEXT NOT NULL,
+                    surface_seq        INTEGER NOT NULL,
+                    turn_id            TEXT NOT NULL,
+                    iteration          INTEGER NOT NULL,
+                    role               TEXT NOT NULL,
+                    content            TEXT NOT NULL,
+                    source_kind        TEXT NOT NULL,
+                    status             TEXT NOT NULL,
+                    projection_version INTEGER NOT NULL,
+                    operation_key      TEXT NOT NULL,
+                    surface_op         TEXT NOT NULL DEFAULT 'append',
+                    replace_start      INTEGER,
+                    replace_end        INTEGER,
+                    replace_generation INTEGER NOT NULL DEFAULT 0,
+                    created_at         TEXT NOT NULL,
+                    PRIMARY KEY (session_key, surface_seq),
+                    UNIQUE (session_key, operation_key),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_surface_events_session_order
+                    ON surface_events(session_key, surface_seq);
+                CREATE INDEX IF NOT EXISTS idx_surface_events_session_status
+                    ON surface_events(session_key, status);
+
                 CREATE TABLE IF NOT EXISTS session_compaction_prepares (
                     session_key                  TEXT NOT NULL,
                     session_created_at           TEXT NOT NULL,
@@ -1036,6 +1126,313 @@ class SessionStore:
             "status": message.status,
             "metadata": dict(message.metadata),
         }
+
+    def _append_surface_sync(self, event: NewSurfaceEvent) -> dict[str, Any]:
+        """在 SQLite 写事务中分配 surface 序号并折叠替换边界。"""
+
+        key = self._validate_session_key(event.session_key)
+        epoch_id = str(event.epoch_id).strip()
+        turn_id = str(event.turn_id).strip()
+        source_kind = str(event.source_kind).strip()
+        operation_key = str(event.operation_key).strip()
+        role = str(event.role).strip().lower()
+        surface_op = str(event.surface_op).strip().lower()
+        if not epoch_id:
+            raise ValueError("surface epoch_id 不能为空")
+        if not operation_key:
+            raise ValueError("surface operation_key 不能为空")
+        if role not in _SURFACE_ROLES:
+            raise ValueError(f"不支持的 surface role: {event.role!r}")
+        if not source_kind:
+            raise ValueError("surface source_kind 不能为空")
+        if surface_op not in _SURFACE_OPS:
+            raise ValueError(f"不支持的 surface_op: {event.surface_op!r}")
+        if not isinstance(event.content, dict):
+            raise TypeError("surface content 必须是完整模型消息字典")
+        if str(event.content.get("role") or role).strip().lower() != role:
+            raise ValueError("surface role 必须与 content.role 一致")
+        if surface_op == "append" and (
+            event.replace_start is not None or event.replace_end is not None
+        ):
+            raise ValueError("append surface 不能携带 replace 边界")
+        if surface_op == "replace":
+            if event.replace_start is None or event.replace_end is None:
+                raise ValueError("replace surface 必须携带 start/end")
+
+        content_payload = json.dumps(
+            event.content,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = _now_iso()
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO sessions (
+                        key, created_at, updated_at, last_consolidated,
+                        next_seq, metadata
+                    ) VALUES (?, ?, ?, 0, 0, '{}')
+                    """,
+                    (key, now, now),
+                )
+                existing = self._conn.execute(
+                    """
+                    SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
+                           role, content, source_kind, status, projection_version,
+                           operation_key, surface_op, replace_start, replace_end,
+                           replace_generation, created_at
+                    FROM surface_events
+                    WHERE session_key = ? AND operation_key = ?
+                    """,
+                    (key, operation_key),
+                ).fetchone()
+                if existing is not None:
+                    current = self._row_to_surface_event(existing)
+                    if not self._surface_event_matches(
+                        current,
+                        epoch_id=epoch_id,
+                        turn_id=turn_id,
+                        iteration=int(event.iteration),
+                        role=role,
+                        content=event.content,
+                        source_kind=source_kind,
+                        status=str(event.status),
+                        projection_version=int(event.projection_version),
+                        operation_key=operation_key,
+                        surface_op=surface_op,
+                        replace_start=event.replace_start,
+                        replace_end=event.replace_end,
+                    ):
+                        raise ValueError(
+                            f"surface operation_key 已绑定不同事件: {key}:{operation_key}"
+                        )
+                    self._conn.commit()
+                    return current
+
+                current_nodes = self._surface_projection_events_locked(key)
+                replace_generation = max(
+                    (int(item["replace_generation"]) for item in current_nodes),
+                    default=0,
+                )
+                if surface_op == "replace":
+                    start = int(event.replace_start)
+                    end = int(event.replace_end)
+                    start_index = next(
+                        (
+                            index
+                            for index, item in enumerate(current_nodes)
+                            if int(item["surface_seq"]) == start
+                        ),
+                        None,
+                    )
+                    end_index = next(
+                        (
+                            index
+                            for index, item in enumerate(current_nodes)
+                            if int(item["surface_seq"]) == end
+                        ),
+                        None,
+                    )
+                    if start_index is None or end_index is None or start_index > end_index:
+                        raise ValueError(
+                            "replace 边界必须覆盖当前 surface 中连续存在的节点"
+                        )
+                    replace_generation += 1
+
+                seq_row = self._conn.execute(
+                    """
+                    SELECT COALESCE(MAX(surface_seq), -1) + 1 AS next_surface_seq
+                    FROM surface_events
+                    WHERE session_key = ?
+                    """,
+                    (key,),
+                ).fetchone()
+                surface_seq = int(seq_row["next_surface_seq"] if seq_row else 0)
+                self._conn.execute(
+                    """
+                    INSERT INTO surface_events (
+                        session_key, epoch_id, surface_seq, turn_id, iteration,
+                        role, content, source_kind, status, projection_version,
+                        operation_key, surface_op, replace_start, replace_end,
+                        replace_generation, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        epoch_id,
+                        surface_seq,
+                        turn_id,
+                        int(event.iteration),
+                        role,
+                        content_payload,
+                        source_kind,
+                        str(event.status),
+                        int(event.projection_version),
+                        operation_key,
+                        surface_op,
+                        int(event.replace_start) if event.replace_start is not None else None,
+                        int(event.replace_end) if event.replace_end is not None else None,
+                        replace_generation,
+                        now,
+                    ),
+                )
+                self._conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE key = ?",
+                    (now, key),
+                )
+                self._conn.commit()
+                row = self._conn.execute(
+                    """
+                    SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
+                           role, content, source_kind, status, projection_version,
+                           operation_key, surface_op, replace_start, replace_end,
+                           replace_generation, created_at
+                    FROM surface_events
+                    WHERE session_key = ? AND surface_seq = ?
+                    """,
+                    (key, surface_seq),
+                ).fetchone()
+            except Exception:
+                self._conn.rollback()
+                raise
+        if row is None:
+            raise RuntimeError(f"surface 事件写入后无法读取: {key}:{surface_seq}")
+        return self._row_to_surface_event(row)
+
+    def _fetch_surface_events_sync(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None,
+    ) -> list[dict[str, Any]]:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            if epoch_id is None:
+                rows = self._conn.execute(
+                    """
+                    SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
+                           role, content, source_kind, status, projection_version,
+                           operation_key, surface_op, replace_start, replace_end,
+                           replace_generation, created_at
+                    FROM surface_events
+                    WHERE session_key = ?
+                    ORDER BY surface_seq ASC
+                    """,
+                    (key,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
+                           role, content, source_kind, status, projection_version,
+                           operation_key, surface_op, replace_start, replace_end,
+                           replace_generation, created_at
+                    FROM surface_events
+                    WHERE session_key = ? AND epoch_id = ?
+                    ORDER BY surface_seq ASC
+                    """,
+                    (key, str(epoch_id).strip()),
+                ).fetchall()
+        return [self._row_to_surface_event(row) for row in rows]
+
+    def _load_surface_sync(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None,
+    ) -> list[dict[str, Any]]:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            nodes = self._surface_projection_events_locked(key)
+        if epoch_id is not None:
+            # epoch 只影响缓存声明；历史消息仍需保留在当前模型上下文中。
+            # 因此这里不按 epoch 丢弃旧节点，只允许调用方筛选原始事件。
+            expected = str(epoch_id).strip()
+            if expected and not any(str(node.get("epoch_id")) == expected for node in nodes):
+                return [dict(node["message"]) for node in nodes]
+        return [dict(node["message"]) for node in nodes]
+
+    def _surface_projection_events_locked(
+        self,
+        session_key: str,
+    ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
+                   role, content, source_kind, status, projection_version,
+                   operation_key, surface_op, replace_start, replace_end,
+                   replace_generation, created_at
+            FROM surface_events
+            WHERE session_key = ?
+            ORDER BY surface_seq ASC
+            """,
+            (session_key,),
+        ).fetchall()
+        nodes: list[dict[str, Any]] = []
+        for row in rows:
+            event = self._row_to_surface_event(row)
+            if event["surface_op"] == "append":
+                nodes.append(event)
+                continue
+            start = event["replace_start"]
+            end = event["replace_end"]
+            if start is None or end is None:
+                raise ValueError("surface replace 事件缺少边界")
+            start_index = next(
+                (
+                    index for index, node in enumerate(nodes)
+                    if int(node["surface_seq"]) == int(start)
+                ),
+                None,
+            )
+            end_index = next(
+                (
+                    index for index, node in enumerate(nodes)
+                    if int(node["surface_seq"]) == int(end)
+                ),
+                None,
+            )
+            if start_index is None or end_index is None or start_index > end_index:
+                raise ValueError("surface replace 事件覆盖了不连续的当前节点")
+            nodes[start_index:end_index + 1] = [event]
+        return nodes
+
+    @staticmethod
+    def _surface_event_matches(
+        current: dict[str, Any],
+        *,
+        epoch_id: str,
+        turn_id: str,
+        iteration: int,
+        role: str,
+        content: dict[str, Any],
+        source_kind: str,
+        status: str,
+        projection_version: int,
+        operation_key: str,
+        surface_op: str,
+        replace_start: int | None,
+        replace_end: int | None,
+    ) -> bool:
+        return (
+            current["epoch_id"] == epoch_id
+            and current["turn_id"] == turn_id
+            and int(current["iteration"]) == iteration
+            and current["role"] == role
+            and current["message"] == content
+            and current["source_kind"] == source_kind
+            and current["status"] == status
+            and int(current["projection_version"]) == projection_version
+            and current["operation_key"] == operation_key
+            and current["surface_op"] == surface_op
+            and current["replace_start"] == replace_start
+            and current["replace_end"] == replace_end
+        )
 
     def _get_session_meta_sync(self, session_key: str) -> dict[str, Any] | None:
         key = self._validate_session_key(session_key)
@@ -1889,6 +2286,45 @@ class SessionStore:
         return message
 
     @staticmethod
+    def _row_to_surface_event(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            message = json.loads(str(row["content"]))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"surface 事件内容不是合法 JSON: {row['session_key']}:{row['surface_seq']}"
+            ) from error
+        if not isinstance(message, dict):
+            raise ValueError(
+                f"surface 事件内容必须是消息对象: {row['session_key']}:{row['surface_seq']}"
+            )
+        return {
+            "session_key": str(row["session_key"]),
+            "epoch_id": str(row["epoch_id"]),
+            "surface_seq": int(row["surface_seq"]),
+            "turn_id": str(row["turn_id"]),
+            "iteration": int(row["iteration"]),
+            "role": str(row["role"]),
+            "message": message,
+            "source_kind": str(row["source_kind"]),
+            "status": str(row["status"]),
+            "projection_version": int(row["projection_version"]),
+            "operation_key": str(row["operation_key"]),
+            "surface_op": str(row["surface_op"]),
+            "replace_start": (
+                int(row["replace_start"])
+                if row["replace_start"] is not None
+                else None
+            ),
+            "replace_end": (
+                int(row["replace_end"])
+                if row["replace_end"] is not None
+                else None
+            ),
+            "replace_generation": int(row["replace_generation"] or 0),
+            "created_at": str(row["created_at"]),
+        }
+
+    @staticmethod
     def _row_to_prepare(row: sqlite3.Row) -> SessionCompactionPrepare:
         return SessionCompactionPrepare(
             session_key=str(row["session_key"]),
@@ -2026,6 +2462,7 @@ def _prepare_matches_checkpoint(
 
 __all__ = [
     "NewMessage",
+    "NewSurfaceEvent",
     "SessionCompaction",
     "SessionCompactionPrepare",
     "SessionStore",

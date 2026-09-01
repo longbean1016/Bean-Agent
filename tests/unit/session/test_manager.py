@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 
 from session.manager import Session, SessionManager
+from session.store import NewSurfaceEvent
 
 
 @pytest_asyncio.fixture
@@ -41,6 +42,31 @@ async def test_get_or_create_caches_complete_session_and_reloads_after_invalidat
     assert reloaded.messages[0]["turn_id"] == "turn-1"
     assert user["timestamp"].endswith("+08:00")
     assert first.created_at.utcoffset().total_seconds() == 8 * 60 * 60
+
+
+@pytest.mark.asyncio
+async def test_manager_surface_api_is_session_scoped_and_idempotent(
+    manager: SessionManager,
+) -> None:
+    event = NewSurfaceEvent(
+        session_key="web:surface",
+        epoch_id="epoch-a",
+        turn_id="turn-1",
+        iteration=0,
+        role="user",
+        content={"role": "user", "content": "问题"},
+        source_kind="user",
+        operation_key="turn-1:0:user",
+    )
+
+    first = await manager.append_surface(event)
+    retry = await manager.append_surface(event)
+
+    assert first == retry
+    assert await manager.load_surface("web:surface") == [event.content]
+    assert [item["operation_key"] for item in await manager.fetch_surface_events("web:surface")] == [
+        "turn-1:0:user"
+    ]
 
 
 @pytest.mark.asyncio

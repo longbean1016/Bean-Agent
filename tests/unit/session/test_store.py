@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-from session.store import NewMessage, SessionStore
+from session.store import NewMessage, NewSurfaceEvent, SessionStore
 
 
 @pytest_asyncio.fixture
@@ -97,6 +97,135 @@ async def test_add_message_allocates_seq_and_preserves_turn_fields(
     )
     assert [item["seq"] for item in fetched] == [0, 1]
     assert fetched[1]["turn_id"] == "turn-1"
+
+
+def _surface_event(
+    *,
+    session_key: str = "web:surface",
+    operation_key: str = "turn-1:0:frame",
+    message: dict[str, object] | None = None,
+    surface_op: str = "append",
+    replace_start: int | None = None,
+    replace_end: int | None = None,
+    status: str = "committed",
+) -> NewSurfaceEvent:
+    payload = message or {"role": "user", "content": "frame"}
+    return NewSurfaceEvent(
+        session_key=session_key,
+        epoch_id="epoch-a",
+        turn_id="turn-1",
+        iteration=0,
+        role=str(payload["role"]),
+        content=payload,
+        source_kind="context_frame",
+        operation_key=operation_key,
+        surface_op=surface_op,
+        replace_start=replace_start,
+        replace_end=replace_end,
+        status=status,
+    )
+
+
+def test_surface_append_is_idempotent_and_preserves_full_message(store: SessionStore) -> None:
+    first = store.append_surface(_surface_event())
+    retry = store.append_surface(_surface_event())
+
+    assert first == retry
+    assert first["surface_seq"] == 0
+    assert first["message"] == {"role": "user", "content": "frame"}
+    assert store.load_surface("web:surface") == [{"role": "user", "content": "frame"}]
+    assert len(store.fetch_surface_events("web:surface")) == 1
+
+
+def test_surface_replace_folds_current_nodes_and_increments_generation(
+    store: SessionStore,
+) -> None:
+    store.append_surface(_surface_event(operation_key="a", message={"role": "user", "content": "a"}))
+    store.append_surface(_surface_event(operation_key="b", message={"role": "assistant", "content": "b"}))
+    replaced = store.replace_surface(_surface_event(
+        operation_key="replace-1",
+        message={"role": "user", "content": "summary"},
+        surface_op="replace",
+        replace_start=0,
+        replace_end=1,
+    ))
+
+    assert replaced["surface_seq"] == 2
+    assert replaced["replace_generation"] == 1
+    assert store.load_surface("web:surface") == [{"role": "user", "content": "summary"}]
+    assert store.fetch_surface_events("web:surface")[2]["surface_op"] == "replace"
+
+
+def test_surface_replace_uses_node_boundaries_after_prior_replace(
+    store: SessionStore,
+) -> None:
+    store.append_surface(_surface_event(operation_key="a", message={"role": "user", "content": "a"}))
+    store.append_surface(_surface_event(operation_key="b", message={"role": "assistant", "content": "b"}))
+    store.append_surface(_surface_event(operation_key="c", message={"role": "tool", "content": "c"}))
+    store.replace_surface(_surface_event(
+        operation_key="replace-1",
+        message={"role": "user", "content": "summary"},
+        surface_op="replace",
+        replace_start=0,
+        replace_end=1,
+    ))
+
+    # The current nodes are seq 3 (replacement) and seq 2 (tool); DSH resolves
+    # start/end by their positions in the current surface, not numeric order.
+    second = store.replace_surface(_surface_event(
+        operation_key="replace-2",
+        message={"role": "user", "content": "final summary"},
+        surface_op="replace",
+        replace_start=3,
+        replace_end=2,
+    ))
+    assert second["replace_generation"] == 2
+    assert store.load_surface("web:surface") == [{"role": "user", "content": "final summary"}]
+
+
+def test_surface_replace_rejects_non_contiguous_current_nodes(store: SessionStore) -> None:
+    store.append_surface(_surface_event(operation_key="a"))
+    store.append_surface(_surface_event(operation_key="b", message={"role": "assistant", "content": "b"}))
+    store.replace_surface(_surface_event(
+        operation_key="replace-1",
+        message={"role": "user", "content": "summary"},
+        surface_op="replace",
+        replace_start=0,
+        replace_end=1,
+    ))
+    store.append_surface(_surface_event(operation_key="c", message={"role": "tool", "content": "c"}))
+
+    with pytest.raises(ValueError, match="连续存在"):
+        store.replace_surface(_surface_event(
+            operation_key="replace-invalid",
+            message={"role": "user", "content": "invalid"},
+            surface_op="replace",
+            replace_start=0,
+            replace_end=2,
+        ))
+
+
+def test_surface_pending_events_are_isolated_and_recoverable(store: SessionStore) -> None:
+    store.append_surface(_surface_event(
+        session_key="web:a",
+        operation_key="pending",
+        status="pending",
+    ))
+    store.append_surface(_surface_event(
+        session_key="web:b",
+        operation_key="other",
+        status="pending",
+    ))
+
+    assert [event["operation_key"] for event in store.recover_surface("web:a")] == ["pending"]
+    assert [event["session_key"] for event in store.fetch_surface_events("web:a")] == ["web:a"]
+    assert [event["session_key"] for event in store.fetch_surface_events("web:b")] == ["web:b"]
+
+
+def test_surface_operation_key_rejects_conflicting_retry(store: SessionStore) -> None:
+    store.append_surface(_surface_event())
+    with pytest.raises(ValueError, match="不同事件"):
+        store.append_surface(_surface_event(message={"role": "user", "content": "changed"}))
 
 
 @pytest.mark.asyncio
