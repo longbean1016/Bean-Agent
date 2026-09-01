@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import uuid4
@@ -207,7 +208,25 @@ class AgentLoop:
 
         session = await self._sessions.get_or_create(message.session_key)
         context_retry = dict(getattr(result, "context_retry", {}) or {})
-        user = session.add_message("user", message.content, media=message.media, turn_id=turn_id)
+        user_projection: dict[str, Any] = {}
+        llm_user_content = getattr(result, "llm_user_content", None)
+        if llm_user_content is not None:
+            user_projection["llm_user_content"] = deepcopy(llm_user_content)
+        llm_context_frame = str(getattr(result, "llm_context_frame", "") or "")
+        if llm_context_frame:
+            user_projection["llm_context_frame"] = llm_context_frame
+        llm_message_timestamp = str(
+            getattr(result, "llm_message_timestamp", "") or ""
+        )
+        if llm_message_timestamp:
+            user_projection["llm_message_timestamp"] = llm_message_timestamp
+        user = session.add_message(
+            "user",
+            message.content,
+            media=message.media,
+            turn_id=turn_id,
+            **user_projection,
+        )
         assistant = session.add_message(
             "assistant", result.content, media=result.media, turn_id=turn_id,
             reasoning_content=result.thinking, tool_chain=result.tool_chain,

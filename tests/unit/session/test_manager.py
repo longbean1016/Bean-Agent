@@ -44,6 +44,38 @@ async def test_get_or_create_caches_complete_session_and_reloads_after_invalidat
 
 
 @pytest.mark.asyncio
+async def test_load_history_replays_model_user_projection_and_context_frame(
+    manager: SessionManager,
+) -> None:
+    session = await manager.get_or_create("web:projection")
+    model_user = [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        {"type": "text", "text": "[当前消息时间: 2026-08-31T10:00:00+08:00]\n问题"},
+    ]
+    user = session.add_message(
+        "user",
+        "问题",
+        turn_id="turn-1",
+        llm_user_content=model_user,
+        llm_context_frame="<system-reminder data-system-context-frame=\"true\">frame-1</system-reminder>",
+        llm_message_timestamp="2026-08-31T10:00:00+08:00",
+    )
+    assistant = session.add_message("assistant", "回答", turn_id="turn-1")
+    await manager.append_messages(session, [user, assistant])
+    manager.invalidate("web:projection")
+
+    history = await manager.load_history("web:projection")
+
+    assert history == [
+        {
+            "role": "user",
+            "content": "<system-reminder data-system-context-frame=\"true\">frame-1</system-reminder>",
+        },
+        {"role": "user", "content": model_user},
+        {"role": "assistant", "content": "回答", "reasoning_content": ""},
+    ]
+
+@pytest.mark.asyncio
 async def test_peek_next_message_id_uses_persisted_next_sequence(
     manager: SessionManager,
 ) -> None:
@@ -307,7 +339,7 @@ def test_get_history_aligns_turn_and_expands_tools_with_truncation() -> None:
     assert history[0]["content"] == "第二问"
     assert history[1]["reasoning_content"] == "工具思考"
     assert len(history[2]["content"]) <= 10_100
-    assert "chars truncated" in history[2]["content"]
+    assert "已截断工具结果" in history[2]["content"]
     assert history[3]["reasoning_content"] == "最终思考"
 
 

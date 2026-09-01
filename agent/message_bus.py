@@ -53,6 +53,11 @@ class PipelineResult:
     tool_chain: list[dict[str, Any]] = field(default_factory=list)
     tools_used: list[str] = field(default_factory=list)
     context_retry: dict[str, Any] = field(default_factory=dict)
+    # 模型实际看到的本轮用户消息和动态 frame。它们是隐藏的模型侧投影，
+    # 不参与前端展示或记忆提取；持久化后下一轮按原字节重放以保持缓存前缀。
+    llm_user_content: object | None = None
+    llm_context_frame: str = ""
+    llm_message_timestamp: str = ""
 
 
 OutboundCallback: TypeAlias = Callable[[OutboundMessage], Awaitable[None] | None]

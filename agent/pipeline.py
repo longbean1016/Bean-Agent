@@ -186,6 +186,10 @@ class Pipeline:
             vl_available=self._vl_available,
         )
         message_timestamp = datetime.now(_LOCAL_TZ)
+        # 记录最终模型消息中的用户包装和动态 frame；完成 Turn 后由 AgentLoop
+        # 作为隐藏投影落库，下一轮直接重放而不是重新生成时间戳或媒体 block。
+        llm_user_content: object | None = None
+        llm_context_frame = ""
         context_retry: dict[str, Any] = {
             "attempts": [],
             "selected_plan": "token_gate",
@@ -263,6 +267,7 @@ class Pipeline:
 
         async def chat_with_context_retry() -> LLMResponse:
             nonlocal last_base_messages, history, forced_compaction_attempted, measurement
+            nonlocal llm_user_content, llm_context_frame
             while True:
                 history_for_attempt = history
                 disabled_sections: set[str] = set()
@@ -279,6 +284,19 @@ class Pipeline:
                     message_timestamp=message_timestamp,
                     disabled_sections=disabled_sections,
                 )
+                if assembled.messages:
+                    last_message = assembled.messages[-1]
+                    if last_message.get("role") == "user":
+                        llm_user_content = deepcopy(last_message.get("content"))
+                    for candidate in reversed(assembled.messages[:-1]):
+                        content = candidate.get("content")
+                        if (
+                            candidate.get("role") == "user"
+                            and isinstance(content, str)
+                            and content.startswith("<system-reminder data-system-context-frame=\"true\">")
+                        ):
+                            llm_context_frame = content
+                            break
                 tool_schemas = self._tools.get_schemas(
                     visible_names=tool_view.visible_names,
                     visible_order=tool_view.visible_order,
@@ -548,6 +566,9 @@ class Pipeline:
                     tool_chain=tool_chain,
                     tools_used=list(dict.fromkeys(tools_used)),
                     context_retry=context_retry,
+                    llm_user_content=deepcopy(llm_user_content),
+                    llm_context_frame=llm_context_frame,
+                    llm_message_timestamp=message_timestamp.isoformat(),
                 )
 
             # 工具调用 assistant 消息必须原样进入下一轮，尤其要保留 DeepSeek 的
@@ -567,7 +588,7 @@ class Pipeline:
                 if call.name not in tool_view.visible_names:
                     result = normalize_tool_result(f"工具 '{call.name}' 未被当前执行上下文授权")
                     append_tool_result(react_messages, tool_call_id=call.id, content=result, tool_name=call.name)
-                    group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "status": "error"})
+                    group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "content_blocks": deepcopy(result.content_blocks), "status": "error"})
                     continue
                 if not suppress_stream:
                     # 先写入运行中快照，再发实时事件；刷新重连正好发生在事件前后时，订阅端都能恢复工具图标。
@@ -622,7 +643,7 @@ class Pipeline:
                         result_preview=preview,
                     )
                     await self._events.emit(ToolCallCompleted(message.session_key, turn_id, call.id, call.name, status, preview))
-                group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "status": status})
+                group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "content_blocks": deepcopy(result.content_blocks), "status": status})
                 tools_used.append(call.name)
                 # 一组内后续工具也可能阻塞或被取消；每完成一个调用就刷新快照，避免丢失已完成结果。
                 snapshot = self._interrupt_snapshots[turn_id]
@@ -652,6 +673,9 @@ class Pipeline:
             tool_chain=tool_chain,
             tools_used=list(dict.fromkeys(tools_used)),
             context_retry=context_retry,
+            llm_user_content=deepcopy(llm_user_content),
+            llm_context_frame=llm_context_frame,
+            llm_message_timestamp=message_timestamp.isoformat(),
         )
 
     def snapshot_interrupt_state(self, turn_id: str) -> dict[str, Any]:

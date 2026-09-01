@@ -13,8 +13,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from session.store import NewMessage, SessionStore
+from tools.base import ToolResult
+from tools.runtime import serialize_tool_result_messages
 
-_TOOL_RESULT_CHAR_BUDGET = 10_000
 _TEXT_ATTACHMENT_CHAR_BUDGET = 100_000
 _TEXT_ATTACHMENT_SUFFIXES = {
     ".txt", ".md", ".markdown", ".py", ".json", ".toml", ".yaml", ".yml",
@@ -25,26 +26,6 @@ _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 def _now_local() -> datetime:
     return datetime.now(_LOCAL_TZ)
-
-
-def _truncate_tool_result(content: object) -> str:
-    """按 akashic 的预算保留工具结果首尾，避免历史被单次输出占满。"""
-
-    text = content if isinstance(content, str) else str(content)
-    if len(text) <= _TOOL_RESULT_CHAR_BUDGET:
-        return text
-    omitted = len(text) - _TOOL_RESULT_CHAR_BUDGET
-    while True:
-        marker = f"…{omitted} chars truncated…"
-        keep = max(0, _TOOL_RESULT_CHAR_BUDGET - len(marker))
-        actual_omitted = len(text) - keep
-        if actual_omitted == omitted:
-            break
-        omitted = actual_omitted
-    head = keep // 2
-    tail = keep - head
-    truncated = text[:head] + marker + (text[-tail:] if tail else "")
-    return f"Total output lines: {len(text.splitlines())}\n\n{truncated}"
 
 
 def _rebuild_user_content(text: str, media_paths: list[str]) -> str | list[dict[str, Any]]:
@@ -171,6 +152,9 @@ class Session:
                     text = str(message.get("content", ""))
                     media = message.get("media") or []
                     content = _rebuild_user_content(text, list(media)) if media else text
+                frame = message.get("llm_context_frame")
+                if isinstance(frame, str) and frame.strip():
+                    history.append({"role": "user", "content": frame})
                 history.append({"role": "user", "content": content})
                 continue
             if role != "assistant":
@@ -215,12 +199,23 @@ class Session:
                     assistant_message["reasoning_content"] = reasoning
                 history.append(assistant_message)
                 for call in calls:
-                    history.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["call_id"],
-                            "content": _truncate_tool_result(call.get("result", "")),
-                        }
+                    content_blocks = call.get("content_blocks")
+                    tool_content: str | ToolResult = str(call.get("result", ""))
+                    if isinstance(content_blocks, list) and content_blocks:
+                        tool_content = ToolResult(
+                            text=str(call.get("result", "")),
+                            content_blocks=[
+                                dict(block)
+                                for block in content_blocks
+                                if isinstance(block, dict)
+                            ],
+                        )
+                    history.extend(
+                        serialize_tool_result_messages(
+                            tool_call_id=str(call.get("call_id", "")),
+                            content=tool_content,
+                            tool_name=str(call.get("name", "")) or None,
+                        )
                     )
 
             final_message: dict[str, Any] = {
