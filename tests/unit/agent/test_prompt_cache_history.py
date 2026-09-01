@@ -108,6 +108,38 @@ async def test_next_turn_reuses_saved_frame_and_model_user_prefix(
 
 
 @pytest.mark.asyncio
+async def test_third_turn_keeps_the_first_request_as_a_complete_prefix(
+    tmp_path: Path,
+) -> None:
+    sessions = SessionManager(tmp_path)
+    provider = CapturingProvider()
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        EventBus(),
+        PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        ),
+        workspace=str(tmp_path),
+        history_loader=sessions.load_history,
+    )
+    bus = MessageBus()
+    loop = AgentLoop(bus, EventBus(), pipeline, sessions)
+
+    for content in ("第一轮", "第二轮", "第三轮"):
+        await bus.publish_inbound(InboundMessage("web", "u", "c", content))
+        await loop.run_once()
+
+    first_request, second_request, third_request = provider.messages
+    assert second_request[: len(first_request)] == first_request
+    assert third_request[: len(first_request)] == first_request
+    assert third_request[len(first_request)]["role"] == "assistant"
+    assert third_request[-1]["role"] == "user"
+    await sessions.close()
+
+
+@pytest.mark.asyncio
 async def test_react_surface_replays_tool_messages_without_semantic_duplication(
     tmp_path: Path,
 ) -> None:
