@@ -58,6 +58,11 @@ class TurnInterruptState:
     tools_used: list[str] = field(default_factory=list)
     tools: list[dict[str, Any]] = field(default_factory=list)
     tool_chain_partial: list[dict[str, Any]] = field(default_factory=list)
+    llm_user_content: object | None = None
+    llm_context_frame: str = ""
+    llm_message_timestamp: str = ""
+    llm_epoch_id: str = ""
+    llm_surface_messages: list[dict[str, Any]] = field(default_factory=list)
 
 
 class AgentLoop:
@@ -199,7 +204,15 @@ class AgentLoop:
             return
         except Exception as error:
             logger.exception("Agent 推理异常: session_key=%s", message.session_key)
-            await self._persist_terminal_turn(message, turn_id, "error", f"出错：{error}")
+            snapshotter = getattr(self._pipeline, "snapshot_interrupt_state", None)
+            snapshot = snapshotter(turn_id) if callable(snapshotter) else {}
+            await self._persist_terminal_turn(
+                message,
+                turn_id,
+                "error",
+                f"出错：{error}",
+                snapshot=snapshot,
+            )
             await self._bus.publish_outbound(OutboundMessage(
                 message.channel, message.chat_id, f"出错：{error}",
                 metadata={"turn_id": turn_id, "request_id": request_id, "status": "error"},
@@ -269,9 +282,24 @@ class AgentLoop:
                 "context_retry": context_retry,
             },
         ))
-    async def _persist_terminal_turn(self, message: InboundMessage, turn_id: str, status: str, assistant_content: str) -> None:
+    async def _persist_terminal_turn(
+        self,
+        message: InboundMessage,
+        turn_id: str,
+        status: str,
+        assistant_content: str,
+        *,
+        snapshot: dict[str, Any] | None = None,
+    ) -> None:
         session = await self._sessions.get_or_create(message.session_key)
-        user = session.add_message("user", message.content, media=message.media, turn_id=turn_id)
+        projection = _model_projection_from_snapshot(snapshot or {})
+        user = session.add_message(
+            "user",
+            message.content,
+            media=message.media,
+            turn_id=turn_id,
+            **projection,
+        )
         assistant = session.add_message("assistant", assistant_content, turn_id=turn_id, status=status)
         await self._sessions.append_messages(session, [user, assistant])
         # error/interrupted 表示推理结果不完整，不发 TurnCommitted，避免记忆模块把错误文本
@@ -295,6 +323,13 @@ class AgentLoop:
                 tools_used=list(snapshot.get("tools_used") or []),
                 tools=list(snapshot.get("tools") or []),
                 tool_chain_partial=list(snapshot.get("tool_chain_partial") or []),
+                llm_user_content=deepcopy(snapshot.get("llm_user_content")),
+                llm_context_frame=str(snapshot.get("llm_context_frame") or ""),
+                llm_message_timestamp=str(snapshot.get("llm_message_timestamp") or ""),
+                llm_epoch_id=str(snapshot.get("llm_epoch_id") or ""),
+                llm_surface_messages=deepcopy(
+                    [item for item in snapshot.get("llm_surface_messages") or [] if isinstance(item, dict)]
+                ),
             )
         result = await self._scheduler.cancel(session_key)
         if result.status == "interrupted" and task is not None and interrupted is not None:
@@ -320,11 +355,25 @@ class AgentLoop:
             for call in group["calls"]
             if str(call.get("name") or "")
         ))
+        projection = _model_projection_from_state(state)
+        surface = projection.get("llm_surface_messages")
+        if isinstance(surface, list) and surface:
+            # 语义中断消息仍需在模型协议中闭合上一轮工具链，否则下一轮会看到
+            # 未配对的 tool result；该标记不进入 UI 之外的普通正文。
+            if not surface or surface[-1] != {
+                "role": "assistant",
+                "content": INTERRUPTED_ASSISTANT_CONTENT,
+            }:
+                surface.append({
+                    "role": "assistant",
+                    "content": INTERRUPTED_ASSISTANT_CONTENT,
+                })
         user = session.add_message(
             "user",
             state.original_user_message,
             media=state.original_media,
             turn_id=turn_id,
+            **projection,
         )
         assistant = session.add_message(
             "assistant",
@@ -393,6 +442,56 @@ class AgentLoop:
         discarded = await self._bus.discard_pending_inbound()
         for message in discarded:
             self._finish_waiter(message)
+
+
+def _model_projection_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """从失败/中断快照提取隐藏模型投影，不改变语义消息正文。"""
+
+    return _model_projection(
+        llm_user_content=snapshot.get("llm_user_content"),
+        llm_context_frame=str(snapshot.get("llm_context_frame") or ""),
+        llm_message_timestamp=str(snapshot.get("llm_message_timestamp") or ""),
+        llm_epoch_id=str(snapshot.get("llm_epoch_id") or ""),
+        llm_surface_messages=snapshot.get("llm_surface_messages"),
+    )
+
+
+def _model_projection_from_state(state: TurnInterruptState) -> dict[str, Any]:
+    """从已复制的中断状态提取可重放的模型侧消息。"""
+
+    return _model_projection(
+        llm_user_content=state.llm_user_content,
+        llm_context_frame=state.llm_context_frame,
+        llm_message_timestamp=state.llm_message_timestamp,
+        llm_epoch_id=state.llm_epoch_id,
+        llm_surface_messages=state.llm_surface_messages,
+    )
+
+
+def _model_projection(
+    *,
+    llm_user_content: object | None,
+    llm_context_frame: str,
+    llm_message_timestamp: str,
+    llm_epoch_id: str,
+    llm_surface_messages: object,
+) -> dict[str, Any]:
+    """统一组装隐藏字段，避免正常、失败和中断路径发生字段漂移。"""
+
+    projection: dict[str, Any] = {}
+    if llm_user_content is not None:
+        projection["llm_user_content"] = deepcopy(llm_user_content)
+    if llm_context_frame:
+        projection["llm_context_frame"] = llm_context_frame
+    if llm_message_timestamp:
+        projection["llm_message_timestamp"] = llm_message_timestamp
+    if llm_epoch_id:
+        projection["llm_epoch_id"] = llm_epoch_id
+    if isinstance(llm_surface_messages, list):
+        copied = [item for item in llm_surface_messages if isinstance(item, dict)]
+        if copied:
+            projection["llm_surface_messages"] = deepcopy(copied)
+    return projection
 
 
 def interrupted_tool_chain(

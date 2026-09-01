@@ -127,6 +127,11 @@ class Pipeline:
             "tools": [],
             "tools_used": [],
             "tool_chain_partial": [],
+            "llm_surface_messages": [],
+            "llm_user_content": None,
+            "llm_context_frame": "",
+            "llm_message_timestamp": "",
+            "llm_epoch_id": "",
         }
         raw_allowed_tools = message.metadata.get("allowed_tools")
         allowed_tools = (
@@ -211,6 +216,20 @@ class Pipeline:
         last_base_messages: list[dict[str, Any]] = []
         forced_compaction_attempted = False
         llm_epoch_id = ""
+
+        def sync_surface_snapshot() -> None:
+            """把已发送的模型侧前缀同步到中断/失败快照，供恢复时精确重放。"""
+
+            snapshot = self._interrupt_snapshots.get(turn_id)
+            if snapshot is None:
+                return
+            snapshot.update({
+                "llm_surface_messages": deepcopy(llm_surface_messages),
+                "llm_user_content": deepcopy(llm_user_content),
+                "llm_context_frame": llm_context_frame,
+                "llm_message_timestamp": message_timestamp.isoformat(),
+                "llm_epoch_id": llm_epoch_id,
+            })
 
         async def compact_with_status(*, estimated_tokens: int, force: bool) -> bool:
             """等待当前 Turn 所需的 summary，同时把压缩阶段明确广播给前端。"""
@@ -316,6 +335,7 @@ class Pipeline:
                                 "role": "user",
                                 "content": deepcopy(llm_user_content),
                             })
+                        sync_surface_snapshot()
                 tool_schemas = self._tools.get_schemas(
                     visible_names=tool_view.visible_names,
                     visible_order=tool_view.visible_order,
@@ -449,7 +469,7 @@ class Pipeline:
                         sent_messages: list[dict[str, Any]],
                         sent_tools: list[dict[str, Any]],
                     ) -> None:
-                        nonlocal request_diagnostic
+                        nonlocal request_diagnostic, llm_epoch_id
                         request_diagnostic = self._prompt_cache_diagnostics.observe(
                             message.session_key,
                             sent_messages,
@@ -461,6 +481,8 @@ class Pipeline:
                                 tool_choice="auto",
                             ),
                         )
+                        llm_epoch_id = request_diagnostic.epoch_id
+                        sync_surface_snapshot()
 
                     async def on_usage(usage: ProviderUsage) -> None:
                         # 同一 iteration 的所有 usage 样本都写入同一幂等键；存储层
@@ -494,6 +516,8 @@ class Pipeline:
                                 tool_choice="auto",
                             ),
                         )
+                        llm_epoch_id = request_diagnostic.epoch_id
+                        sync_surface_snapshot()
                     provider_pressure = _provider_pressure_tokens(response)
                     if provider_pressure is not None:
                         measurement = {
@@ -598,19 +622,21 @@ class Pipeline:
                     empty_assistant = {"role": "assistant", "content": ""}
                     react_messages.append(empty_assistant)
                     llm_surface_messages.append(deepcopy(empty_assistant))
+                    sync_surface_snapshot()
                     nudge_message = {
                         "role": "user",
                         "content": "你刚才只输出了思考过程，没有给出正式回复。请直接回复用户，不要重复思考。",
                     }
                     react_messages.append(nudge_message)
                     llm_surface_messages.append(deepcopy(nudge_message))
+                    sync_surface_snapshot()
                     retry_diagnostic: PromptCacheRequestDiagnostics | None = None
 
                     def on_retry_request(
                         sent_messages: list[dict[str, Any]],
                         sent_tools: list[dict[str, Any]],
                     ) -> None:
-                        nonlocal retry_diagnostic
+                        nonlocal retry_diagnostic, llm_epoch_id
                         retry_diagnostic = self._prompt_cache_diagnostics.observe(
                             message.session_key,
                             sent_messages,
@@ -623,6 +649,8 @@ class Pipeline:
                                 max_tokens=_SUMMARY_MAX_TOKENS,
                             ),
                         )
+                        llm_epoch_id = retry_diagnostic.epoch_id
+                        sync_surface_snapshot()
 
                     retry = await self._provider.chat(
                         [*last_base_messages, *react_messages],
@@ -645,6 +673,8 @@ class Pipeline:
                                 max_tokens=_SUMMARY_MAX_TOKENS,
                             ),
                         )
+                        llm_epoch_id = request_diagnostic.epoch_id
+                        sync_surface_snapshot()
                     if retry.content:
                         response = retry
                         append_turn_thinking(response.thinking)
@@ -659,6 +689,7 @@ class Pipeline:
                 if response.thinking and "reasoning_content" not in final_model_message:
                     final_model_message["reasoning_content"] = response.thinking
                 llm_surface_messages.append(final_model_message)
+                sync_surface_snapshot()
                 return PipelineResult(
                     content=str(content or ""),
                     thinking=merged_turn_thinking(),
@@ -689,6 +720,7 @@ class Pipeline:
             }
             react_messages.append(assistant_message)
             llm_surface_messages.append(deepcopy(assistant_message))
+            sync_surface_snapshot()
             group: dict[str, Any] = {"iteration": iteration, "text": response.content or "", "calls": [], "provider_fields": dict(response.provider_fields)}
             for call in response.tool_calls:
                 if call.name not in tool_view.visible_names:
@@ -698,6 +730,7 @@ class Pipeline:
                     llm_surface_messages.extend(
                         deepcopy(react_messages[before_tool_messages:])
                     )
+                    sync_surface_snapshot()
                     group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "content_blocks": deepcopy(result.content_blocks), "status": "error"})
                     continue
                 if not suppress_stream:
@@ -745,6 +778,7 @@ class Pipeline:
                 llm_surface_messages.extend(
                     deepcopy(react_messages[before_tool_messages:])
                 )
+                sync_surface_snapshot()
                 if not suppress_stream:
                     preview = result.preview()[:500]
                     # 完成态同样先落快照再发事件，避免刷新窗口里看到旧的 running 状态。
@@ -797,7 +831,25 @@ class Pipeline:
     def snapshot_interrupt_state(self, turn_id: str) -> dict[str, Any]:
         """返回当前 Turn 的隔离副本，避免取消后的清理影响中断状态。"""
 
-        return deepcopy(self._interrupt_snapshots.get(turn_id, {}))
+        state = deepcopy(self._interrupt_snapshots.get(turn_id, {}))
+        surface = state.get("llm_surface_messages")
+        if not isinstance(surface, list):
+            surface = []
+            state["llm_surface_messages"] = surface
+        partial_reply = str(state.get("partial_reply") or "")
+        partial_thinking = str(state.get("partial_thinking") or "")
+        if partial_reply or partial_thinking:
+            # 流式取消时 Provider 尚未返回完整响应，仍保留已送达用户的模型前缀；
+            # 未完成的工具调用继续由语义中断快照单独审计，不能伪造 tool result。
+            if not surface or not isinstance(surface[-1], dict) or surface[-1].get("role") != "assistant":
+                message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": partial_reply,
+                }
+                if partial_thinking:
+                    message["reasoning_content"] = partial_thinking
+                surface.append(message)
+        return state
 
     def _upsert_interrupt_tool(
         self,

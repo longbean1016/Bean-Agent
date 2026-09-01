@@ -177,6 +177,41 @@ async def test_pipeline_failure_persists_error_turn_without_committed(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_pipeline_failure_persists_model_surface_for_replay(tmp_path: Path) -> None:
+    class FailingPipeline:
+        async def process(self, message, *, turn_id):
+            raise RuntimeError("模型失败")
+
+        def snapshot_interrupt_state(self, turn_id: str):
+            frame = '<system-reminder data-system-context-frame="true">frame</system-reminder>'
+            wrapped = "[当前消息时间: 2026-09-01T10:00:00+08:00]\n问题"
+            return {
+                "llm_context_frame": frame,
+                "llm_user_content": wrapped,
+                "llm_message_timestamp": "2026-09-01T10:00:00+08:00",
+                "llm_epoch_id": "epoch-1",
+                "llm_surface_messages": [
+                    {"role": "user", "content": frame},
+                    {"role": "user", "content": wrapped},
+                ],
+            }
+
+    bus = MessageBus()
+    sessions = SessionManager(tmp_path)
+    loop = AgentLoop(bus, EventBus(), FailingPipeline(), sessions)
+    await bus.publish_inbound(InboundMessage(channel="web", sender="u", chat_id="c", content="问题"))
+
+    await loop.run_once()
+
+    row = sessions.store.fetch_session_messages("web:c")[0]
+    assert row["llm_epoch_id"] == "epoch-1"
+    assert row["llm_surface_messages"][-1]["content"] == "[当前消息时间: 2026-09-01T10:00:00+08:00]\n问题"
+    history = await sessions.load_history("web:c")
+    assert history == row["llm_surface_messages"]
+    await sessions.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_persists_and_dispatches_context_retry_trace(
     tmp_path: Path,
 ) -> None:
