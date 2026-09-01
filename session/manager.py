@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
 from session.store import NewMessage, SessionStore
 from tools.base import ToolResult
 from tools.runtime import serialize_tool_result_messages
@@ -185,11 +186,13 @@ class Session:
             for group in message.get("tool_chain") or []:
                 calls = group.get("calls") or []
                 if interrupted:
-                    # 中断轮完整保留页面审计数据，但模型历史只能重放已有终态结果的
-                    # 调用；运行中调用没有匹配的最终 tool result，不能进入协议消息链。
+                    # 中断轮的语义快照保留完整审计数据；模型历史也保留已发出的
+                    # tool-call，并用确定性的占位结果闭合尚未完成的调用。
                     calls = [
                         call for call in calls
-                        if str(call.get("status") or "") in {"ok", "completed", "error"}
+                        if isinstance(call, dict)
+                        and str(call.get("status") or "")
+                        in {"ok", "completed", "error", "running", "interrupted"}
                     ]
                 if not calls:
                     continue
@@ -220,9 +223,16 @@ class Session:
                     assistant_message["reasoning_content"] = reasoning
                 history.append(assistant_message)
                 for call in calls:
+                    interrupted_call = interrupted and str(call.get("status") or "") in {
+                        "running", "interrupted"
+                    }
                     content_blocks = call.get("content_blocks")
-                    tool_content: str | ToolResult = str(call.get("result", ""))
-                    if isinstance(content_blocks, list) and content_blocks:
+                    tool_content: str | ToolResult = (
+                        INTERRUPTED_TOOL_RESULT_CONTENT
+                        if interrupted_call
+                        else str(call.get("result", ""))
+                    )
+                    if not interrupted_call and isinstance(content_blocks, list) and content_blocks:
                         tool_content = ToolResult(
                             text=str(call.get("result", "")),
                             content_blocks=[

@@ -347,11 +347,20 @@ async def test_load_history_keeps_finished_tools_from_interrupted_turn(
                     "id": "call-error", "type": "function",
                     "function": {"name": "shell", "arguments": '{"command": "bad"}'},
                 },
+                {
+                    "id": "call-running", "type": "function",
+                    "function": {"name": "search", "arguments": '{"query": "weather"}'},
+                },
             ],
             "reasoning_content": "先读取文件",
         },
         {"role": "tool", "tool_call_id": "call-ok", "content": "文件内容"},
         {"role": "tool", "tool_call_id": "call-error", "content": "命令失败"},
+        {
+            "role": "tool",
+            "tool_call_id": "call-running",
+            "content": "工具调用在中断前已经发出，但没有记录完整结果；结果未知。请根据工具语义决定是否重试：只有只读或幂等操作可以重试；可能产生副作用时先核验外部状态或询问用户，不要盲目重试。",
+        },
         {"role": "assistant", "content": "[用户已停止生成]"},
     ]
 

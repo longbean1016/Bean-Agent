@@ -374,8 +374,12 @@ async def test_interrupted_turn_is_expanded_into_next_provider_messages(
             "tool_call_id": "interrupted-call",
             "content": "echo:已读取内容",
         }
-        assert history[4]["role"] == "assistant"
-        assert history[4]["content"] == "[用户已停止生成]"
+        # interrupted 只保留在语义 assistant；模型 surface 在已闭合的工具结果后
+        # 直接追加下一轮动态 frame，不把 UI 占位文案插入缓存前缀。
+        assert history[4]["role"] == "user"
+        assert str(history[4]["content"]).startswith(
+            '<system-reminder data-system-context-frame="true">'
+        )
         assert history[-2]["role"] == "user"
         assert str(history[-2]["content"]).startswith(
             '<system-reminder data-system-context-frame="true">'

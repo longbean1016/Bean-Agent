@@ -20,6 +20,8 @@ from agent.event_bus import (
 from agent.message_bus import InboundMessage, MessageBus, OutboundMessage, PipelineResult
 from agent.turn_scheduler import QueuePosition, TurnScheduler
 from session.manager import SessionManager
+from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
+from tools.runtime import serialize_tool_result_messages
 
 logger = logging.getLogger(__name__)
 
@@ -358,16 +360,10 @@ class AgentLoop:
         projection = _model_projection_from_state(state)
         surface = projection.get("llm_surface_messages")
         if isinstance(surface, list) and surface:
-            # 语义中断消息仍需在模型协议中闭合上一轮工具链，否则下一轮会看到
-            # 未配对的 tool result；该标记不进入 UI 之外的普通正文。
-            if not surface or surface[-1] != {
-                "role": "assistant",
-                "content": INTERRUPTED_ASSISTANT_CONTENT,
-            }:
-                surface.append({
-                    "role": "assistant",
-                    "content": INTERRUPTED_ASSISTANT_CONTENT,
-                })
+            # 模型侧沿用参考实现的恢复规则：已经收到的半截 assistant 内容继续保留，
+            # 未完成工具只补确定性的占位结果；前端看到的 interrupted 文案仍只在
+            # 语义 assistant 中保存，不能把第二个 assistant 消息插入模型前缀。
+            _repair_interrupted_surface(surface)
         user = session.add_message(
             "user",
             state.original_user_message,
@@ -447,13 +443,17 @@ class AgentLoop:
 def _model_projection_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     """从失败/中断快照提取隐藏模型投影，不改变语义消息正文。"""
 
-    return _model_projection(
+    projection = _model_projection(
         llm_user_content=snapshot.get("llm_user_content"),
         llm_context_frame=str(snapshot.get("llm_context_frame") or ""),
         llm_message_timestamp=str(snapshot.get("llm_message_timestamp") or ""),
         llm_epoch_id=str(snapshot.get("llm_epoch_id") or ""),
         llm_surface_messages=snapshot.get("llm_surface_messages"),
     )
+    surface = projection.get("llm_surface_messages")
+    if isinstance(surface, list) and surface:
+        _repair_interrupted_surface(surface)
+    return projection
 
 
 def _model_projection_from_state(state: TurnInterruptState) -> dict[str, Any]:
@@ -546,6 +546,58 @@ def interrupted_tool_chain(
         else:
             completed.append({"iteration": 1, "text": "", "calls": interrupted_calls})
     return completed
+
+
+def _repair_interrupted_surface(
+    surface: list[dict[str, Any]],
+) -> None:
+    """闭合中断时已发出的工具调用，保持模型下一轮请求协议合法。"""
+
+    tool_call_names: dict[str, str] = {}
+    tool_call_order: list[str] = []
+    result_ids: set[str] = set()
+    for message in surface:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        if role == "assistant":
+            calls = message.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                call_id = str(call.get("id") or "").strip()
+                if not call_id:
+                    continue
+                if call_id not in tool_call_names:
+                    tool_call_order.append(call_id)
+                tool_call_names[call_id] = (
+                    str(function.get("name") or "")
+                    if isinstance(function, dict)
+                    else ""
+                )
+        elif role == "tool":
+            call_id = str(message.get("tool_call_id") or "").strip()
+            if call_id:
+                result_ids.add(call_id)
+
+    # 只为模型已经收到的 tool-call 补结果；没有 assistant tool-call 的语义快照
+    # 仍走旧历史重建逻辑，不能凭 UI 的 running 工具凭空制造孤立 tool 消息。
+    missing_ids = [
+        call_id
+        for call_id in tool_call_order
+        if call_id not in result_ids
+    ]
+    for call_id in missing_ids:
+        surface.extend(
+            serialize_tool_result_messages(
+                tool_call_id=call_id,
+                content=INTERRUPTED_TOOL_RESULT_CONTENT,
+                tool_name=tool_call_names.get(call_id) or None,
+            )
+        )
 
 
 def _normalize_snapshot_tool_status(value: object) -> str:

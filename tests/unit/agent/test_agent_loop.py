@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.agent_loop import AgentLoop
+from agent.agent_loop import AgentLoop, _repair_interrupted_surface
 from agent.event_bus import EventBus, SessionUpdated, TurnCommitted, TurnStarted
 from agent.message_bus import InboundMessage, MessageBus, PipelineResult
 from agent.config_models import MemoryConfig
@@ -379,13 +379,169 @@ async def test_interrupt_immediately_persists_marker_and_completed_tools(tmp_pat
                 "id": "call-1",
                 "type": "function",
                 "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+            }, {
+                "id": "call-2",
+                "type": "function",
+                "function": {"name": "long_running_tool", "arguments": "{}"},
             }],
             "reasoning_content": "先读取文件",
         },
         {"role": "tool", "tool_call_id": "call-1", "content": "文件内容"},
+        {
+            "role": "tool",
+            "tool_call_id": "call-2",
+            "content": "工具调用在中断前已经发出，但没有记录完整结果；结果未知。请根据工具语义决定是否重试：只有只读或幂等操作可以重试；可能产生副作用时先核验外部状态或询问用户，不要盲目重试。",
+        },
         {"role": "assistant", "content": "[用户已停止生成]"},
     ]
     await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_repairs_model_surface_for_next_question(tmp_path: Path) -> None:
+    class BlockingPipeline:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def process(self, message, *, turn_id):
+            self.started.set()
+            await asyncio.Event().wait()
+
+        def snapshot_interrupt_state(self, turn_id: str):
+            frame = '<system-reminder data-system-context-frame="true">frame</system-reminder>'
+            wrapped = "[当前消息时间: 2026-09-01T10:00:00+08:00]\n问题"
+            return {
+                "llm_context_frame": frame,
+                "llm_user_content": wrapped,
+                "llm_surface_messages": [
+                    {"role": "user", "content": frame},
+                    {"role": "user", "content": wrapped},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "complete-call",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": "{}"},
+                            },
+                            {
+                                "id": "pending-call",
+                                "type": "function",
+                                "function": {"name": "write_file", "arguments": "{}"},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "complete-call",
+                        "content": "完整文件内容",
+                    },
+                ],
+                "tool_chain_partial": [
+                    {
+                        "iteration": 1,
+                        "calls": [
+                            {
+                                "call_id": "complete-call",
+                                "name": "read_file",
+                                "arguments": {},
+                                "result": "完整文件内容",
+                                "status": "ok",
+                            }
+                        ],
+                    }
+                ],
+                "tools": [
+                    {
+                        "call_id": "pending-call",
+                        "name": "write_file",
+                        "arguments": {},
+                        "result_preview": "部分写入",
+                        "status": "running",
+                    }
+                ],
+            }
+
+        def discard_interrupt_snapshot(self, turn_id: str) -> None:
+            pass
+
+    sessions = SessionManager(tmp_path)
+    blocking = BlockingPipeline()
+    loop = AgentLoop(MessageBus(), EventBus(), blocking, sessions)
+    await loop._bus.publish_inbound(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="问题")
+    )
+    running = asyncio.create_task(loop.run_once())
+    await blocking.started.wait()
+
+    result = await loop.request_interrupt("web:c")
+    await running
+
+    rows = sessions.store.fetch_session_messages("web:c")
+    surface = rows[0]["llm_surface_messages"]
+    assert [item.get("role") for item in surface] == [
+        "user", "user", "assistant", "tool", "tool"
+    ]
+    assert surface[3]["content"] == "完整文件内容"
+    assert surface[4]["tool_call_id"] == "pending-call"
+    assert "结果未知" in surface[4]["content"]
+    assert rows[1]["content"] == "[用户已停止生成]"
+
+    history = await sessions.load_history("web:c")
+    assert history == surface
+
+    captured: list[list[dict[str, Any]]] = []
+
+    class ContinuationPipeline:
+        async def process(self, message, *, turn_id):
+            captured.append(await sessions.load_history(message.session_key, None))
+            return PipelineResult("继续回答")
+
+    loop._pipeline = ContinuationPipeline()
+    await loop._bus.publish_inbound(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="继续")
+    )
+    await loop.run_once()
+
+    assert captured == [surface]
+    await sessions.close()
+
+
+def test_repair_interrupted_surface_is_idempotent() -> None:
+    surface = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "pending-call",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        }
+    ]
+    _repair_interrupted_surface(surface)
+    _repair_interrupted_surface(surface)
+
+    assert len(surface) == 2
+    assert surface[1]["tool_call_id"] == "pending-call"
+
+
+def test_interrupted_surface_keeps_partial_assistant_separate_from_semantic_marker() -> None:
+    surface = [
+        {"role": "user", "content": "当前问题"},
+        {"role": "assistant", "content": "已经输出的一半"},
+    ]
+
+    _repair_interrupted_surface(surface)
+
+    # 模型侧继续看到已发送内容；[用户已停止生成] 只由语义 assistant 展示。
+    assert surface == [
+        {"role": "user", "content": "当前问题"},
+        {"role": "assistant", "content": "已经输出的一半"},
+    ]
 
 
 @pytest.mark.asyncio

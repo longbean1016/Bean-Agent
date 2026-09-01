@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
+
 logger = logging.getLogger(__name__)
 
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
@@ -1777,11 +1779,13 @@ class SessionStore:
         for group in message["tool_chain"]:
             calls = group.get("calls") or []
             if interrupted:
-                # 数据库保留全部已发起工具供前端恢复；给模型重建历史时只允许
-                # 具有最终结果的调用，避免产生缺少 tool result 的非法协议链。
+                # 数据库保留全部已发起工具供前端恢复；模型历史也保留调用，
+                # 对没有完整结果的调用补确定性占位，避免协议链断裂。
                 calls = [
                     call for call in calls
-                    if str(call.get("status") or "") in {"ok", "completed", "error"}
+                    if isinstance(call, dict)
+                    and str(call.get("status") or "")
+                    in {"ok", "completed", "error", "running", "interrupted"}
                 ]
             if not calls:
                 continue
@@ -1814,11 +1818,18 @@ class SessionStore:
                 ]
             result.append(assistant_message)
             for call in calls:
+                interrupted_call = interrupted and str(call.get("status") or "") in {
+                    "running", "interrupted"
+                }
                 result.append(
                     {
                         "role": "tool",
                         "tool_call_id": str(call.get("call_id", "")),
-                        "content": str(call.get("result", "")),
+                        "content": (
+                            INTERRUPTED_TOOL_RESULT_CONTENT
+                            if interrupted_call
+                            else str(call.get("result", ""))
+                        ),
                     }
                 )
 
