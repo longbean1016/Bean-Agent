@@ -70,6 +70,7 @@ _MODEL_ONLY_MESSAGE_FIELDS = frozenset({
     "llm_user_content",
     "llm_context_frame",
     "llm_message_timestamp",
+    "llm_epoch_id",
     "llm_surface_messages",
 })
 

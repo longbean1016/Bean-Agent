@@ -126,6 +126,25 @@ def test_writer_persists_structure_only_diagnostics(tmp_path: Path) -> None:
     row = _read_rows(path)[0]
 
     assert row["canonical_hash"] == snapshot.canonical_hash
+    assert row["epoch_id"] == "default"
     assert row["message_count"] == 1
     assert row["common_prefix_messages"] == 0
     assert "固定" not in json.dumps(row, ensure_ascii=False)
+
+
+def test_header_change_starts_a_new_cache_epoch() -> None:
+    diagnostics = PromptCacheDiagnostics()
+    first = diagnostics.observe(
+        "web:a",
+        [{"role": "system", "content": "固定"}],
+        header={"provider": "fake", "model": "m1", "system": "固定"},
+    )
+    second = diagnostics.observe(
+        "web:a",
+        [{"role": "system", "content": "固定"}, {"role": "user", "content": "新"}],
+        header={"provider": "fake", "model": "m2", "system": "固定"},
+    )
+
+    assert first.epoch_id != second.epoch_id
+    assert second.common_prefix_messages == 0
+    assert second.header_hash

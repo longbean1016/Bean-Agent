@@ -210,6 +210,7 @@ class Pipeline:
         thinking_parts: list[str] = []
         last_base_messages: list[dict[str, Any]] = []
         forced_compaction_attempted = False
+        llm_epoch_id = ""
 
         async def compact_with_status(*, estimated_tokens: int, force: bool) -> bool:
             """等待当前 Turn 所需的 summary，同时把压缩阶段明确广播给前端。"""
@@ -453,6 +454,12 @@ class Pipeline:
                             message.session_key,
                             sent_messages,
                             sent_tools,
+                            header=_request_header_identity(
+                                self._provider,
+                                sent_messages,
+                                sent_tools,
+                                tool_choice="auto",
+                            ),
                         )
 
                     async def on_usage(usage: ProviderUsage) -> None:
@@ -480,6 +487,12 @@ class Pipeline:
                             message.session_key,
                             model_messages,
                             tool_schemas,
+                            header=_request_header_identity(
+                                self._provider,
+                                model_messages,
+                                tool_schemas,
+                                tool_choice="auto",
+                            ),
                         )
                     provider_pressure = _provider_pressure_tokens(response)
                     if provider_pressure is not None:
@@ -541,6 +554,7 @@ class Pipeline:
 
         for iteration in range(1, self._max_iterations + 1):
             response, request_diagnostic = await chat_with_context_retry()
+            llm_epoch_id = request_diagnostic.epoch_id
             append_turn_thinking(response.thinking)
             await self._record_session_usage(
                 message.session_key,
@@ -601,6 +615,13 @@ class Pipeline:
                             message.session_key,
                             sent_messages,
                             sent_tools,
+                            header=_request_header_identity(
+                                self._provider,
+                                sent_messages,
+                                sent_tools,
+                                tool_choice="none",
+                                max_tokens=_SUMMARY_MAX_TOKENS,
+                            ),
                         )
 
                     retry = await self._provider.chat(
@@ -616,6 +637,13 @@ class Pipeline:
                             message.session_key,
                             [*last_base_messages, *react_messages],
                             [],
+                            header=_request_header_identity(
+                                self._provider,
+                                [*last_base_messages, *react_messages],
+                                [],
+                                tool_choice="none",
+                                max_tokens=_SUMMARY_MAX_TOKENS,
+                            ),
                         )
                     if retry.content:
                         response = retry
@@ -644,6 +672,7 @@ class Pipeline:
                     llm_user_content=deepcopy(llm_user_content),
                     llm_context_frame=llm_context_frame,
                     llm_message_timestamp=message_timestamp.isoformat(),
+                    llm_epoch_id=llm_epoch_id,
                     llm_surface_messages=deepcopy(llm_surface_messages),
                 )
 
@@ -761,6 +790,7 @@ class Pipeline:
             llm_user_content=deepcopy(llm_user_content),
             llm_context_frame=llm_context_frame,
             llm_message_timestamp=message_timestamp.isoformat(),
+            llm_epoch_id=llm_epoch_id,
             llm_surface_messages=deepcopy(llm_surface_messages),
         )
 
@@ -962,6 +992,34 @@ def _provider_pressure_tokens(response: LLMResponse) -> int | None:
     if value is None:
         return None
     return max(0, int(value))
+
+
+def _request_header_identity(
+    provider: object,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    *,
+    tool_choice: str,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    """提取影响缓存域的 header；正文仍只通过消息哈希诊断。"""
+
+    system = messages[0].get("content") if messages and messages[0].get("role") == "system" else ""
+    configured_max_tokens = max_tokens
+    if configured_max_tokens is None:
+        configured_max_tokens = getattr(provider, "max_tokens", None)
+    extra_body = getattr(provider, "_extra_body", {})
+    return {
+        "provider": str(getattr(provider, "provider_name", "") or ""),
+        "model": str(getattr(provider, "model", "") or ""),
+        "system": system,
+        "tools": tools,
+        "options": {
+            "max_tokens": configured_max_tokens,
+            "tool_choice": tool_choice,
+            "extra_body": extra_body if isinstance(extra_body, dict) else {},
+        },
+    }
 
 
 def _context_as_of_seq(message: InboundMessage) -> int | None:

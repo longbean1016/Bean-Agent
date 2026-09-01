@@ -220,6 +220,9 @@ class AgentLoop:
         )
         if llm_message_timestamp:
             user_projection["llm_message_timestamp"] = llm_message_timestamp
+        llm_epoch_id = str(getattr(result, "llm_epoch_id", "") or "")
+        if llm_epoch_id:
+            user_projection["llm_epoch_id"] = llm_epoch_id
         llm_surface_messages = getattr(result, "llm_surface_messages", None)
         if isinstance(llm_surface_messages, list) and llm_surface_messages:
             user_projection["llm_surface_messages"] = deepcopy(

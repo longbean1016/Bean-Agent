@@ -58,6 +58,7 @@ class PipelineResult:
     llm_user_content: object | None = None
     llm_context_frame: str = ""
     llm_message_timestamp: str = ""
+    llm_epoch_id: str = ""
     llm_surface_messages: list[dict[str, Any]] = field(default_factory=list)
 
 

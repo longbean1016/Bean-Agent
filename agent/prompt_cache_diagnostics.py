@@ -32,11 +32,19 @@ def canonical_payload_hash(
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def canonical_header_hash(header: object) -> str:
+    """返回请求 header/config 的 SHA-256 摘要，不把明文写入诊断。"""
+
+    return hashlib.sha256(canonical_json(header).encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class PromptCacheRequestDiagnostics:
     """一次实际模型请求的结构诊断，不包含正文或工具参数。"""
 
     canonical_hash: str
+    header_hash: str
+    epoch_id: str
     message_count: int
     tool_count: int
     estimated_input_tokens: int
@@ -48,6 +56,8 @@ class PromptCacheRequestDiagnostics:
 
         return {
             "canonical_hash": self.canonical_hash,
+            "header_hash": self.header_hash,
+            "epoch_id": self.epoch_id,
             "message_count": self.message_count,
             "tool_count": self.tool_count,
             "estimated_input_tokens": self.estimated_input_tokens,
@@ -60,6 +70,7 @@ class PromptCacheRequestDiagnostics:
 class _RequestFingerprint:
     message_fingerprints: tuple[str, ...]
     message_count: int
+    header_hash: str
 
 
 class PromptCacheDiagnostics:
@@ -73,14 +84,17 @@ class PromptCacheDiagnostics:
         session_key: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        header: object | None = None,
     ) -> PromptCacheRequestDiagnostics:
         """记录一次请求并返回与该会话上一次请求的共同前缀。"""
 
         key = str(session_key)
         message_fingerprints = tuple(canonical_json(item) for item in messages)
+        header_hash = canonical_header_hash(header) if header is not None else ""
+        epoch_id = header_hash[:16] if header_hash else "default"
         previous = self._previous.get(key)
         common = 0
-        if previous is not None:
+        if previous is not None and previous.header_hash == header_hash:
             limit = min(previous.message_count, len(message_fingerprints))
             # 一旦某条消息不同，后面的消息不能再作为连续前缀复用。
             while common < limit and (
@@ -91,6 +105,8 @@ class PromptCacheDiagnostics:
         common_prefix_tokens = estimate_tokens(list(messages[:common])) + common * 4
         diagnostics = PromptCacheRequestDiagnostics(
             canonical_hash=canonical_payload_hash(messages, tools),
+            header_hash=header_hash,
+            epoch_id=epoch_id,
             message_count=len(messages),
             tool_count=len(tools or []),
             estimated_input_tokens=estimate_payload_tokens(messages, tools),
@@ -100,6 +116,7 @@ class PromptCacheDiagnostics:
         self._previous[key] = _RequestFingerprint(
             message_fingerprints=message_fingerprints,
             message_count=len(message_fingerprints),
+            header_hash=header_hash,
         )
         return diagnostics
 
@@ -113,5 +130,6 @@ __all__ = [
     "PromptCacheDiagnostics",
     "PromptCacheRequestDiagnostics",
     "canonical_json",
+    "canonical_header_hash",
     "canonical_payload_hash",
 ]
