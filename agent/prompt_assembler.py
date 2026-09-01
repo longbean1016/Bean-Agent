@@ -8,7 +8,18 @@ from zoneinfo import ZoneInfo
 
 from agent.prompt_block import PromptSectionMeta, PromptSectionRender, SystemPromptBuilder, TurnContext
 
-_FRAME_SECTIONS = {"deferred_tools_hint", "active_tools", "active_skills", "retrieved_memory"}
+# 这些区块可能随记忆、会话或工具状态变化，必须作为本轮 frame 追加并持久化；
+# system 只保留跨请求稳定的规则和 Skill 目录，避免变化内容截断缓存前缀。
+_FRAME_SECTIONS = {
+    "bean",
+    "self_model",
+    "long_term_memory",
+    "session_context",
+    "deferred_tools_hint",
+    "active_tools",
+    "active_skills",
+    "retrieved_memory",
+}
 _FRAME_START = '<system-reminder data-system-context-frame="true">'
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 

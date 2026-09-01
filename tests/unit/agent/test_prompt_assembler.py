@@ -40,13 +40,17 @@ def test_static_prefix_cache_and_dynamic_context_frame_are_separated() -> None:
 
     assert first.messages[0]["role"] == "system"
     assert first.messages[0]["content"] == second.messages[0]["content"]
-    assert "你是 BeanAgent" in str(first.messages[0]["content"])
+    assert "你是 BeanAgent" not in str(first.messages[0]["content"])
     assert "会话近期摘要" not in str(first.messages[0]["content"])
     assert {item.name for item in second.debug_breakdown if item.cache_hit} == {
         "behavior_rules"
     }
     reminder = first.messages[-2]["content"]
     assert reminder.startswith('<system-reminder data-system-context-frame="true">')
+    assert "你是 BeanAgent" in str(reminder)
+    assert "保持直接" in str(reminder)
+    assert "用户是开发者" in str(reminder)
+    assert "## 会话环境" in str(reminder)
     assert "用户偏好中文" in reminder
     assert "项目开发" not in reminder
     assert "重复消息" not in reminder
