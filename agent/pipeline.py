@@ -33,6 +33,10 @@ from agent.event_bus import (
 from agent.message_bus import InboundMessage, PipelineResult
 from agent.prompt_assembler import PromptAssembler
 from agent.prompt_block import TurnContext
+from agent.prompt_cache_diagnostics import (
+    PromptCacheDiagnostics,
+    PromptCacheRequestDiagnostics,
+)
 from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import ContextLengthError, LLMResponse, ProviderUsage
 from agent.skills import SkillsLoader, collect_skill_mentions
@@ -98,6 +102,8 @@ class Pipeline:
         self._memory = memory
         self._skills = skills
         self._prompt_cache_log = prompt_cache_log
+        # 诊断锚点按会话隔离；它只保存消息指纹，不保存 Prompt 正文。
+        self._prompt_cache_diagnostics = PromptCacheDiagnostics()
         self._history_loader = history_loader
         self._context_compactor = context_compactor
         self._context_usage_loader = context_usage_loader
@@ -266,7 +272,7 @@ class Pipeline:
                 thinking_delta=str(delta.get("thinking_delta") or ""),
             ))
 
-        async def chat_with_context_retry() -> LLMResponse:
+        async def chat_with_context_retry() -> tuple[LLMResponse, PromptCacheRequestDiagnostics]:
             nonlocal last_base_messages, history, forced_compaction_attempted, measurement
             nonlocal llm_user_content, llm_context_frame
             while True:
@@ -436,6 +442,19 @@ class Pipeline:
                         # 不能只替换已生成的 history 列表，否则 system 顺序和 cache key 会漂移。
                         continue
                 try:
+                    request_diagnostic: PromptCacheRequestDiagnostics | None = None
+
+                    def on_request(
+                        sent_messages: list[dict[str, Any]],
+                        sent_tools: list[dict[str, Any]],
+                    ) -> None:
+                        nonlocal request_diagnostic
+                        request_diagnostic = self._prompt_cache_diagnostics.observe(
+                            message.session_key,
+                            sent_messages,
+                            sent_tools,
+                        )
+
                     async def on_usage(usage: ProviderUsage) -> None:
                         # 同一 iteration 的所有 usage 样本都写入同一幂等键；存储层
                         # 用最终样本覆盖早到样本，流中断时也保留已经收到的事实。
@@ -452,7 +471,16 @@ class Pipeline:
                         tool_choice="auto",
                         on_content_delta=on_delta,
                         on_usage=on_usage,
+                        on_request=on_request,
                     )
+                    if request_diagnostic is None:
+                        # 测试 Provider 或旧适配器可能忽略诊断回调；仍以送入
+                        # 适配器的完整数组建立基线，但不伪称已捕获最终规范化值。
+                        request_diagnostic = self._prompt_cache_diagnostics.observe(
+                            message.session_key,
+                            model_messages,
+                            tool_schemas,
+                        )
                     provider_pressure = _provider_pressure_tokens(response)
                     if provider_pressure is not None:
                         measurement = {
@@ -489,7 +517,7 @@ class Pipeline:
                         ))
                     context_retry["history_messages"] = len(history_for_attempt)
                     context_retry["disabled_sections"] = sorted(disabled_sections)
-                    return response
+                    return response, request_diagnostic
                 except ContextLengthError:
                     if (
                         self._context_compactor is not None
@@ -512,7 +540,7 @@ class Pipeline:
                     raise
 
         for iteration in range(1, self._max_iterations + 1):
-            response = await chat_with_context_retry()
+            response, request_diagnostic = await chat_with_context_retry()
             append_turn_thinking(response.thinking)
             await self._record_session_usage(
                 message.session_key,
@@ -534,6 +562,7 @@ class Pipeline:
                         iteration=iteration,
                         prompt_tokens=response.cache_prompt_tokens,
                         hit_tokens=response.cache_hit_tokens,
+                        diagnostics=request_diagnostic,
                     )
                 except OSError as error:
                     # 缓存观测是辅助能力，磁盘只读或空间不足不能中断用户对话。
@@ -561,11 +590,33 @@ class Pipeline:
                     }
                     react_messages.append(nudge_message)
                     llm_surface_messages.append(deepcopy(nudge_message))
+                    retry_diagnostic: PromptCacheRequestDiagnostics | None = None
+
+                    def on_retry_request(
+                        sent_messages: list[dict[str, Any]],
+                        sent_tools: list[dict[str, Any]],
+                    ) -> None:
+                        nonlocal retry_diagnostic
+                        retry_diagnostic = self._prompt_cache_diagnostics.observe(
+                            message.session_key,
+                            sent_messages,
+                            sent_tools,
+                        )
+
                     retry = await self._provider.chat(
                         [*last_base_messages, *react_messages],
                         tools=[],
                         tool_choice="none",
-)
+                        on_request=on_retry_request,
+                    )
+                    if retry_diagnostic is not None:
+                        request_diagnostic = retry_diagnostic
+                    else:
+                        request_diagnostic = self._prompt_cache_diagnostics.observe(
+                            message.session_key,
+                            [*last_base_messages, *react_messages],
+                            [],
+                        )
                     if retry.content:
                         response = retry
                         append_turn_thinking(response.thinking)

@@ -370,6 +370,10 @@ async def test_pipeline_persists_each_provider_cache_result_for_session(
         (1, 40),
         (2, 80),
     ]
+    assert all(len(str(row["canonical_hash"])) == 64 for row in rows)
+    assert rows[0]["common_prefix_messages"] == 0
+    assert rows[1]["common_prefix_messages"] >= 1
+    assert all("测试缓存日志" not in json.dumps(row, ensure_ascii=False) for row in rows)
 
 
 @pytest.mark.asyncio

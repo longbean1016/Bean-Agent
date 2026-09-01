@@ -37,6 +37,7 @@ _PAYLOAD_SNAPSHOT_SEQ = itertools.count(1)
 StreamDelta = dict[str, str]
 StreamCallback = Callable[[StreamDelta], Awaitable[None]]
 UsageCallback = Callable[["ProviderUsage"], Awaitable[None]]
+RequestObserver = Callable[[list[dict[str, Any]], list[dict[str, Any]]], None]
 
 # 不同 OpenAI 兼容服务返回的错误类型并不统一，因此上下文超限不能只看
 # status_code。这里集中维护已知文本特征，后续 Pipeline 可据此触发历史裁剪。
@@ -436,6 +437,7 @@ class LLMProvider:
         disable_thinking: bool = False,
         on_content_delta: StreamCallback | None = None,
         on_usage: UsageCallback | None = None,
+        on_request: RequestObserver | None = None,
     ) -> LLMResponse:
         """调用模型；传入增量回调时使用流式接口，否则返回普通响应。
 
@@ -484,6 +486,18 @@ class LLMProvider:
             merged_extra_body,
             disable_thinking=self._force_disable_thinking or disable_thinking,
         )
+        if on_request is not None:
+            try:
+                # 观察点位于所有 system 合并和供应商消息规范化之后，记录的才是
+                # 实际发送给 Provider 的模型输入，而不是上游临时对象。
+                on_request(
+                    list(request["messages"]),
+                    list(request.get("tools") or []),
+                )
+            except Exception as error:
+                # 诊断回调不能改变模型请求结果；调用方会在返回后使用逻辑请求
+                # 作为降级观测值，避免第三方诊断插件阻断对话。
+                logger.warning("LLM 请求诊断回调失败 error=%s", error)
 
         if on_content_delta is not None:
             return await self._chat_streaming(request, on_content_delta, strategy, on_usage)

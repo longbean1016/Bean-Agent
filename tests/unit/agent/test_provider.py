@@ -323,6 +323,37 @@ async def test_leading_system_messages_are_merged() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_request_observer_sees_normalized_provider_messages() -> None:
+    response = _ns(
+        choices=[_ns(message=_ns(content="完成", tool_calls=[]))],
+        usage=None,
+    )
+    client = _Client(response)
+    provider = _provider(client, provider="openai", model="gpt-test")
+    observed: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+
+    await provider.chat(
+        [
+            {"role": "system", "content": "规则一"},
+            {"role": "system", "content": "规则二"},
+            {"role": "user", "content": "问题"},
+        ],
+        on_request=lambda messages, tools: observed.append((messages, tools)),
+    )
+
+    assert observed == [
+        (
+            [
+                {"role": "system", "content": "规则一\n\n规则二"},
+                {"role": "user", "content": "问题"},
+            ],
+            [],
+        )
+    ]
+    assert "on_request" not in client.completions.calls[-1]
+
+
 def test_base_url_removes_completion_endpoint_suffix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
