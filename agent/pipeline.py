@@ -190,6 +190,7 @@ class Pipeline:
         # 作为隐藏投影落库，下一轮直接重放而不是重新生成时间戳或媒体 block。
         llm_user_content: object | None = None
         llm_context_frame = ""
+        llm_surface_messages: list[dict[str, Any]] = []
         context_retry: dict[str, Any] = {
             "attempts": [],
             "selected_plan": "token_gate",
@@ -297,6 +298,17 @@ class Pipeline:
                         ):
                             llm_context_frame = content
                             break
+                    if not llm_surface_messages:
+                        if llm_context_frame:
+                            llm_surface_messages.append({
+                                "role": "user",
+                                "content": llm_context_frame,
+                            })
+                        if llm_user_content is not None:
+                            llm_surface_messages.append({
+                                "role": "user",
+                                "content": deepcopy(llm_user_content),
+                            })
                 tool_schemas = self._tools.get_schemas(
                     visible_names=tool_view.visible_names,
                     visible_order=tool_view.visible_order,
@@ -540,11 +552,15 @@ class Pipeline:
                         message.session_key,
                         iteration,
                     )
-                    react_messages.append({"role": "assistant", "content": ""})
-                    react_messages.append({
+                    empty_assistant = {"role": "assistant", "content": ""}
+                    react_messages.append(empty_assistant)
+                    llm_surface_messages.append(deepcopy(empty_assistant))
+                    nudge_message = {
                         "role": "user",
                         "content": "你刚才只输出了思考过程，没有给出正式回复。请直接回复用户，不要重复思考。",
-                    })
+                    }
+                    react_messages.append(nudge_message)
+                    llm_surface_messages.append(deepcopy(nudge_message))
                     retry = await self._provider.chat(
                         [*last_base_messages, *react_messages],
                         tools=[],
@@ -556,6 +572,14 @@ class Pipeline:
                         content = str(retry.content or "").strip()
                     else:
                         logger.warning("空回复重试仍为空: session=%s", message.session_key)
+                final_model_message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": response.content or "",
+                }
+                final_model_message.update(dict(response.provider_fields))
+                if response.thinking and "reasoning_content" not in final_model_message:
+                    final_model_message["reasoning_content"] = response.thinking
+                llm_surface_messages.append(final_model_message)
                 return PipelineResult(
                     content=str(content or ""),
                     thinking=merged_turn_thinking(),
@@ -569,6 +593,7 @@ class Pipeline:
                     llm_user_content=deepcopy(llm_user_content),
                     llm_context_frame=llm_context_frame,
                     llm_message_timestamp=message_timestamp.isoformat(),
+                    llm_surface_messages=deepcopy(llm_surface_messages),
                 )
 
             # 工具调用 assistant 消息必须原样进入下一轮，尤其要保留 DeepSeek 的
@@ -583,11 +608,16 @@ class Pipeline:
                 **response.provider_fields,
             }
             react_messages.append(assistant_message)
+            llm_surface_messages.append(deepcopy(assistant_message))
             group: dict[str, Any] = {"iteration": iteration, "text": response.content or "", "calls": [], "provider_fields": dict(response.provider_fields)}
             for call in response.tool_calls:
                 if call.name not in tool_view.visible_names:
                     result = normalize_tool_result(f"工具 '{call.name}' 未被当前执行上下文授权")
+                    before_tool_messages = len(react_messages)
                     append_tool_result(react_messages, tool_call_id=call.id, content=result, tool_name=call.name)
+                    llm_surface_messages.extend(
+                        deepcopy(react_messages[before_tool_messages:])
+                    )
                     group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "content_blocks": deepcopy(result.content_blocks), "status": "error"})
                     continue
                 if not suppress_stream:
@@ -630,7 +660,11 @@ class Pipeline:
                         # 搜索结果异常只表示本次没有解锁，原工具结果仍完整交给模型。
                         logger.warning("tool_search 返回了无法解析的结果")
                 status = "error" if result.text.startswith("工具执行出错:") or result.text.startswith("工具 '") else "ok"
+                before_tool_messages = len(react_messages)
                 append_tool_result(react_messages, tool_call_id=call.id, content=result, tool_name=call.name)
+                llm_surface_messages.extend(
+                    deepcopy(react_messages[before_tool_messages:])
+                )
                 if not suppress_stream:
                     preview = result.preview()[:500]
                     # 完成态同样先落快照再发事件，避免刷新窗口里看到旧的 running 状态。
@@ -676,6 +710,7 @@ class Pipeline:
             llm_user_content=deepcopy(llm_user_content),
             llm_context_frame=llm_context_frame,
             llm_message_timestamp=message_timestamp.isoformat(),
+            llm_surface_messages=deepcopy(llm_surface_messages),
         )
 
     def snapshot_interrupt_state(self, turn_id: str) -> dict[str, Any]:

@@ -66,6 +66,22 @@ _TEXT_SUFFIXES = {
 _IMAGE_FORMATS = {"PNG", "JPEG", "GIF", "WEBP", "BMP"}
 _MAX_TEXT_UPLOAD = 2 * 1024 * 1024
 _MAX_IMAGE_UPLOAD = 10 * 1024 * 1024
+_MODEL_ONLY_MESSAGE_FIELDS = frozenset({
+    "llm_user_content",
+    "llm_context_frame",
+    "llm_message_timestamp",
+    "llm_surface_messages",
+})
+
+
+def _public_chat_message(message: dict[str, Any]) -> dict[str, Any]:
+    """聊天接口只返回语义消息，隐藏模型侧 Prompt 投影。"""
+
+    return {
+        key: value
+        for key, value in message.items()
+        if key not in _MODEL_ONLY_MESSAGE_FIELDS
+    }
 
 
 class MemoryMaintenanceLoop:
@@ -453,6 +469,7 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             limit=limit,
         )
         items = _append_running_snapshot(items, application.core.agent_loop.get_active_turn_snapshot(session_key))
+        items = [_public_chat_message(item) for item in items]
         return {
             "items": items,
             "total": total,
@@ -472,7 +489,7 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             limit=limit,
         )
         return {
-            "items": items,
+            "items": [_public_chat_message(item) for item in items],
             "has_more": has_more,
             "next_before_seq": next_before_seq,
         }
@@ -489,7 +506,7 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             limit=limit,
         )
         return {
-            "items": items,
+            "items": [_public_chat_message(item) for item in items],
             "has_before": has_before,
             "has_after": has_after,
             "next_before_seq": next_before_seq,

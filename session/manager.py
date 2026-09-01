@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -144,9 +145,25 @@ class Session:
             messages = self.messages[-max_messages:]
 
         history: list[dict[str, Any]] = []
+        projected_turn_ids: set[str] = set()
         for message in messages:
             role = message.get("role")
             if role == "user":
+                surface_messages = message.get("llm_surface_messages")
+                if isinstance(surface_messages, list) and surface_messages:
+                    history.extend(
+                        deepcopy(
+                            [
+                                item
+                                for item in surface_messages
+                                if isinstance(item, dict)
+                            ]
+                        )
+                    )
+                    turn_id = str(message.get("turn_id") or "")
+                    if turn_id:
+                        projected_turn_ids.add(turn_id)
+                    continue
                 content: object = message.get("llm_user_content")
                 if content is None:
                     text = str(message.get("content", ""))
@@ -158,6 +175,10 @@ class Session:
                 history.append({"role": "user", "content": content})
                 continue
             if role != "assistant":
+                continue
+            if str(message.get("turn_id") or "") in projected_turn_ids:
+                # provider surface 已包含该 Turn 的 assistant/tool 消息；语义
+                # assistant 只供 UI 和记忆使用，不能再次展开到模型历史。
                 continue
 
             interrupted = message.get("status") == "interrupted"

@@ -40,7 +40,16 @@ def _client(tmp_path: Path) -> tuple[TestClient, object]:
 def test_chat_api_lists_sessions_and_messages(tmp_path: Path) -> None:
     client, runtime = _client(tmp_path)
     runtime.sessions.store.add_message(
-        NewMessage(session_key="web:chat-1", role="user", content="第一问")
+        NewMessage(
+            session_key="web:chat-1",
+            role="user",
+            content="第一问",
+            extra={
+                "llm_user_content": "hidden",
+                "llm_context_frame": "hidden",
+                "llm_surface_messages": [{"role": "user", "content": "hidden"}],
+            },
+        )
     )
     runtime.sessions.store.add_message(
         NewMessage(session_key="web:chat-1", role="assistant", content="第一答")
@@ -53,6 +62,7 @@ def test_chat_api_lists_sessions_and_messages(tmp_path: Path) -> None:
     assert sessions["total"] == 1
     assert sessions["items"][0]["key"] == "web:chat-1"
     assert [item["content"] for item in messages["items"]] == ["第一问", "第一答"]
+    assert not any(key.startswith("llm_") for key in messages["items"][0])
 
 
 def test_chat_api_lists_titled_running_session_without_messages(tmp_path: Path) -> None:

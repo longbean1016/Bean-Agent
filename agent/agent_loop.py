@@ -220,6 +220,11 @@ class AgentLoop:
         )
         if llm_message_timestamp:
             user_projection["llm_message_timestamp"] = llm_message_timestamp
+        llm_surface_messages = getattr(result, "llm_surface_messages", None)
+        if isinstance(llm_surface_messages, list) and llm_surface_messages:
+            user_projection["llm_surface_messages"] = deepcopy(
+                [item for item in llm_surface_messages if isinstance(item, dict)]
+            )
         user = session.add_message(
             "user",
             message.content,
