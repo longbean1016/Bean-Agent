@@ -188,7 +188,7 @@ class Pipeline:
         active_skills = collect_skill_mentions(message.content, available_skills)
         deferred_hint = _build_deferred_tools_hint(self._tools, tool_view.visible_names)
         checkpoint_summary = ""
-        if self._memory and not skip_memory:
+        if self._memory and not skip_memory and self._surface_loader is None:
             read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
             if callable(read_checkpoint):
                 checkpoint_summary = str(read_checkpoint(message.session_key) or "")
@@ -540,7 +540,7 @@ class Pipeline:
                             else await self._history_loader(message.session_key, None)
                         )
                         read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
-                        if callable(read_checkpoint):
+                        if callable(read_checkpoint) and self._surface_loader is None:
                             context.checkpoint_summary = str(
                                 read_checkpoint(message.session_key) or ""
                             )
@@ -658,7 +658,7 @@ class Pipeline:
                                 else await self._history_loader(message.session_key, None)
                             )
                             read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
-                            if callable(read_checkpoint):
+                            if callable(read_checkpoint) and self._surface_loader is None:
                                 context.checkpoint_summary = str(
                                     read_checkpoint(message.session_key) or ""
                                 )

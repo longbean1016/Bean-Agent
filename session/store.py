@@ -183,6 +183,17 @@ class SessionStore:
 
         return self._fetch_surface_events_sync(session_key, epoch_id=epoch_id)
 
+    def load_surface_events(
+        self,
+        session_key: str,
+    ) -> list[dict[str, Any]]:
+        """读取当前折叠后的 surface 节点及其序号。"""
+
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            return [dict(item) for item in self._surface_projection_events_locked(key)]
+
     def replace_surface(self, event: NewSurfaceEvent) -> dict[str, Any]:
         """追加一条带明确起止边界的 surface 替换事件。"""
 

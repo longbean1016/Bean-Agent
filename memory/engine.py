@@ -51,7 +51,7 @@ from session.compaction import (
     compaction_scope_id,
     compaction_source_ref,
 )
-from session.store import SessionCompaction, SessionCompactionPrepare
+from session.store import NewSurfaceEvent, SessionCompaction, SessionCompactionPrepare
 
 if TYPE_CHECKING:
     from agent.event_bus import EventBus
@@ -452,6 +452,7 @@ class MemoryEngine:
         # 这里才推进 active generation；之后的记忆副作用失败不能让原文重新回到
         # 模型窗口，也不能生成另一代重复覆盖同一 source plan。
         self._sessions.commit_compaction(checkpoint)
+        self._replace_provider_surface(checkpoint)
         try:
             # submit 只把 durable job 放入内存队列，不等待 LLM/Embedding/Markdown。
             await self._compaction_worker.submit(job_payload)
@@ -459,6 +460,56 @@ class MemoryEngine:
             # checkpoint 已 durable commit；outbox 仍可在启动恢复阶段重放。
             logger.exception("checkpoint outbox 调度失败: source_ref=%s", source_ref)
         return True
+
+    def _replace_provider_surface(self, checkpoint: SessionCompaction) -> None:
+        """把语义压缩映射成模型侧 surface 的单个 DSH 风格 replace 节点。"""
+
+        nodes = self._sessions.load_surface_events(checkpoint.session_key)
+        if not nodes:
+            # 没有模型侧 surface 时只可能是非 Provider 的历史维护调用；语义
+            # checkpoint 仍按原有逻辑提交，不凭空制造模型消息。
+            return
+        selected_turns = {
+            str(item.get("turn_id") or "")
+            for item in checkpoint.selected_source_messages
+            if str(item.get("turn_id") or "")
+        }
+        selected = [
+            node for node in nodes
+            if str(node.get("turn_id") or "") in selected_turns
+        ]
+        if not selected:
+            return
+        first_index = next(index for index, node in enumerate(nodes) if node is selected[0])
+        last_index = max(index for index, node in enumerate(nodes) if node is selected[-1])
+        shadowed = nodes[first_index:last_index + 1]
+        if not all(
+            str(node.get("turn_id") or "") in selected_turns
+            for node in shadowed
+        ):
+            raise ValueError("compaction surface replace 不能跨越未选中的 Turn")
+        start = int(shadowed[0]["surface_seq"])
+        end = int(shadowed[-1]["surface_seq"])
+        epoch_id = str(shadowed[0].get("epoch_id") or "default")
+        content = (
+            "<session-context-compaction>\n"
+            "以下是已归档历史的上下文摘要；与当前用户原文冲突时以原文为准。\n"
+            f"{checkpoint.summary.strip()}\n"
+            "</session-context-compaction>"
+        )
+        self._sessions.append_surface(NewSurfaceEvent(
+            session_key=checkpoint.session_key,
+            epoch_id=epoch_id,
+            turn_id=f"compaction:{checkpoint.generation}",
+            iteration=0,
+            role="user",
+            content={"role": "user", "content": content},
+            source_kind="compaction_summary",
+            operation_key=f"compaction:{checkpoint.source_ref}",
+            surface_op="replace",
+            replace_start=start,
+            replace_end=end,
+        ))
 
     async def _summarize_checkpoint(self, previous_summary: str, conversation: str) -> str:
         """用上一代 summary + 本轮归档 source 生成稳定 checkpoint 摘要。"""

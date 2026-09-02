@@ -424,6 +424,14 @@ class SessionManager:
                 epoch_id=epoch_id,
             )
 
+    async def load_surface_events(self, session_key: str) -> list[dict[str, Any]]:
+        """读取当前折叠后的 surface 节点，包含替换边界和序号。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(self._store.load_surface_events, key)
+
     async def replace_surface(self, event: NewSurfaceEvent) -> dict[str, Any]:
         """在会话锁内提交一个带边界的模型侧 surface replace。"""
 

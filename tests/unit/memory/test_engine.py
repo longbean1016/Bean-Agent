@@ -17,7 +17,7 @@ from memory.contracts import (
 )
 from memory.engine import MemoryEngine
 from memory.implicit_extractor import ImplicitMemoryDraft
-from session.store import NewMessage, SessionStore
+from session.store import NewMessage, NewSurfaceEvent, SessionStore
 
 
 class Embedder:
@@ -573,6 +573,55 @@ async def test_compact_for_context_commits_generation_and_keeps_complete_tail(tm
 
     assert "消息 0" not in " ".join(str(item.get("content") or "") for item in history)
     assert "消息 7" in " ".join(str(item.get("content") or "") for item in history)
+
+
+@pytest.mark.asyncio
+async def test_compact_for_context_replaces_provider_surface_only(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    for index in range(8):
+        turn_id = f"t{index // 2}"
+        role = "user" if index % 2 == 0 else "assistant"
+        sessions.add_message(
+            NewMessage(
+                session_key="web:c",
+                role=role,
+                content=f"消息 {index}",
+                turn_id=turn_id,
+            )
+        )
+        sessions.append_surface(NewSurfaceEvent(
+            session_key="web:c",
+            epoch_id="epoch-a",
+            turn_id=turn_id,
+            iteration=0,
+            role=role,
+            content={"role": role, "content": f"消息 {index}"},
+            source_kind=role,
+            operation_key=f"{turn_id}:{index}",
+        ))
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(
+        tmp_path,
+        Embedder(),
+        BudgetProvider(),
+        sessions,
+        config=config,
+        consolidation_extractor=Extractor(),
+        implicit_extractor=EmptyImplicitExtractor(),
+    )
+    try:
+        assert await engine.compact_for_context("web:c", estimated_tokens=35)
+        nodes = sessions.load_surface_events("web:c")
+        assert len(nodes) < 8
+        assert nodes[0]["surface_op"] == "replace"
+        assert nodes[0]["source_kind"] == "compaction_summary"
+        assert "消息 0" not in str(nodes[0]["message"]["content"])
+        # Semantic history remains the source for UI and memory bookkeeping.
+        assert len(sessions.fetch_session_messages("web:c")) == 8
+    finally:
+        await engine.close()
+        sessions.close()
 
 
 @pytest.mark.asyncio
