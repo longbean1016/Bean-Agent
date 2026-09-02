@@ -322,6 +322,19 @@ class AgentLoop:
                 turn_id,
             )
         projection = _model_projection_from_snapshot(snapshot or {})
+        partial_tool_chain = snapshot.get("tool_chain_partial") if isinstance(snapshot, dict) else []
+        live_tools = snapshot.get("tools") if isinstance(snapshot, dict) else []
+        if not isinstance(partial_tool_chain, list):
+            partial_tool_chain = []
+        if not isinstance(live_tools, list):
+            live_tools = []
+        tool_chain = interrupted_tool_chain(partial_tool_chain, live_tools)
+        tools_used = list(dict.fromkeys(
+            str(call.get("name") or "")
+            for group in tool_chain
+            for call in group.get("calls", [])
+            if isinstance(call, dict) and str(call.get("name") or "")
+        ))
         user = session.add_message(
             "user",
             message.content,
@@ -329,7 +342,14 @@ class AgentLoop:
             turn_id=turn_id,
             **projection,
         )
-        assistant = session.add_message("assistant", assistant_content, turn_id=turn_id, status=status)
+        assistant = session.add_message(
+            "assistant",
+            assistant_content,
+            turn_id=turn_id,
+            status=status,
+            tools_used=tools_used,
+            tool_chain=tool_chain,
+        )
         await self._sessions.append_messages(session, [user, assistant])
         # error/interrupted 表示推理结果不完整，不发 TurnCommitted，避免记忆模块把错误文本
         # 当作正常 assistant 证据进行归档或隐式提取。
