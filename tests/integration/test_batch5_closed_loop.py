@@ -341,6 +341,8 @@ async def test_interrupted_turn_is_expanded_into_next_provider_messages(
         ),
         workspace=str(tmp_path),
         history_loader=sessions.load_history,
+        surface_loader=sessions.load_surface,
+        surface_appender=sessions.append_surface,
     )
     loop = AgentLoop(bus, events, pipeline, sessions)
 
@@ -356,6 +358,12 @@ async def test_interrupted_turn_is_expanded_into_next_provider_messages(
         # 中断完成后立即落库，刷新或进程退出不应丢失这一轮。
         interrupted_rows = sessions.store.fetch_session_messages("web:c")
         assert [row["content"] for row in interrupted_rows] == ["读取文件并分析", "[用户已停止生成]"]
+        assert all("llm_surface_messages" not in row for row in interrupted_rows)
+        surface_events = sessions.store.load_surface_events("web:c")
+        assert any(
+            event["source_kind"] == "assistant_tool_call"
+            for event in surface_events
+        )
         await bus.publish_inbound(InboundMessage("web", "u", "c", "继续"))
         await loop.run_once()
 

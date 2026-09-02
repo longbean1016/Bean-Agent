@@ -525,7 +525,7 @@ class SessionStore:
             return cursor.rowcount > 0
 
     def delete_empty_chat_session(self, session_key: str) -> bool:
-        """仅删除没有任何消息的会话，避免清理正在使用的历史会话。"""
+        """仅删除没有语义消息和模型 surface 的临时会话。"""
 
         key = self._validate_session_key(session_key)
         with self._lock:
@@ -536,6 +536,9 @@ class SessionStore:
                 WHERE key = ?
                   AND NOT EXISTS (
                       SELECT 1 FROM messages WHERE session_key = sessions.key
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM surface_events WHERE session_key = sessions.key
                   )
                 """,
                 (key,),

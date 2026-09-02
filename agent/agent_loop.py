@@ -21,6 +21,7 @@ from agent.message_bus import InboundMessage, MessageBus, OutboundMessage, Pipel
 from agent.turn_scheduler import QueuePosition, TurnScheduler
 from session.manager import SessionManager
 from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
+from session.store import NewSurfaceEvent
 from tools.runtime import serialize_tool_result_messages
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ class TurnInterruptState:
     llm_epoch_id: str = ""
     llm_surface_messages: list[dict[str, Any]] = field(default_factory=list)
     llm_surface_persisted: bool = False
+    iteration: int = 0
 
 
 class AgentLoop:
@@ -335,6 +337,7 @@ class AgentLoop:
                     [item for item in snapshot.get("llm_surface_messages") or [] if isinstance(item, dict)]
                 ),
                 llm_surface_persisted=bool(snapshot.get("llm_surface_persisted")),
+                iteration=max(0, int(snapshot.get("iteration") or 0)),
             )
         result = await self._scheduler.cancel(session_key)
         if result.status == "interrupted" and task is not None and interrupted is not None:
@@ -348,6 +351,8 @@ class AgentLoop:
         session = await self._sessions.get_or_create(state.session_key)
         if any(str(message.get("turn_id") or "") == turn_id for message in session.messages):
             return
+        if state.llm_surface_persisted:
+            await self._repair_durable_surface(state, turn_id)
         tool_chain = interrupted_tool_chain(state.tool_chain_partial, state.tools)
         has_unfinished_tool = any(
             str(call.get("status") or "") in {"running", "interrupted"}
@@ -393,6 +398,91 @@ class AgentLoop:
         )
         # 中断轮不发 TurnCommitted，避免未完成内容参与长期记忆提取。
         await self._sessions.append_messages(session, [user, assistant])
+
+    async def _repair_durable_surface(
+        self,
+        state: TurnInterruptState,
+        turn_id: str,
+    ) -> None:
+        """为已持久化的中断轮补半截 assistant 和未完成工具结果。"""
+
+        nodes = await self._sessions.load_surface_events(state.session_key)
+        current = [
+            node for node in nodes
+            if str(node.get("turn_id") or "") == turn_id
+        ]
+        if not current:
+            return
+        epoch_id = str(state.llm_epoch_id or current[-1].get("epoch_id") or "default")
+        assistant_calls: list[tuple[int, str]] = []
+        completed_calls: set[str] = set()
+        for node in current:
+            message = node.get("message")
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("role") or "") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    if isinstance(call, dict) and str(call.get("id") or ""):
+                        assistant_calls.append((int(node.get("iteration") or 0), str(call["id"])))
+            elif str(message.get("role") or "") == "tool":
+                call_id = str(message.get("tool_call_id") or "")
+                if call_id:
+                    completed_calls.add(call_id)
+
+        # 流式 Provider 尚未返回完整 assistant 时，仍把已交付正文保存在模型侧 surface；
+        # UI 的停止文案仍只写语义 assistant，不会污染这个模型前缀。
+        partial_reply = str(state.partial_reply or "")
+        partial_thinking = str(state.partial_thinking or "")
+        if partial_reply or partial_thinking:
+            already_persisted = any(
+                isinstance(node.get("message"), dict)
+                and node["message"].get("role") == "assistant"
+                and node["message"].get("content") == partial_reply
+                for node in current
+            )
+            if not already_persisted:
+                await self._sessions.append_surface(NewSurfaceEvent(
+                    session_key=state.session_key,
+                    epoch_id=epoch_id,
+                    turn_id=turn_id,
+                    iteration=max(0, int(self._interrupt_iteration(state))),
+                    role="assistant",
+                    content={
+                        "role": "assistant",
+                        "content": partial_reply,
+                        **({"reasoning_content": partial_thinking} if partial_thinking else {}),
+                    },
+                    source_kind="interrupted_partial_assistant",
+                    operation_key=f"{turn_id}:interrupted-partial-assistant",
+                ))
+
+        for iteration, call_id in assistant_calls:
+            if call_id in completed_calls:
+                continue
+            await self._sessions.append_surface(NewSurfaceEvent(
+                session_key=state.session_key,
+                epoch_id=epoch_id,
+                turn_id=turn_id,
+                iteration=iteration,
+                role="tool",
+                content={
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": INTERRUPTED_TOOL_RESULT_CONTENT,
+                },
+                source_kind="interrupted_tool_result",
+                operation_key=f"{turn_id}:{iteration}:interrupted-tool-result:{call_id}",
+            ))
+
+    @staticmethod
+    def _interrupt_iteration(state: TurnInterruptState) -> int:
+        """从快照扩展字段读取流式中断所在 iteration。"""
+
+        value = getattr(state, "iteration", 0)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
 
     def get_active_turn_snapshot(self, session_key: str) -> dict[str, Any] | None:
         """导出正在运行的 Turn 快照，供 WebSocket 刷新/重连后按 session 补发。"""

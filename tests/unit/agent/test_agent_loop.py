@@ -7,13 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from agent.agent_loop import AgentLoop, _repair_interrupted_surface
+from agent.agent_loop import AgentLoop, TurnInterruptState, _repair_interrupted_surface
 from agent.event_bus import EventBus, SessionUpdated, TurnCommitted, TurnStarted
 from agent.message_bus import InboundMessage, MessageBus, PipelineResult
 from agent.config_models import MemoryConfig
 from memory.consolidator import ConsolidationDraft
 from memory.engine import MemoryEngine
 from session.manager import SessionManager
+from session.store import NewSurfaceEvent
 
 
 class Pipeline:
@@ -34,6 +35,61 @@ class BlockingContextGuard:
 class PreparingContextGuard(BlockingContextGuard):
     def needs_context_preparation(self, session_key: str) -> bool:
         return True
+
+
+@pytest.mark.asyncio
+async def test_durable_surface_repair_adds_unknown_tool_result_without_semantic_projection(
+    tmp_path: Path,
+) -> None:
+    sessions = SessionManager(tmp_path)
+    loop = AgentLoop(MessageBus(), EventBus(), Pipeline(), sessions)
+    try:
+        await sessions.append_surface(NewSurfaceEvent(
+            session_key="web:repair",
+            epoch_id="epoch-a",
+            turn_id="turn-1",
+            iteration=1,
+            role="user",
+            content={"role": "user", "content": "查询"},
+            source_kind="user_message",
+            operation_key="turn-1:1:user",
+        ))
+        await sessions.append_surface(NewSurfaceEvent(
+            session_key="web:repair",
+            epoch_id="epoch-a",
+            turn_id="turn-1",
+            iteration=1,
+            role="assistant",
+            content={
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-pending",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }],
+            },
+            source_kind="assistant_tool_call",
+            operation_key="turn-1:1:assistant",
+        ))
+        await loop._repair_durable_surface(
+            TurnInterruptState(
+                session_key="web:repair",
+                original_user_message="查询",
+                llm_epoch_id="epoch-a",
+                llm_surface_persisted=True,
+                iteration=1,
+            ),
+            "turn-1",
+        )
+
+        surface = await sessions.load_surface("web:repair")
+        assert surface[-1]["role"] == "tool"
+        assert surface[-1]["tool_call_id"] == "call-pending"
+        assert "结果未知" in surface[-1]["content"]
+        assert (await sessions.get_or_create("web:repair")).messages == []
+    finally:
+        await sessions.close()
 
 
 @pytest.mark.asyncio

@@ -666,6 +666,7 @@ class Pipeline:
                     raise
 
         for iteration in range(1, self._max_iterations + 1):
+            self._interrupt_snapshots[turn_id]["iteration"] = iteration
             response, request_diagnostic = await chat_with_context_retry()
             llm_epoch_id = request_diagnostic.epoch_id
             append_turn_thinking(response.thinking)
