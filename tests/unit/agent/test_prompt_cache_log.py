@@ -148,3 +148,15 @@ def test_header_change_starts_a_new_cache_epoch() -> None:
     assert first.epoch_id != second.epoch_id
     assert second.common_prefix_messages == 0
     assert second.header_hash
+
+
+def test_diagnostics_can_anchor_request_to_surface_sequence() -> None:
+    diagnostics = PromptCacheDiagnostics()
+    snapshot = diagnostics.observe(
+        "web:a",
+        [{"role": "system", "content": "固定"}],
+        surface_seq=7,
+    )
+
+    assert snapshot.surface_seq == 7
+    assert snapshot.as_log_fields()["surface_seq"] == 7

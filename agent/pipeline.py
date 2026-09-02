@@ -232,6 +232,7 @@ class Pipeline:
         llm_epoch_id = ""
         surface_turn_initialized = False
         surface_persisted = False
+        surface_tail_seq: int | None = None
 
         async def append_surface_message(
             model_message: dict[str, Any],
@@ -243,7 +244,7 @@ class Pipeline:
         ) -> None:
             """按 Provider 发送顺序写入 durable surface；无写入器时保留旧测试路径。"""
 
-            nonlocal surface_persisted
+            nonlocal surface_persisted, surface_tail_seq
             if self._surface_appender is None:
                 return
             role = str(model_message.get("role") or "").strip().lower()
@@ -251,7 +252,7 @@ class Pipeline:
             # Provider 返回后优先使用实际请求 header 的 epoch，避免工具 schema
             # 或配置变化仍把新节点错误归入旧缓存域。
             epoch = str(llm_epoch_id or surface_epoch_id or "default")
-            await self._surface_appender(NewSurfaceEvent(
+            persisted = await self._surface_appender(NewSurfaceEvent(
                 session_key=message.session_key,
                 epoch_id=epoch,
                 turn_id=turn_id,
@@ -263,6 +264,8 @@ class Pipeline:
                 status=status,
             ))
             surface_persisted = True
+            if isinstance(persisted, dict) and persisted.get("surface_seq") is not None:
+                surface_tail_seq = max(0, int(persisted["surface_seq"]))
 
         surface_epoch_id = ""
 
@@ -574,6 +577,7 @@ class Pipeline:
                                 sent_tools,
                                 tool_choice="auto",
                             ),
+                            surface_seq=surface_tail_seq,
                         )
                         llm_epoch_id = request_diagnostic.epoch_id
                         sync_surface_snapshot()
@@ -609,6 +613,7 @@ class Pipeline:
                                 tool_schemas,
                                 tool_choice="auto",
                             ),
+                            surface_seq=surface_tail_seq,
                         )
                         llm_epoch_id = request_diagnostic.epoch_id
                         sync_surface_snapshot()
@@ -765,6 +770,7 @@ class Pipeline:
                                 tool_choice="none",
                                 max_tokens=_SUMMARY_MAX_TOKENS,
                             ),
+                            surface_seq=surface_tail_seq,
                         )
                         llm_epoch_id = retry_diagnostic.epoch_id
                         sync_surface_snapshot()
@@ -789,6 +795,7 @@ class Pipeline:
                                 tool_choice="none",
                                 max_tokens=_SUMMARY_MAX_TOKENS,
                             ),
+                            surface_seq=surface_tail_seq,
                         )
                         llm_epoch_id = request_diagnostic.epoch_id
                         sync_surface_snapshot()

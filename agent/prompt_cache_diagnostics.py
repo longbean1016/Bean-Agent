@@ -50,11 +50,12 @@ class PromptCacheRequestDiagnostics:
     estimated_input_tokens: int
     common_prefix_messages: int
     common_prefix_tokens: int
+    surface_seq: int | None = None
 
     def as_log_fields(self) -> dict[str, object]:
         """转换为 Prompt Cache JSONL 可追加的无敏感字段。"""
 
-        return {
+        fields = {
             "canonical_hash": self.canonical_hash,
             "header_hash": self.header_hash,
             "epoch_id": self.epoch_id,
@@ -64,6 +65,9 @@ class PromptCacheRequestDiagnostics:
             "common_prefix_messages": self.common_prefix_messages,
             "common_prefix_tokens": self.common_prefix_tokens,
         }
+        if self.surface_seq is not None:
+            fields["surface_seq"] = self.surface_seq
+        return fields
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +89,7 @@ class PromptCacheDiagnostics:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         header: object | None = None,
+        surface_seq: int | None = None,
     ) -> PromptCacheRequestDiagnostics:
         """记录一次请求并返回与该会话上一次请求的共同前缀。"""
 
@@ -112,6 +117,7 @@ class PromptCacheDiagnostics:
             estimated_input_tokens=estimate_payload_tokens(messages, tools),
             common_prefix_messages=common,
             common_prefix_tokens=common_prefix_tokens,
+            surface_seq=(max(0, int(surface_seq)) if surface_seq is not None else None),
         )
         self._previous[key] = _RequestFingerprint(
             message_fingerprints=message_fingerprints,
