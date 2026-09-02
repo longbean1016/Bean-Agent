@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -203,7 +204,19 @@ class SessionStore:
                 """,
                 (key,),
             ).fetchall()
-        return [self._row_to_session_event(row) for row in rows]
+            chunk_rows = self._conn.execute(
+                """
+                SELECT session_key, row_seq, chunks
+                FROM session_chunk_rows
+                WHERE session_key = ?
+                ORDER BY row_seq ASC
+                """,
+                (key,),
+            ).fetchall()
+        events = [self._row_to_session_event(row) for row in rows]
+        for row in chunk_rows:
+            events.extend(self._decode_chunk_row(row))
+        return sorted(events, key=lambda item: int(item["event_seq"]))
 
     def load_surface(
         self,
@@ -918,6 +931,21 @@ class SessionStore:
                 CREATE INDEX IF NOT EXISTS idx_session_events_session_order
                     ON session_events(session_key, event_seq);
 
+                CREATE TABLE IF NOT EXISTS session_chunk_rows (
+                    session_key        TEXT NOT NULL,
+                    row_seq            INTEGER NOT NULL,
+                    turn_id            TEXT NOT NULL,
+                    step               INTEGER NOT NULL,
+                    chunks             TEXT NOT NULL,
+                    created_at         TEXT NOT NULL,
+                    PRIMARY KEY (session_key, row_seq),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_chunk_rows_session_order
+                    ON session_chunk_rows(session_key, row_seq);
+
                 CREATE TABLE IF NOT EXISTS session_compaction_prepares (
                     session_key                  TEXT NOT NULL,
                     session_created_at           TEXT NOT NULL,
@@ -1401,6 +1429,9 @@ class SessionStore:
     def _append_session_event_sync(self, event: NewSessionEvent) -> dict[str, Any]:
         """在 SQLite 事务中追加不可变事件，并按 operation_key 幂等返回。"""
 
+        if str(event.event_type).strip() == "assistant/chunk":
+            return self._append_chunk_event_sync(event)
+
         key = self._validate_session_key(event.session_key)
         event_type = str(event.event_type).strip()
         turn_id = str(event.turn_id).strip()
@@ -1441,13 +1472,19 @@ class SessionStore:
                     (key, now, now),
                 )
                 if refs:
-                    placeholders = ",".join("?" for _ in refs)
-                    count_row = self._conn.execute(
-                        f"SELECT COUNT(*) AS count FROM session_events "
-                        f"WHERE session_key = ? AND event_seq IN ({placeholders})",
-                        (key, *refs),
-                    ).fetchone()
-                    if int(count_row["count"] if count_row else 0) != len(refs):
+                    found = {
+                        int(row["event_seq"])
+                        for row in self._conn.execute(
+                            "SELECT event_seq FROM session_events WHERE session_key = ?",
+                            (key,),
+                        ).fetchall()
+                    }
+                    for row in self._conn.execute(
+                        "SELECT session_key, row_seq, chunks FROM session_chunk_rows WHERE session_key = ?",
+                        (key,),
+                    ).fetchall():
+                        found.update(int(item["event_seq"]) for item in self._decode_chunk_row(row))
+                    if any(ref not in found for ref in refs):
                         raise ValueError(
                             f"session event provenance 不属于当前会话: {key}"
                         )
@@ -1474,13 +1511,17 @@ class SessionStore:
                     self._conn.commit()
                     return current
                 seq_row = self._conn.execute(
-                    """
-                    SELECT COALESCE(MAX(event_seq), -1) + 1 AS next_event_seq
-                    FROM session_events WHERE session_key = ?
-                    """,
+                    "SELECT COALESCE(MAX(event_seq), -1) + 1 AS next_event_seq FROM session_events WHERE session_key = ?",
                     (key,),
                 ).fetchone()
                 event_seq = int(seq_row["next_event_seq"] if seq_row else 0)
+                for chunk_row in self._conn.execute(
+                    "SELECT session_key, row_seq, chunks FROM session_chunk_rows WHERE session_key = ?",
+                    (key,),
+                ).fetchall():
+                    decoded = self._decode_chunk_row(chunk_row)
+                    if decoded:
+                        event_seq = max(event_seq, max(int(item["event_seq"]) for item in decoded) + 1)
                 self._conn.execute(
                     """
                     INSERT INTO session_events (
@@ -1510,6 +1551,112 @@ class SessionStore:
         if row is None:
             raise RuntimeError(f"session event 写入后无法读取: {key}:{event_seq}")
         return self._row_to_session_event(row)
+
+    def _append_chunk_event_sync(self, event: NewSessionEvent) -> dict[str, Any]:
+        """把连续 assistant chunk 合并到物理行，同时保留可无损展开的逻辑事件。"""
+
+        key = self._validate_session_key(event.session_key)
+        turn_id = str(event.turn_id).strip()
+        operation_key = str(event.operation_key).strip()
+        status = str(event.status).strip().lower() or "committed"
+        if not turn_id or not operation_key:
+            raise ValueError("assistant/chunk 必须包含 turn_id 和 operation_key")
+        if not isinstance(event.data, dict):
+            raise TypeError("assistant/chunk data 必须是对象")
+        refs = None
+        if event.source_event_seqs is not None:
+            refs = [int(item) for item in event.source_event_seqs]
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = _now_iso()
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO sessions (
+                        key, created_at, updated_at, last_consolidated,
+                        next_seq, metadata
+                    ) VALUES (?, ?, ?, 0, 0, '{}')
+                    """,
+                    (key, now, now),
+                )
+                for row in self._conn.execute(
+                    "SELECT session_key, row_seq, chunks FROM session_chunk_rows WHERE session_key = ?",
+                    (key,),
+                ).fetchall():
+                    for current in self._decode_chunk_row(row):
+                        if current["operation_key"] == operation_key:
+                            if current["data"] != event.data or current["turn_id"] != turn_id:
+                                raise ValueError(f"session event operation_key 已绑定不同事件: {key}:{operation_key}")
+                            self._conn.commit()
+                            return current
+                existing = self._conn.execute(
+                    "SELECT session_key, event_seq, event_type, turn_id, step, data, operation_key, status, source_event_seqs, created_at FROM session_events WHERE session_key = ? AND operation_key = ?",
+                    (key, operation_key),
+                ).fetchone()
+                if existing is not None:
+                    current = self._row_to_session_event(existing)
+                    if current["event_type"] != "assistant/chunk" or current["data"] != event.data:
+                        raise ValueError(f"session event operation_key 已绑定不同事件: {key}:{operation_key}")
+                    self._conn.commit()
+                    return current
+                max_event = self._conn.execute(
+                    "SELECT COALESCE(MAX(event_seq), -1) AS value FROM session_events WHERE session_key = ?",
+                    (key,),
+                ).fetchone()
+                event_seq = int(max_event["value"] if max_event else -1) + 1
+                for row in self._conn.execute(
+                    "SELECT chunks FROM session_chunk_rows WHERE session_key = ?", (key,)
+                ).fetchall():
+                    decoded = self._decode_chunk_row(row)
+                    if decoded:
+                        event_seq = max(event_seq, max(int(item["event_seq"]) for item in decoded) + 1)
+                logical = {
+                    "session_key": key,
+                    "event_seq": event_seq,
+                    "event_type": "assistant/chunk",
+                    "turn_id": turn_id,
+                    "step": int(event.step),
+                    "data": deepcopy(event.data),
+                    "operation_key": operation_key,
+                    "status": status,
+                    "source_event_seqs": refs,
+                    "created_at": now,
+                }
+                tail = self._conn.execute(
+                    "SELECT row_seq, turn_id, step, chunks FROM session_chunk_rows WHERE session_key = ? ORDER BY row_seq DESC LIMIT 1",
+                    (key,),
+                ).fetchone()
+                tail_items = self._decode_chunk_row(tail) if tail is not None else []
+                if (
+                    tail is not None
+                    and tail_items
+                    and str(tail["turn_id"]) == turn_id
+                    and int(tail["step"]) == int(event.step)
+                    and int(tail_items[-1]["event_seq"]) + 1 == event_seq
+                ):
+                    packed = json.loads(str(tail["chunks"]))
+                    packed.setdefault("items", []).append(logical)
+                    self._conn.execute(
+                        "UPDATE session_chunk_rows SET chunks = ? WHERE session_key = ? AND row_seq = ?",
+                        (json.dumps(packed, ensure_ascii=False, separators=(",", ":")), key, int(tail["row_seq"])),
+                    )
+                else:
+                    row_seq = int(self._conn.execute(
+                        "SELECT COALESCE(MAX(row_seq), -1) + 1 AS value FROM session_chunk_rows WHERE session_key = ?",
+                        (key,),
+                    ).fetchone()["value"])
+                    packed = {"event_type": "assistant/chunk", "turn_id": turn_id, "step": int(event.step), "items": [logical]}
+                    self._conn.execute(
+                        "INSERT INTO session_chunk_rows (session_key, row_seq, turn_id, step, chunks, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (key, row_seq, turn_id, int(event.step), json.dumps(packed, ensure_ascii=False, separators=(",", ":")), now),
+                    )
+                self._conn.execute("UPDATE sessions SET updated_at = ? WHERE key = ?", (now, key))
+                self._conn.commit()
+                return logical
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def _fetch_surface_events_sync(
         self,
@@ -2588,6 +2735,37 @@ class SessionStore:
             "source_event_seqs": _load_json_int_list(row["source_event_seqs"]),
             "created_at": str(row["created_at"]),
         }
+
+    @staticmethod
+    def _decode_chunk_row(row: sqlite3.Row | None) -> list[dict[str, Any]]:
+        if row is None:
+            return []
+        try:
+            packed = json.loads(str(row["chunks"]))
+        except (TypeError, json.JSONDecodeError):
+            raise ValueError("session chunk row 不是合法 JSON")
+        if not isinstance(packed, dict) or not isinstance(packed.get("items"), list):
+            raise ValueError("session chunk row 格式无效")
+        columns = set(row.keys())
+        session_key = str(row["session_key"]) if "session_key" in columns else ""
+        row_created_at = str(row["created_at"]) if "created_at" in columns else ""
+        events: list[dict[str, Any]] = []
+        for item in packed["items"]:
+            if not isinstance(item, dict):
+                raise ValueError("session chunk row item 格式无效")
+            events.append({
+                "session_key": session_key,
+                "event_seq": int(item["event_seq"]),
+                "event_type": "assistant/chunk",
+                "turn_id": str(item.get("turn_id") or packed.get("turn_id") or ""),
+                "step": int(item.get("step", packed.get("step", 0))),
+                "data": dict(item.get("data") or {}),
+                "operation_key": str(item["operation_key"]),
+                "status": str(item.get("status") or "committed"),
+                "source_event_seqs": item.get("source_event_seqs"),
+                "created_at": str(item.get("created_at") or row_created_at),
+            })
+        return events
 
     @staticmethod
     def _row_to_prepare(row: sqlite3.Row) -> SessionCompactionPrepare:
