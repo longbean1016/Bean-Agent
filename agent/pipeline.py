@@ -247,7 +247,10 @@ class Pipeline:
             if self._surface_appender is None:
                 return
             role = str(model_message.get("role") or "").strip().lower()
-            epoch = str(surface_epoch_id or llm_epoch_id or "default")
+            # 首轮 frame/user 在请求发出前没有诊断 epoch，沿用预计算值；后续
+            # Provider 返回后优先使用实际请求 header 的 epoch，避免工具 schema
+            # 或配置变化仍把新节点错误归入旧缓存域。
+            epoch = str(llm_epoch_id or surface_epoch_id or "default")
             await self._surface_appender(NewSurfaceEvent(
                 session_key=message.session_key,
                 epoch_id=epoch,

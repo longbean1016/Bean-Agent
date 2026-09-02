@@ -220,6 +220,7 @@ def test_surface_pending_events_are_isolated_and_recoverable(store: SessionStore
     assert [event["operation_key"] for event in store.recover_surface("web:a")] == ["pending"]
     assert [event["session_key"] for event in store.fetch_surface_events("web:a")] == ["web:a"]
     assert [event["session_key"] for event in store.fetch_surface_events("web:b")] == ["web:b"]
+    assert store.load_surface("web:a") == []
 
 
 def test_surface_operation_key_rejects_conflicting_retry(store: SessionStore) -> None:

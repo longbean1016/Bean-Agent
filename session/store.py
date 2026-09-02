@@ -20,6 +20,9 @@ _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 _MESSAGE_ROLES = {"user", "assistant", "tool"}
 _SURFACE_ROLES = {"system", "user", "assistant", "tool"}
 _SURFACE_OPS = {"append", "replace"}
+# pending/aborted 事件只供恢复器判断，不能进入下一次模型请求的可见前缀；
+# error 仍是模型实际收到的工具失败结果，必须保留在 projection 中。
+_SURFACE_PROJECTABLE_STATUSES = {"committed", "replaced", "error", "completed"}
 _MESSAGE_COLUMNS = "id, session_key, seq, role, content, tool_chain, extra, ts"
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 _DEFAULT_TITLE_LIMIT = 80
@@ -1390,6 +1393,8 @@ class SessionStore:
         nodes: list[dict[str, Any]] = []
         for row in rows:
             event = self._row_to_surface_event(row)
+            if event["status"] not in _SURFACE_PROJECTABLE_STATUSES:
+                continue
             if event["surface_op"] == "append":
                 nodes.append(event)
                 continue
