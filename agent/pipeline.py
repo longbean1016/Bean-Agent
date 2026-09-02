@@ -542,6 +542,12 @@ class Pipeline:
                             if self._surface_loader
                             else await self._history_loader(message.session_key, None)
                         )
+                        if self._surface_loader:
+                            history = _drop_current_surface_suffix(
+                                history,
+                                context_frame=llm_context_frame,
+                                user_content=llm_user_content,
+                            )
                         read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
                         if callable(read_checkpoint) and self._surface_loader is None:
                             context.checkpoint_summary = str(
@@ -660,6 +666,12 @@ class Pipeline:
                                 if self._surface_loader
                                 else await self._history_loader(message.session_key, None)
                             )
+                            if self._surface_loader:
+                                history = _drop_current_surface_suffix(
+                                    history,
+                                    context_frame=llm_context_frame,
+                                    user_content=llm_user_content,
+                                )
                             read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
                             if callable(read_checkpoint) and self._surface_loader is None:
                                 context.checkpoint_summary = str(
@@ -1177,6 +1189,26 @@ def _provider_pressure_tokens(response: LLMResponse) -> int | None:
     if value is None:
         return None
     return max(0, int(value))
+
+
+def _drop_current_surface_suffix(
+    history: list[dict[str, Any]],
+    *,
+    context_frame: str,
+    user_content: object | None,
+) -> list[dict[str, Any]]:
+    """压缩重载 surface 后移除本轮已写入的尾部，避免组装器再次追加。"""
+
+    current: list[dict[str, Any]] = []
+    if context_frame:
+        current.append({"role": "user", "content": context_frame})
+    if user_content is not None:
+        current.append({"role": "user", "content": deepcopy(user_content)})
+    if not current or len(history) < len(current):
+        return history
+    if history[-len(current):] != current:
+        return history
+    return history[:-len(current)]
 
 
 def _request_header_identity(

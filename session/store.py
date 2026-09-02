@@ -20,6 +20,7 @@ _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 _MESSAGE_ROLES = {"user", "assistant", "tool"}
 _SURFACE_ROLES = {"system", "user", "assistant", "tool"}
 _SURFACE_OPS = {"append", "replace"}
+_SURFACE_STATUSES = {"pending", "committed", "replaced", "aborted", "error", "completed"}
 # pending/aborted 事件只供恢复器判断，不能进入下一次模型请求的可见前缀；
 # error 仍是模型实际收到的工具失败结果，必须保留在 projection 中。
 _SURFACE_PROJECTABLE_STATUSES = {"committed", "replaced", "error", "completed"}
@@ -1153,6 +1154,7 @@ class SessionStore:
         source_kind = str(event.source_kind).strip()
         operation_key = str(event.operation_key).strip()
         role = str(event.role).strip().lower()
+        status = str(event.status).strip().lower()
         surface_op = str(event.surface_op).strip().lower()
         if not epoch_id:
             raise ValueError("surface epoch_id 不能为空")
@@ -1162,6 +1164,8 @@ class SessionStore:
             raise ValueError(f"不支持的 surface role: {event.role!r}")
         if not source_kind:
             raise ValueError("surface source_kind 不能为空")
+        if status not in _SURFACE_STATUSES:
+            raise ValueError(f"不支持的 surface status: {event.status!r}")
         if surface_op not in _SURFACE_OPS:
             raise ValueError(f"不支持的 surface_op: {event.surface_op!r}")
         if not isinstance(event.content, dict):
@@ -1216,7 +1220,7 @@ class SessionStore:
                         role=role,
                         content=event.content,
                         source_kind=source_kind,
-                        status=str(event.status),
+                        status=status,
                         projection_version=int(event.projection_version),
                         operation_key=operation_key,
                         surface_op=surface_op,
@@ -1286,7 +1290,7 @@ class SessionStore:
                         role,
                         content_payload,
                         source_kind,
-                        str(event.status),
+                        status,
                         int(event.projection_version),
                         operation_key,
                         surface_op,

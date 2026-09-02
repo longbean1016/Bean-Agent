@@ -506,6 +506,7 @@ class MemoryEngine:
             content={"role": "user", "content": content},
             source_kind="compaction_summary",
             operation_key=f"compaction:{checkpoint.source_ref}",
+            status="replaced",
             surface_op="replace",
             replace_start=start,
             replace_end=end,

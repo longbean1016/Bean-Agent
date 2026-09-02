@@ -229,6 +229,11 @@ def test_surface_operation_key_rejects_conflicting_retry(store: SessionStore) ->
         store.append_surface(_surface_event(message={"role": "user", "content": "changed"}))
 
 
+def test_surface_rejects_unknown_status(store: SessionStore) -> None:
+    with pytest.raises(ValueError, match="status"):
+        store.append_surface(_surface_event(status="unknown"))
+
+
 @pytest.mark.asyncio
 async def test_concurrent_add_message_keeps_unique_contiguous_seq(
     store: SessionStore,

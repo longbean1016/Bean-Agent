@@ -851,6 +851,66 @@ async def test_pipeline_emits_compaction_lifecycle_events(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_surface_compaction_reload_does_not_duplicate_current_turn(
+    tmp_path: Path,
+) -> None:
+    class GateProvider:
+        context_window = 100
+        max_tokens = 10
+
+        def __init__(self) -> None:
+            self.compacted = False
+            self.messages: list[list[dict[str, object]]] = []
+
+        def estimate_context_tokens(self, messages, tools):
+            return 10 if self.compacted else 80
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages.append([dict(item) for item in messages])
+            return LLMResponse("完成")
+
+    sessions = SessionManager(tmp_path)
+    provider = GateProvider()
+
+    async def compact(_session_key: str, **kwargs) -> bool:
+        provider.compacted = True
+        return True
+
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        surface_loader=sessions.load_surface,
+        surface_appender=sessions.append_surface,
+        context_compactor=compact,
+    )
+    try:
+        await pipeline.process(
+            InboundMessage("web", "u", "surface-compact", "当前问题"),
+            turn_id="surface-compaction-turn",
+        )
+    finally:
+        await sessions.close()
+
+    request = provider.messages[-1]
+    current_user = [
+        item for item in request
+        if item.get("role") == "user" and str(item.get("content", "")).endswith("当前问题")
+    ]
+    frames = [
+        item for item in request
+        if item.get("role") == "user"
+        and str(item.get("content", "")).startswith(
+            '<system-reminder data-system-context-frame="true">'
+        )
+    ]
+    assert len(current_user) == 1
+    assert len(frames) == 1
+
+
+@pytest.mark.asyncio
 async def test_pipeline_emits_complete_context_usage_breakdown(tmp_path: Path) -> None:
     class UsageProvider:
         context_window = 1000

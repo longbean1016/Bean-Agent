@@ -298,6 +298,29 @@ class AgentLoop:
         snapshot: dict[str, Any] | None = None,
     ) -> None:
         session = await self._sessions.get_or_create(message.session_key)
+        if snapshot and bool(snapshot.get("llm_surface_persisted")):
+            # Provider/工具异常也可能留下已发送但未闭合的 tool-call；错误路径
+            # 与主动中断共享同一 repair，避免下一轮携带非法的模型 transcript。
+            await self._repair_durable_surface(
+                TurnInterruptState(
+                    session_key=message.session_key,
+                    original_user_message=message.content,
+                    original_media=list(message.media),
+                    original_metadata=dict(message.metadata),
+                    partial_reply=str(snapshot.get("partial_reply") or ""),
+                    partial_thinking=str(snapshot.get("partial_thinking") or "") or None,
+                    llm_user_content=deepcopy(snapshot.get("llm_user_content")),
+                    llm_context_frame=str(snapshot.get("llm_context_frame") or ""),
+                    llm_message_timestamp=str(snapshot.get("llm_message_timestamp") or ""),
+                    llm_epoch_id=str(snapshot.get("llm_epoch_id") or ""),
+                    llm_surface_messages=deepcopy(
+                        [item for item in snapshot.get("llm_surface_messages") or [] if isinstance(item, dict)]
+                    ),
+                    llm_surface_persisted=True,
+                    iteration=max(0, int(snapshot.get("iteration") or 0)),
+                ),
+                turn_id,
+            )
         projection = _model_projection_from_snapshot(snapshot or {})
         user = session.add_message(
             "user",

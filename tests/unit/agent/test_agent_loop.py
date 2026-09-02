@@ -268,6 +268,52 @@ async def test_pipeline_failure_persists_model_surface_for_replay(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_pipeline_failure_repairs_persisted_surface_tool_call(tmp_path: Path) -> None:
+    sessions = SessionManager(tmp_path)
+
+    class FailingSurfacePipeline:
+        async def process(self, message, *, turn_id):
+            await sessions.append_surface(NewSurfaceEvent(
+                session_key=message.session_key,
+                epoch_id="epoch-error",
+                turn_id=turn_id,
+                iteration=1,
+                role="assistant",
+                content={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-error",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }],
+                },
+                source_kind="assistant_tool_call",
+                operation_key=f"{turn_id}:assistant",
+            ))
+            raise RuntimeError("模型失败")
+
+        def snapshot_interrupt_state(self, turn_id: str):
+            return {
+                "llm_epoch_id": "epoch-error",
+                "llm_surface_persisted": True,
+                "iteration": 1,
+            }
+
+    bus = MessageBus()
+    loop = AgentLoop(bus, EventBus(), FailingSurfacePipeline(), sessions)
+    await bus.publish_inbound(InboundMessage("web", "u", "error-surface", "问题"))
+
+    await loop.run_once()
+
+    surface = sessions.store.load_surface("web:error-surface")
+    assert surface[-1]["role"] == "tool"
+    assert surface[-1]["tool_call_id"] == "call-error"
+    assert "结果未知" in surface[-1]["content"]
+    await sessions.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_persists_and_dispatches_context_retry_trace(
     tmp_path: Path,
 ) -> None:
