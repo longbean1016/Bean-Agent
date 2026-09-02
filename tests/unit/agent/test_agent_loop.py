@@ -93,6 +93,40 @@ async def test_durable_surface_repair_adds_unknown_tool_result_without_semantic_
 
 
 @pytest.mark.asyncio
+async def test_durable_surface_repair_recovers_snapshot_when_append_was_not_observed(
+    tmp_path: Path,
+) -> None:
+    sessions = SessionManager(tmp_path)
+    loop = AgentLoop(MessageBus(), EventBus(), Pipeline(), sessions)
+    try:
+        await loop._repair_durable_surface(
+            TurnInterruptState(
+                session_key="web:repair-missing",
+                original_user_message="查询",
+                llm_epoch_id="epoch-a",
+                llm_surface_persisted=True,
+                llm_surface_messages=[{
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-missing",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }],
+                }],
+                iteration=1,
+            ),
+            "turn-missing",
+        )
+
+        surface = await sessions.load_surface("web:repair-missing")
+        assert surface[0]["role"] == "assistant"
+        assert surface[1]["tool_call_id"] == "call-missing"
+    finally:
+        await sessions.close()
+
+
+@pytest.mark.asyncio
 async def test_context_guard_is_not_called_before_pipeline(tmp_path: Path) -> None:
     class OrderedGuard(PreparingContextGuard):
         def __init__(self) -> None:

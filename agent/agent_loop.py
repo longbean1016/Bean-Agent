@@ -454,9 +454,11 @@ class AgentLoop:
             node for node in nodes
             if str(node.get("turn_id") or "") == turn_id
         ]
-        if not current:
-            return
-        epoch_id = str(state.llm_epoch_id or current[-1].get("epoch_id") or "default")
+        epoch_id = str(
+            state.llm_epoch_id
+            or (current[-1].get("epoch_id") if current else "")
+            or "default"
+        )
         # 追加器在协程取消窗口内可能已经收到 Provider 消息但尚未完成写事务；
         # 用快照与已落库节点做顺序前缀对账，缺失尾部按稳定 operation_key 补写。
         persisted_messages = [
@@ -508,6 +510,8 @@ class AgentLoop:
             node for node in nodes
             if str(node.get("turn_id") or "") == turn_id
         ]
+        if not current:
+            return
         assistant_calls: list[tuple[int, str]] = []
         completed_calls: set[str] = set()
         for node in current:
