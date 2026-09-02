@@ -214,7 +214,8 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .turn-section { display: flow-root; }
 .virtual-conversation { position: relative; width: 100%; }
 .virtual-turn-section { position: absolute; top: 0; left: 0; width: 100%; }
-.turn-navigator { position: absolute; z-index: 12; top: 50%; right: 7px; width: 30px; max-height: calc(100% - 32px); transform: translateY(-50%); }
+/* 给主消息滚动条保留独立的拖拽区域，导航刻度只占用滚动条左侧空间。 */
+.turn-navigator { position: absolute; z-index: 12; top: 50%; right: 18px; width: 30px; max-height: calc(100% - 32px); transform: translateY(-50%); }
 .turn-marker-rail { display: flex; width: 30px; max-height: min(52vh, 420px); flex-direction: column; align-items: center; gap: 24px; padding: 8px 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; }
 .turn-marker-rail::-webkit-scrollbar { display: none; }
 .turn-marker { flex: 0 0 auto; width: 14px; height: 4px; padding: 0; border: 0; border-radius: 2px; background: var(--border-strong); cursor: pointer; transition: width .16s ease, background-color .16s ease, box-shadow .16s ease; }
@@ -581,7 +582,7 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
   .theme-control button { min-width: 30px; width: 30px; padding: 0; }
   .theme-control button span { display: none; }
   .conversation-content { padding: 20px 42px 80px 14px; }
-  .turn-navigator { right: 3px; }
+  .turn-navigator { right: 14px; }
   .turn-directory { right: 27px; width: min(220px, calc(100vw - 42px)); }
   .mermaid-toolbar { align-items: flex-start; flex-direction: column; }
   .mermaid-actions { width: 100%; justify-content: flex-end; }
