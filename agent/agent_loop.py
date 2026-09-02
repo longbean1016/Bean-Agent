@@ -457,6 +457,57 @@ class AgentLoop:
         if not current:
             return
         epoch_id = str(state.llm_epoch_id or current[-1].get("epoch_id") or "default")
+        # 追加器在协程取消窗口内可能已经收到 Provider 消息但尚未完成写事务；
+        # 用快照与已落库节点做顺序前缀对账，缺失尾部按稳定 operation_key 补写。
+        persisted_messages = [
+            node.get("message")
+            for node in current
+            if isinstance(node.get("message"), dict)
+        ]
+        snapshot_messages = [
+            item for item in state.llm_surface_messages
+            if isinstance(item, dict)
+        ]
+        common = 0
+        while (
+            common < len(persisted_messages)
+            and common < len(snapshot_messages)
+            and persisted_messages[common] == snapshot_messages[common]
+        ):
+            common += 1
+        recovery_iteration = max(0, int(self._interrupt_iteration(state)))
+        for index, model_message in enumerate(snapshot_messages[common:], start=common):
+            role = str(model_message.get("role") or "").strip().lower()
+            if role not in {"system", "user", "assistant", "tool"}:
+                continue
+            if role == "assistant" and model_message.get("tool_calls"):
+                source_kind = "assistant_tool_call"
+            elif role == "tool":
+                source_kind = "tool_result"
+            elif role == "user" and str(model_message.get("content") or "").startswith(
+                '<system-reminder data-system-context-frame="true">'
+            ):
+                source_kind = "context_frame"
+            elif role == "user":
+                source_kind = "user_message"
+            else:
+                source_kind = "recovered_message"
+            await self._sessions.append_surface(NewSurfaceEvent(
+                session_key=state.session_key,
+                epoch_id=epoch_id,
+                turn_id=turn_id,
+                iteration=recovery_iteration,
+                role=role,
+                content=deepcopy(model_message),
+                source_kind=source_kind,
+                operation_key=f"{turn_id}:recovery:{index}",
+            ))
+
+        nodes = await self._sessions.load_surface_events(state.session_key)
+        current = [
+            node for node in nodes
+            if str(node.get("turn_id") or "") == turn_id
+        ]
         assistant_calls: list[tuple[int, str]] = []
         completed_calls: set[str] = set()
         for node in current:
