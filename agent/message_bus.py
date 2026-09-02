@@ -60,6 +60,9 @@ class PipelineResult:
     llm_message_timestamp: str = ""
     llm_epoch_id: str = ""
     llm_surface_messages: list[dict[str, Any]] = field(default_factory=list)
+    # 生产链路使用独立 durable surface 后，语义消息不再携带隐藏模型投影。
+    # 旧的测试 Pipeline 未提供 surface 写入器时仍保留默认 False 兼容行为。
+    llm_surface_persisted: bool = False
 
 
 OutboundCallback: TypeAlias = Callable[[OutboundMessage], Awaitable[None] | None]

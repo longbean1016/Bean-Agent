@@ -338,6 +338,8 @@ def build_core_runtime(
         skills=skills,
         prompt_cache_log=prompt_cache_log,
         history_loader=sessions.load_history,
+        surface_loader=sessions.load_surface,
+        surface_appender=sessions.append_surface,
         context_compactor=(memory.compact_for_context if memory is not None else None),
         context_usage_loader=lambda session_key: asyncio.to_thread(
             sessions.store.get_context_usage, session_key

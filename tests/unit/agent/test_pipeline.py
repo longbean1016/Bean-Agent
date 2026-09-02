@@ -29,6 +29,7 @@ from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
 from agent.provider import ContextLengthError, LLMResponse, ToolCall
 from agent.skills import SkillsLoader
+from session.manager import SessionManager
 from tools.base import Tool
 from tools.registry import ToolRegistry
 from tools.tool_search import ToolSearchTool
@@ -90,6 +91,60 @@ class Memory:
     def read_self(self): return ""
     def get_memory_context(self): return ""
     def read_recent_context(self): return ""
+
+
+@pytest.mark.asyncio
+async def test_durable_surface_is_the_only_production_history_source(tmp_path: Path) -> None:
+    class TwoTurnProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.messages: list[list[dict[str, object]]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.calls += 1
+            self.messages.append([dict(item) for item in messages])
+            return LLMResponse(f"回答-{self.calls}")
+
+    sessions = SessionManager(tmp_path)
+    try:
+        provider = TwoTurnProvider()
+        registry = ToolRegistry()
+        assembler = PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        )
+        pipeline = Pipeline(
+            provider,
+            registry,
+            EventBus(),
+            assembler,
+            workspace=str(tmp_path),
+            surface_loader=sessions.load_surface,
+            surface_appender=sessions.append_surface,
+        )
+
+        first = await pipeline.process(
+            InboundMessage("web", "u", "surface-chat", "第一问"),
+            turn_id="turn-1",
+        )
+        second = await pipeline.process(
+            InboundMessage("web", "u", "surface-chat", "第二问"),
+            turn_id="turn-2",
+        )
+
+        assert first.llm_surface_persisted is True
+        assert second.llm_surface_persisted is True
+        surface = await sessions.load_surface("web:surface-chat")
+        assert [item["content"] for item in surface if item.get("role") == "assistant"] == [
+            "回答-1",
+            "回答-2",
+        ]
+        assert first.llm_surface_messages
+        # Semantic persistence is owned by AgentLoop; Pipeline only writes surface.
+        assert (await sessions.get_or_create("web:surface-chat")).messages == []
+        assert provider.messages[1][:len(provider.messages[0])] == provider.messages[0]
+    finally:
+        await sessions.close()
 
 
 @pytest.mark.asyncio

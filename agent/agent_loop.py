@@ -65,6 +65,7 @@ class TurnInterruptState:
     llm_message_timestamp: str = ""
     llm_epoch_id: str = ""
     llm_surface_messages: list[dict[str, Any]] = field(default_factory=list)
+    llm_surface_persisted: bool = False
 
 
 class AgentLoop:
@@ -239,7 +240,8 @@ class AgentLoop:
         if llm_epoch_id:
             user_projection["llm_epoch_id"] = llm_epoch_id
         llm_surface_messages = getattr(result, "llm_surface_messages", None)
-        if isinstance(llm_surface_messages, list) and llm_surface_messages:
+        llm_surface_persisted = bool(getattr(result, "llm_surface_persisted", False))
+        if not llm_surface_persisted and isinstance(llm_surface_messages, list) and llm_surface_messages:
             user_projection["llm_surface_messages"] = deepcopy(
                 [item for item in llm_surface_messages if isinstance(item, dict)]
             )
@@ -332,6 +334,7 @@ class AgentLoop:
                 llm_surface_messages=deepcopy(
                     [item for item in snapshot.get("llm_surface_messages") or [] if isinstance(item, dict)]
                 ),
+                llm_surface_persisted=bool(snapshot.get("llm_surface_persisted")),
             )
         result = await self._scheduler.cancel(session_key)
         if result.status == "interrupted" and task is not None and interrupted is not None:
@@ -443,12 +446,16 @@ class AgentLoop:
 def _model_projection_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     """从失败/中断快照提取隐藏模型投影，不改变语义消息正文。"""
 
+    if bool(snapshot.get("llm_surface_persisted")):
+        return {}
+
     projection = _model_projection(
         llm_user_content=snapshot.get("llm_user_content"),
         llm_context_frame=str(snapshot.get("llm_context_frame") or ""),
         llm_message_timestamp=str(snapshot.get("llm_message_timestamp") or ""),
         llm_epoch_id=str(snapshot.get("llm_epoch_id") or ""),
         llm_surface_messages=snapshot.get("llm_surface_messages"),
+        llm_surface_persisted=bool(snapshot.get("llm_surface_persisted")),
     )
     surface = projection.get("llm_surface_messages")
     if isinstance(surface, list) and surface:
@@ -465,6 +472,7 @@ def _model_projection_from_state(state: TurnInterruptState) -> dict[str, Any]:
         llm_message_timestamp=state.llm_message_timestamp,
         llm_epoch_id=state.llm_epoch_id,
         llm_surface_messages=state.llm_surface_messages,
+        llm_surface_persisted=state.llm_surface_persisted,
     )
 
 
@@ -475,9 +483,12 @@ def _model_projection(
     llm_message_timestamp: str,
     llm_epoch_id: str,
     llm_surface_messages: object,
+    llm_surface_persisted: bool = False,
 ) -> dict[str, Any]:
     """统一组装隐藏字段，避免正常、失败和中断路径发生字段漂移。"""
 
+    if llm_surface_persisted:
+        return {}
     projection: dict[str, Any] = {}
     if llm_user_content is not None:
         projection["llm_user_content"] = deepcopy(llm_user_content)

@@ -36,11 +36,13 @@ from agent.prompt_block import TurnContext
 from agent.prompt_cache_diagnostics import (
     PromptCacheDiagnostics,
     PromptCacheRequestDiagnostics,
+    canonical_header_hash,
 )
 from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import ContextLengthError, LLMResponse, ProviderUsage
 from agent.skills import SkillsLoader, collect_skill_mentions
 from agent.tool_runtime import ToolRuntimeView
+from session.store import NewSurfaceEvent
 from tools.base import normalize_tool_result
 from tools.registry import ToolRegistry
 from tools.runtime import append_tool_result
@@ -51,6 +53,8 @@ class ProviderApi(Protocol):
 
 
 HistoryLoader = Callable[[str, int | None], Awaitable[list[dict[str, Any]]]]
+SurfaceLoader = Callable[[str], Awaitable[list[dict[str, Any]]]]
+SurfaceAppender = Callable[[NewSurfaceEvent], Awaitable[dict[str, Any]]]
 ContextCompactor = Callable[..., Awaitable[bool]]
 ContextUsageLoader = Callable[[str], Awaitable[dict[str, Any] | None]]
 ContextUsageWriter = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -86,6 +90,8 @@ class Pipeline:
         skills: SkillsLoader | None = None,
         prompt_cache_log: PromptCacheLogWriter | None = None,
         history_loader: HistoryLoader | None = None,
+        surface_loader: SurfaceLoader | None = None,
+        surface_appender: SurfaceAppender | None = None,
         context_compactor: ContextCompactor | None = None,
         context_usage_loader: ContextUsageLoader | None = None,
         context_usage_writer: ContextUsageWriter | None = None,
@@ -105,6 +111,8 @@ class Pipeline:
         # 诊断锚点按会话隔离；它只保存消息指纹，不保存 Prompt 正文。
         self._prompt_cache_diagnostics = PromptCacheDiagnostics()
         self._history_loader = history_loader
+        self._surface_loader = surface_loader
+        self._surface_appender = surface_appender
         self._context_compactor = context_compactor
         self._context_usage_loader = context_usage_loader
         self._context_usage_writer = context_usage_writer
@@ -132,6 +140,7 @@ class Pipeline:
             "llm_context_frame": "",
             "llm_message_timestamp": "",
             "llm_epoch_id": "",
+            "llm_surface_persisted": False,
         }
         raw_allowed_tools = message.metadata.get("allowed_tools")
         allowed_tools = (
@@ -158,11 +167,16 @@ class Pipeline:
         skip_history = bool(message.metadata.get("skip_history"))
         skip_memory = bool(message.metadata.get("skip_memory_retrieval"))
         suppress_stream = bool(message.metadata.get("suppress_stream_events"))
-        history = (
-            await self._history_loader(message.session_key, None)
-            if self._history_loader and not skip_history
-            else []
-        )
+        if self._surface_loader and not skip_history:
+            # Provider 历史只从 durable surface 派生；语义消息由 AgentLoop 单独保存，
+            # 不能在这里再次拼接，否则同一 Turn 会出现两份模型消息。
+            history = await self._surface_loader(message.session_key)
+        else:
+            history = (
+                await self._history_loader(message.session_key, None)
+                if self._history_loader and not skip_history
+                else []
+            )
         measurement = await self._load_context_measurement(message.session_key)
         retrieved = await self._memory.retrieve_for_turn(message) if self._memory and not skip_memory else ""
         names = list(tool_view.visible_order)
@@ -197,8 +211,8 @@ class Pipeline:
             vl_available=self._vl_available,
         )
         message_timestamp = datetime.now(_LOCAL_TZ)
-        # 记录最终模型消息中的用户包装和动态 frame；完成 Turn 后由 AgentLoop
-        # 作为隐藏投影落库，下一轮直接重放而不是重新生成时间戳或媒体 block。
+        # 记录最终模型消息中的用户包装和动态 frame；生产链路由 durable surface
+        # 在 Provider 调用前增量落库，下一轮直接重放而不是重新生成时间戳或媒体 block。
         llm_user_content: object | None = None
         llm_context_frame = ""
         llm_surface_messages: list[dict[str, Any]] = []
@@ -216,6 +230,38 @@ class Pipeline:
         last_base_messages: list[dict[str, Any]] = []
         forced_compaction_attempted = False
         llm_epoch_id = ""
+        surface_turn_initialized = False
+        surface_persisted = False
+
+        async def append_surface_message(
+            model_message: dict[str, Any],
+            *,
+            iteration: int,
+            source_kind: str,
+            operation_suffix: str,
+            status: str = "committed",
+        ) -> None:
+            """按 Provider 发送顺序写入 durable surface；无写入器时保留旧测试路径。"""
+
+            nonlocal surface_persisted
+            if self._surface_appender is None:
+                return
+            role = str(model_message.get("role") or "").strip().lower()
+            epoch = str(surface_epoch_id or llm_epoch_id or "default")
+            await self._surface_appender(NewSurfaceEvent(
+                session_key=message.session_key,
+                epoch_id=epoch,
+                turn_id=turn_id,
+                iteration=iteration,
+                role=role,
+                content=deepcopy(model_message),
+                source_kind=source_kind,
+                operation_key=f"{turn_id}:{iteration}:{operation_suffix}",
+                status=status,
+            ))
+            surface_persisted = True
+
+        surface_epoch_id = ""
 
         def sync_surface_snapshot() -> None:
             """把已发送的模型侧前缀同步到中断/失败快照，供恢复时精确重放。"""
@@ -229,6 +275,7 @@ class Pipeline:
                 "llm_context_frame": llm_context_frame,
                 "llm_message_timestamp": message_timestamp.isoformat(),
                 "llm_epoch_id": llm_epoch_id,
+                "llm_surface_persisted": surface_persisted,
             })
 
         async def compact_with_status(*, estimated_tokens: int, force: bool) -> bool:
@@ -295,6 +342,7 @@ class Pipeline:
         async def chat_with_context_retry() -> tuple[LLMResponse, PromptCacheRequestDiagnostics]:
             nonlocal last_base_messages, history, forced_compaction_attempted, measurement
             nonlocal llm_user_content, llm_context_frame
+            nonlocal surface_turn_initialized, surface_epoch_id
             while True:
                 history_for_attempt = history
                 disabled_sections: set[str] = set()
@@ -340,6 +388,39 @@ class Pipeline:
                     visible_names=tool_view.visible_names,
                     visible_order=tool_view.visible_order,
                 )
+                if self._surface_appender is not None and not surface_turn_initialized:
+                    surface_epoch_id = canonical_header_hash(
+                        _request_header_identity(
+                            self._provider,
+                            assembled.messages,
+                            tool_schemas,
+                            tool_choice="auto",
+                        )
+                    )[:16]
+                    if llm_context_frame:
+                        frame_message = {
+                            "role": "user",
+                            "content": llm_context_frame,
+                        }
+                        await append_surface_message(
+                            frame_message,
+                            iteration=0,
+                            source_kind="context_frame",
+                            operation_suffix="frame",
+                        )
+                    if llm_user_content is not None:
+                        user_message = {
+                            "role": "user",
+                            "content": deepcopy(llm_user_content),
+                        }
+                        await append_surface_message(
+                            user_message,
+                            iteration=0,
+                            source_kind="user_message",
+                            operation_suffix="user",
+                        )
+                    surface_turn_initialized = True
+                    sync_surface_snapshot()
                 # ReAct 后缀可能包含已经执行过的工具结果。超限重试只重建基础
                 # Prompt，原样保留该后缀，避免重复执行有副作用的工具。
                 model_messages = [*assembled.messages, *react_messages]
@@ -452,8 +533,12 @@ class Pipeline:
                         estimated_tokens=estimate,
                         force=False,
                     )
-                    if compacted and self._history_loader is not None:
-                        history = await self._history_loader(message.session_key, None)
+                    if compacted and (self._surface_loader or self._history_loader) is not None:
+                        history = (
+                            await self._surface_loader(message.session_key)
+                            if self._surface_loader
+                            else await self._history_loader(message.session_key, None)
+                        )
                         read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
                         if callable(read_checkpoint):
                             context.checkpoint_summary = str(
@@ -566,8 +651,12 @@ class Pipeline:
                             estimated_tokens=estimate,
                             force=True,
                         )
-                        if compacted and self._history_loader is not None:
-                            history = await self._history_loader(message.session_key, None)
+                        if compacted and (self._surface_loader or self._history_loader) is not None:
+                            history = (
+                                await self._surface_loader(message.session_key)
+                                if self._surface_loader
+                                else await self._history_loader(message.session_key, None)
+                            )
                             read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
                             if callable(read_checkpoint):
                                 context.checkpoint_summary = str(
@@ -622,6 +711,12 @@ class Pipeline:
                     empty_assistant = {"role": "assistant", "content": ""}
                     react_messages.append(empty_assistant)
                     llm_surface_messages.append(deepcopy(empty_assistant))
+                    await append_surface_message(
+                        empty_assistant,
+                        iteration=iteration,
+                        source_kind="assistant_empty",
+                        operation_suffix="assistant-empty",
+                    )
                     sync_surface_snapshot()
                     nudge_message = {
                         "role": "user",
@@ -629,6 +724,12 @@ class Pipeline:
                     }
                     react_messages.append(nudge_message)
                     llm_surface_messages.append(deepcopy(nudge_message))
+                    await append_surface_message(
+                        nudge_message,
+                        iteration=iteration,
+                        source_kind="retry_nudge",
+                        operation_suffix="retry-nudge",
+                    )
                     sync_surface_snapshot()
                     retry_diagnostic: PromptCacheRequestDiagnostics | None = None
 
@@ -689,6 +790,12 @@ class Pipeline:
                 if response.thinking and "reasoning_content" not in final_model_message:
                     final_model_message["reasoning_content"] = response.thinking
                 llm_surface_messages.append(final_model_message)
+                await append_surface_message(
+                    final_model_message,
+                    iteration=iteration,
+                    source_kind="assistant_final",
+                    operation_suffix="assistant-final",
+                )
                 sync_surface_snapshot()
                 return PipelineResult(
                     content=str(content or ""),
@@ -705,6 +812,7 @@ class Pipeline:
                     llm_message_timestamp=message_timestamp.isoformat(),
                     llm_epoch_id=llm_epoch_id,
                     llm_surface_messages=deepcopy(llm_surface_messages),
+                    llm_surface_persisted=surface_persisted,
                 )
 
             # 工具调用 assistant 消息必须原样进入下一轮，尤其要保留 DeepSeek 的
@@ -720,6 +828,12 @@ class Pipeline:
             }
             react_messages.append(assistant_message)
             llm_surface_messages.append(deepcopy(assistant_message))
+            await append_surface_message(
+                assistant_message,
+                iteration=iteration,
+                source_kind="assistant_tool_call",
+                operation_suffix="assistant-tool-call",
+            )
             sync_surface_snapshot()
             group: dict[str, Any] = {"iteration": iteration, "text": response.content or "", "calls": [], "provider_fields": dict(response.provider_fields)}
             for call in response.tool_calls:
@@ -730,6 +844,13 @@ class Pipeline:
                     llm_surface_messages.extend(
                         deepcopy(react_messages[before_tool_messages:])
                     )
+                    for offset, tool_message in enumerate(react_messages[before_tool_messages:]):
+                        await append_surface_message(
+                            tool_message,
+                            iteration=iteration,
+                            source_kind="tool_result",
+                            operation_suffix=f"tool-result-{call.id}-{offset}",
+                        )
                     sync_surface_snapshot()
                     group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "content_blocks": deepcopy(result.content_blocks), "status": "error"})
                     continue
@@ -778,6 +899,13 @@ class Pipeline:
                 llm_surface_messages.extend(
                     deepcopy(react_messages[before_tool_messages:])
                 )
+                for offset, tool_message in enumerate(react_messages[before_tool_messages:]):
+                    await append_surface_message(
+                        tool_message,
+                        iteration=iteration,
+                        source_kind="tool_result",
+                        operation_suffix=f"tool-result-{call.id}-{offset}",
+                    )
                 sync_surface_snapshot()
                 if not suppress_stream:
                     preview = result.preview()[:500]
@@ -826,6 +954,7 @@ class Pipeline:
             llm_message_timestamp=message_timestamp.isoformat(),
             llm_epoch_id=llm_epoch_id,
             llm_surface_messages=deepcopy(llm_surface_messages),
+            llm_surface_persisted=surface_persisted,
         )
 
     def snapshot_interrupt_state(self, turn_id: str) -> dict[str, Any]:
