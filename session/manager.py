@@ -14,7 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
-from session.store import NewMessage, NewSurfaceEvent, SessionStore
+from session.store import NewMessage, NewSessionEvent, NewSurfaceEvent, SessionStore
 from tools.base import ToolResult
 from tools.runtime import serialize_tool_result_messages
 
@@ -389,6 +389,23 @@ class SessionManager:
         async with self._lock_for(key):
             self._ensure_not_deleted(key)
             return await asyncio.to_thread(self._store.append_surface, event)
+
+    async def append_session_event(self, event: NewSessionEvent) -> dict[str, Any]:
+        """在会话锁内追加模型事件日志，chunk 与边界不进入语义消息。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(event.session_key)
+        async with self._lock_for(key):
+            self._ensure_not_deleted(key)
+            return await asyncio.to_thread(self._store.append_session_event, event)
+
+    async def fetch_session_events(self, session_key: str) -> list[dict[str, Any]]:
+        """按事件序号读取模型事件日志，供恢复器和诊断使用。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(self._store.fetch_session_events, key)
 
     async def load_surface(
         self,

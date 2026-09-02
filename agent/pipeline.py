@@ -42,7 +42,7 @@ from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import ContextLengthError, LLMResponse, ProviderUsage
 from agent.skills import SkillsLoader, collect_skill_mentions
 from agent.tool_runtime import ToolRuntimeView
-from session.store import NewSurfaceEvent
+from session.store import NewSessionEvent, NewSurfaceEvent
 from tools.base import normalize_tool_result
 from tools.registry import ToolRegistry
 from tools.runtime import append_tool_result
@@ -55,6 +55,7 @@ class ProviderApi(Protocol):
 HistoryLoader = Callable[[str, int | None], Awaitable[list[dict[str, Any]]]]
 SurfaceLoader = Callable[[str], Awaitable[list[dict[str, Any]]]]
 SurfaceAppender = Callable[[NewSurfaceEvent], Awaitable[dict[str, Any]]]
+SessionEventAppender = Callable[[NewSessionEvent], Awaitable[dict[str, Any]]]
 ContextCompactor = Callable[..., Awaitable[bool]]
 ContextUsageLoader = Callable[[str], Awaitable[dict[str, Any] | None]]
 ContextUsageWriter = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -92,6 +93,7 @@ class Pipeline:
         history_loader: HistoryLoader | None = None,
         surface_loader: SurfaceLoader | None = None,
         surface_appender: SurfaceAppender | None = None,
+        event_appender: SessionEventAppender | None = None,
         context_compactor: ContextCompactor | None = None,
         context_usage_loader: ContextUsageLoader | None = None,
         context_usage_writer: ContextUsageWriter | None = None,
@@ -113,6 +115,7 @@ class Pipeline:
         self._history_loader = history_loader
         self._surface_loader = surface_loader
         self._surface_appender = surface_appender
+        self._event_appender = event_appender
         self._context_compactor = context_compactor
         self._context_usage_loader = context_usage_loader
         self._context_usage_writer = context_usage_writer
@@ -142,6 +145,15 @@ class Pipeline:
             "llm_epoch_id": "",
             "llm_surface_persisted": False,
         }
+        if self._event_appender is not None:
+            await self._event_appender(NewSessionEvent(
+                session_key=message.session_key,
+                event_type="turn/start",
+                turn_id=turn_id,
+                step=0,
+                data={"channel": message.channel, "chat_id": message.chat_id},
+                operation_key=f"{turn_id}:turn-start",
+            ))
         raw_allowed_tools = message.metadata.get("allowed_tools")
         allowed_tools = (
             [str(name) for name in raw_allowed_tools if str(name).strip()]
@@ -233,6 +245,28 @@ class Pipeline:
         surface_turn_initialized = False
         surface_persisted = False
         surface_tail_seq: int | None = None
+        chunk_index: dict[int, int] = {}
+        chunk_event_seqs: dict[int, list[int]] = {}
+
+        async def append_session_event(
+            event_type: str,
+            *,
+            iteration: int,
+            data: dict[str, Any],
+            operation_suffix: str,
+            source_event_seqs: list[int] | None = None,
+        ) -> dict[str, Any] | None:
+            if self._event_appender is None:
+                return None
+            return await self._event_appender(NewSessionEvent(
+                session_key=message.session_key,
+                event_type=event_type,
+                turn_id=turn_id,
+                step=max(0, int(iteration)),
+                data=deepcopy(data),
+                operation_key=f"{turn_id}:{operation_suffix}",
+                source_event_seqs=source_event_seqs,
+            ))
 
         async def append_surface_message(
             model_message: dict[str, Any],
@@ -245,27 +279,45 @@ class Pipeline:
             """按 Provider 发送顺序写入 durable surface；无写入器时保留旧测试路径。"""
 
             nonlocal surface_persisted, surface_tail_seq
-            if self._surface_appender is None:
-                return
             role = str(model_message.get("role") or "").strip().lower()
-            # 首轮 frame/user 在请求发出前没有诊断 epoch，沿用预计算值；后续
-            # Provider 返回后优先使用实际请求 header 的 epoch，避免工具 schema
-            # 或配置变化仍把新节点错误归入旧缓存域。
-            epoch = str(llm_epoch_id or surface_epoch_id or "default")
-            persisted = await self._surface_appender(NewSurfaceEvent(
-                session_key=message.session_key,
-                epoch_id=epoch,
-                turn_id=turn_id,
-                iteration=iteration,
-                role=role,
-                content=deepcopy(model_message),
-                source_kind=source_kind,
-                operation_key=f"{turn_id}:{iteration}:{operation_suffix}",
-                status=status,
-            ))
-            surface_persisted = True
-            if isinstance(persisted, dict) and persisted.get("surface_seq") is not None:
-                surface_tail_seq = max(0, int(persisted["surface_seq"]))
+            if self._surface_appender is not None:
+                # 首轮 frame/user 在请求发出前没有诊断 epoch，沿用预计算值；后续
+                # Provider 返回后优先使用实际请求 header 的 epoch，避免工具 schema
+                # 或配置变化仍把新节点错误归入旧缓存域。
+                epoch = str(llm_epoch_id or surface_epoch_id or "default")
+                persisted = await self._surface_appender(NewSurfaceEvent(
+                    session_key=message.session_key,
+                    epoch_id=epoch,
+                    turn_id=turn_id,
+                    iteration=iteration,
+                    role=role,
+                    content=deepcopy(model_message),
+                    source_kind=source_kind,
+                    operation_key=f"{turn_id}:{iteration}:{operation_suffix}",
+                    status=status,
+                ))
+                surface_persisted = True
+                if isinstance(persisted, dict) and persisted.get("surface_seq") is not None:
+                    surface_tail_seq = max(0, int(persisted["surface_seq"]))
+            event_type = {
+                "context_frame": "user/message",
+                "user_message": "user/message",
+                "assistant_tool_call": "assistant/message",
+                "assistant_empty": "assistant/message",
+                "assistant_final": "assistant/message",
+                "tool_result": "tool/result",
+            }.get(source_kind)
+            if event_type:
+                await append_session_event(
+                    event_type,
+                    iteration=iteration,
+                    data={"message": deepcopy(model_message)},
+                    operation_suffix=f"{iteration}:{operation_suffix}:message",
+                    source_event_seqs=(
+                        list(chunk_event_seqs.get(iteration, []))
+                        if event_type == "assistant/message" else None
+                    ),
+                )
 
         surface_epoch_id = ""
 
@@ -333,9 +385,24 @@ class Pipeline:
             return "\n\n".join(thinking_parts)
 
         async def on_delta(delta: dict[str, str]) -> None:
+            iteration = max(0, int(self._interrupt_snapshots[turn_id].get("iteration") or 0))
+            index = chunk_index.get(iteration, 0)
+            chunk_index[iteration] = index + 1
             snapshot = self._interrupt_snapshots[turn_id]
             snapshot["partial_reply"] += str(delta.get("content_delta") or "")
             snapshot["partial_thinking"] += str(delta.get("thinking_delta") or "")
+            event = await append_session_event(
+                "assistant/chunk",
+                iteration=iteration,
+                data={
+                    "content_delta": str(delta.get("content_delta") or ""),
+                    "thinking_delta": str(delta.get("thinking_delta") or ""),
+                    "index": index,
+                },
+                operation_suffix=f"{iteration}:assistant-chunk:{index}",
+            )
+            if event is not None and event.get("event_seq") is not None:
+                chunk_event_seqs.setdefault(iteration, []).append(int(event["event_seq"]))
             if suppress_stream:
                 return
             await self._events.emit(StreamDeltaReady(
@@ -394,7 +461,10 @@ class Pipeline:
                     visible_names=tool_view.visible_names,
                     visible_order=tool_view.visible_order,
                 )
-                if self._surface_appender is not None and not surface_turn_initialized:
+                if (
+                    (self._surface_appender is not None or self._event_appender is not None)
+                    and not surface_turn_initialized
+                ):
                     surface_epoch_id = canonical_header_hash(
                         _request_header_identity(
                             self._provider,
@@ -687,6 +757,12 @@ class Pipeline:
 
         for iteration in range(1, self._max_iterations + 1):
             self._interrupt_snapshots[turn_id]["iteration"] = iteration
+            await append_session_event(
+                "step/start",
+                iteration=iteration,
+                data={"iteration": iteration},
+                operation_suffix=f"{iteration}:step-start",
+            )
             response, request_diagnostic = await chat_with_context_retry()
             llm_epoch_id = request_diagnostic.epoch_id
             append_turn_thinking(response.thinking)
@@ -820,6 +896,18 @@ class Pipeline:
                     operation_suffix="assistant-final",
                 )
                 sync_surface_snapshot()
+                await append_session_event(
+                    "step/end",
+                    iteration=iteration,
+                    data={"status": "completed", "reason": "assistant_final"},
+                    operation_suffix=f"{iteration}:step-end",
+                )
+                await append_session_event(
+                    "turn/end",
+                    iteration=iteration,
+                    data={"status": "completed"},
+                    operation_suffix="turn-end",
+                )
                 return PipelineResult(
                     content=str(content or ""),
                     thinking=merged_turn_thinking(),
@@ -877,6 +965,16 @@ class Pipeline:
                     sync_surface_snapshot()
                     group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "content_blocks": deepcopy(result.content_blocks), "status": "error"})
                     continue
+                await append_session_event(
+                    "tool/call",
+                    iteration=iteration,
+                    data={
+                        "call_id": call.id,
+                        "name": call.name,
+                        "arguments": deepcopy(call.arguments),
+                    },
+                    operation_suffix=f"{iteration}:tool-call:{call.id}",
+                )
                 if not suppress_stream:
                     # 先写入运行中快照，再发实时事件；刷新重连正好发生在事件前后时，订阅端都能恢复工具图标。
                     self._upsert_interrupt_tool(
@@ -949,6 +1047,12 @@ class Pipeline:
                 snapshot["tools_used"] = list(dict.fromkeys(tools_used))
                 snapshot["tool_chain_partial"] = deepcopy([*tool_chain, group])
             tool_chain.append(group)
+            await append_session_event(
+                "step/end",
+                iteration=iteration,
+                data={"status": "completed", "reason": "tool_results"},
+                operation_suffix=f"{iteration}:step-end",
+            )
         # 达到最大迭代次数后生成阶段性进度总结，不直接崩溃。
         logger.warning(
             "ReAct 达到最大迭代次数: session=%s iteration=%d tools=%s",
@@ -978,6 +1082,12 @@ class Pipeline:
             llm_epoch_id=llm_epoch_id,
             llm_surface_messages=deepcopy(llm_surface_messages),
             llm_surface_persisted=surface_persisted,
+        )
+        await append_session_event(
+            "turn/end",
+            iteration=self._max_iterations,
+            data={"status": "incomplete", "reason": "max_iterations"},
+            operation_suffix="turn-end",
         )
 
     def snapshot_interrupt_state(self, turn_id: str) -> dict[str, Any]:

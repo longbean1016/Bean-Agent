@@ -81,6 +81,21 @@ class NewSurfaceEvent:
     surface_op: str = "append"
     replace_start: int | None = None
     replace_end: int | None = None
+    source_event_seqs: list[int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NewSessionEvent:
+    """写入模型事件日志的不可变事件。"""
+
+    session_key: str
+    event_type: str
+    turn_id: str
+    step: int
+    data: dict[str, Any]
+    operation_key: str
+    status: str = "committed"
+    source_event_seqs: list[int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +181,29 @@ class SessionStore:
         """在同一事务内幂等追加一条模型侧 surface 事件。"""
 
         return self._append_surface_sync(event)
+
+    def append_session_event(self, event: NewSessionEvent) -> dict[str, Any]:
+        """在同一事务内幂等追加一条模型事件日志记录。"""
+
+        return self._append_session_event_sync(event)
+
+    def fetch_session_events(self, session_key: str) -> list[dict[str, Any]]:
+        """按事件序号读取会话的完整模型事件日志。"""
+
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                """
+                SELECT session_key, event_seq, event_type, turn_id, step, data,
+                       operation_key, status, source_event_seqs, created_at
+                FROM session_events
+                WHERE session_key = ?
+                ORDER BY event_seq ASC
+                """,
+                (key,),
+            ).fetchall()
+        return [self._row_to_session_event(row) for row in rows]
 
     def load_surface(
         self,
@@ -860,6 +898,26 @@ class SessionStore:
                 CREATE INDEX IF NOT EXISTS idx_surface_events_session_status
                     ON surface_events(session_key, status);
 
+                CREATE TABLE IF NOT EXISTS session_events (
+                    session_key        TEXT NOT NULL,
+                    event_seq          INTEGER NOT NULL,
+                    event_type         TEXT NOT NULL,
+                    turn_id            TEXT NOT NULL,
+                    step               INTEGER NOT NULL,
+                    data               TEXT NOT NULL,
+                    operation_key      TEXT NOT NULL,
+                    status             TEXT NOT NULL,
+                    source_event_seqs  TEXT,
+                    created_at         TEXT NOT NULL,
+                    PRIMARY KEY (session_key, event_seq),
+                    UNIQUE (session_key, operation_key),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_events_session_order
+                    ON session_events(session_key, event_seq);
+
                 CREATE TABLE IF NOT EXISTS session_compaction_prepares (
                     session_key                  TEXT NOT NULL,
                     session_created_at           TEXT NOT NULL,
@@ -935,6 +993,15 @@ class SessionStore:
                     ON session_usage(session_key);
                 """
             )
+            surface_columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(surface_events)")
+            }
+            if "source_event_seqs" not in surface_columns:
+                # 仅增加可选 provenance 列；旧测试数据不需要迁移内容。
+                self._conn.execute(
+                    "ALTER TABLE surface_events ADD COLUMN source_event_seqs TEXT"
+                )
             try:
                 self._conn.executescript(
                     """
@@ -1204,7 +1271,7 @@ class SessionStore:
                     SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
                            role, content, source_kind, status, projection_version,
                            operation_key, surface_op, replace_start, replace_end,
-                           replace_generation, created_at
+                           replace_generation, source_event_seqs, created_at
                     FROM surface_events
                     WHERE session_key = ? AND operation_key = ?
                     """,
@@ -1226,6 +1293,7 @@ class SessionStore:
                         surface_op=surface_op,
                         replace_start=event.replace_start,
                         replace_end=event.replace_end,
+                        source_event_seqs=event.source_event_seqs,
                     ):
                         raise ValueError(
                             f"surface operation_key 已绑定不同事件: {key}:{operation_key}"
@@ -1261,6 +1329,11 @@ class SessionStore:
                         raise ValueError(
                             "replace 边界必须覆盖当前 surface 中连续存在的节点"
                         )
+                    self._validate_surface_provenance(
+                        event.source_event_seqs,
+                        shadowed=current_nodes[start_index:end_index + 1],
+                        session_key=key,
+                    )
                     replace_generation += 1
 
                 seq_row = self._conn.execute(
@@ -1278,8 +1351,8 @@ class SessionStore:
                         session_key, epoch_id, surface_seq, turn_id, iteration,
                         role, content, source_kind, status, projection_version,
                         operation_key, surface_op, replace_start, replace_end,
-                        replace_generation, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        replace_generation, source_event_seqs, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         key,
@@ -1297,6 +1370,8 @@ class SessionStore:
                         int(event.replace_start) if event.replace_start is not None else None,
                         int(event.replace_end) if event.replace_end is not None else None,
                         replace_generation,
+                        json.dumps(event.source_event_seqs, ensure_ascii=False)
+                        if event.source_event_seqs is not None else None,
                         now,
                     ),
                 )
@@ -1310,7 +1385,7 @@ class SessionStore:
                     SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
                            role, content, source_kind, status, projection_version,
                            operation_key, surface_op, replace_start, replace_end,
-                           replace_generation, created_at
+                           replace_generation, source_event_seqs, created_at
                     FROM surface_events
                     WHERE session_key = ? AND surface_seq = ?
                     """,
@@ -1322,6 +1397,119 @@ class SessionStore:
         if row is None:
             raise RuntimeError(f"surface 事件写入后无法读取: {key}:{surface_seq}")
         return self._row_to_surface_event(row)
+
+    def _append_session_event_sync(self, event: NewSessionEvent) -> dict[str, Any]:
+        """在 SQLite 事务中追加不可变事件，并按 operation_key 幂等返回。"""
+
+        key = self._validate_session_key(event.session_key)
+        event_type = str(event.event_type).strip()
+        turn_id = str(event.turn_id).strip()
+        operation_key = str(event.operation_key).strip()
+        status = str(event.status).strip().lower()
+        if not event_type:
+            raise ValueError("session event_type 不能为空")
+        if not turn_id:
+            raise ValueError("session event turn_id 不能为空")
+        if not operation_key:
+            raise ValueError("session event operation_key 不能为空")
+        if not isinstance(event.data, dict):
+            raise TypeError("session event data 必须是对象")
+        if not status:
+            raise ValueError("session event status 不能为空")
+        refs = None
+        if event.source_event_seqs is not None:
+            try:
+                refs = [int(item) for item in event.source_event_seqs]
+            except (TypeError, ValueError) as error:
+                raise ValueError("session event source_event_seqs 必须是整数列表") from error
+            if refs != sorted(set(refs)):
+                raise ValueError("session event source_event_seqs 必须严格递增且不能重复")
+        payload = json.dumps(event.data, ensure_ascii=False, separators=(",", ":"))
+        refs_payload = json.dumps(refs, ensure_ascii=False) if refs is not None else None
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = _now_iso()
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO sessions (
+                        key, created_at, updated_at, last_consolidated,
+                        next_seq, metadata
+                    ) VALUES (?, ?, ?, 0, 0, '{}')
+                    """,
+                    (key, now, now),
+                )
+                if refs:
+                    placeholders = ",".join("?" for _ in refs)
+                    count_row = self._conn.execute(
+                        f"SELECT COUNT(*) AS count FROM session_events "
+                        f"WHERE session_key = ? AND event_seq IN ({placeholders})",
+                        (key, *refs),
+                    ).fetchone()
+                    if int(count_row["count"] if count_row else 0) != len(refs):
+                        raise ValueError(
+                            f"session event provenance 不属于当前会话: {key}"
+                        )
+                existing = self._conn.execute(
+                    """
+                    SELECT session_key, event_seq, event_type, turn_id, step, data,
+                           operation_key, status, source_event_seqs, created_at
+                    FROM session_events
+                    WHERE session_key = ? AND operation_key = ?
+                    """,
+                    (key, operation_key),
+                ).fetchone()
+                if existing is not None:
+                    current = self._row_to_session_event(existing)
+                    if (
+                        current["event_type"] != event_type
+                        or current["turn_id"] != turn_id
+                        or int(current["step"]) != int(event.step)
+                        or current["data"] != event.data
+                        or current["status"] != status
+                        or current.get("source_event_seqs") != refs
+                    ):
+                        raise ValueError(f"session event operation_key 已绑定不同事件: {key}:{operation_key}")
+                    self._conn.commit()
+                    return current
+                seq_row = self._conn.execute(
+                    """
+                    SELECT COALESCE(MAX(event_seq), -1) + 1 AS next_event_seq
+                    FROM session_events WHERE session_key = ?
+                    """,
+                    (key,),
+                ).fetchone()
+                event_seq = int(seq_row["next_event_seq"] if seq_row else 0)
+                self._conn.execute(
+                    """
+                    INSERT INTO session_events (
+                        session_key, event_seq, event_type, turn_id, step, data,
+                        operation_key, status, source_event_seqs, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (key, event_seq, event_type, turn_id, int(event.step), payload,
+                     operation_key, status, refs_payload, now),
+                )
+                self._conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE key = ?", (now, key)
+                )
+                self._conn.commit()
+                row = self._conn.execute(
+                    """
+                    SELECT session_key, event_seq, event_type, turn_id, step, data,
+                           operation_key, status, source_event_seqs, created_at
+                    FROM session_events
+                    WHERE session_key = ? AND event_seq = ?
+                    """,
+                    (key, event_seq),
+                ).fetchone()
+            except Exception:
+                self._conn.rollback()
+                raise
+        if row is None:
+            raise RuntimeError(f"session event 写入后无法读取: {key}:{event_seq}")
+        return self._row_to_session_event(row)
 
     def _fetch_surface_events_sync(
         self,
@@ -1338,7 +1526,7 @@ class SessionStore:
                     SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
                            role, content, source_kind, status, projection_version,
                            operation_key, surface_op, replace_start, replace_end,
-                           replace_generation, created_at
+                           replace_generation, source_event_seqs, created_at
                     FROM surface_events
                     WHERE session_key = ?
                     ORDER BY surface_seq ASC
@@ -1351,7 +1539,7 @@ class SessionStore:
                     SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
                            role, content, source_kind, status, projection_version,
                            operation_key, surface_op, replace_start, replace_end,
-                           replace_generation, created_at
+                           replace_generation, source_event_seqs, created_at
                     FROM surface_events
                     WHERE session_key = ? AND epoch_id = ?
                     ORDER BY surface_seq ASC
@@ -1387,7 +1575,7 @@ class SessionStore:
             SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
                    role, content, source_kind, status, projection_version,
                    operation_key, surface_op, replace_start, replace_end,
-                   replace_generation, created_at
+                   replace_generation, source_event_seqs, created_at
             FROM surface_events
             WHERE session_key = ?
             ORDER BY surface_seq ASC
@@ -1441,6 +1629,7 @@ class SessionStore:
         surface_op: str,
         replace_start: int | None,
         replace_end: int | None,
+        source_event_seqs: list[int] | None,
     ) -> bool:
         return (
             current["epoch_id"] == epoch_id
@@ -1455,7 +1644,36 @@ class SessionStore:
             and current["surface_op"] == surface_op
             and current["replace_start"] == replace_start
             and current["replace_end"] == replace_end
+            and current.get("source_event_seqs") == (
+                [int(item) for item in source_event_seqs]
+                if source_event_seqs is not None else None
+            )
         )
+
+    @staticmethod
+    def _validate_surface_provenance(
+        source_event_seqs: list[int] | None,
+        *,
+        shadowed: list[dict[str, Any]],
+        session_key: str,
+    ) -> None:
+        """校验 replace 来源完整覆盖当前节点，防止异步压缩误替换新前缀。"""
+
+        if source_event_seqs is None:
+            return
+        if not isinstance(source_event_seqs, list):
+            raise TypeError("surface source_event_seqs 必须是整数列表")
+        try:
+            refs = [int(item) for item in source_event_seqs]
+        except (TypeError, ValueError) as error:
+            raise ValueError("surface source_event_seqs 必须全部是整数") from error
+        if refs != sorted(set(refs)):
+            raise ValueError("surface source_event_seqs 必须严格递增且不能重复")
+        expected = [int(item["surface_seq"]) for item in shadowed]
+        if refs != expected:
+            raise ValueError(
+                f"surface replace provenance 与当前覆盖范围不一致: session={session_key}"
+            )
 
     def _get_session_meta_sync(self, session_key: str) -> dict[str, Any] | None:
         key = self._validate_session_key(session_key)
@@ -2344,6 +2562,30 @@ class SessionStore:
                 else None
             ),
             "replace_generation": int(row["replace_generation"] or 0),
+            "source_event_seqs": _load_json_int_list(row["source_event_seqs"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    @staticmethod
+    def _row_to_session_event(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            data = json.loads(str(row["data"]))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"session event data 不是合法 JSON: {row['session_key']}:{row['event_seq']}"
+            ) from error
+        if not isinstance(data, dict):
+            raise ValueError("session event data 必须是对象")
+        return {
+            "session_key": str(row["session_key"]),
+            "event_seq": int(row["event_seq"]),
+            "event_type": str(row["event_type"]),
+            "turn_id": str(row["turn_id"]),
+            "step": int(row["step"]),
+            "data": data,
+            "operation_key": str(row["operation_key"]),
+            "status": str(row["status"]),
+            "source_event_seqs": _load_json_int_list(row["source_event_seqs"]),
             "created_at": str(row["created_at"]),
         }
 
@@ -2451,6 +2693,21 @@ def _load_json_string_list(value: object) -> list[str]:
     return [str(item) for item in loaded] if isinstance(loaded, list) else []
 
 
+def _load_json_int_list(value: object) -> list[int] | None:
+    if value is None or value == "":
+        return None
+    try:
+        loaded = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(loaded, list):
+        return None
+    try:
+        return [int(item) for item in loaded]
+    except (TypeError, ValueError):
+        return None
+
+
 def _load_json_dict_list(value: object) -> list[dict[str, Any]]:
     if not value:
         return []
@@ -2485,6 +2742,7 @@ def _prepare_matches_checkpoint(
 
 __all__ = [
     "NewMessage",
+    "NewSessionEvent",
     "NewSurfaceEvent",
     "SessionCompaction",
     "SessionCompactionPrepare",

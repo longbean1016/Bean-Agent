@@ -510,6 +510,7 @@ class MemoryEngine:
             surface_op="replace",
             replace_start=start,
             replace_end=end,
+            source_event_seqs=[int(node["surface_seq"]) for node in shadowed],
         ))
 
     async def _summarize_checkpoint(self, previous_summary: str, conversation: str) -> str:

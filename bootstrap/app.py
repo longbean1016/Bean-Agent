@@ -340,6 +340,7 @@ def build_core_runtime(
         history_loader=sessions.load_history,
         surface_loader=sessions.load_surface,
         surface_appender=sessions.append_surface,
+        event_appender=sessions.append_session_event,
         context_compactor=(memory.compact_for_context if memory is not None else None),
         context_usage_loader=lambda session_key: asyncio.to_thread(
             sessions.store.get_context_usage, session_key

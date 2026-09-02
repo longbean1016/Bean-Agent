@@ -20,8 +20,12 @@ from agent.event_bus import (
 from agent.message_bus import InboundMessage, MessageBus, OutboundMessage, PipelineResult
 from agent.turn_scheduler import QueuePosition, TurnScheduler
 from session.manager import SessionManager
-from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
-from session.store import NewSurfaceEvent
+from session.model_surface import (
+    INTERRUPTED_TOOL_RESULT_CONTENT,
+    TOOL_NOT_STARTED_RESULT_CONTENT,
+    TOOL_OUTCOME_UNKNOWN_RESULT_CONTENT,
+)
+from session.store import NewSessionEvent, NewSurfaceEvent
 from tools.runtime import serialize_tool_result_messages
 
 logger = logging.getLogger(__name__)
@@ -351,6 +355,16 @@ class AgentLoop:
             tool_chain=tool_chain,
         )
         await self._sessions.append_messages(session, [user, assistant])
+        append_event = getattr(self._sessions, "append_session_event", None)
+        if callable(append_event):
+            await append_event(NewSessionEvent(
+                session_key=message.session_key,
+                event_type="turn/end",
+                turn_id=turn_id,
+                step=max(0, int(snapshot.get("iteration") or 0)) if isinstance(snapshot, dict) else 0,
+                data={"status": status},
+                operation_key=f"{turn_id}:{status}-turn-end",
+            ))
         # error/interrupted 表示推理结果不完整，不发 TurnCommitted，避免记忆模块把错误文本
         # 当作正常 assistant 证据进行归档或隐式提取。
 
@@ -414,7 +428,16 @@ class AgentLoop:
             # 模型侧沿用参考实现的恢复规则：已经收到的半截 assistant 内容继续保留，
             # 未完成工具只补确定性的占位结果；前端看到的 interrupted 文案仍只在
             # 语义 assistant 中保存，不能把第二个 assistant 消息插入模型前缀。
-            _repair_interrupted_surface(surface)
+            _repair_interrupted_surface(
+                surface,
+                started_call_ids={
+                    str(item.get("call_id") or "")
+                    for item in state.tools
+                    if isinstance(item, dict)
+                    and str(item.get("call_id") or "")
+                    and str(item.get("status") or "") in {"running", "completed", "error"}
+                },
+            )
         user = session.add_message(
             "user",
             state.original_user_message,
@@ -441,6 +464,16 @@ class AgentLoop:
         )
         # 中断轮不发 TurnCommitted，避免未完成内容参与长期记忆提取。
         await self._sessions.append_messages(session, [user, assistant])
+        append_event = getattr(self._sessions, "append_session_event", None)
+        if callable(append_event):
+            await append_event(NewSessionEvent(
+                session_key=state.session_key,
+                event_type="turn/end",
+                turn_id=turn_id,
+                step=max(0, self._interrupt_iteration(state)),
+                data={"status": "interrupted"},
+                operation_key=f"{turn_id}:interrupt-turn-end",
+            ))
 
     async def _repair_durable_surface(
         self,
@@ -450,6 +483,25 @@ class AgentLoop:
         """为已持久化的中断轮补半截 assistant 和未完成工具结果。"""
 
         nodes = await self._sessions.load_surface_events(state.session_key)
+        fetch_events = getattr(self._sessions, "fetch_session_events", None)
+        session_events = (
+            await fetch_events(state.session_key)
+            if callable(fetch_events) else []
+        )
+        started_call_ids = {
+            str(item.get("data", {}).get("call_id") or "")
+            for item in session_events
+            if isinstance(item, dict)
+            and str(item.get("turn_id") or "") == turn_id
+            and item.get("event_type") == "tool/call"
+            and isinstance(item.get("data"), dict)
+        }
+        # 旧调用方可能只持久化了 surface，没有事件日志；此时沿用旧语义，
+        # 已存在的 assistant tool-call 按“结果未知”处理，避免误判成未启动。
+        has_event_log = any(
+            isinstance(item, dict) and str(item.get("turn_id") or "") == turn_id
+            for item in session_events
+        )
         current = [
             node for node in nodes
             if str(node.get("turn_id") or "") == turn_id
@@ -470,6 +522,57 @@ class AgentLoop:
             item for item in state.llm_surface_messages
             if isinstance(item, dict)
         ]
+        recovered_partial_reply = ""
+        recovered_partial_thinking = ""
+        recovered_assistant_messages: list[tuple[int, dict[str, Any]]] = []
+        if not snapshot_messages and has_event_log:
+            # 进程重启后没有内存快照时，从完整消息事件和 chunk 事实恢复本轮
+            # 模型前缀；chunk 只在没有 assistant/message 投影时合并成半截消息。
+            recovered_messages: list[dict[str, Any]] = []
+            assistant_steps: set[int] = set()
+            chunks: dict[int, dict[str, str]] = {}
+            for item in session_events:
+                if not isinstance(item, dict) or str(item.get("turn_id") or "") != turn_id:
+                    continue
+                event_type = str(item.get("event_type") or "")
+                data = item.get("data")
+                if not isinstance(data, dict):
+                    continue
+                if event_type in {"user/message", "assistant/message", "tool/result"}:
+                    model_message = data.get("message")
+                    if isinstance(model_message, dict):
+                        recovered_messages.append(deepcopy(model_message))
+                        if event_type == "assistant/message":
+                            assistant_steps.add(int(item.get("step") or 0))
+                elif event_type == "assistant/chunk":
+                    step = max(0, int(item.get("step") or 0))
+                    bucket = chunks.setdefault(step, {"content": "", "thinking": ""})
+                    bucket["content"] += str(data.get("content_delta") or "")
+                    bucket["thinking"] += str(data.get("thinking_delta") or "")
+            for step, chunk in sorted(chunks.items()):
+                if step in assistant_steps or not (chunk["content"] or chunk["thinking"]):
+                    continue
+                recovered_message = {
+                    "role": "assistant",
+                    "content": chunk["content"],
+                    **({"reasoning_content": chunk["thinking"]} if chunk["thinking"] else {}),
+                }
+                recovered_messages.append(recovered_message)
+                recovered_assistant_messages.append((step, recovered_message))
+                recovered_partial_reply = chunk["content"]
+                recovered_partial_thinking = chunk["thinking"]
+            snapshot_messages = recovered_messages
+        append_event = getattr(self._sessions, "append_session_event", None)
+        if recovered_assistant_messages and callable(append_event):
+            for step, recovered_message in recovered_assistant_messages:
+                await append_event(NewSessionEvent(
+                    session_key=state.session_key,
+                    event_type="assistant/message",
+                    turn_id=turn_id,
+                    step=step,
+                    data={"message": deepcopy(recovered_message), "recovered": True},
+                    operation_key=f"{turn_id}:{step}:recovered-assistant-message",
+                ))
         common = 0
         while (
             common < len(persisted_messages)
@@ -529,8 +632,8 @@ class AgentLoop:
 
         # 流式 Provider 尚未返回完整 assistant 时，仍把已交付正文保存在模型侧 surface；
         # UI 的停止文案仍只写语义 assistant，不会污染这个模型前缀。
-        partial_reply = str(state.partial_reply or "")
-        partial_thinking = str(state.partial_thinking or "")
+        partial_reply = str(state.partial_reply or "") or recovered_partial_reply
+        partial_thinking = str(state.partial_thinking or "") or recovered_partial_thinking
         if partial_reply or partial_thinking:
             already_persisted = any(
                 isinstance(node.get("message"), dict)
@@ -557,6 +660,11 @@ class AgentLoop:
         for iteration, call_id in assistant_calls:
             if call_id in completed_calls:
                 continue
+            placeholder = (
+                TOOL_OUTCOME_UNKNOWN_RESULT_CONTENT
+                if call_id in started_call_ids or not has_event_log
+                else TOOL_NOT_STARTED_RESULT_CONTENT
+            )
             await self._sessions.append_surface(NewSurfaceEvent(
                 session_key=state.session_key,
                 epoch_id=epoch_id,
@@ -566,10 +674,44 @@ class AgentLoop:
                 content={
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": INTERRUPTED_TOOL_RESULT_CONTENT,
+                    "content": placeholder,
                 },
                 source_kind="interrupted_tool_result",
                 operation_key=f"{turn_id}:{iteration}:interrupted-tool-result:{call_id}",
+            ))
+            append_event = getattr(self._sessions, "append_session_event", None)
+            if callable(append_event):
+                await append_event(NewSessionEvent(
+                    session_key=state.session_key,
+                    event_type="tool/result",
+                    turn_id=turn_id,
+                    step=iteration,
+                    data={
+                        "call_id": call_id,
+                        "content": placeholder,
+                        "recovery": True,
+                        "outcome_known": False,
+                    },
+                    operation_key=f"{turn_id}:{iteration}:interrupted-tool-result-event:{call_id}",
+                ))
+
+        append_event = getattr(self._sessions, "append_session_event", None)
+        if callable(append_event):
+            await append_event(NewSessionEvent(
+                session_key=state.session_key,
+                event_type="step/end",
+                turn_id=turn_id,
+                step=recovery_iteration,
+                data={"status": "interrupted", "repaired": True},
+                operation_key=f"{turn_id}:{recovery_iteration}:repair-step-end",
+            ))
+            await append_event(NewSessionEvent(
+                session_key=state.session_key,
+                event_type="turn/end",
+                turn_id=turn_id,
+                step=recovery_iteration,
+                data={"status": "interrupted", "repaired": True},
+                operation_key=f"{turn_id}:repair-turn-end",
             ))
 
     @staticmethod
@@ -647,7 +789,16 @@ def _model_projection_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     )
     surface = projection.get("llm_surface_messages")
     if isinstance(surface, list) and surface:
-        _repair_interrupted_surface(surface)
+        _repair_interrupted_surface(
+            surface,
+            started_call_ids={
+                str(item.get("call_id") or "")
+                for item in snapshot.get("tools") or []
+                if isinstance(item, dict)
+                and str(item.get("call_id") or "")
+                and str(item.get("status") or "") in {"running", "completed", "error"}
+            },
+        )
     return projection
 
 
@@ -661,6 +812,13 @@ def _model_projection_from_state(state: TurnInterruptState) -> dict[str, Any]:
         llm_epoch_id=state.llm_epoch_id,
         llm_surface_messages=state.llm_surface_messages,
         llm_surface_persisted=state.llm_surface_persisted,
+        started_call_ids={
+            str(item.get("call_id") or "")
+            for item in state.tools
+            if isinstance(item, dict)
+            and str(item.get("call_id") or "")
+            and str(item.get("status") or "") in {"running", "completed", "error"}
+        },
     )
 
 
@@ -672,6 +830,7 @@ def _model_projection(
     llm_epoch_id: str,
     llm_surface_messages: object,
     llm_surface_persisted: bool = False,
+    started_call_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """统一组装隐藏字段，避免正常、失败和中断路径发生字段漂移。"""
 
@@ -749,6 +908,8 @@ def interrupted_tool_chain(
 
 def _repair_interrupted_surface(
     surface: list[dict[str, Any]],
+    *,
+    started_call_ids: set[str] | None = None,
 ) -> None:
     """闭合中断时已发出的工具调用，保持模型下一轮请求协议合法。"""
 
@@ -790,10 +951,15 @@ def _repair_interrupted_surface(
         if call_id not in result_ids
     ]
     for call_id in missing_ids:
+        placeholder = (
+            TOOL_OUTCOME_UNKNOWN_RESULT_CONTENT
+            if started_call_ids is None or call_id in started_call_ids
+            else TOOL_NOT_STARTED_RESULT_CONTENT
+        )
         surface.extend(
             serialize_tool_result_messages(
                 tool_call_id=call_id,
-                content=INTERRUPTED_TOOL_RESULT_CONTENT,
+                content=placeholder,
                 tool_name=tool_call_names.get(call_id) or None,
             )
         )
