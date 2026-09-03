@@ -1,5 +1,6 @@
 # LLM 与嵌入客户端
 openai>=2.0.0
+keyring>=25.6.0
 
 # SKILL.md YAML frontmatter 安全解析
 PyYAML>=6.0.2
