@@ -93,18 +93,23 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
   }
   if (action.type === "session.subscribed") return state;
   if (action.type === "error") {
+    const requestSessionId = Object.entries(state.turnStates)
+      .find(([, turn]) => turn.requestId && turn.requestId === action.request_id)?.[0];
     const rejected = action.code === "queue_full" || action.code === "session_busy" || action.code === "closed";
-    if (!rejected || !action.session_id) return { ...state, error: action.message };
-    const current = action.session_id === state.sessionId;
-    const sessionMessages = getSessionMessages(state, action.session_id)
+    const failedSessionId = rejected ? action.session_id : requestSessionId;
+    if (!failedSessionId) return { ...state, error: action.message };
+    // 首轮创建 Session 后错误帧可能省略 session_id，必须通过 request id 找回已迁移的
+    // submitting 状态，否则输入框会永久停留在“停止”按钮。
+    const current = failedSessionId === state.sessionId;
+    const sessionMessages = getSessionMessages(state, failedSessionId)
       .filter((message) => message.id !== `user-${action.request_id}`);
     return {
       ...state,
       activeTurnId: current ? "" : state.activeTurnId,
       messages: current ? sessionMessages : state.messages,
-      sessionMessages: setSessionMessages(state, action.session_id, sessionMessages),
+      sessionMessages: setSessionMessages(state, failedSessionId, sessionMessages),
       error: current ? action.message : state.error,
-      turnStates: setTurnState(state, action.session_id, idleTurnState),
+      turnStates: setTurnState(state, failedSessionId, idleTurnState),
     };
   }
   if (action.type === "pong") return state;

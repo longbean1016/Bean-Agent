@@ -56,7 +56,7 @@ test("展示结构化错误并停止活跃 Turn", async ({ page }) => {
 
   await input.fill("等待停止");
   await page.getByRole("button", { name: "发送" }).click();
-  await page.getByRole("button", { name: "停止" }).click();
+  await page.getByRole("button", { name: "停止", exact: true }).click();
   await expect(page.getByText("已停止")).toBeVisible();
 });
 
@@ -106,8 +106,42 @@ test("加载历史会话并新建空会话", async ({ page }, testInfo) => {
   await expect(page.getByRole("button", { name: "打开会话列表" })).toBeHidden();
   await page.getByRole("button", { name: "历史问题", exact: true }).click();
   await expect(page.getByText("历史回答")).toBeVisible();
-  await page.getByRole("button", { name: "新建会话" }).click();
+  await page.getByRole("button", { name: "新建会话", exact: true }).click();
   await expect(page.getByText("从一个具体问题开始")).toBeVisible();
+});
+
+test("工作目录与会话权限可以在输入框切换", async ({ page }) => {
+  await page.getByRole("button", { name: "工作目录：无工作目录" }).click();
+  await page.getByRole("menuitemradio", { name: /Bean Demo/ }).click();
+  await page.getByRole("button", { name: "权限：只读" }).click();
+  await page.getByRole("menuitemradio", { name: /工作区可写/ }).click();
+
+  await expect(page.getByRole("button", { name: "工作目录：Bean Demo" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "权限：工作区可写" })).toBeVisible();
+});
+
+test("完全访问需要显式风险确认", async ({ page }) => {
+  await page.getByRole("button", { name: "权限：只读" }).click();
+  await page.getByRole("menuitemradio", { name: /完全访问/ }).click();
+  const dialog = page.getByRole("dialog", { name: "启用完全访问？" });
+  const confirm = dialog.getByRole("button", { name: "启用完全访问" });
+  await expect(confirm).toBeDisabled();
+  await dialog.getByRole("checkbox").check();
+  await confirm.click();
+  await expect(page.getByRole("button", { name: "权限：完全访问" })).toBeVisible();
+});
+
+test("越权请求用审批面板替换输入框并只允许单次决定", async ({ page }) => {
+  const input = page.getByPlaceholder("输入消息，或附加文本与图片");
+  await input.fill("审批测试");
+  await page.getByRole("button", { name: "发送" }).click();
+
+  await expect(page.getByLabel("待处理权限审批")).toBeVisible();
+  await expect(page.getByText("Set-Content D:\\outside.txt 'approved'")).toBeVisible();
+  await expect(input).toHaveCount(0);
+  await page.getByRole("button", { name: "仅允许本次" }).click();
+  await expect(page.getByText("审批流程已结束")).toBeVisible();
+  await expect(page.getByPlaceholder("输入消息，或附加文本与图片")).toBeVisible();
 });
 
 test("长回答只滚动消息区并始终保留输入框", async ({ page }) => {

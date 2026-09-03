@@ -16,35 +16,33 @@ import {
   Menu,
   MessageSquarePlus,
   Mic,
-  MoreHorizontal,
   Monitor,
   Moon,
   Paperclip,
-  Pencil,
   PlugZap,
   RefreshCw,
   SendHorizontal,
   Sun,
-  Trash2,
   Wrench,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { ComponentPropsWithoutRef, CSSProperties, ReactNode } from "react";
+import type { ComponentPropsWithoutRef, CSSProperties } from "react";
 import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import type { StickToBottomContext } from "use-stick-to-bottom";
 
-import { deleteReminder, deleteSession, fetchMessagePage, fetchMessagesAroundPage, fetchNotifications, fetchOlderMessages, fetchProactiveSettings, fetchReminders, fetchSessions, fetchTurns, mediaUrl, renameSession, saveProactiveSettings, uploadAttachment } from "./api";
+import { deleteSession, deleteWorkspace, fetchMessagePage, fetchMessagesAroundPage, fetchNotifications, fetchOlderMessages, fetchSessions, fetchTurns, fetchWorkspaces, mediaUrl, registerWorkspace, renameSession, uploadAttachment } from "./api";
 import { idleTurnState, initialChatState, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
 import { composeTimeline, reconcileMessages } from "./timeline";
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
+import { ApprovalPanel, PermissionSelector, WorkspaceSelector } from "./SandboxControls";
+import { SessionSidebar } from "./SessionSidebar";
 import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
-import { groupSessionsByUpdatedAt } from "./sessionGroups";
-import type { ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ProactiveSettings, ScheduledReminder, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry } from "./types";
+import type { ApprovalRequest, ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, SandboxMode, SandboxSnapshot, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry, Workspace } from "./types";
 import { groupMessagesIntoNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
 
@@ -182,6 +180,13 @@ export function App() {
   const [routeSession, setRouteSession] = useState(initialSession);
   const [connection, setConnection] = useState<ConnectionStatus>("connecting");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [sandboxBySession, setSandboxBySession] = useState<Record<string, SandboxSnapshot>>({});
+  const [pendingApprovals, setPendingApprovals] = useState<Record<string, ApprovalRequest[]>>({});
+  const [approvalDecisionRequests, setApprovalDecisionRequests] = useState<Record<string, string>>({});
+  const [sandboxRequest, setSandboxRequest] = useState<{ id: string; sessionId: string } | null>(null);
+  const [newSessionWorkspaceId, setNewSessionWorkspaceId] = useState<string | null>(null);
+  const [newSessionMode, setNewSessionMode] = useState<SandboxMode>("read-only");
   const [turnsBySession, setTurnsBySession] = useState<Record<string, TurnNavigationEntry[]>>({});
   const [requestedTurnId, setRequestedTurnId] = useState("");
   const [notificationsBySession, setNotificationsBySession] = useState<Record<string, ChatMessage[]>>({});
@@ -206,11 +211,24 @@ export function App() {
   const compactionStartedAtRef = useRef<Record<string, number>>({});
   const compactionNoticeTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const routeSessionRef = useRef(routeSession);
+  const workspacesRef = useRef(workspaces);
+  const pendingApprovalsRef = useRef(pendingApprovals);
+  const approvalDecisionRequestsRef = useRef(approvalDecisionRequests);
+  const sandboxRequestRef = useRef(sandboxRequest);
+  const newSessionConfigRef = useRef<{ workspaceId: string | null; mode: SandboxMode }>({
+    workspaceId: null,
+    mode: "read-only",
+  });
   const sessionLoadVersionsRef = useRef<Record<string, number>>({});
   const reloadSessionRef = useRef<(sessionId: string) => void>(() => undefined);
   chatRef.current = chat;
   messageWindowsRef.current = messageWindows;
   routeSessionRef.current = routeSession;
+  workspacesRef.current = workspaces;
+  pendingApprovalsRef.current = pendingApprovals;
+  approvalDecisionRequestsRef.current = approvalDecisionRequests;
+  sandboxRequestRef.current = sandboxRequest;
+  newSessionConfigRef.current = { workspaceId: newSessionWorkspaceId, mode: newSessionMode };
 
   useEffect(() => () => {
     for (const timer of Object.values(compactionNoticeTimersRef.current)) clearTimeout(timer);
@@ -219,6 +237,18 @@ export function App() {
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
   const currentContextUsage = chat.contextUsage[chat.sessionId];
   const currentSessionUsage = chat.sessionUsage[chat.sessionId];
+  const currentSessionSummary = sessions.find((session) => session.key === chat.sessionId);
+  const currentSandbox = sandboxBySession[chat.sessionId];
+  const currentWorkspaceId = chat.sessionId
+    ? (currentSandbox?.workspace_id ?? currentSessionSummary?.workspace_id ?? null)
+    : newSessionWorkspaceId;
+  const currentSandboxMode = chat.sessionId
+    ? (currentSandbox?.sandbox_mode ?? currentSessionSummary?.sandbox_mode ?? "read-only")
+    : newSessionMode;
+  const currentWorkspaceValid = chat.sessionId
+    ? (currentSandbox?.workspace_valid ?? currentSessionSummary?.workspace_valid ?? true)
+    : (workspaces.find((workspace) => workspace.id === newSessionWorkspaceId)?.valid ?? true);
+  const currentApproval = pendingApprovals[chat.sessionId]?.[0];
   const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running" || currentTurn.status === "compacting";
   const restoringSession = Boolean(chat.sessionId && loadingSessionId === chat.sessionId && chat.messages.length === 0);
   const displayMessages = useMemo(() => composeTimeline(
@@ -275,6 +305,14 @@ export function App() {
     }
   }, []);
 
+  const refreshWorkspaces = useCallback(async () => {
+    try {
+      setWorkspaces(await fetchWorkspaces());
+    } catch (error) {
+      dispatch(errorFrame(error));
+    }
+  }, []);
+
   const refreshTurnPreviews = useCallback(async (sessionId: string) => {
     if (!sessionId) return;
     try {
@@ -297,9 +335,84 @@ export function App() {
     return true;
   }, []);
 
+  const clearApprovalsForSession = useCallback((sessionId: string) => {
+    const approvalIds = new Set(
+      (pendingApprovalsRef.current[sessionId] ?? []).map((approval) => approval.id),
+    );
+    const nextApprovals = { ...pendingApprovalsRef.current, [sessionId]: [] };
+    pendingApprovalsRef.current = nextApprovals;
+    setPendingApprovals(nextApprovals);
+    if (!approvalIds.size) return;
+    const nextRequests = Object.fromEntries(
+      Object.entries(approvalDecisionRequestsRef.current)
+        .filter(([approvalId]) => !approvalIds.has(approvalId)),
+    );
+    approvalDecisionRequestsRef.current = nextRequests;
+    setApprovalDecisionRequests(nextRequests);
+  }, []);
+
   const handleFrame = useCallback((frame: ChatFrame) => {
     if (handleNotificationFrame(frame)) return;
     dispatch(frame);
+    if (frame.type === "session.subscribed") {
+      // 服务端会在订阅确认后重放当前 pending；先丢弃旧缓存，避免重连产生重复审批卡片。
+      clearApprovalsForSession(frame.session_id);
+    }
+    if (frame.type === "sandbox.updated") {
+      const snapshot = frame.sandbox;
+      setSandboxBySession((current) => ({ ...current, [snapshot.session_id]: snapshot }));
+      setSessions((current) => current.map((session) => session.key === snapshot.session_id ? {
+        ...session,
+        workspace_id: snapshot.workspace_id,
+        cwd_snapshot: snapshot.cwd_snapshot,
+        workspace_title: snapshot.workspace_title,
+        workspace_path: snapshot.workspace_path,
+        workspace_valid: snapshot.workspace_valid,
+        sandbox_mode: snapshot.sandbox_mode,
+      } : session));
+      if (frame.request_id && sandboxRequestRef.current?.id === frame.request_id) {
+        sandboxRequestRef.current = null;
+        setSandboxRequest(null);
+      }
+    }
+    if (frame.type === "approval.requested") {
+      const existing = pendingApprovalsRef.current[frame.session_id] ?? [];
+      const nextApprovals = {
+        ...pendingApprovalsRef.current,
+        [frame.session_id]: existing.some((item) => item.id === frame.approval.id)
+          ? existing.map((item) => item.id === frame.approval.id ? frame.approval : item)
+          : [...existing, frame.approval],
+      };
+      pendingApprovalsRef.current = nextApprovals;
+      setPendingApprovals(nextApprovals);
+    }
+    if (frame.type === "approval.resolved") {
+      const nextApprovals = {
+        ...pendingApprovalsRef.current,
+        [frame.session_id]: (pendingApprovalsRef.current[frame.session_id] ?? [])
+          .filter((item) => item.id !== frame.approval_id),
+      };
+      pendingApprovalsRef.current = nextApprovals;
+      setPendingApprovals(nextApprovals);
+      const nextRequests = { ...approvalDecisionRequestsRef.current };
+      delete nextRequests[frame.approval_id];
+      approvalDecisionRequestsRef.current = nextRequests;
+      setApprovalDecisionRequests(nextRequests);
+    }
+    if (frame.type === "error") {
+      if (frame.request_id && sandboxRequestRef.current?.id === frame.request_id) {
+        sandboxRequestRef.current = null;
+        setSandboxRequest(null);
+      }
+      const approvalId = Object.entries(approvalDecisionRequestsRef.current)
+        .find(([, requestId]) => requestId === frame.request_id)?.[0];
+      if (approvalId) {
+        const nextRequests = { ...approvalDecisionRequestsRef.current };
+        delete nextRequests[approvalId];
+        approvalDecisionRequestsRef.current = nextRequests;
+        setApprovalDecisionRequests(nextRequests);
+      }
+    }
     if (frame.type === "context.compaction.started") {
       compactionStartedAtRef.current[frame.session_id] = Date.now();
       const previousTimer = compactionNoticeTimersRef.current[frame.session_id];
@@ -340,6 +453,11 @@ export function App() {
             updated_at: createdAt,
             message_count: 0,
             first_message_content: "",
+            workspace_id: newSessionConfigRef.current.workspaceId,
+            workspace_title: workspacesRef.current.find((workspace) => workspace.id === newSessionConfigRef.current.workspaceId)?.title ?? null,
+            workspace_path: workspacesRef.current.find((workspace) => workspace.id === newSessionConfigRef.current.workspaceId)?.canonical_path ?? null,
+            workspace_valid: workspacesRef.current.find((workspace) => workspace.id === newSessionConfigRef.current.workspaceId)?.valid ?? false,
+            sandbox_mode: newSessionConfigRef.current.mode,
           }, ...current]);
     }
     if (frame.type === "session.updated") {
@@ -355,6 +473,8 @@ export function App() {
       )));
     }
     if (frame.type === "message.final") {
+      // cancelled/unavailable 审批不一定另发 resolved；Turn 结束时必须让 composer 收敛。
+      clearApprovalsForSession(frame.session_id);
       void refreshSessions();
       void refreshTurnPreviews(frame.session_id);
     }
@@ -362,8 +482,9 @@ export function App() {
       // 后端发送该帧前已完成中断轮持久化。立刻用带 seq 的权威行替换本地草稿，
       // 避免连续中断时多个无 seq 草稿按客户端时间错序。
       reloadSessionRef.current(frame.session_id);
+      clearApprovalsForSession(frame.session_id);
     }
-  }, [handleNotificationFrame, refreshSessions, refreshTurnPreviews]);
+  }, [clearApprovalsForSession, handleNotificationFrame, refreshSessions, refreshTurnPreviews]);
 
   useEffect(() => {
     const client = new BeanWebSocketClient({
@@ -375,8 +496,9 @@ export function App() {
     clientRef.current = client;
     client.connect();
     void refreshSessions();
+    void refreshWorkspaces();
     return () => client.close();
-  }, [handleFrame, refreshSessions]);
+  }, [handleFrame, refreshSessions, refreshWorkspaces]);
 
   useEffect(() => {
     if (connection !== "connected" || !chat.sessionId) return;
@@ -430,8 +552,44 @@ export function App() {
     void loadSession(sessionId, false);
   };
 
-  const createSession = () => {
+  const decideApproval = useCallback((approval: ApprovalRequest, decision: "allowed-once" | "rejected") => {
+    if (approvalDecisionRequestsRef.current[approval.id]) return;
+    const requestId = crypto.randomUUID();
+    const nextRequests = { ...approvalDecisionRequestsRef.current, [approval.id]: requestId };
+    approvalDecisionRequestsRef.current = nextRequests;
+    setApprovalDecisionRequests(nextRequests);
+    const sent = clientRef.current?.send({
+      type: "approval.decide",
+      request_id: requestId,
+      session_id: approval.session_id,
+      approval_id: approval.id,
+      decision,
+    });
+    if (!sent) {
+      const currentRequests = { ...approvalDecisionRequestsRef.current };
+      delete currentRequests[approval.id];
+      approvalDecisionRequestsRef.current = currentRequests;
+      setApprovalDecisionRequests(currentRequests);
+      dispatch({
+        type: "error",
+        request_id: requestId,
+        session_id: approval.session_id,
+        code: "closed",
+        message: "审批结果未发送，连接已断开",
+      });
+      return;
+    }
+  }, []);
+
+  const rejectPendingApprovals = useCallback((sessionId: string) => {
+    for (const approval of pendingApprovalsRef.current[sessionId] ?? []) {
+      if (!approvalDecisionRequestsRef.current[approval.id]) decideApproval(approval, "rejected");
+    }
+  }, [decideApproval]);
+
+  const createSession = (workspaceId: string | null = null) => {
     if (connection !== "connected") return;
+    if (chat.sessionId) rejectPendingApprovals(chat.sessionId);
     setLoadingSessionId("");
     localStorage.removeItem(SESSION_STORAGE_KEY);
     window.history.pushState({}, "", "/");
@@ -443,16 +601,115 @@ export function App() {
     setFileDrafts((current) => ({ ...current, [routeKey("")]: [] }));
     setInput("");
     setFiles([]);
+    setNewSessionWorkspaceId(workspaceId);
+    setNewSessionMode("read-only");
     setSidebarOpen(false);
   };
 
   const selectSession = (sessionId: string) => {
+    if (chat.sessionId && chat.sessionId !== sessionId) rejectPendingApprovals(chat.sessionId);
     window.history.pushState({}, "", pathForSession(sessionId));
     routeSessionRef.current = sessionId;
     setRouteSession(sessionId);
     setInput(textDrafts[routeKey(sessionId)] ?? "");
     setFiles(fileDrafts[routeKey(sessionId)] ?? []);
     void loadSession(sessionId);
+  };
+
+  const handleRegisterWorkspace = async (path: string, title: string) => {
+    try {
+      const workspace = await registerWorkspace(path, title);
+      setWorkspaces((current) => [workspace, ...current.filter((item) => item.id !== workspace.id)]);
+      return workspace;
+    } catch (error) {
+      dispatch(errorFrame(error));
+      throw error;
+    }
+  };
+
+  const handleDeleteWorkspace = async (workspaceId: string) => {
+    try {
+      await deleteWorkspace(workspaceId);
+      setWorkspaces((current) => current.filter((workspace) => workspace.id !== workspaceId));
+      setSessions((current) => current.map((session) => session.workspace_id === workspaceId ? {
+        ...session,
+        workspace_id: null,
+        cwd_snapshot: null,
+        workspace_title: null,
+        workspace_path: null,
+        workspace_valid: false,
+        sandbox_mode: session.sandbox_mode === "workspace-write" ? "read-only" : session.sandbox_mode,
+      } : session));
+      setSandboxBySession((current) => Object.fromEntries(Object.entries(current).map(([sessionId, snapshot]) => (
+        snapshot.workspace_id === workspaceId
+          ? [sessionId, {
+              ...snapshot,
+              workspace_id: null,
+              cwd_snapshot: null,
+              workspace_title: null,
+              workspace_path: null,
+              workspace_valid: false,
+              sandbox_mode: snapshot.sandbox_mode === "workspace-write" ? "read-only" : snapshot.sandbox_mode,
+            }]
+          : [sessionId, snapshot]
+      ))));
+      if (newSessionWorkspaceId === workspaceId) {
+        setNewSessionWorkspaceId(null);
+        if (newSessionMode === "workspace-write") setNewSessionMode("read-only");
+      }
+    } catch (error) {
+      dispatch(errorFrame(error));
+      throw error;
+    }
+  };
+
+  const handleWorkspaceChange = (workspaceId: string | null) => {
+    if (!chat.sessionId) {
+      setNewSessionWorkspaceId(workspaceId);
+      if (workspaceId === null && newSessionMode === "workspace-write") setNewSessionMode("read-only");
+      return;
+    }
+    const requestId = crypto.randomUUID();
+    const request = { id: requestId, sessionId: chat.sessionId };
+    sandboxRequestRef.current = request;
+    setSandboxRequest(request);
+    const sent = clientRef.current?.send({
+      type: "workspace.bind",
+      request_id: requestId,
+      session_id: chat.sessionId,
+      workspace_id: workspaceId,
+    });
+    if (!sent) {
+      sandboxRequestRef.current = null;
+      setSandboxRequest(null);
+      dispatch({ type: "error", request_id: requestId, session_id: chat.sessionId, code: "closed", message: "工作目录未更新，连接已断开" });
+      return;
+    }
+  };
+
+  const handleSandboxModeChange = (mode: SandboxMode, riskConfirmed = false) => {
+    if (mode === "workspace-write" && currentWorkspaceId === null) return;
+    if (!chat.sessionId) {
+      setNewSessionMode(mode);
+      return;
+    }
+    const requestId = crypto.randomUUID();
+    const request = { id: requestId, sessionId: chat.sessionId };
+    sandboxRequestRef.current = request;
+    setSandboxRequest(request);
+    const sent = clientRef.current?.send({
+      type: "sandbox.mode.set",
+      request_id: requestId,
+      session_id: chat.sessionId,
+      sandbox_mode: mode,
+      ...(mode === "danger-full-access" ? { risk_confirmed: riskConfirmed } : {}),
+    });
+    if (!sent) {
+      sandboxRequestRef.current = null;
+      setSandboxRequest(null);
+      dispatch({ type: "error", request_id: requestId, session_id: chat.sessionId, code: "closed", message: "会话权限未更新，连接已断开" });
+      return;
+    }
   };
 
   const handleTurnRequest = useCallback(async (turn: TurnNavigationEntry) => {
@@ -638,6 +895,10 @@ export function App() {
   useEffect(() => {
     const handlePopState = () => {
       const sessionId = sessionFromPath(window.location.pathname);
+      const previousSessionId = chatRef.current.sessionId;
+      if (previousSessionId && previousSessionId !== sessionId) {
+        rejectPendingApprovals(previousSessionId);
+      }
       routeSessionRef.current = sessionId;
       setRouteSession(sessionId);
       setInput(textDrafts[routeKey(sessionId)] ?? "");
@@ -650,7 +911,7 @@ export function App() {
     };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
-  }, [connection, fileDrafts, textDrafts]);
+  }, [connection, fileDrafts, rejectPendingApprovals, textDrafts]);
 
   const handleRenameSession = async (sessionId: string, title: string) => {
     try {
@@ -692,6 +953,11 @@ export function App() {
         type: "message.send",
         request_id: requestId,
         ...(sessionId ? { session_id: sessionId } : {}),
+        ...(!sessionId ? {
+          workspace_id: newSessionWorkspaceId,
+          sandbox_mode: newSessionMode,
+          ...(newSessionMode === "danger-full-access" ? { risk_confirmed: true } : {}),
+        } : {}),
         text: cleanText,
         media: uploaded.map((item) => item.upload_path),
       });
@@ -756,8 +1022,11 @@ export function App() {
     <SessionSidebar
       activeSessionId={chat.sessionId}
       sessions={sessions}
+      workspaces={workspaces}
       onCreate={createSession}
       onDelete={handleDeleteSession}
+      onDeleteWorkspace={handleDeleteWorkspace}
+      onRegisterWorkspace={handleRegisterWorkspace}
       onRename={handleRenameSession}
       onSelect={selectSession}
     />
@@ -867,30 +1136,48 @@ export function App() {
           />
         </StickToBottom>
 
-        <Composer
-          active={turnActive}
-          turnStatus={currentTurn.status}
-          queuePosition={currentTurn.queuePosition}
-          connected={connection === "connected"}
-          files={files}
-          input={input}
-          sessionId={chat.sessionId}
-          contextUsage={currentContextUsage}
-          sessionUsage={currentSessionUsage}
-          compacting={currentTurn.status === "compacting"
-            || (compactionNotice.sessionId === chat.sessionId && compactionNotice.visible)}
-          sending={sending}
-          onFiles={(next) => {
-            setFiles(next);
-            setFileDrafts((current) => ({ ...current, [routeKey(routeSession)]: next }));
-          }}
-          onInput={(value) => {
-            setInput(value);
-            setTextDrafts((current) => ({ ...current, [routeKey(routeSession)]: value }));
-          }}
-          onSend={() => void submit()}
-          onStop={stopTurn}
-        />
+        {currentApproval ? (
+          <ApprovalPanel
+            approval={currentApproval}
+            submitting={Boolean(approvalDecisionRequests[currentApproval.id])}
+            onDecide={(decision) => decideApproval(currentApproval, decision)}
+          />
+        ) : (
+          <Composer
+            active={turnActive}
+            turnStatus={currentTurn.status}
+            queuePosition={currentTurn.queuePosition}
+            connected={connection === "connected"}
+            files={files}
+            input={input}
+            sessionId={chat.sessionId}
+            contextUsage={currentContextUsage}
+            sessionUsage={currentSessionUsage}
+            workspaces={workspaces}
+            workspaceId={currentWorkspaceId}
+            workspaceValid={currentWorkspaceValid}
+            sandboxMode={currentSandboxMode}
+            sandboxUpdating={sandboxRequest?.sessionId === chat.sessionId}
+            workspaceLocked={Boolean(chat.sessionId && (
+              (currentSessionSummary?.message_count ?? 0) > 0 || chat.messages.length > 0
+            ))}
+            compacting={currentTurn.status === "compacting"
+              || (compactionNotice.sessionId === chat.sessionId && compactionNotice.visible)}
+            sending={sending}
+            onFiles={(next) => {
+              setFiles(next);
+              setFileDrafts((current) => ({ ...current, [routeKey(routeSession)]: next }));
+            }}
+            onInput={(value) => {
+              setInput(value);
+              setTextDrafts((current) => ({ ...current, [routeKey(routeSession)]: value }));
+            }}
+            onSend={() => void submit()}
+            onStop={stopTurn}
+            onWorkspaceChange={handleWorkspaceChange}
+            onSandboxModeChange={handleSandboxModeChange}
+          />
+        )}
       </main>
     </div>
   );
@@ -964,330 +1251,7 @@ function ConversationScrollButton({ hasTailWindow, onReturnToLatest }: {
   );
 }
 
-function SessionSidebar(props: {
-  sessions: SessionSummary[];
-  activeSessionId: string;
-  onCreate: () => void;
-  onDelete: (id: string) => Promise<void>;
-  onRename: (id: string, title: string) => Promise<void>;
-  onSelect: (id: string) => void;
-}) {
-  const groups = useMemo(() => groupSessionsByUpdatedAt(props.sessions), [props.sessions]);
-  const [menuSessionId, setMenuSessionId] = useState("");
-  const [editingSessionId, setEditingSessionId] = useState("");
-  const [titleDraft, setTitleDraft] = useState("");
-  const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
-  const [proactiveTarget, setProactiveTarget] = useState<SessionSummary | null>(null);
-  const [deleting, setDeleting] = useState(false);
-  const [scrollbarVisible, setScrollbarVisible] = useState(false);
-  const scrollbarHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const sessionListRef = useRef<HTMLElement>(null);
 
-  useEffect(() => {
-    // 新会话发送消息后出现在侧栏时，自动滚动定位到该会话
-    if (sessionListRef.current) {
-      const activeRow = sessionListRef.current.querySelector(".session-row.active");
-      if (activeRow && typeof activeRow.scrollIntoView === "function") {
-        try {
-          activeRow.scrollIntoView({ behavior: "smooth", block: "nearest" });
-        } catch {
-          // jsdom 环境可能不支持 scrollIntoView，忽略
-        }
-      }
-    }
-  }, [props.activeSessionId, props.sessions]);
-
-  useEffect(() => () => {
-    if (scrollbarHideTimerRef.current !== null) clearTimeout(scrollbarHideTimerRef.current);
-  }, []);
-
-  const showSessionScrollbar = () => {
-    if (scrollbarHideTimerRef.current !== null) {
-      clearTimeout(scrollbarHideTimerRef.current);
-      scrollbarHideTimerRef.current = null;
-    }
-    setScrollbarVisible(true);
-  };
-
-  const scheduleSessionScrollbarHide = () => {
-    if (scrollbarHideTimerRef.current !== null) clearTimeout(scrollbarHideTimerRef.current);
-    // 移出后保留短暂视觉提示，避免用户刚离开列表时滚动位置突然失去参照。
-    scrollbarHideTimerRef.current = setTimeout(() => {
-      setScrollbarVisible(false);
-      scrollbarHideTimerRef.current = null;
-    }, 3_000);
-  };
-
-  useEffect(() => {
-    if (!menuSessionId) return;
-    const closeMenuOutside = (event: PointerEvent) => {
-      const owner = event.target instanceof Element
-        ? event.target.closest<HTMLElement>("[data-session-menu-owner]")
-        : null;
-      if (owner?.dataset.sessionMenuOwner !== menuSessionId) setMenuSessionId("");
-    };
-    // 使用捕获阶段，保证点击会话切换等控件时先收起菜单，再执行目标控件自己的动作。
-    document.addEventListener("pointerdown", closeMenuOutside, true);
-    return () => document.removeEventListener("pointerdown", closeMenuOutside, true);
-  }, [menuSessionId]);
-
-  const beginRename = (session: SessionSummary) => {
-    setMenuSessionId("");
-    setEditingSessionId(session.key);
-    setTitleDraft(session.title || session.first_message_content || "未命名会话");
-  };
-
-  const commitRename = async (session: SessionSummary) => {
-    const title = titleDraft.trim();
-    const original = session.title || session.first_message_content || "未命名会话";
-    if (!title || title === original) {
-      setEditingSessionId("");
-      return;
-    }
-    setEditingSessionId("");
-    await props.onRename(session.key, title).catch(() => setEditingSessionId(session.key));
-  };
-
-  return (
-    <div className="session-panel">
-      <div className="brand-lockup">
-        <span className="brand-mark">B</span>
-        <strong>BeanAgent</strong>
-      </div>
-      <button className="new-chat-button" onClick={props.onCreate}><MessageSquarePlus size={17} />新建会话</button>
-      <nav
-        ref={sessionListRef}
-        className={`session-list ${scrollbarVisible ? "scrollbar-visible" : ""}`}
-        aria-label="会话列表"
-        onPointerEnter={showSessionScrollbar}
-        onPointerLeave={scheduleSessionScrollbarHide}
-      >
-        {props.sessions.length === 0 ? <p className="session-empty">完成第一轮对话后，会话会出现在这里。</p> : groups.map((group) => (
-          <section className="session-group" key={group.label}>
-            <h2 className="session-group-title">{group.label}</h2>
-            {group.sessions.map((session) => {
-              const title = session.title || session.first_message_content || "未命名会话";
-              const active = session.key === props.activeSessionId;
-              return (
-                <div
-                  key={session.key}
-                  className={`session-row ${active ? "active" : ""}`}
-                  data-session-menu-owner={session.key}
-                >
-                  {editingSessionId === session.key ? (
-                    <input
-                      className="session-title-input"
-                      aria-label="会话标题"
-                      autoFocus
-                      maxLength={60}
-                      value={titleDraft}
-                      onBlur={() => void commitRename(session)}
-                      onChange={(event) => setTitleDraft(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") void commitRename(session);
-                        if (event.key === "Escape") setEditingSessionId("");
-                      }}
-                    />
-                  ) : (
-                    <button className="session-row-select" onClick={() => props.onSelect(session.key)}>
-                      <span>{title}</span>
-                    </button>
-                  )}
-                  <button
-                    className="session-menu-trigger"
-                    aria-label={`打开会话“${title}”的菜单`}
-                    aria-expanded={menuSessionId === session.key}
-                    onClick={() => setMenuSessionId((current) => current === session.key ? "" : session.key)}
-                  >
-                    <MoreHorizontal size={17} />
-                  </button>
-                  {menuSessionId === session.key ? (
-                    <div className="session-menu" role="menu">
-                      <button role="menuitem" onClick={() => { setMenuSessionId(""); setProactiveTarget(session); }}><Bell size={15} />主动设置</button>
-                      <button role="menuitem" onClick={() => beginRename(session)}><Pencil size={15} />重命名</button>
-                      <button className="danger" role="menuitem" onClick={() => { setMenuSessionId(""); setDeleteTarget(session); }}><Trash2 size={15} />删除</button>
-                    </div>
-                  ) : null}
-                </div>
-              );
-            })}
-          </section>
-        ))}
-      </nav>
-      <Dialog.Root open={deleteTarget !== null} onOpenChange={(open) => { if (!open && !deleting) setDeleteTarget(null); }}>
-        <Dialog.Portal>
-          <Dialog.Overlay className="dialog-overlay" onClick={() => { if (!deleting) setDeleteTarget(null); }} />
-          <Dialog.Content className="delete-session-dialog">
-            <Dialog.Title>删除“{deleteTarget ? (deleteTarget.title || deleteTarget.first_message_content || "未命名会话") : ""}”？</Dialog.Title>
-            <Dialog.Description>
-              该会话中的消息和工具执行记录将被永久删除。<br />
-              已沉淀的长期记忆不会随会话删除。<br />
-              此操作无法撤销。
-            </Dialog.Description>
-            <div className="delete-dialog-actions">
-              <Dialog.Close asChild><button disabled={deleting}>取消</button></Dialog.Close>
-              <button
-                className="confirm-delete"
-                disabled={deleting}
-                onClick={() => {
-                  if (!deleteTarget) return;
-                  setDeleting(true);
-                  void props.onDelete(deleteTarget.key)
-                    .then(() => setDeleteTarget(null))
-                    .catch(() => undefined)
-                    .finally(() => setDeleting(false));
-                }}
-              >确认删除</button>
-            </div>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
-      <ProactiveSettingsDialog target={proactiveTarget} onClose={() => setProactiveTarget(null)} />
-    </div>
-  );
-}
-
-function ProactiveSettingsDialog({ target, onClose }: { target: SessionSummary | null; onClose: () => void }) {
-  const [settings, setSettings] = useState<ProactiveSettings | null>(null);
-  const [reminders, setReminders] = useState<ScheduledReminder[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const [help, setHelp] = useState("");
-  const [confirmReminderId, setConfirmReminderId] = useState("");
-  const [deletingReminderId, setDeletingReminderId] = useState("");
-
-  useEffect(() => {
-    if (!target) return;
-    setLoading(true);
-    setError("");
-    setConfirmReminderId("");
-    setDeletingReminderId("");
-    Promise.all([fetchProactiveSettings(target.key), fetchReminders(target.key)])
-      .then(([nextSettings, nextReminders]) => { setSettings(nextSettings); setReminders(nextReminders); })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "加载失败"))
-      .finally(() => setLoading(false));
-  }, [target]);
-
-  useEffect(() => {
-    if (!help) return;
-    const close = () => setHelp("");
-    document.addEventListener("pointerdown", close);
-    return () => document.removeEventListener("pointerdown", close);
-  }, [help]);
-
-  const update = <K extends keyof ProactiveSettings>(key: K, value: ProactiveSettings[K]) => {
-    setSettings((current) => current ? { ...current, [key]: value } : current);
-  };
-  const save = async () => {
-    if (!target || !settings) return;
-    setSaving(true);
-    setError("");
-    try {
-      setSettings(await saveProactiveSettings(target.key, settings));
-      onClose();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "保存失败");
-    } finally {
-      setSaving(false);
-    }
-  };
-  const refreshReminderList = async () => {
-    if (target) setReminders(await fetchReminders(target.key));
-  };
-  const removeReminder = async (item: ScheduledReminder) => {
-    if (!target || deletingReminderId) return;
-    setDeletingReminderId(item.id);
-    setError("");
-    try {
-      await deleteReminder(target.key, item.id);
-      setConfirmReminderId("");
-      await refreshReminderList();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setDeletingReminderId("");
-    }
-  };
-
-  return (
-    <Dialog.Root open={target !== null} onOpenChange={(open) => { if (!open && !saving) onClose(); }}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="dialog-overlay" />
-        <Dialog.Content className="proactive-dialog">
-          <header className="proactive-dialog-header">
-            <div><Dialog.Title>主动设置</Dialog.Title><Dialog.Description>{target?.title || target?.first_message_content || "当前会话"}</Dialog.Description></div>
-            <Dialog.Close asChild><button className="icon-button" aria-label="关闭"><X size={17} /></button></Dialog.Close>
-          </header>
-          {loading || !settings ? <div className="proactive-loading">{error || "正在加载…"}</div> : (
-            <div className="proactive-dialog-body">
-              <SettingsSection title="提醒" enabled={settings.reminders_enabled} onEnabled={(value) => update("reminders_enabled", value)}>
-                <SettingRow label="勿扰时段处理" helpId="reminder-policy" help={help} onHelp={setHelp} helpText="延后：勿扰结束后发送；照常发送：仍按原时间；跳过：本次不发送。">
-                  <select value={settings.reminder_quiet_policy} onChange={(event) => update("reminder_quiet_policy", event.target.value as ProactiveSettings["reminder_quiet_policy"])}>
-                    <option value="delay">延后发送</option><option value="send">照常发送</option><option value="skip">跳过本次</option>
-                  </select>
-                </SettingRow>
-                <div className="reminder-list">
-                  <div className="reminder-list-title"><span>已创建的提醒</span><small>通过对话创建</small></div>
-                  {reminders.length === 0 ? <p className="reminder-empty">暂无提醒</p> : reminders.map((item) => (
-                    <div className={`reminder-item${confirmReminderId === item.id ? " confirming" : ""}`} key={item.id}>
-                      <div><strong>{item.name || (item.tier === "instant" ? "固定提醒" : "AI 定时任务")}</strong><small>{item.trigger === "every" ? "周期 · " : ""}{new Date(item.fire_at).toLocaleString()} · {item.tier === "instant" ? "固定文本" : "到期执行 prompt"}{item.status === "failed" ? ` · 失败：${item.last_error}` : ""}</small></div>
-                      {confirmReminderId === item.id ? (
-                        <span className="reminder-confirm-actions">
-                          <button type="button" disabled={deletingReminderId === item.id} onClick={() => setConfirmReminderId("")}>取消</button>
-                          <button type="button" className="confirm-delete" disabled={deletingReminderId === item.id} onClick={() => void removeReminder(item)}>{deletingReminderId === item.id ? "删除中" : "确认删除"}</button>
-                        </span>
-                      ) : (
-                        <button className="icon-button danger" aria-label="删除提醒" onClick={() => setConfirmReminderId(item.id)}><Trash2 size={15} /></button>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </SettingsSection>
-
-              <SettingsSection title="主动聊天" enabled={settings.conversation_enabled} onEnabled={(value) => update("conversation_enabled", value)}>
-                <SettingRow label="主动程度" helpId="activity" help={help} onHelp={setHelp} helpText="算法倾向：克制更少尝试，均衡适合日常，积极更愿意延续明确未完成的话题；所有档位仍受间隔、次数和勿扰限制。">
-                  <select value={settings.activity_level} onChange={(event) => update("activity_level", event.target.value as ProactiveSettings["activity_level"])}>
-                    <option value="restrained">克制</option><option value="balanced">均衡</option><option value="active">积极</option>
-                  </select>
-                </SettingRow>
-                <SettingRow label="最短间隔" helpId="interval" help={help} onHelp={setHelp} helpText="一次主动聊天后，至少等待这么久再尝试。这是明确的频率边界，主动程度不会越过它。">
-                  <NumberSetting value={settings.min_conversation_interval_hours} min={1} max={168} suffix="小时" onChange={(value) => update("min_conversation_interval_hours", value)} />
-                </SettingRow>
-                <SettingRow label="每日最多" helpId="daily" help={help} onHelp={setHelp} helpText="当天最多主动聊天的次数，可输入 1 到 20。普通问题的正常回答不计入。">
-                  <NumberSetting value={settings.daily_conversation_limit} min={1} max={20} suffix="次" onChange={(value) => update("daily_conversation_limit", value)} />
-                </SettingRow>
-              </SettingsSection>
-
-              <section className="settings-section quiet-section">
-                <div className="settings-section-title"><div><strong>勿扰时间</strong><span>提醒和主动聊天共用</span></div><Toggle checked={settings.quiet_hours_enabled} onChange={(value) => update("quiet_hours_enabled", value)} /></div>
-                <div className="quiet-time-row"><input type="time" value={settings.quiet_start} onChange={(event) => update("quiet_start", event.target.value)} /><span>至</span><input type="time" value={settings.quiet_end} onChange={(event) => update("quiet_end", event.target.value)} /></div>
-              </section>
-              {error ? <div className="settings-error" role="alert">{error}</div> : null}
-            </div>
-          )}
-          <footer className="proactive-dialog-footer"><Dialog.Close asChild><button className="secondary-action" disabled={saving}>取消</button></Dialog.Close><button className="primary-action" disabled={saving || loading || !settings} onClick={() => void save()}>{saving ? "保存中…" : "保存设置"}</button></footer>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
-  );
-}
-
-function SettingsSection({ title, enabled, onEnabled, children }: { title: string; enabled: boolean; onEnabled: (value: boolean) => void; children: ReactNode }) {
-  return <section className={`settings-section${enabled ? "" : " disabled"}`}><div className="settings-section-title"><strong>{title}</strong><Toggle checked={enabled} onChange={onEnabled} /></div><div className="settings-section-content">{children}</div></section>;
-}
-
-function SettingRow({ label, helpId, help, onHelp, helpText, children }: { label: string; helpId: string; help: string; onHelp: (id: string) => void; helpText: string; children: ReactNode }) {
-  return <div className="setting-row"><div className="setting-label"><span>{label}</span><span className="help-owner" onPointerDown={(event) => event.stopPropagation()}><button className="help-button" aria-label={`说明：${label}`} onClick={() => onHelp(help === helpId ? "" : helpId)}><AlertCircle size={13} /></button>{help === helpId ? <span className="help-popover">{helpText}</span> : null}</span></div>{children}</div>;
-}
-
-function Toggle({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }) {
-  return <button type="button" className={`toggle${checked ? " on" : ""}`} role="switch" aria-checked={checked} onClick={() => onChange(!checked)}><span /></button>;
-}
-
-function NumberSetting({ value, min, max, suffix, onChange }: { value: number; min: number; max: number; suffix: string; onChange: (value: number) => void }) {
-  return <label className="number-setting"><input type="number" min={min} max={max} value={value} onChange={(event) => onChange(Math.max(min, Math.min(max, Number(event.target.value) || min)))} /><span>{suffix}</span></label>;
-}
 
 function ConnectionControl({ status, onReconnect }: { status: ConnectionStatus; onReconnect: () => void }) {
   const label = { connecting: "连接中", connected: "已连接", reconnecting: "重连中", offline: "已断开" }[status];
@@ -1573,7 +1537,8 @@ function AttachmentGallery({ paths }: { paths: string[] }) {
 
 function Composer(props: {
   input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running" | "compacting"; compacting: boolean; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string; contextUsage?: ContextUsage; sessionUsage?: SessionUsage;
-  onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void;
+  workspaces: Workspace[]; workspaceId: string | null; workspaceValid: boolean; sandboxMode: SandboxMode; sandboxUpdating: boolean; workspaceLocked: boolean;
+  onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void; onWorkspaceChange: (workspaceId: string | null) => void; onSandboxModeChange: (mode: SandboxMode, riskConfirmed?: boolean) => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -1804,6 +1769,7 @@ function Composer(props: {
     props.onStop();
   }, [props.onStop]);
   const speechRunning = listening || speechActiveRef.current;
+  const sandboxControlsLocked = !props.connected || props.active || props.sending || props.sandboxUpdating;
 
   return (
     <>
@@ -1853,6 +1819,19 @@ function Composer(props: {
         ) : null}
         <div className="composer-actions">
           <ContextUsageIndicator usage={props.contextUsage} compacting={props.compacting} />
+          <WorkspaceSelector
+            workspaces={props.workspaces}
+            value={props.workspaceId}
+            valid={props.workspaceValid}
+            disabled={sandboxControlsLocked || props.workspaceLocked}
+            onChange={props.onWorkspaceChange}
+          />
+          <PermissionSelector
+            value={props.sandboxMode}
+            hasWorkspace={props.workspaceId !== null}
+            disabled={sandboxControlsLocked}
+            onChange={props.onSandboxModeChange}
+          />
           <label className="icon-button composer-tool-button attach-button" title="添加文本或图片">
             <Paperclip size={18} /><span className="sr-only">添加附件</span>
             <input type="file" multiple accept={ATTACHMENT_ACCEPT} onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />

@@ -1,4 +1,4 @@
-import type { MessagePage, MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile } from "./types";
+import type { MessagePage, MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile, Workspace } from "./types";
 
 // 仅控制聊天页面的滚动分页，不参与模型上下文 token gate 或 checkpoint 边界。
 const MESSAGE_WINDOW_LIMIT = 60;
@@ -8,6 +8,36 @@ export async function fetchSessions(): Promise<SessionSummary[]> {
   if (!response.ok) throw new Error("无法加载会话列表");
   const payload = await response.json() as { items?: SessionSummary[] };
   return payload.items ?? [];
+}
+
+export async function fetchWorkspaces(): Promise<Workspace[]> {
+  const response = await fetch("/api/chat/workspaces");
+  if (!response.ok) throw new Error("无法加载工作目录");
+  const payload = await response.json() as { items?: Workspace[] };
+  return (payload.items ?? []).filter((item) => (
+    typeof item?.id === "string" && typeof item.canonical_path === "string"
+  ));
+}
+
+export async function registerWorkspace(path: string, title: string): Promise<Workspace> {
+  const response = await fetch("/api/chat/workspaces", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, title }),
+  });
+  const payload = await response.json().catch(() => ({})) as Partial<Workspace> & { detail?: string };
+  if (!response.ok || !payload.id) throw new Error(payload.detail || "无法添加工作目录");
+  return payload as Workspace;
+}
+
+export async function deleteWorkspace(workspaceId: string): Promise<void> {
+  const response = await fetch(`/api/chat/workspaces/${encodeURIComponent(workspaceId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { detail?: string };
+    throw new Error(payload.detail || "无法移除工作目录");
+  }
 }
 
 export async function fetchMessages(sessionId: string): Promise<MessageRow[]> {
