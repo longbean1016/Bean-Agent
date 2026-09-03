@@ -521,6 +521,17 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
 
     @app.delete("/api/chat/workspaces/{workspace_id}", status_code=204)
     async def unregister_workspace(workspace_id: str) -> Response:
+        session_keys = application.core.sessions.store.list_workspace_session_keys(
+            workspace_id
+        )
+        if any(
+            application.core.agent_loop.is_session_busy(session_key)
+            for session_key in session_keys
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="工作区仍有关联会话正在运行或排队，请结束后再移除",
+            )
         if not application.core.sessions.store.delete_workspace(workspace_id):
             raise HTTPException(status_code=404, detail="工作区不存在")
         # 删除关系可能让多个缓存策略失效；Policy 每次回源，不需要全局缓存失效。

@@ -346,6 +346,20 @@ class SessionStore:
             ).fetchone()
         return self._row_to_workspace(row) if row is not None else None
 
+    def list_workspace_session_keys(self, workspace_id: str) -> list[str]:
+        """返回仍绑定到工作区的会话，用于变更前检查运行状态。"""
+
+        clean_id = str(workspace_id or "").strip()
+        if not clean_id:
+            return []
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                "SELECT key FROM sessions WHERE workspace_id = ? ORDER BY key",
+                (clean_id,),
+            ).fetchall()
+        return [str(row["key"]) for row in rows]
+
     def delete_workspace(self, workspace_id: str) -> bool:
         """删除注册关系并解除会话绑定，绝不操作用户目录。"""
 

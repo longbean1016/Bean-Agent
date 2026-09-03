@@ -118,6 +118,38 @@ def test_workspace_api_and_session_sandbox_closed_loop(tmp_path: Path) -> None:
     assert project.exists()
 
 
+def test_workspace_api_refuses_to_detach_busy_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, runtime = _client(tmp_path)
+    project = tmp_path / "busy-project"
+    project.mkdir()
+    workspace = runtime.sessions.store.create_workspace(str(project))
+    session_id = "web:busy-workspace"
+    runtime.sessions.store.create_session(
+        session_id,
+        workspace_id=workspace["id"],
+        sandbox_mode="workspace-write",
+    )
+    monkeypatch.setattr(
+        runtime.agent_loop,
+        "is_session_busy",
+        lambda key: key == session_id,
+    )
+
+    with client:
+        removed = client.delete(f"/api/chat/workspaces/{workspace['id']}")
+        assert runtime.sessions.store.get_workspace(workspace["id"]) is not None
+        assert (
+            runtime.sessions.store.get_session_meta(session_id)["workspace_id"]
+            == workspace["id"]
+        )
+
+    assert removed.status_code == 409
+    assert "正在运行或排队" in removed.json()["detail"]
+
+
 def test_chat_api_lists_titled_running_session_without_messages(tmp_path: Path) -> None:
     client, runtime = _client(tmp_path)
     runtime.sessions.store.ensure_default_chat_session_title(
