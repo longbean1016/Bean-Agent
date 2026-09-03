@@ -40,6 +40,12 @@ class ConsolidationCommitted:
     scope_channel: str
     scope_chat_id: str
     conversation: str
+    # checkpoint 预先完成的统一提取结果；旧 outbox 没有这些字段时，消费端
+    # 仍可按兼容路径重新提取 implicit memory。
+    session_key: str = ""
+    generation: int = 0
+    pending_items: list[dict[str, object]] = field(default_factory=list)
+    implicit_memory: dict[str, list[dict[str, object]]] = field(default_factory=dict)
 
 
 __all__ = ["ConsolidationCommitted", "MemoryWritten", "TurnIngested"]

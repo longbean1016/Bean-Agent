@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-from session.store import NewMessage, SessionStore
+from session.store import NewMessage, NewSessionEvent, NewSurfaceEvent, SessionStore
 
 
 @pytest_asyncio.fixture
@@ -33,6 +33,51 @@ async def test_create_session_is_idempotent(store: SessionStore) -> None:
     assert second["last_consolidated"] == 0
     assert second["next_seq"] == 0
     assert first["created_at"].endswith("+08:00")
+
+
+def test_context_usage_snapshot_is_persisted_without_overwriting_metadata(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "context-usage.db"
+    first = SessionStore(db_path)
+    first.create_session("web:usage")
+    snapshot = {
+        "pressure_tokens": 120,
+        "projected_tokens": 135,
+        "context_window": 1_000_000,
+        "model_runtime_id": "deepseek:deepseek-v4-flash:1000000",
+    }
+    first.save_context_usage("web:usage", snapshot)
+    first.update_chat_session_title("web:usage", "计量会话")
+    first.close()
+
+    second = SessionStore(db_path)
+    try:
+        assert second.get_context_usage("web:usage") == snapshot
+        meta = second.get_session_meta("web:usage")
+        assert meta is not None
+        assert meta["metadata"]["title"] == "计量会话"
+    finally:
+        second.close()
+
+
+def test_metadata_upsert_does_not_restore_stale_context_usage(tmp_path: Path) -> None:
+    db_path = tmp_path / "context-usage-upsert.db"
+    session_store = SessionStore(db_path)
+    try:
+        session_store.create_session("web:usage-upsert")
+        fresh = {"pressure_tokens": 640, "projected_tokens": 640}
+        session_store.save_context_usage("web:usage-upsert", fresh)
+        session_store.upsert_session(
+            "web:usage-upsert",
+            created_at="2026-01-01T00:00:00+08:00",
+            updated_at="2026-01-01T00:01:00+08:00",
+            last_consolidated=0,
+            metadata={"title": "旧内存快照", "context_usage": {"pressure_tokens": 9000}},
+        )
+        assert session_store.get_context_usage("web:usage-upsert") == fresh
+    finally:
+        session_store.close()
 
 
 @pytest.mark.asyncio
@@ -71,6 +116,227 @@ async def test_add_message_allocates_seq_and_preserves_turn_fields(
     )
     assert [item["seq"] for item in fetched] == [0, 1]
     assert fetched[1]["turn_id"] == "turn-1"
+
+
+def test_turn_timing_is_recovered_from_start_and_end_events(store: SessionStore) -> None:
+    store.append_session_event(NewSessionEvent(
+        session_key="web:timing",
+        event_type="turn/start",
+        turn_id="turn-1",
+        step=0,
+        data={"started_at": "2026-09-02T10:00:00+08:00"},
+        operation_key="turn-1:turn-start",
+    ))
+    store.append_session_event(NewSessionEvent(
+        session_key="web:timing",
+        event_type="turn/end",
+        turn_id="turn-1",
+        step=1,
+        data={
+            "status": "completed",
+            "started_at": "2026-09-02T10:00:00+08:00",
+            "ended_at": "2026-09-02T10:00:01.250000+08:00",
+        },
+        operation_key="turn-1:turn-end",
+    ))
+
+    assert store.get_turn_timing("web:timing", "turn-1") == {
+        "started_at": "2026-09-02T10:00:00+08:00",
+        "ended_at": "2026-09-02T10:00:01.250000+08:00",
+        "duration_ms": 1250,
+        "status": "completed",
+    }
+
+
+def test_turn_timing_uses_event_creation_time_for_invalid_boundary_values(
+    store: SessionStore,
+) -> None:
+    start = store.append_session_event(NewSessionEvent(
+        session_key="web:timing-fallback",
+        event_type="turn/start",
+        turn_id="turn-1",
+        step=0,
+        data={"started_at": "not-a-timestamp"},
+        operation_key="turn-1:turn-start",
+    ))
+    end = store.append_session_event(NewSessionEvent(
+        session_key="web:timing-fallback",
+        event_type="turn/end",
+        turn_id="turn-1",
+        step=1,
+        data={"status": "completed", "ended_at": "also-invalid"},
+        operation_key="turn-1:turn-end",
+    ))
+
+    timing = store.get_turn_timing("web:timing-fallback", "turn-1")
+    assert timing["started_at"] == start["created_at"]
+    assert timing["ended_at"] == end["created_at"]
+    assert timing["duration_ms"] >= 0
+
+
+def test_chat_turn_navigation_includes_persisted_duration(store: SessionStore) -> None:
+    store.add_message(NewMessage(
+        session_key="web:timing-nav",
+        role="user",
+        content="问题",
+        turn_id="turn-1",
+    ))
+    store.append_session_event(NewSessionEvent(
+        session_key="web:timing-nav",
+        event_type="turn/start",
+        turn_id="turn-1",
+        step=0,
+        data={"started_at": "2026-09-02T10:00:00+08:00"},
+        operation_key="turn-1:turn-start",
+    ))
+    store.append_session_event(NewSessionEvent(
+        session_key="web:timing-nav",
+        event_type="turn/end",
+        turn_id="turn-1",
+        step=1,
+        data={"ended_at": "2026-09-02T10:00:02+08:00", "status": "completed"},
+        operation_key="turn-1:turn-end",
+    ))
+
+    turns = store.list_chat_turns("web:timing-nav")
+    assert turns[0]["duration_ms"] == 2000
+    assert turns[0]["started_at"] == "2026-09-02T10:00:00+08:00"
+    assert turns[0]["ended_at"] == "2026-09-02T10:00:02+08:00"
+
+
+def _surface_event(
+    *,
+    session_key: str = "web:surface",
+    operation_key: str = "turn-1:0:frame",
+    message: dict[str, object] | None = None,
+    surface_op: str = "append",
+    replace_start: int | None = None,
+    replace_end: int | None = None,
+    status: str = "committed",
+) -> NewSurfaceEvent:
+    payload = message or {"role": "user", "content": "frame"}
+    return NewSurfaceEvent(
+        session_key=session_key,
+        epoch_id="epoch-a",
+        turn_id="turn-1",
+        iteration=0,
+        role=str(payload["role"]),
+        content=payload,
+        source_kind="context_frame",
+        operation_key=operation_key,
+        surface_op=surface_op,
+        replace_start=replace_start,
+        replace_end=replace_end,
+        status=status,
+    )
+
+
+def test_surface_append_is_idempotent_and_preserves_full_message(store: SessionStore) -> None:
+    first = store.append_surface(_surface_event())
+    retry = store.append_surface(_surface_event())
+
+    assert first == retry
+    assert first["surface_seq"] == 0
+    assert first["message"] == {"role": "user", "content": "frame"}
+    assert store.load_surface("web:surface") == [{"role": "user", "content": "frame"}]
+    assert len(store.fetch_surface_events("web:surface")) == 1
+
+
+def test_surface_replace_folds_current_nodes_and_increments_generation(
+    store: SessionStore,
+) -> None:
+    store.append_surface(_surface_event(operation_key="a", message={"role": "user", "content": "a"}))
+    store.append_surface(_surface_event(operation_key="b", message={"role": "assistant", "content": "b"}))
+    replaced = store.replace_surface(_surface_event(
+        operation_key="replace-1",
+        message={"role": "user", "content": "summary"},
+        surface_op="replace",
+        replace_start=0,
+        replace_end=1,
+    ))
+
+    assert replaced["surface_seq"] == 2
+    assert replaced["replace_generation"] == 1
+    assert store.load_surface("web:surface") == [{"role": "user", "content": "summary"}]
+    assert store.fetch_surface_events("web:surface")[2]["surface_op"] == "replace"
+
+
+def test_surface_replace_uses_node_boundaries_after_prior_replace(
+    store: SessionStore,
+) -> None:
+    store.append_surface(_surface_event(operation_key="a", message={"role": "user", "content": "a"}))
+    store.append_surface(_surface_event(operation_key="b", message={"role": "assistant", "content": "b"}))
+    store.append_surface(_surface_event(operation_key="c", message={"role": "tool", "content": "c"}))
+    store.replace_surface(_surface_event(
+        operation_key="replace-1",
+        message={"role": "user", "content": "summary"},
+        surface_op="replace",
+        replace_start=0,
+        replace_end=1,
+    ))
+
+    # The current nodes are seq 3 (replacement) and seq 2 (tool); DSH resolves
+    # start/end by their positions in the current surface, not numeric order.
+    second = store.replace_surface(_surface_event(
+        operation_key="replace-2",
+        message={"role": "user", "content": "final summary"},
+        surface_op="replace",
+        replace_start=3,
+        replace_end=2,
+    ))
+    assert second["replace_generation"] == 2
+    assert store.load_surface("web:surface") == [{"role": "user", "content": "final summary"}]
+
+
+def test_surface_replace_rejects_non_contiguous_current_nodes(store: SessionStore) -> None:
+    store.append_surface(_surface_event(operation_key="a"))
+    store.append_surface(_surface_event(operation_key="b", message={"role": "assistant", "content": "b"}))
+    store.replace_surface(_surface_event(
+        operation_key="replace-1",
+        message={"role": "user", "content": "summary"},
+        surface_op="replace",
+        replace_start=0,
+        replace_end=1,
+    ))
+    store.append_surface(_surface_event(operation_key="c", message={"role": "tool", "content": "c"}))
+
+    with pytest.raises(ValueError, match="连续存在"):
+        store.replace_surface(_surface_event(
+            operation_key="replace-invalid",
+            message={"role": "user", "content": "invalid"},
+            surface_op="replace",
+            replace_start=0,
+            replace_end=2,
+        ))
+
+
+def test_surface_pending_events_are_isolated_and_recoverable(store: SessionStore) -> None:
+    store.append_surface(_surface_event(
+        session_key="web:a",
+        operation_key="pending",
+        status="pending",
+    ))
+    store.append_surface(_surface_event(
+        session_key="web:b",
+        operation_key="other",
+        status="pending",
+    ))
+
+    assert [event["operation_key"] for event in store.recover_surface("web:a")] == ["pending"]
+    assert [event["session_key"] for event in store.fetch_surface_events("web:a")] == ["web:a"]
+    assert [event["session_key"] for event in store.fetch_surface_events("web:b")] == ["web:b"]
+    assert store.load_surface("web:a") == []
+
+
+def test_surface_operation_key_rejects_conflicting_retry(store: SessionStore) -> None:
+    store.append_surface(_surface_event())
+    with pytest.raises(ValueError, match="不同事件"):
+        store.append_surface(_surface_event(message={"role": "user", "content": "changed"}))
+
+
+def test_surface_rejects_unknown_status(store: SessionStore) -> None:
+    with pytest.raises(ValueError, match="status"):
+        store.append_surface(_surface_event(status="unknown"))
 
 
 @pytest.mark.asyncio
@@ -321,11 +587,20 @@ async def test_load_history_keeps_finished_tools_from_interrupted_turn(
                     "id": "call-error", "type": "function",
                     "function": {"name": "shell", "arguments": '{"command": "bad"}'},
                 },
+                {
+                    "id": "call-running", "type": "function",
+                    "function": {"name": "search", "arguments": '{"query": "weather"}'},
+                },
             ],
             "reasoning_content": "先读取文件",
         },
         {"role": "tool", "tool_call_id": "call-ok", "content": "文件内容"},
         {"role": "tool", "tool_call_id": "call-error", "content": "命令失败"},
+        {
+            "role": "tool",
+            "tool_call_id": "call-running",
+            "content": "工具调用在中断前已经发出，但没有记录完整结果；结果未知。请根据工具语义决定是否重试：只有只读或幂等操作可以重试；可能产生副作用时先核验外部状态或询问用户，不要盲目重试。",
+        },
         {"role": "assistant", "content": "[用户已停止生成]"},
     ]
 
@@ -678,78 +953,6 @@ def test_delete_empty_chat_session_does_not_delete_sessions_with_messages(
     assert store.get_session_meta("web:with-message") is not None
 
 
-def test_consolidation_window_counts_before_decoding_messages(
-    store: SessionStore,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    for index in range(3):
-        store.add_message(NewMessage(
-            session_key="web:below-threshold",
-            role="user" if index % 2 == 0 else "assistant",
-            content=f"消息 {index}",
-        ))
-    # 阈值以下只能执行 COUNT；即使消息扩展字段损坏，也不应读取或反序列化正文行。
-    store._conn.execute(
-        "UPDATE messages SET extra='not-json' WHERE session_key=? AND seq=?",
-        ("web:below-threshold", 0),
-    )
-    store._conn.commit()
-    monkeypatch.setattr(
-        SessionStore,
-        "_row_to_message",
-        staticmethod(lambda row: pytest.fail("阈值以下不应解码消息行")),
-    )
-
-    result = store.fetch_consolidation_window(
-        "web:below-threshold",
-        keep_count=2,
-        threshold=2,
-        recent_count=1,
-    )
-
-    assert result is None
-
-
-def test_consolidation_window_reads_only_cursor_tail(
-    store: SessionStore,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    for index in range(6):
-        store.add_message(NewMessage(
-            session_key="web:window",
-            role="user" if index % 2 == 0 else "assistant",
-            content=f"消息 {index}",
-        ))
-    store.set_cursor("web:window", 2)
-    # cursor 以前的数据不属于活动窗口，不能再被归档查询反序列化。
-    store._conn.execute(
-        "UPDATE messages SET extra='not-json' WHERE session_key=? AND seq=?",
-        ("web:window", 0),
-    )
-    store._conn.commit()
-    original = SessionStore._row_to_message
-
-    def decode_active_row(row):
-        assert int(row["seq"]) >= 2
-        return original(row)
-
-    monkeypatch.setattr(SessionStore, "_row_to_message", staticmethod(decode_active_row))
-
-    result = store.fetch_consolidation_window(
-        "web:window",
-        keep_count=2,
-        threshold=2,
-        recent_count=1,
-    )
-
-    assert result is not None
-    assert result.cursor == 2
-    assert result.next_cursor == 4
-    assert result.active_count == 4
-    assert [item["seq"] for item in result.messages] == [2, 3]
-    assert [item["seq"] for item in result.recent_messages] == [5]
-
-
 def test_list_chat_messages_returns_persisted_frontend_fields(
     store: SessionStore,
 ) -> None:
@@ -789,40 +992,6 @@ def test_last_chat_message_timestamp_uses_messages_not_session_updated_at(
     assert first["timestamp"] != second["timestamp"] or second["timestamp"]
 
 
-def test_session_recent_context_is_scoped_by_session(store: SessionStore) -> None:
-    store.create_session("web:chat-1")
-    store.create_session("web:chat-2")
-
-    assert store.get_recent_context("web:chat-1") == ""
-
-    store.set_recent_context(
-        "web:chat-1",
-        "# Recent Context\n\n## Compression\n- 最近持续关注：项目\n",
-        source_ref="web:chat-1@0-3",
-    )
-    store.set_recent_context(
-        "web:chat-2",
-        "# Recent Context\n\n## Compression\n- 最近持续关注：生活\n",
-        source_ref="web:chat-2@0-3",
-    )
-
-    assert "项目" in store.get_recent_context("web:chat-1")
-    assert "生活" not in store.get_recent_context("web:chat-1")
-    assert "生活" in store.get_recent_context("web:chat-2")
-
-
-def test_session_recent_context_is_deleted_with_session(store: SessionStore) -> None:
-    store.set_recent_context(
-        "web:delete",
-        "# Recent Context\n\n## Compression\n- 最近持续关注：待删除\n",
-        source_ref="web:delete@0-1",
-    )
-
-    assert store.get_recent_context("web:delete")
-    assert store.delete_chat_session("web:delete") is True
-    assert store.get_recent_context("web:delete") == ""
-
-
 @pytest.mark.asyncio
 async def test_add_message_rejects_invalid_role(store: SessionStore) -> None:
     with pytest.raises(ValueError, match="role"):
@@ -852,3 +1021,40 @@ async def test_reopen_keeps_messages_and_close_is_idempotent(tmp_path: Path) -> 
 
     assert history == [{"role": "user", "content": "持久化消息"}]
     assert added["seq"] == 1
+
+
+def test_session_usage_is_idempotent_and_aggregated(store: SessionStore) -> None:
+    store.create_session("web:usage")
+    first = store.save_session_usage(
+        "web:usage", "turn-1", 1,
+        {
+            "uncached_input_tokens": 100,
+            "cache_read_tokens": 900,
+            "cache_write_tokens": 0,
+            "output_tokens": 40,
+        },
+    )
+    repeated = store.save_session_usage(
+        "web:usage", "turn-1", 1,
+        {
+            "uncached_input_tokens": 120,
+            "cache_read_tokens": 880,
+            "cache_write_tokens": 0,
+            "output_tokens": 45,
+        },
+    )
+    second = store.save_session_usage(
+        "web:usage", "turn-1", 2,
+        {
+            "uncached_input_tokens": 50,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 10,
+            "output_tokens": 5,
+        },
+    )
+
+    assert first["total_input_tokens"] == repeated["total_input_tokens"] == 1_000
+    assert repeated["total_output_tokens"] == 45
+    assert second["total_input_tokens"] == 1_060
+    assert second["total_output_tokens"] == 50
+    assert second["cache_hit_rate"] == pytest.approx(880 / 1060)

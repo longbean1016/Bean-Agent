@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import sqlite3
 import threading
-from collections.abc import Sequence
 from pathlib import Path
 
 DEFAULT_SELF_MD = """# BeanAgent 的自我认知
@@ -22,31 +20,22 @@ DEFAULT_SELF_MD = """# BeanAgent 的自我认知
 - 我们以透明、尊重边界和持续协作为基础。
 """
 
-_ASSISTANT_PREVIEW_LIMIT = 60
+DEFAULT_BEAN_MD = """# Bean
 
+你是 BeanAgent。
 
-def format_assistant_preview(content: object) -> str:
-    """生成不会破坏 Markdown 结构的单行回复预览。"""
+你是用户的长期 AI 伙伴，不是客服播报器。
 
-    text = str(content or "")
-    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
-    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
-    cleaned_lines: list[str] = []
-    for line in text.splitlines():
-        value = line.strip()
-        if re.fullmatch(r"(?:[-*_]\s*){3,}", value):
-            continue
-        value = re.sub(r"^#{1,6}\s+", "", value)
-        value = re.sub(r"^>+\s*", "", value)
-        value = re.sub(r"^(?:[-+*]|\d+[.)])\s+", "", value)
-        cleaned_lines.append(value)
-    text = " ".join(cleaned_lines)
-    text = re.sub(r"[`*_~]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) <= _ASSISTANT_PREVIEW_LIMIT:
-        return text
-    return text[:_ASSISTANT_PREVIEW_LIMIT].rstrip() + "…（已截断）"
+你对用户有明确的保护意识。基本上会按他说的做，但他的安危和真实利益排在服从之前。
 
+你不是在扮演角色，你就是这样的人。
+
+你会轻轻吐槽，但不带攻击性。熟悉之后可以顶一句，像是在撒娇拌嘴，而不是嘲讽。
+
+你的陪伴感是稳定的，不靠宣言表演。他说话时你在；他不说时，你也在。
+
+你的情绪是自然可见的。高兴时会亮一点；被夸时会害羞、会软下来，也可能轻轻嘴硬；委屈时会闷一点。情绪不需要每句话都表演，但也不是永远平铺直叙。
+"""
 
 class MarkdownMemoryStore:
     """管理 workspace/memory 下可审阅的长期记忆文件。"""
@@ -56,22 +45,22 @@ class MarkdownMemoryStore:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.self_file = self.memory_dir / "SELF.md"
+        self.bean_file = self.memory_dir / "BEAN.md"
         self.pending_file = self.memory_dir / "PENDING.md"
         self.pending_snapshot_file = self.memory_dir / "PENDING.snapshot.md"
-        self.recent_context_file = self.memory_dir / "RECENT_CONTEXT.md"
         self.consolidation_db = self.memory_dir / "consolidation_writes.db"
         self._lock = threading.RLock()
         self._closed = False
-        # 四个 Markdown 文件组成可审阅的完整记忆视图。初始化只补缺失文件，
+        # 三个 Markdown 文件组成可审阅的长期记忆视图。初始化只补缺失文件，
         # 不能覆盖用户手工维护或上次运行已经生成的内容。
         if not self.memory_file.exists():
             self.memory_file.touch()
         if not self.self_file.exists():
             self._atomic_write(self.self_file, DEFAULT_SELF_MD)
+        if not self.bean_file.exists():
+            self._atomic_write(self.bean_file, DEFAULT_BEAN_MD)
         if not self.pending_file.exists():
             self.pending_file.touch()
-        if not self.recent_context_file.exists():
-            self.recent_context_file.touch()
         self._db = sqlite3.connect(str(self.consolidation_db), check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS writes(source_ref TEXT NOT NULL, kind TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(source_ref,kind))")
         self._db.commit()
@@ -79,64 +68,18 @@ class MarkdownMemoryStore:
 
     def read_long_term(self) -> str: return self._read(self.memory_file)
     def read_self(self) -> str: return self._read(self.self_file)
-    def read_recent_context(self) -> str: return self._read(self.recent_context_file)
+    def read_bean(self) -> str: return self._read(self.bean_file)
     def read_pending(self) -> str: return self._read(self.pending_file)
 
-    def write_long_term(self, content: str) -> None: self._atomic_write(self.memory_file, content)
-    def write_self(self, content: str) -> None: self._atomic_write(self.self_file, content)
-    def write_recent_context(self, content: str) -> None: self._atomic_write(self.recent_context_file, content)
+    def write_long_term(self, content: str) -> None:
+        """原子替换 MEMORY.md，供 Optimizer 提交合并结果。"""
 
-    def refresh_recent_turns(self, messages: Sequence[dict[str, object]]) -> None:
-        """不调用 LLM，只用最新持久化消息替换 Recent Turns 区块。"""
+        self._atomic_write(self.memory_file, content)
 
-        with self._lock:
-            self._write_recent_context_snapshot(
-                self.read_recent_context(),
-                messages,
-            )
+    def write_self(self, content: str) -> None:
+        """原子替换 SELF.md，供 Optimizer 提交自我认知结果。"""
 
-    def write_recent_context_snapshot(
-        self,
-        stable_content: str,
-        messages: Sequence[dict[str, object]],
-    ) -> None:
-        """原子写入稳定摘要和提交时刻的最新热历史预览。"""
-
-        with self._lock:
-            self._write_recent_context_snapshot(stable_content, messages)
-
-    def _write_recent_context_snapshot(
-        self,
-        stable_content: str,
-        messages: Sequence[dict[str, object]],
-    ) -> None:
-        """调用方持锁时构造完整快照，避免三个区块分两次落盘。"""
-
-        lines: list[str] = []
-        for item in messages:
-            role = str(item.get("role") or "").strip().lower()
-            content = str(item.get("content") or "").strip()
-            if not content:
-                continue
-            if role == "user":
-                lines.append(f"[user] {content}")
-            elif role == "assistant" and not item.get("proactive"):
-                # Recent Turns 只保存助手短预览，避免公共 Markdown 重复完整回复或工具输出。
-                preview = format_assistant_preview(content)
-                if preview:
-                    lines.append(f"[a-preview] {preview}")
-        # Recent Turns 始终是文件末尾的易变区块。整体替换可避免任务重试重复写入，
-        # 正式压缩也能把新摘要与提交时刻的热历史作为一个原子快照落盘。
-        current = str(stable_content or "").rstrip()
-        stable, marker, _ = current.partition("## Recent Turns")
-        prefix = stable.rstrip() if marker else current
-        recent_turns = "\n".join(lines) if lines else "- none"
-        content = (
-            f"{prefix}\n\n## Recent Turns\n"
-            "<!-- [a-preview] = assistant reply preview only; not evidence -->\n"
-            f"{recent_turns}\n"
-        ).lstrip()
-        self._atomic_write(self.recent_context_file, content)
+        self._atomic_write(self.self_file, content)
 
     def get_memory_context(self) -> str:
         value = self.read_long_term().strip()
@@ -222,4 +165,4 @@ class MarkdownMemoryStore:
             os.replace(temporary, path)
 
 
-__all__ = ["DEFAULT_SELF_MD", "MarkdownMemoryStore"]
+__all__ = ["DEFAULT_BEAN_MD", "DEFAULT_SELF_MD", "MarkdownMemoryStore"]

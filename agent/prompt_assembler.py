@@ -8,7 +8,18 @@ from zoneinfo import ZoneInfo
 
 from agent.prompt_block import PromptSectionMeta, PromptSectionRender, SystemPromptBuilder, TurnContext
 
-_FRAME_SECTIONS = {"deferred_tools_hint", "active_tools", "active_skills", "retrieved_memory"}
+# 这些区块可能随记忆、会话或工具状态变化，必须作为本轮 frame 追加并持久化；
+# system 只保留跨请求稳定的规则和 Skill 目录，避免变化内容截断缓存前缀。
+_FRAME_SECTIONS = {
+    "bean",
+    "self_model",
+    "long_term_memory",
+    "session_context",
+    "deferred_tools_hint",
+    "active_tools",
+    "active_skills",
+    "retrieved_memory",
+}
 _FRAME_START = '<system-reminder data-system-context-frame="true">'
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -32,8 +43,21 @@ def build_context_frame_content(sections: list[PromptSectionRender]) -> str:
 
 
 class MessageEnvelopeBuilder:
-    def build(self, *, history: list[dict[str, object]], current_message: object, system_prompt: str, context_frame: str, message_timestamp: datetime | None = None) -> list[dict[str, object]]:
-        messages: list[dict[str, object]] = [{"role": "system", "content": system_prompt}, *history]
+    def build(self, *, history: list[dict[str, object]], current_message: object, system_prompt: str, context_frame: str, checkpoint_summary: str = "", message_timestamp: datetime | None = None) -> list[dict[str, object]]:
+        messages: list[dict[str, object]] = [{"role": "system", "content": system_prompt}]
+        if checkpoint_summary.strip():
+            # checkpoint 是动态但稳定的历史投影，放在静态 system 后、原文历史前，
+            # 既避免污染可缓存前缀，也让模型先看到归档摘要再读取 retained history。
+            messages.append({
+                "role": "system",
+                "content": (
+                    "<session-context-compaction>\n"
+                    "以下是已归档历史的上下文摘要；与当前用户原文冲突时以原文为准。\n"
+                    f"{checkpoint_summary.strip()}\n"
+                    "</session-context-compaction>"
+                ),
+            })
+        messages.extend(history)
         if context_frame.strip():
             messages.append({"role": "user", "content": context_frame})
         timestamp = message_timestamp or datetime.now(_LOCAL_TZ)
@@ -74,6 +98,7 @@ class PromptAssembler:
             current_message=current_message,
             system_prompt=system_prompt,
             context_frame=build_context_frame_content(dynamic),
+            checkpoint_summary=turn_ctx.checkpoint_summary,
             message_timestamp=message_timestamp,
         )
         return PromptAssemblyResult(messages, built.debug_breakdown)

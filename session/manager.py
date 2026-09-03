@@ -6,15 +6,18 @@ import asyncio
 import base64
 import json
 import mimetypes
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from session.store import NewMessage, SessionStore
+from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
+from session.store import NewMessage, NewSessionEvent, NewSurfaceEvent, SessionStore
+from tools.base import ToolResult
+from tools.runtime import serialize_tool_result_messages
 
-_TOOL_RESULT_CHAR_BUDGET = 10_000
 _TEXT_ATTACHMENT_CHAR_BUDGET = 100_000
 _TEXT_ATTACHMENT_SUFFIXES = {
     ".txt", ".md", ".markdown", ".py", ".json", ".toml", ".yaml", ".yml",
@@ -25,26 +28,6 @@ _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 def _now_local() -> datetime:
     return datetime.now(_LOCAL_TZ)
-
-
-def _truncate_tool_result(content: object) -> str:
-    """按 akashic 的预算保留工具结果首尾，避免历史被单次输出占满。"""
-
-    text = content if isinstance(content, str) else str(content)
-    if len(text) <= _TOOL_RESULT_CHAR_BUDGET:
-        return text
-    omitted = len(text) - _TOOL_RESULT_CHAR_BUDGET
-    while True:
-        marker = f"…{omitted} chars truncated…"
-        keep = max(0, _TOOL_RESULT_CHAR_BUDGET - len(marker))
-        actual_omitted = len(text) - keep
-        if actual_omitted == omitted:
-            break
-        omitted = actual_omitted
-    head = keep // 2
-    tail = keep - head
-    truncated = text[:head] + marker + (text[-tail:] if tail else "")
-    return f"Total output lines: {len(text.splitlines())}\n\n{truncated}"
 
 
 def _rebuild_user_content(text: str, media_paths: list[str]) -> str | list[dict[str, Any]]:
@@ -163,28 +146,53 @@ class Session:
             messages = self.messages[-max_messages:]
 
         history: list[dict[str, Any]] = []
+        projected_turn_ids: set[str] = set()
         for message in messages:
             role = message.get("role")
             if role == "user":
+                surface_messages = message.get("llm_surface_messages")
+                if isinstance(surface_messages, list) and surface_messages:
+                    history.extend(
+                        deepcopy(
+                            [
+                                item
+                                for item in surface_messages
+                                if isinstance(item, dict)
+                            ]
+                        )
+                    )
+                    turn_id = str(message.get("turn_id") or "")
+                    if turn_id:
+                        projected_turn_ids.add(turn_id)
+                    continue
                 content: object = message.get("llm_user_content")
                 if content is None:
                     text = str(message.get("content", ""))
                     media = message.get("media") or []
                     content = _rebuild_user_content(text, list(media)) if media else text
+                frame = message.get("llm_context_frame")
+                if isinstance(frame, str) and frame.strip():
+                    history.append({"role": "user", "content": frame})
                 history.append({"role": "user", "content": content})
                 continue
             if role != "assistant":
+                continue
+            if str(message.get("turn_id") or "") in projected_turn_ids:
+                # provider surface 已包含该 Turn 的 assistant/tool 消息；语义
+                # assistant 只供 UI 和记忆使用，不能再次展开到模型历史。
                 continue
 
             interrupted = message.get("status") == "interrupted"
             for group in message.get("tool_chain") or []:
                 calls = group.get("calls") or []
                 if interrupted:
-                    # 中断轮完整保留页面审计数据，但模型历史只能重放已有终态结果的
-                    # 调用；运行中调用没有匹配的最终 tool result，不能进入协议消息链。
+                    # 中断轮的语义快照保留完整审计数据；模型历史也保留已发出的
+                    # tool-call，并用确定性的占位结果闭合尚未完成的调用。
                     calls = [
                         call for call in calls
-                        if str(call.get("status") or "") in {"ok", "completed", "error"}
+                        if isinstance(call, dict)
+                        and str(call.get("status") or "")
+                        in {"ok", "completed", "error", "running", "interrupted"}
                     ]
                 if not calls:
                     continue
@@ -215,12 +223,30 @@ class Session:
                     assistant_message["reasoning_content"] = reasoning
                 history.append(assistant_message)
                 for call in calls:
-                    history.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["call_id"],
-                            "content": _truncate_tool_result(call.get("result", "")),
-                        }
+                    interrupted_call = interrupted and str(call.get("status") or "") in {
+                        "running", "interrupted"
+                    }
+                    content_blocks = call.get("content_blocks")
+                    tool_content: str | ToolResult = (
+                        INTERRUPTED_TOOL_RESULT_CONTENT
+                        if interrupted_call
+                        else str(call.get("result", ""))
+                    )
+                    if not interrupted_call and isinstance(content_blocks, list) and content_blocks:
+                        tool_content = ToolResult(
+                            text=str(call.get("result", "")),
+                            content_blocks=[
+                                dict(block)
+                                for block in content_blocks
+                                if isinstance(block, dict)
+                            ],
+                        )
+                    history.extend(
+                        serialize_tool_result_messages(
+                            tool_call_id=str(call.get("call_id", "")),
+                            content=tool_content,
+                            tool_name=str(call.get("name", "")) or None,
+                        )
                     )
 
             final_message: dict[str, Any] = {
@@ -252,10 +278,11 @@ class SessionManager:
 
     _METADATA_REFRESH_EVERY = 10
 
-    def __init__(self, workspace: Path, history_window: int = 40) -> None:
-        if history_window <= 0:
+    def __init__(self, workspace: Path, history_window: int | None = None) -> None:
+        # 兼容旧调用方的参数形状，但它不再参与历史加载；活动边界只由
+        # checkpoint.consolidated_through_seq 决定，limit=None 才是主链路语义。
+        if history_window is not None and int(history_window) <= 0:
             raise ValueError("history_window 必须大于 0")
-
         # 对齐 akashic 的目录布局：sessions/ 为后续会话附件或导出能力预留，
         # 结构化会话和消息统一写入 workspace 根目录下的 sessions.db。
         self.workspace = Path(workspace)
@@ -263,8 +290,6 @@ class SessionManager:
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.workspace / "sessions.db"
         self._store = SessionStore(self.db_path)
-        self._history_window = int(history_window)
-
         # cache 保存完整 Session 而非只保存元数据。命中缓存时历史生成不访问
         # SQLite；invalidate 后才从数据库重新构建完整消息快照。
         self._cache: dict[str, Session] = {}
@@ -356,6 +381,99 @@ class SessionManager:
             await self._save_metadata(session)
             self._cache[session.key] = session
 
+    async def append_surface(self, event: NewSurfaceEvent) -> dict[str, Any]:
+        """在会话锁内追加模型侧 surface，并保证序号和幂等键隔离。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(event.session_key)
+        async with self._lock_for(key):
+            self._ensure_not_deleted(key)
+            return await asyncio.to_thread(self._store.append_surface, event)
+
+    async def append_session_event(self, event: NewSessionEvent) -> dict[str, Any]:
+        """在会话锁内追加模型事件日志，chunk 与边界不进入语义消息。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(event.session_key)
+        async with self._lock_for(key):
+            self._ensure_not_deleted(key)
+            return await asyncio.to_thread(self._store.append_session_event, event)
+
+    async def fetch_session_events(self, session_key: str) -> list[dict[str, Any]]:
+        """按事件序号读取模型事件日志，供恢复器和诊断使用。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(self._store.fetch_session_events, key)
+
+    async def get_turn_timing(self, session_key: str, turn_id: str) -> dict[str, Any]:
+        """读取持久化 Turn 起止时间，供语义消息和 API 共用。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(self._store.get_turn_timing, key, turn_id)
+
+    async def load_surface(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """读取当前会话的模型消息投影，不触碰语义消息缓存。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(
+                self._store.load_surface,
+                key,
+                epoch_id=epoch_id,
+            )
+
+    async def fetch_surface_events(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """读取 surface 原始事件，供诊断和恢复流程使用。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(
+                self._store.fetch_surface_events,
+                key,
+                epoch_id=epoch_id,
+            )
+
+    async def load_surface_events(self, session_key: str) -> list[dict[str, Any]]:
+        """读取当前折叠后的 surface 节点，包含替换边界和序号。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(self._store.load_surface_events, key)
+
+    async def replace_surface(self, event: NewSurfaceEvent) -> dict[str, Any]:
+        """在会话锁内提交一个带边界的模型侧 surface replace。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(event.session_key)
+        async with self._lock_for(key):
+            self._ensure_not_deleted(key)
+            return await asyncio.to_thread(self._store.replace_surface, event)
+
+    async def recover_surface(self, session_key: str) -> list[dict[str, Any]]:
+        """读取当前会话待恢复的 surface 事件。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(self._store.recover_surface, key)
+
     async def load_history(
         self,
         session_key: str,
@@ -368,12 +486,16 @@ class SessionManager:
         """
 
         session = await self.get_or_create(session_key)
-        actual_limit = self._history_window if limit is None else max(0, int(limit))
-        # MemoryEngine 直接持有同一个 Store 并在后台推进 cursor；缓存 Session
-        # 不会自动收到该变更，因此每次模型加载前以 SQLite 元数据为权威同步。
-        persisted_cursor = self._store.get_cursor(session.key)
-        cursor = max(0, min(int(persisted_cursor), len(session.messages)))
-        session.last_consolidated = cursor
+        actual_limit = len(session.messages) if limit is None else max(0, int(limit))
+        # MemoryEngine 直接持有同一个 Store 并在后台推进 generation；缓存 Session
+        # 不会自动收到该变更，因此每次模型加载前以 ledger 的消息边界为权威。
+        # Session 快照仍回写 generation 指针，供旧的 UI/测试观察；真正的消息边界
+        # 单独从 active checkpoint 读取，不能再把这两个数混作一个 cursor。
+        session.last_consolidated = self._store.get_cursor(session.key)
+        cursor = max(
+            0,
+            min(self._store.get_active_message_boundary(session.key), len(session.messages)),
+        )
         start = max(cursor, len(session.messages) - actual_limit)
         return session.get_history(
             max_messages=actual_limit,

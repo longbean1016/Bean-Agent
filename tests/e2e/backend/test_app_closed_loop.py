@@ -113,6 +113,10 @@ def test_websocket_tool_turn_reconnects_with_history_and_memory(tmp_path: Path) 
 
 
 class CompressionProvider:
+    context_window = 200
+    max_tokens = 32
+    model = "compression-test-model"
+
     def __init__(self) -> None:
         self.pipeline_messages: list[list[dict[str, object]]] = []
 
@@ -122,18 +126,6 @@ class CompressionProvider:
             return _structured_memory_response(
                 "submit_consolidation_events",
                 {"history_entries": [], "pending_items": []},
-            )
-        if "近期语境压缩代理" in prompt:
-            return _structured_memory_response(
-                "submit_recent_context",
-                {
-                    "active_topics": ["第一阶段"],
-                    "user_preferences": [],
-                    "follow_ups": [],
-                    "avoidances": [],
-                    "dormant_threads": [],
-                    "ongoing_threads": [],
-                },
             )
         if "记忆检索决策器" in prompt:
             return SimpleNamespace(content="<decision>SKIP</decision>")
@@ -196,9 +188,10 @@ def test_websocket_consolidation_advances_cursor_and_next_turn_uses_summary(
                 frames = _receive_final(websocket)
                 assert frames[-1]["request_id"] == f"r{turn}"
 
-        assert core.sessions.store.get_cursor("web:c") == 6
+        checkpoint = core.sessions.store.get_active_compaction("web:c")
+        assert checkpoint is not None
         fifth_prompt = provider.pipeline_messages[4]
         assert "问题1" not in str(fifth_prompt)
         assert "问题3" not in str(fifth_prompt)
-        assert "问题4" in str(fifth_prompt)
-        assert "第一阶段" in str(fifth_prompt)
+        assert "问题5" in str(fifth_prompt)
+        assert "第一阶段" in str(fifth_prompt) or "session-context-compaction" in str(fifth_prompt)

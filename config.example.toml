@@ -7,7 +7,6 @@ api_key = "${DEEPSEEK_API_KEY}"
 base_url = "https://api.deepseek.com/v1"
 max_tokens = 8192 # 单次回复允许生成的最大 token 数
 max_iterations = 40 # 单轮 ReAct 最大迭代次数，0 表示不限制
-system_prompt = "You are BeanAgent, a helpful AI assistant with access to tools. Always respond in the same language the user uses."
 request_timeout_s = 90.0 # 单次模型请求的超时秒数
 multimodal = false # 主模型是否能直接接收图片；false 时可配置独立 VL 模型
 enable_thinking = true # 开启 DeepSeek 推理模式，Provider 会转换为 thinking.type
@@ -25,7 +24,7 @@ enable_thinking = true # 开启 DeepSeek 推理模式，Provider 会转换为 th
 [memory]
 enabled = true # 是否启用长期记忆
 engine_name = "default" # 当前最小版本使用的记忆引擎
-context_window = 40 # 上下文基准窗口，热历史与压缩阈值由此派生
+# 上下文 token 上限配置在 [llm].context_window；此处不再配置消息窗口。
 
 [memory.embedding]
 model = "text-embedding-v3"

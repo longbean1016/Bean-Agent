@@ -8,14 +8,23 @@ import sqlite3
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
 
 logger = logging.getLogger(__name__)
 
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 _MESSAGE_ROLES = {"user", "assistant", "tool"}
+_SURFACE_ROLES = {"system", "user", "assistant", "tool"}
+_SURFACE_OPS = {"append", "replace"}
+_SURFACE_STATUSES = {"pending", "committed", "replaced", "aborted", "error", "completed"}
+# pending/aborted 事件只供恢复器判断，不能进入下一次模型请求的可见前缀；
+# error 仍是模型实际收到的工具失败结果，必须保留在 projection 中。
+_SURFACE_PROJECTABLE_STATUSES = {"committed", "replaced", "error", "completed"}
 _MESSAGE_COLUMNS = "id, session_key, seq, role, content, tool_chain, extra, ts"
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 _DEFAULT_TITLE_LIMIT = 80
@@ -57,14 +66,89 @@ class NewMessage:
 
 
 @dataclass(frozen=True, slots=True)
-class ConsolidationMessageWindow:
-    """一次归档判断所需的活动消息快照。"""
+class NewSurfaceEvent:
+    """写入模型侧 durable surface 的完整事件。"""
 
-    cursor: int
-    next_cursor: int
-    active_count: int
-    messages: list[dict[str, Any]]
-    recent_messages: list[dict[str, Any]]
+    session_key: str
+    epoch_id: str
+    turn_id: str
+    iteration: int
+    role: str
+    content: dict[str, Any]
+    source_kind: str
+    operation_key: str
+    status: str = "committed"
+    projection_version: int = 1
+    surface_op: str = "append"
+    replace_start: int | None = None
+    replace_end: int | None = None
+    source_event_seqs: list[int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NewSessionEvent:
+    """写入模型事件日志的不可变事件。"""
+
+    session_key: str
+    event_type: str
+    turn_id: str
+    step: int
+    data: dict[str, Any]
+    operation_key: str
+    status: str = "committed"
+    source_event_seqs: list[int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCompactionPrepare:
+    """压缩提交前的不可变 prepare 快照。"""
+
+    session_key: str
+    session_created_at: str
+    generation: int
+    parent_generation: int
+    source_ref: str
+    source_plan_digest: str
+    source_mutation_digest: str
+    source_from_seq: int
+    consolidated_through_seq: int
+    source_message_ids: list[str]
+    selected_source_messages: list[dict[str, Any]]
+    retained_tail: list[dict[str, Any]]
+    prepared_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCompaction:
+    """已经提交并可注入下一轮 Prompt 的 checkpoint ledger 行。"""
+
+    session_key: str
+    session_created_at: str
+    generation: int
+    parent_generation: int
+    created_at: str
+    trigger: str
+    summary_format_version: int
+    summary: str
+    source_ref: str
+    source_plan_digest: str
+    source_mutation_digest: str
+    source_from_seq: int
+    consolidated_through_seq: int
+    source_message_ids: list[str]
+    selected_source_messages: list[dict[str, Any]]
+    retained_tail: list[dict[str, Any]]
+    model_runtime_id: str
+    model: str
+    context_window: int
+    threshold_tokens: int
+    hard_input_tokens: int
+    keep_recent_tokens: int
+    tokens_before: int
+    tokens_after: int
+    summary_usage: dict[str, Any]
+    invalidated_at: str | None = None
+    invalidated_reason: str | None = None
 
 
 class SessionStore:
@@ -94,6 +178,99 @@ class SessionStore:
 
         return self._add_message_sync(message)
 
+    def append_surface(self, event: NewSurfaceEvent) -> dict[str, Any]:
+        """在同一事务内幂等追加一条模型侧 surface 事件。"""
+
+        return self._append_surface_sync(event)
+
+    def append_session_event(self, event: NewSessionEvent) -> dict[str, Any]:
+        """在同一事务内幂等追加一条模型事件日志记录。"""
+
+        return self._append_session_event_sync(event)
+
+    def fetch_session_events(self, session_key: str) -> list[dict[str, Any]]:
+        """按事件序号读取会话的完整模型事件日志。"""
+
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                """
+                SELECT session_key, event_seq, event_type, turn_id, step, data,
+                       operation_key, status, source_event_seqs, created_at
+                FROM session_events
+                WHERE session_key = ?
+                ORDER BY event_seq ASC
+                """,
+                (key,),
+            ).fetchall()
+            chunk_rows = self._conn.execute(
+                """
+                SELECT session_key, row_seq, chunks
+                FROM session_chunk_rows
+                WHERE session_key = ?
+                ORDER BY row_seq ASC
+                """,
+                (key,),
+            ).fetchall()
+        events = [self._row_to_session_event(row) for row in rows]
+        for row in chunk_rows:
+            events.extend(self._decode_chunk_row(row))
+        return sorted(events, key=lambda item: int(item["event_seq"]))
+
+    def get_turn_timing(self, session_key: str, turn_id: str) -> dict[str, Any]:
+        """从持久化 turn 边界恢复真实起止时间和耗时。"""
+
+        key = self._validate_session_key(session_key)
+        return turn_timing_from_events(self.fetch_session_events(key), turn_id)
+
+    def load_surface(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """按事件顺序折叠会话的当前模型消息投影。"""
+
+        return self._load_surface_sync(session_key, epoch_id=epoch_id)
+
+    def fetch_surface_events(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """读取 surface 原始事件，供恢复和诊断使用。"""
+
+        return self._fetch_surface_events_sync(session_key, epoch_id=epoch_id)
+
+    def load_surface_events(
+        self,
+        session_key: str,
+    ) -> list[dict[str, Any]]:
+        """读取当前折叠后的 surface 节点及其序号。"""
+
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            return [dict(item) for item in self._surface_projection_events_locked(key)]
+
+    def replace_surface(self, event: NewSurfaceEvent) -> dict[str, Any]:
+        """追加一条带明确起止边界的 surface 替换事件。"""
+
+        if event.surface_op != "replace":
+            raise ValueError("replace_surface 只能接收 surface_op='replace'")
+        return self._append_surface_sync(event)
+
+    def recover_surface(self, session_key: str) -> list[dict[str, Any]]:
+        """返回尚未完成的 surface 事件，恢复器据此决定继续或终止。"""
+
+        return [
+            event
+            for event in self.fetch_surface_events(session_key)
+            if str(event.get("status") or "") == "pending"
+        ]
+
     def get_session_meta(self, session_key: str) -> dict[str, Any] | None:
         """读取会话元数据；不存在时返回 None。"""
 
@@ -106,23 +283,6 @@ class SessionStore:
         """按 seq 升序读取会话的全部持久化消息。"""
 
         return self._fetch_session_messages_sync(session_key)
-
-    def fetch_consolidation_window(
-        self,
-        session_key: str,
-        *,
-        keep_count: int,
-        threshold: int,
-        recent_count: int,
-    ) -> ConsolidationMessageWindow | None:
-        """只读取 cursor 后达到归档门槛的消息窗口。"""
-
-        return self._fetch_consolidation_window_sync(
-            session_key,
-            keep_count=keep_count,
-            threshold=threshold,
-            recent_count=recent_count,
-        )
 
     def upsert_session(
         self,
@@ -146,7 +306,7 @@ class SessionStore:
     def load_history(
         self,
         session_key: str,
-        limit: int = 40,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """加载最近的持久化消息，并转换成模型可消费的标准消息。"""
 
@@ -426,7 +586,7 @@ class SessionStore:
             return cursor.rowcount > 0
 
     def delete_empty_chat_session(self, session_key: str) -> bool:
-        """仅删除没有任何消息的会话，避免清理正在使用的历史会话。"""
+        """仅删除没有语义消息和模型 surface 的临时会话。"""
 
         key = self._validate_session_key(session_key)
         with self._lock:
@@ -437,6 +597,15 @@ class SessionStore:
                 WHERE key = ?
                   AND NOT EXISTS (
                       SELECT 1 FROM messages WHERE session_key = sessions.key
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM surface_events WHERE session_key = sessions.key
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_events WHERE session_key = sessions.key
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_chunk_rows WHERE session_key = sessions.key
                   )
                 """,
                 (key,),
@@ -595,19 +764,32 @@ class SessionStore:
                 (key,),
             ).fetchall()
         turns: list[dict[str, Any]] = []
+        events = self.fetch_session_events(key)
+        timing_by_turn: dict[str, dict[str, Any]] = {}
+        for event in events:
+            event_turn_id = str(event.get("turn_id") or "")
+            if not event_turn_id or event_turn_id in timing_by_turn:
+                continue
+            timing_by_turn[event_turn_id] = turn_timing_from_events(events, event_turn_id)
         for index, row in enumerate(rows, start=1):
             message = self._row_to_message(row)
+            turn_id = str(message.get("turn_id") or message["id"])
+            timing = timing_by_turn.get(turn_id, {})
             question = " ".join(str(message.get("content") or "").split()) or "附件消息"
             preview = question[:80].rstrip()
-            turns.append({
-                "id": str(message.get("turn_id") or message["id"]),
+            turn = {
+                "id": turn_id,
                 "message_id": message["id"],
                 "seq": int(message["seq"]),
                 "turn_index": index,
                 "question": question[:240].rstrip(),
                 "preview": preview,
                 "timestamp": message["timestamp"],
-            })
+            }
+            for field in ("started_at", "ended_at", "duration_ms", "status"):
+                if timing.get(field) is not None:
+                    turn[field] = timing[field]
+            turns.append(turn)
         return turns
 
     def get_last_chat_message_timestamp(self, session_key: str) -> str | None:
@@ -638,21 +820,56 @@ class SessionStore:
 
         return self._get_cursor_sync(session_key)
 
-    def get_recent_context(self, session_key: str) -> str:
-        """读取当前会话的近期压缩上下文；未生成时返回空字符串。"""
+    def get_active_compaction(self, session_key: str) -> SessionCompaction | None:
+        """读取当前 generation；消息边界由 ledger 的 seq 字段决定。"""
 
-        return self._get_recent_context_sync(session_key)
+        return self._get_active_compaction_sync(session_key)
 
-    def set_recent_context(
+    def get_compaction(self, session_key: str, generation: int) -> SessionCompaction | None:
+        """按 generation 读取 checkpoint，供重试和恢复校验使用。"""
+
+        return self._get_compaction_sync(session_key, generation)
+
+    def next_compaction_generation(self, session_key: str) -> int:
+        """返回该 session 下一代 generation，不把消息 seq 当作 generation。"""
+
+        return self._next_compaction_generation_sync(session_key)
+
+    def prepare_compaction(self, prepare: SessionCompactionPrepare) -> SessionCompactionPrepare:
+        """持久化 prepare；同一 generation 已存在时只允许完全相同的快照重试。"""
+
+        return self._prepare_compaction_sync(prepare)
+
+    def commit_compaction(self, checkpoint: SessionCompaction) -> SessionCompaction:
+        """原子写入 ledger 并推进 sessions.last_consolidated generation 指针。"""
+
+        return self._commit_compaction_sync(checkpoint)
+
+    def save_context_usage(self, session_key: str, snapshot: dict[str, Any]) -> None:
+        """保存会话最近一次上下文计量快照，不混入会话业务 metadata。"""
+
+        self._save_context_usage_sync(session_key, snapshot)
+
+    def get_context_usage(self, session_key: str) -> dict[str, Any] | None:
+        """读取上下文计量快照；没有真实 usage 时仍可返回不完整快照。"""
+
+        return self._get_context_usage_sync(session_key)
+
+    def save_session_usage(
         self,
         session_key: str,
-        content: str,
-        *,
-        source_ref: str = "",
-    ) -> None:
-        """写入当前会话的近期压缩上下文，与消息 cursor 使用同一个 Session DB。"""
+        turn_id: str,
+        iteration: int,
+        usage: dict[str, Any],
+    ) -> dict[str, Any]:
+        """幂等保存一次模型调用用量并返回当前会话累计值。"""
 
-        self._set_recent_context_sync(session_key, content, source_ref=source_ref)
+        return self._save_session_usage_sync(session_key, turn_id, iteration, usage)
+
+    def get_session_usage(self, session_key: str) -> dict[str, Any] | None:
+        """读取会话累计用量；没有真实 Provider usage 时返回 None。"""
+
+        return self._get_session_usage_sync(session_key)
 
     def close(self) -> None:
         """幂等关闭 SQLite 连接。"""
@@ -691,16 +908,153 @@ class SessionStore:
                 CREATE INDEX IF NOT EXISTS idx_messages_session_seq
                     ON messages(session_key, seq);
 
-                CREATE TABLE IF NOT EXISTS session_recent_context (
-                    session_key TEXT PRIMARY KEY,
-                    content     TEXT NOT NULL DEFAULT '',
-                    source_ref  TEXT NOT NULL DEFAULT '',
-                    updated_at  TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS surface_events (
+                    session_key        TEXT NOT NULL,
+                    epoch_id           TEXT NOT NULL,
+                    surface_seq        INTEGER NOT NULL,
+                    turn_id            TEXT NOT NULL,
+                    iteration          INTEGER NOT NULL,
+                    role               TEXT NOT NULL,
+                    content            TEXT NOT NULL,
+                    source_kind        TEXT NOT NULL,
+                    status             TEXT NOT NULL,
+                    projection_version INTEGER NOT NULL,
+                    operation_key      TEXT NOT NULL,
+                    surface_op         TEXT NOT NULL DEFAULT 'append',
+                    replace_start      INTEGER,
+                    replace_end        INTEGER,
+                    replace_generation INTEGER NOT NULL DEFAULT 0,
+                    created_at         TEXT NOT NULL,
+                    PRIMARY KEY (session_key, surface_seq),
+                    UNIQUE (session_key, operation_key),
                     FOREIGN KEY (session_key) REFERENCES sessions(key)
                         ON DELETE CASCADE
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_surface_events_session_order
+                    ON surface_events(session_key, surface_seq);
+                CREATE INDEX IF NOT EXISTS idx_surface_events_session_status
+                    ON surface_events(session_key, status);
+
+                CREATE TABLE IF NOT EXISTS session_events (
+                    session_key        TEXT NOT NULL,
+                    event_seq          INTEGER NOT NULL,
+                    event_type         TEXT NOT NULL,
+                    turn_id            TEXT NOT NULL,
+                    step               INTEGER NOT NULL,
+                    data               TEXT NOT NULL,
+                    operation_key      TEXT NOT NULL,
+                    status             TEXT NOT NULL,
+                    source_event_seqs  TEXT,
+                    created_at         TEXT NOT NULL,
+                    PRIMARY KEY (session_key, event_seq),
+                    UNIQUE (session_key, operation_key),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_events_session_order
+                    ON session_events(session_key, event_seq);
+
+                CREATE TABLE IF NOT EXISTS session_chunk_rows (
+                    session_key        TEXT NOT NULL,
+                    row_seq            INTEGER NOT NULL,
+                    turn_id            TEXT NOT NULL,
+                    step               INTEGER NOT NULL,
+                    chunks             TEXT NOT NULL,
+                    created_at         TEXT NOT NULL,
+                    PRIMARY KEY (session_key, row_seq),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_chunk_rows_session_order
+                    ON session_chunk_rows(session_key, row_seq);
+
+                CREATE TABLE IF NOT EXISTS session_compaction_prepares (
+                    session_key                  TEXT NOT NULL,
+                    session_created_at           TEXT NOT NULL,
+                    generation                   INTEGER NOT NULL,
+                    parent_generation            INTEGER NOT NULL,
+                    source_ref                   TEXT NOT NULL,
+                    source_plan_digest           TEXT NOT NULL,
+                    source_mutation_digest       TEXT NOT NULL,
+                    source_from_seq              INTEGER NOT NULL,
+                    consolidated_through_seq     INTEGER NOT NULL,
+                    source_message_ids_json      TEXT NOT NULL,
+                    selected_source_messages_json TEXT NOT NULL,
+                    retained_tail_json           TEXT NOT NULL,
+                    prepared_at                  TEXT NOT NULL,
+                    PRIMARY KEY (session_key, generation),
+                    UNIQUE (session_key, source_ref),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS session_compactions (
+                    session_key                  TEXT NOT NULL,
+                    session_created_at           TEXT NOT NULL,
+                    generation                   INTEGER NOT NULL,
+                    parent_generation            INTEGER NOT NULL DEFAULT 0,
+                    created_at                   TEXT NOT NULL,
+                    trigger                      TEXT NOT NULL,
+                    summary_format_version      INTEGER NOT NULL,
+                    summary                     TEXT NOT NULL,
+                    source_ref                   TEXT NOT NULL,
+                    source_plan_digest           TEXT NOT NULL,
+                    source_mutation_digest       TEXT NOT NULL,
+                    source_from_seq              INTEGER NOT NULL,
+                    consolidated_through_seq     INTEGER NOT NULL,
+                    source_message_ids_json      TEXT NOT NULL,
+                    selected_source_messages_json TEXT NOT NULL,
+                    retained_tail_json           TEXT NOT NULL,
+                    model_runtime_id             TEXT NOT NULL,
+                    model                       TEXT NOT NULL,
+                    context_window              INTEGER NOT NULL,
+                    threshold_tokens            INTEGER NOT NULL,
+                    hard_input_tokens           INTEGER NOT NULL,
+                    keep_recent_tokens          INTEGER NOT NULL,
+                    tokens_before               INTEGER NOT NULL,
+                    tokens_after                INTEGER NOT NULL,
+                    summary_usage_json          TEXT NOT NULL,
+                    invalidated_at              TEXT,
+                    invalidated_reason          TEXT,
+                    PRIMARY KEY (session_key, generation),
+                    UNIQUE (session_key, source_ref),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_compactions_active
+                    ON session_compactions(session_key, invalidated_at, generation);
+
+                CREATE TABLE IF NOT EXISTS session_usage (
+                    session_key                  TEXT NOT NULL,
+                    turn_id                     TEXT NOT NULL,
+                    iteration                   INTEGER NOT NULL,
+                    uncached_input_tokens      INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens          INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens         INTEGER NOT NULL DEFAULT 0,
+                    output_tokens              INTEGER NOT NULL DEFAULT 0,
+                    updated_at                 TEXT NOT NULL,
+                    PRIMARY KEY (session_key, turn_id, iteration),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_usage_session
+                    ON session_usage(session_key);
                 """
             )
+            surface_columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(surface_events)")
+            }
+            if "source_event_seqs" not in surface_columns:
+                # 仅增加可选 provenance 列；旧测试数据不需要迁移内容。
+                self._conn.execute(
+                    "ALTER TABLE surface_events ADD COLUMN source_event_seqs TEXT"
+                )
             try:
                 self._conn.executescript(
                     """
@@ -911,6 +1265,588 @@ class SessionStore:
             "metadata": dict(message.metadata),
         }
 
+    def _append_surface_sync(self, event: NewSurfaceEvent) -> dict[str, Any]:
+        """在 SQLite 写事务中分配 surface 序号并折叠替换边界。"""
+
+        key = self._validate_session_key(event.session_key)
+        epoch_id = str(event.epoch_id).strip()
+        turn_id = str(event.turn_id).strip()
+        source_kind = str(event.source_kind).strip()
+        operation_key = str(event.operation_key).strip()
+        role = str(event.role).strip().lower()
+        status = str(event.status).strip().lower()
+        surface_op = str(event.surface_op).strip().lower()
+        if not epoch_id:
+            raise ValueError("surface epoch_id 不能为空")
+        if not operation_key:
+            raise ValueError("surface operation_key 不能为空")
+        if role not in _SURFACE_ROLES:
+            raise ValueError(f"不支持的 surface role: {event.role!r}")
+        if not source_kind:
+            raise ValueError("surface source_kind 不能为空")
+        if status not in _SURFACE_STATUSES:
+            raise ValueError(f"不支持的 surface status: {event.status!r}")
+        if surface_op not in _SURFACE_OPS:
+            raise ValueError(f"不支持的 surface_op: {event.surface_op!r}")
+        if not isinstance(event.content, dict):
+            raise TypeError("surface content 必须是完整模型消息字典")
+        if str(event.content.get("role") or role).strip().lower() != role:
+            raise ValueError("surface role 必须与 content.role 一致")
+        if surface_op == "append" and (
+            event.replace_start is not None or event.replace_end is not None
+        ):
+            raise ValueError("append surface 不能携带 replace 边界")
+        if surface_op == "replace":
+            if event.replace_start is None or event.replace_end is None:
+                raise ValueError("replace surface 必须携带 start/end")
+
+        content_payload = json.dumps(
+            event.content,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = _now_iso()
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO sessions (
+                        key, created_at, updated_at, last_consolidated,
+                        next_seq, metadata
+                    ) VALUES (?, ?, ?, 0, 0, '{}')
+                    """,
+                    (key, now, now),
+                )
+                existing = self._conn.execute(
+                    """
+                    SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
+                           role, content, source_kind, status, projection_version,
+                           operation_key, surface_op, replace_start, replace_end,
+                           replace_generation, source_event_seqs, created_at
+                    FROM surface_events
+                    WHERE session_key = ? AND operation_key = ?
+                    """,
+                    (key, operation_key),
+                ).fetchone()
+                if existing is not None:
+                    current = self._row_to_surface_event(existing)
+                    if not self._surface_event_matches(
+                        current,
+                        epoch_id=epoch_id,
+                        turn_id=turn_id,
+                        iteration=int(event.iteration),
+                        role=role,
+                        content=event.content,
+                        source_kind=source_kind,
+                        status=status,
+                        projection_version=int(event.projection_version),
+                        operation_key=operation_key,
+                        surface_op=surface_op,
+                        replace_start=event.replace_start,
+                        replace_end=event.replace_end,
+                        source_event_seqs=event.source_event_seqs,
+                    ):
+                        raise ValueError(
+                            f"surface operation_key 已绑定不同事件: {key}:{operation_key}"
+                        )
+                    self._conn.commit()
+                    return current
+
+                current_nodes = self._surface_projection_events_locked(key)
+                replace_generation = max(
+                    (int(item["replace_generation"]) for item in current_nodes),
+                    default=0,
+                )
+                if surface_op == "replace":
+                    start = int(event.replace_start)
+                    end = int(event.replace_end)
+                    start_index = next(
+                        (
+                            index
+                            for index, item in enumerate(current_nodes)
+                            if int(item["surface_seq"]) == start
+                        ),
+                        None,
+                    )
+                    end_index = next(
+                        (
+                            index
+                            for index, item in enumerate(current_nodes)
+                            if int(item["surface_seq"]) == end
+                        ),
+                        None,
+                    )
+                    if start_index is None or end_index is None or start_index > end_index:
+                        raise ValueError(
+                            "replace 边界必须覆盖当前 surface 中连续存在的节点"
+                        )
+                    self._validate_surface_provenance(
+                        event.source_event_seqs,
+                        shadowed=current_nodes[start_index:end_index + 1],
+                        session_key=key,
+                    )
+                    replace_generation += 1
+
+                seq_row = self._conn.execute(
+                    """
+                    SELECT COALESCE(MAX(surface_seq), -1) + 1 AS next_surface_seq
+                    FROM surface_events
+                    WHERE session_key = ?
+                    """,
+                    (key,),
+                ).fetchone()
+                surface_seq = int(seq_row["next_surface_seq"] if seq_row else 0)
+                self._conn.execute(
+                    """
+                    INSERT INTO surface_events (
+                        session_key, epoch_id, surface_seq, turn_id, iteration,
+                        role, content, source_kind, status, projection_version,
+                        operation_key, surface_op, replace_start, replace_end,
+                        replace_generation, source_event_seqs, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        epoch_id,
+                        surface_seq,
+                        turn_id,
+                        int(event.iteration),
+                        role,
+                        content_payload,
+                        source_kind,
+                        status,
+                        int(event.projection_version),
+                        operation_key,
+                        surface_op,
+                        int(event.replace_start) if event.replace_start is not None else None,
+                        int(event.replace_end) if event.replace_end is not None else None,
+                        replace_generation,
+                        json.dumps(event.source_event_seqs, ensure_ascii=False)
+                        if event.source_event_seqs is not None else None,
+                        now,
+                    ),
+                )
+                self._conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE key = ?",
+                    (now, key),
+                )
+                self._conn.commit()
+                row = self._conn.execute(
+                    """
+                    SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
+                           role, content, source_kind, status, projection_version,
+                           operation_key, surface_op, replace_start, replace_end,
+                           replace_generation, source_event_seqs, created_at
+                    FROM surface_events
+                    WHERE session_key = ? AND surface_seq = ?
+                    """,
+                    (key, surface_seq),
+                ).fetchone()
+            except Exception:
+                self._conn.rollback()
+                raise
+        if row is None:
+            raise RuntimeError(f"surface 事件写入后无法读取: {key}:{surface_seq}")
+        return self._row_to_surface_event(row)
+
+    def _append_session_event_sync(self, event: NewSessionEvent) -> dict[str, Any]:
+        """在 SQLite 事务中追加不可变事件，并按 operation_key 幂等返回。"""
+
+        if str(event.event_type).strip() == "assistant/chunk":
+            return self._append_chunk_event_sync(event)
+
+        key = self._validate_session_key(event.session_key)
+        event_type = str(event.event_type).strip()
+        turn_id = str(event.turn_id).strip()
+        operation_key = str(event.operation_key).strip()
+        status = str(event.status).strip().lower()
+        if not event_type:
+            raise ValueError("session event_type 不能为空")
+        if not turn_id:
+            raise ValueError("session event turn_id 不能为空")
+        if not operation_key:
+            raise ValueError("session event operation_key 不能为空")
+        if not isinstance(event.data, dict):
+            raise TypeError("session event data 必须是对象")
+        if not status:
+            raise ValueError("session event status 不能为空")
+        refs = None
+        if event.source_event_seqs is not None:
+            try:
+                refs = [int(item) for item in event.source_event_seqs]
+            except (TypeError, ValueError) as error:
+                raise ValueError("session event source_event_seqs 必须是整数列表") from error
+            if refs != sorted(set(refs)):
+                raise ValueError("session event source_event_seqs 必须严格递增且不能重复")
+        payload = json.dumps(event.data, ensure_ascii=False, separators=(",", ":"))
+        refs_payload = json.dumps(refs, ensure_ascii=False) if refs is not None else None
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = _now_iso()
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO sessions (
+                        key, created_at, updated_at, last_consolidated,
+                        next_seq, metadata
+                    ) VALUES (?, ?, ?, 0, 0, '{}')
+                    """,
+                    (key, now, now),
+                )
+                if refs:
+                    found = {
+                        int(row["event_seq"])
+                        for row in self._conn.execute(
+                            "SELECT event_seq FROM session_events WHERE session_key = ?",
+                            (key,),
+                        ).fetchall()
+                    }
+                    for row in self._conn.execute(
+                        "SELECT session_key, row_seq, chunks FROM session_chunk_rows WHERE session_key = ?",
+                        (key,),
+                    ).fetchall():
+                        found.update(int(item["event_seq"]) for item in self._decode_chunk_row(row))
+                    if any(ref not in found for ref in refs):
+                        raise ValueError(
+                            f"session event provenance 不属于当前会话: {key}"
+                        )
+                existing = self._conn.execute(
+                    """
+                    SELECT session_key, event_seq, event_type, turn_id, step, data,
+                           operation_key, status, source_event_seqs, created_at
+                    FROM session_events
+                    WHERE session_key = ? AND operation_key = ?
+                    """,
+                    (key, operation_key),
+                ).fetchone()
+                if existing is not None:
+                    current = self._row_to_session_event(existing)
+                    if (
+                        current["event_type"] != event_type
+                        or current["turn_id"] != turn_id
+                        or int(current["step"]) != int(event.step)
+                        or current["data"] != event.data
+                        or current["status"] != status
+                        or current.get("source_event_seqs") != refs
+                    ):
+                        raise ValueError(f"session event operation_key 已绑定不同事件: {key}:{operation_key}")
+                    self._conn.commit()
+                    return current
+                seq_row = self._conn.execute(
+                    "SELECT COALESCE(MAX(event_seq), -1) + 1 AS next_event_seq FROM session_events WHERE session_key = ?",
+                    (key,),
+                ).fetchone()
+                event_seq = int(seq_row["next_event_seq"] if seq_row else 0)
+                for chunk_row in self._conn.execute(
+                    "SELECT session_key, row_seq, chunks FROM session_chunk_rows WHERE session_key = ?",
+                    (key,),
+                ).fetchall():
+                    decoded = self._decode_chunk_row(chunk_row)
+                    if decoded:
+                        event_seq = max(event_seq, max(int(item["event_seq"]) for item in decoded) + 1)
+                self._conn.execute(
+                    """
+                    INSERT INTO session_events (
+                        session_key, event_seq, event_type, turn_id, step, data,
+                        operation_key, status, source_event_seqs, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (key, event_seq, event_type, turn_id, int(event.step), payload,
+                     operation_key, status, refs_payload, now),
+                )
+                self._conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE key = ?", (now, key)
+                )
+                self._conn.commit()
+                row = self._conn.execute(
+                    """
+                    SELECT session_key, event_seq, event_type, turn_id, step, data,
+                           operation_key, status, source_event_seqs, created_at
+                    FROM session_events
+                    WHERE session_key = ? AND event_seq = ?
+                    """,
+                    (key, event_seq),
+                ).fetchone()
+            except Exception:
+                self._conn.rollback()
+                raise
+        if row is None:
+            raise RuntimeError(f"session event 写入后无法读取: {key}:{event_seq}")
+        return self._row_to_session_event(row)
+
+    def _append_chunk_event_sync(self, event: NewSessionEvent) -> dict[str, Any]:
+        """把连续 assistant chunk 合并到物理行，同时保留可无损展开的逻辑事件。"""
+
+        key = self._validate_session_key(event.session_key)
+        turn_id = str(event.turn_id).strip()
+        operation_key = str(event.operation_key).strip()
+        status = str(event.status).strip().lower() or "committed"
+        if not turn_id or not operation_key:
+            raise ValueError("assistant/chunk 必须包含 turn_id 和 operation_key")
+        if not isinstance(event.data, dict):
+            raise TypeError("assistant/chunk data 必须是对象")
+        refs = None
+        if event.source_event_seqs is not None:
+            refs = [int(item) for item in event.source_event_seqs]
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = _now_iso()
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO sessions (
+                        key, created_at, updated_at, last_consolidated,
+                        next_seq, metadata
+                    ) VALUES (?, ?, ?, 0, 0, '{}')
+                    """,
+                    (key, now, now),
+                )
+                for row in self._conn.execute(
+                    "SELECT session_key, row_seq, chunks FROM session_chunk_rows WHERE session_key = ?",
+                    (key,),
+                ).fetchall():
+                    for current in self._decode_chunk_row(row):
+                        if current["operation_key"] == operation_key:
+                            if current["data"] != event.data or current["turn_id"] != turn_id:
+                                raise ValueError(f"session event operation_key 已绑定不同事件: {key}:{operation_key}")
+                            self._conn.commit()
+                            return current
+                existing = self._conn.execute(
+                    "SELECT session_key, event_seq, event_type, turn_id, step, data, operation_key, status, source_event_seqs, created_at FROM session_events WHERE session_key = ? AND operation_key = ?",
+                    (key, operation_key),
+                ).fetchone()
+                if existing is not None:
+                    current = self._row_to_session_event(existing)
+                    if current["event_type"] != "assistant/chunk" or current["data"] != event.data:
+                        raise ValueError(f"session event operation_key 已绑定不同事件: {key}:{operation_key}")
+                    self._conn.commit()
+                    return current
+                max_event = self._conn.execute(
+                    "SELECT COALESCE(MAX(event_seq), -1) AS value FROM session_events WHERE session_key = ?",
+                    (key,),
+                ).fetchone()
+                event_seq = int(max_event["value"] if max_event else -1) + 1
+                for row in self._conn.execute(
+                    "SELECT chunks FROM session_chunk_rows WHERE session_key = ?", (key,)
+                ).fetchall():
+                    decoded = self._decode_chunk_row(row)
+                    if decoded:
+                        event_seq = max(event_seq, max(int(item["event_seq"]) for item in decoded) + 1)
+                logical = {
+                    "session_key": key,
+                    "event_seq": event_seq,
+                    "event_type": "assistant/chunk",
+                    "turn_id": turn_id,
+                    "step": int(event.step),
+                    "data": deepcopy(event.data),
+                    "operation_key": operation_key,
+                    "status": status,
+                    "source_event_seqs": refs,
+                    "created_at": now,
+                }
+                tail = self._conn.execute(
+                    "SELECT row_seq, turn_id, step, chunks FROM session_chunk_rows WHERE session_key = ? ORDER BY row_seq DESC LIMIT 1",
+                    (key,),
+                ).fetchone()
+                tail_items = self._decode_chunk_row(tail) if tail is not None else []
+                if (
+                    tail is not None
+                    and tail_items
+                    and str(tail["turn_id"]) == turn_id
+                    and int(tail["step"]) == int(event.step)
+                    and int(tail_items[-1]["event_seq"]) + 1 == event_seq
+                ):
+                    packed = json.loads(str(tail["chunks"]))
+                    packed.setdefault("items", []).append(logical)
+                    self._conn.execute(
+                        "UPDATE session_chunk_rows SET chunks = ? WHERE session_key = ? AND row_seq = ?",
+                        (json.dumps(packed, ensure_ascii=False, separators=(",", ":")), key, int(tail["row_seq"])),
+                    )
+                else:
+                    row_seq = int(self._conn.execute(
+                        "SELECT COALESCE(MAX(row_seq), -1) + 1 AS value FROM session_chunk_rows WHERE session_key = ?",
+                        (key,),
+                    ).fetchone()["value"])
+                    packed = {"event_type": "assistant/chunk", "turn_id": turn_id, "step": int(event.step), "items": [logical]}
+                    self._conn.execute(
+                        "INSERT INTO session_chunk_rows (session_key, row_seq, turn_id, step, chunks, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (key, row_seq, turn_id, int(event.step), json.dumps(packed, ensure_ascii=False, separators=(",", ":")), now),
+                    )
+                self._conn.execute("UPDATE sessions SET updated_at = ? WHERE key = ?", (now, key))
+                self._conn.commit()
+                return logical
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _fetch_surface_events_sync(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None,
+    ) -> list[dict[str, Any]]:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            if epoch_id is None:
+                rows = self._conn.execute(
+                    """
+                    SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
+                           role, content, source_kind, status, projection_version,
+                           operation_key, surface_op, replace_start, replace_end,
+                           replace_generation, source_event_seqs, created_at
+                    FROM surface_events
+                    WHERE session_key = ?
+                    ORDER BY surface_seq ASC
+                    """,
+                    (key,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
+                           role, content, source_kind, status, projection_version,
+                           operation_key, surface_op, replace_start, replace_end,
+                           replace_generation, source_event_seqs, created_at
+                    FROM surface_events
+                    WHERE session_key = ? AND epoch_id = ?
+                    ORDER BY surface_seq ASC
+                    """,
+                    (key, str(epoch_id).strip()),
+                ).fetchall()
+        return [self._row_to_surface_event(row) for row in rows]
+
+    def _load_surface_sync(
+        self,
+        session_key: str,
+        *,
+        epoch_id: str | None,
+    ) -> list[dict[str, Any]]:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            nodes = self._surface_projection_events_locked(key)
+        if epoch_id is not None:
+            # epoch 只影响缓存声明；历史消息仍需保留在当前模型上下文中。
+            # 因此这里不按 epoch 丢弃旧节点，只允许调用方筛选原始事件。
+            expected = str(epoch_id).strip()
+            if expected and not any(str(node.get("epoch_id")) == expected for node in nodes):
+                return [dict(node["message"]) for node in nodes]
+        return [dict(node["message"]) for node in nodes]
+
+    def _surface_projection_events_locked(
+        self,
+        session_key: str,
+    ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT session_key, epoch_id, surface_seq, turn_id, iteration,
+                   role, content, source_kind, status, projection_version,
+                   operation_key, surface_op, replace_start, replace_end,
+                   replace_generation, source_event_seqs, created_at
+            FROM surface_events
+            WHERE session_key = ?
+            ORDER BY surface_seq ASC
+            """,
+            (session_key,),
+        ).fetchall()
+        nodes: list[dict[str, Any]] = []
+        for row in rows:
+            event = self._row_to_surface_event(row)
+            if event["status"] not in _SURFACE_PROJECTABLE_STATUSES:
+                continue
+            if event["surface_op"] == "append":
+                nodes.append(event)
+                continue
+            start = event["replace_start"]
+            end = event["replace_end"]
+            if start is None or end is None:
+                raise ValueError("surface replace 事件缺少边界")
+            start_index = next(
+                (
+                    index for index, node in enumerate(nodes)
+                    if int(node["surface_seq"]) == int(start)
+                ),
+                None,
+            )
+            end_index = next(
+                (
+                    index for index, node in enumerate(nodes)
+                    if int(node["surface_seq"]) == int(end)
+                ),
+                None,
+            )
+            if start_index is None or end_index is None or start_index > end_index:
+                raise ValueError("surface replace 事件覆盖了不连续的当前节点")
+            nodes[start_index:end_index + 1] = [event]
+        return nodes
+
+    @staticmethod
+    def _surface_event_matches(
+        current: dict[str, Any],
+        *,
+        epoch_id: str,
+        turn_id: str,
+        iteration: int,
+        role: str,
+        content: dict[str, Any],
+        source_kind: str,
+        status: str,
+        projection_version: int,
+        operation_key: str,
+        surface_op: str,
+        replace_start: int | None,
+        replace_end: int | None,
+        source_event_seqs: list[int] | None,
+    ) -> bool:
+        return (
+            current["epoch_id"] == epoch_id
+            and current["turn_id"] == turn_id
+            and int(current["iteration"]) == iteration
+            and current["role"] == role
+            and current["message"] == content
+            and current["source_kind"] == source_kind
+            and current["status"] == status
+            and int(current["projection_version"]) == projection_version
+            and current["operation_key"] == operation_key
+            and current["surface_op"] == surface_op
+            and current["replace_start"] == replace_start
+            and current["replace_end"] == replace_end
+            and current.get("source_event_seqs") == (
+                [int(item) for item in source_event_seqs]
+                if source_event_seqs is not None else None
+            )
+        )
+
+    @staticmethod
+    def _validate_surface_provenance(
+        source_event_seqs: list[int] | None,
+        *,
+        shadowed: list[dict[str, Any]],
+        session_key: str,
+    ) -> None:
+        """校验 replace 来源完整覆盖当前节点，防止异步压缩误替换新前缀。"""
+
+        if source_event_seqs is None:
+            return
+        if not isinstance(source_event_seqs, list):
+            raise TypeError("surface source_event_seqs 必须是整数列表")
+        try:
+            refs = [int(item) for item in source_event_seqs]
+        except (TypeError, ValueError) as error:
+            raise ValueError("surface source_event_seqs 必须全部是整数") from error
+        if refs != sorted(set(refs)):
+            raise ValueError("surface source_event_seqs 必须严格递增且不能重复")
+        expected = [int(item["surface_seq"]) for item in shadowed]
+        if refs != expected:
+            raise ValueError(
+                f"surface replace provenance 与当前覆盖范围不一致: session={session_key}"
+            )
+
     def _get_session_meta_sync(self, session_key: str) -> dict[str, Any] | None:
         key = self._validate_session_key(session_key)
         with self._lock:
@@ -943,76 +1879,6 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_message(row) for row in rows]
 
-    def _fetch_consolidation_window_sync(
-        self,
-        session_key: str,
-        *,
-        keep_count: int,
-        threshold: int,
-        recent_count: int,
-    ) -> ConsolidationMessageWindow | None:
-        key = self._validate_session_key(session_key)
-        safe_keep = max(0, int(keep_count))
-        safe_threshold = max(1, int(threshold))
-        safe_recent = max(0, int(recent_count))
-        with self._lock:
-            self._ensure_open()
-            meta = self._conn.execute(
-                "SELECT last_consolidated FROM sessions WHERE key = ?",
-                (key,),
-            ).fetchone()
-            cursor = max(0, int(meta["last_consolidated"] or 0)) if meta else 0
-            count_row = self._conn.execute(
-                """
-                SELECT COUNT(1) AS count
-                FROM messages
-                WHERE session_key = ? AND seq >= ?
-                """,
-                (key, cursor),
-            ).fetchone()
-            active_count = int((count_row["count"] if count_row else 0) or 0)
-            archive_count = max(0, active_count - safe_keep)
-            if archive_count < safe_threshold:
-                # 未到门槛时只读取索引计数，不构建正文、tool_chain 或 extra 对象。
-                return None
-
-            rows = self._conn.execute(
-                f"""
-                SELECT {_MESSAGE_COLUMNS}
-                FROM messages
-                WHERE session_key = ? AND seq >= ?
-                ORDER BY seq ASC
-                LIMIT ?
-                """,
-                (key, cursor, archive_count),
-            ).fetchall()
-            recent_rows = []
-            if safe_recent:
-                recent_rows = self._conn.execute(
-                    f"""
-                    SELECT {_MESSAGE_COLUMNS}
-                    FROM messages
-                    WHERE session_key = ? AND seq >= ?
-                    ORDER BY seq DESC
-                    LIMIT ?
-                    """,
-                    (key, cursor, safe_recent),
-                ).fetchall()
-
-        messages = [self._row_to_message(row) for row in rows]
-        recent_messages = [
-            self._row_to_message(row) for row in reversed(recent_rows)
-        ]
-        if not messages:
-            return None
-        return ConsolidationMessageWindow(
-            cursor=cursor,
-            next_cursor=int(messages[-1]["seq"]) + 1,
-            active_count=active_count,
-            messages=messages,
-            recent_messages=recent_messages,
-        )
-
     def _upsert_session_sync(
         self,
         session_key: str,
@@ -1022,9 +1888,18 @@ class SessionStore:
         metadata: dict[str, Any],
     ) -> None:
         key = self._validate_session_key(session_key)
-        payload = json.dumps(metadata or {}, ensure_ascii=False)
         with self._lock:
             self._ensure_open()
+            incoming = dict(metadata or {})
+            existing_row = self._conn.execute(
+                "SELECT metadata FROM sessions WHERE key = ?", (key,)
+            ).fetchone()
+            existing = _load_json_object(existing_row["metadata"]) if existing_row else {}
+            # 计量快照只由 save_context_usage() 更新；Session 缓存可能长期持有
+            # 旧快照，普通 metadata upsert 必须始终保留数据库中的最新计量值。
+            if "context_usage" in existing:
+                incoming["context_usage"] = existing["context_usage"]
+            payload = json.dumps(incoming, ensure_ascii=False)
             # Consolidation 在后台直接推进 cursor，而 Session 缓存可能仍持有旧值；普通
             # metadata upsert 只允许 cursor 单调前进，显式重置仍由 set_cursor() 负责。
             # next_seq 由 add_message 的事务独立维护；元数据刷新绝不能把它
@@ -1056,30 +1931,37 @@ class SessionStore:
     def _load_history_sync(
         self,
         session_key: str,
-        limit: int,
+        limit: int | None,
     ) -> list[dict[str, Any]]:
         key = self._validate_session_key(session_key)
-        safe_limit = max(0, int(limit))
+        safe_limit = None if limit is None else max(0, int(limit))
         if safe_limit == 0:
             return []
 
         with self._lock:
             self._ensure_open()
-            meta = self._conn.execute(
-                "SELECT last_consolidated FROM sessions WHERE key = ?",
-                (key,),
-            ).fetchone()
-            cursor = max(0, int(meta["last_consolidated"] or 0)) if meta else 0
-            rows = self._conn.execute(
-                f"""
-                SELECT {_MESSAGE_COLUMNS}
-                FROM messages
-                WHERE session_key = ? AND seq >= ?
-                ORDER BY seq DESC
-                LIMIT ?
-                """,
-                (key, cursor, safe_limit),
-            ).fetchall()
+            cursor = self._active_message_boundary_locked(key)
+            if safe_limit is None:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT {_MESSAGE_COLUMNS}
+                    FROM messages
+                    WHERE session_key = ? AND seq >= ?
+                    ORDER BY seq DESC
+                    """,
+                    (key, cursor),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT {_MESSAGE_COLUMNS}
+                    FROM messages
+                    WHERE session_key = ? AND seq >= ?
+                    ORDER BY seq DESC
+                    LIMIT ?
+                    """,
+                    (key, cursor, safe_limit),
+                ).fetchall()
 
             # limit 只决定基础窗口大小。若窗口从 assistant 开始，继续向前
             # 补到最近的 user，避免把同一 Turn 的 user/assistant/tool_chain
@@ -1115,6 +1997,36 @@ class SessionStore:
         for message in persisted:
             history.extend(self._message_to_history(message))
         return history
+
+    def get_active_message_boundary(self, session_key: str) -> int:
+        """返回 active generation 覆盖到的消息 seq；无 ledger 时兼容旧 cursor。"""
+
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            return self._active_message_boundary_locked(key)
+
+    def _active_message_boundary_locked(self, key: str) -> int:
+        """在持有 SQLite 锁时解析 generation -> message seq 的唯一映射。"""
+
+        meta = self._conn.execute(
+            "SELECT last_consolidated FROM sessions WHERE key = ?",
+            (key,),
+        ).fetchone()
+        generation = max(0, int(meta["last_consolidated"] or 0)) if meta else 0
+        if generation <= 0:
+            return generation
+        checkpoint = self._conn.execute(
+            """
+            SELECT consolidated_through_seq
+            FROM session_compactions
+            WHERE session_key = ? AND generation = ? AND invalidated_at IS NULL
+            """,
+            (key, generation),
+        ).fetchone()
+        # 旧版本或人工修复可能只更新了 sessions；在对应 ledger 缺失时保留
+        # legacy cursor 行为，避免把已归档消息重新暴露给模型。
+        return int(checkpoint["consolidated_through_seq"]) if checkpoint else generation
 
     def _fetch_messages_sync(
         self,
@@ -1312,52 +2224,210 @@ class SessionStore:
             ).fetchone()
         return int((row["last_consolidated"] if row else 0) or 0)
 
-    def _get_recent_context_sync(self, session_key: str) -> str:
+    def _get_active_compaction_sync(self, session_key: str) -> SessionCompaction | None:
         key = self._validate_session_key(session_key)
         with self._lock:
             self._ensure_open()
             row = self._conn.execute(
-                "SELECT content FROM session_recent_context WHERE session_key = ?",
+                """
+                SELECT c.*
+                FROM sessions s
+                JOIN session_compactions c
+                  ON c.session_key = s.key
+                 AND c.generation = s.last_consolidated
+                WHERE s.key = ? AND c.invalidated_at IS NULL
+                """,
                 (key,),
             ).fetchone()
-        return str(row["content"] or "") if row else ""
+        return self._row_to_compaction(row) if row is not None else None
 
-    def _set_recent_context_sync(
+    def _get_compaction_sync(
         self,
         session_key: str,
-        content: str,
-        *,
-        source_ref: str = "",
-    ) -> None:
+        generation: int,
+    ) -> SessionCompaction | None:
         key = self._validate_session_key(session_key)
-        now = _now_iso()
+        safe_generation = int(generation)
         with self._lock:
             self._ensure_open()
-            # recent context 是会话 cursor 的伴生状态；缺失会话先幂等创建，避免孤儿摘要。
-            self._conn.execute(
-                """
-                INSERT OR IGNORE INTO sessions(
-                    key, created_at, updated_at, last_consolidated,
-                    next_seq, metadata
+            row = self._conn.execute(
+                "SELECT * FROM session_compactions WHERE session_key = ? AND generation = ?",
+                (key, safe_generation),
+            ).fetchone()
+        return self._row_to_compaction(row) if row is not None else None
+
+    def _next_compaction_generation_sync(self, session_key: str) -> int:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(generation), 0) AS generation FROM session_compactions WHERE session_key = ?",
+                (key,),
+            ).fetchone()
+        return int((row["generation"] if row else 0) or 0) + 1
+
+    def _prepare_compaction_sync(
+        self,
+        prepare: SessionCompactionPrepare,
+    ) -> SessionCompactionPrepare:
+        key = self._validate_session_key(prepare.session_key)
+        if prepare.generation < 1:
+            raise ValueError("compaction generation 必须是正整数")
+        if prepare.consolidated_through_seq < prepare.source_from_seq:
+            raise ValueError("compaction seq 边界无效")
+        payload = (
+            json.dumps(prepare.source_message_ids, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(prepare.selected_source_messages, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(prepare.retained_tail, ensure_ascii=False, separators=(",", ":")),
+        )
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    "SELECT * FROM session_compaction_prepares WHERE session_key = ? AND generation = ?",
+                    (key, prepare.generation),
+                ).fetchone()
+                if existing is not None:
+                    stored = self._row_to_prepare(existing)
+                    if stored != prepare:
+                        raise ValueError(
+                            "同一 compaction generation 的 prepare 不可变字段发生漂移"
+                        )
+                    self._conn.commit()
+                    return stored
+                session = self._conn.execute(
+                    "SELECT created_at FROM sessions WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                if session is None:
+                    raise ValueError(f"compaction session 不存在: {key}")
+                if str(session["created_at"]) != str(prepare.session_created_at):
+                    raise ValueError("compaction session incarnation 不匹配")
+                self._conn.execute(
+                    """
+                    INSERT INTO session_compaction_prepares(
+                        session_key, session_created_at, generation, parent_generation,
+                        source_ref, source_plan_digest, source_mutation_digest,
+                        source_from_seq, consolidated_through_seq,
+                        source_message_ids_json, selected_source_messages_json,
+                        retained_tail_json, prepared_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        prepare.session_created_at,
+                        prepare.generation,
+                        prepare.parent_generation,
+                        prepare.source_ref,
+                        prepare.source_plan_digest,
+                        prepare.source_mutation_digest,
+                        prepare.source_from_seq,
+                        prepare.consolidated_through_seq,
+                        *payload,
+                        prepare.prepared_at,
+                    ),
                 )
-                VALUES (?, ?, ?, 0, 0, '{}')
-                """,
-                (key, now, now),
-            )
-            self._conn.execute(
-                """
-                INSERT INTO session_recent_context(
-                    session_key, content, source_ref, updated_at
+                self._conn.commit()
+                return prepare
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _commit_compaction_sync(
+        self,
+        checkpoint: SessionCompaction,
+    ) -> SessionCompaction:
+        key = self._validate_session_key(checkpoint.session_key)
+        if checkpoint.generation < 1:
+            raise ValueError("compaction generation 必须是正整数")
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                session = self._conn.execute(
+                    "SELECT created_at, last_consolidated FROM sessions WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                if session is None:
+                    raise ValueError(f"compaction session 不存在: {key}")
+                if str(session["created_at"]) != str(checkpoint.session_created_at):
+                    raise ValueError("compaction session incarnation 不匹配")
+                current_generation = int(session["last_consolidated"] or 0)
+                if current_generation > checkpoint.generation:
+                    raise ValueError("compaction generation 不能回退")
+                prepare_row = self._conn.execute(
+                    "SELECT * FROM session_compaction_prepares WHERE session_key = ? AND generation = ?",
+                    (key, checkpoint.generation),
+                ).fetchone()
+                if prepare_row is None:
+                    raise ValueError("提交 checkpoint 前必须先写入 prepare")
+                prepare = self._row_to_prepare(prepare_row)
+                if not _prepare_matches_checkpoint(prepare, checkpoint):
+                    raise ValueError("checkpoint 与 prepare 的来源契约不一致")
+                existing_row = self._conn.execute(
+                    "SELECT * FROM session_compactions WHERE session_key = ? AND generation = ?",
+                    (key, checkpoint.generation),
+                ).fetchone()
+                if existing_row is not None:
+                    existing = self._row_to_compaction(existing_row)
+                    if existing != checkpoint:
+                        raise ValueError("同一 compaction generation 的 checkpoint 不可变字段发生漂移")
+                    self._conn.commit()
+                    return existing
+                self._conn.execute(
+                    """
+                    INSERT INTO session_compactions(
+                        session_key, session_created_at, generation, parent_generation,
+                        created_at, trigger, summary_format_version, summary,
+                        source_ref, source_plan_digest, source_mutation_digest,
+                        source_from_seq, consolidated_through_seq,
+                        source_message_ids_json, selected_source_messages_json,
+                        retained_tail_json, model_runtime_id, model, context_window,
+                        threshold_tokens, hard_input_tokens, keep_recent_tokens,
+                        tokens_before, tokens_after, summary_usage_json,
+                        invalidated_at, invalidated_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        checkpoint.session_created_at,
+                        checkpoint.generation,
+                        checkpoint.parent_generation,
+                        checkpoint.created_at,
+                        checkpoint.trigger,
+                        checkpoint.summary_format_version,
+                        checkpoint.summary,
+                        checkpoint.source_ref,
+                        checkpoint.source_plan_digest,
+                        checkpoint.source_mutation_digest,
+                        checkpoint.source_from_seq,
+                        checkpoint.consolidated_through_seq,
+                        json.dumps(checkpoint.source_message_ids, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(checkpoint.selected_source_messages, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(checkpoint.retained_tail, ensure_ascii=False, separators=(",", ":")),
+                        checkpoint.model_runtime_id,
+                        checkpoint.model,
+                        checkpoint.context_window,
+                        checkpoint.threshold_tokens,
+                        checkpoint.hard_input_tokens,
+                        checkpoint.keep_recent_tokens,
+                        checkpoint.tokens_before,
+                        checkpoint.tokens_after,
+                        json.dumps(checkpoint.summary_usage, ensure_ascii=False, separators=(",", ":")),
+                        checkpoint.invalidated_at,
+                        checkpoint.invalidated_reason,
+                    ),
                 )
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(session_key) DO UPDATE SET
-                    content = excluded.content,
-                    source_ref = excluded.source_ref,
-                    updated_at = excluded.updated_at
-                """,
-                (key, str(content), str(source_ref or ""), now),
-            )
-            self._conn.commit()
+                self._conn.execute(
+                    "UPDATE sessions SET last_consolidated = ?, updated_at = ? WHERE key = ?",
+                    (checkpoint.generation, checkpoint.created_at, key),
+                )
+                self._conn.commit()
+                return checkpoint
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def _close_sync(self) -> None:
         with self._lock:
@@ -1365,6 +2435,135 @@ class SessionStore:
                 return
             self._conn.close()
             self._closed = True
+
+    def _save_context_usage_sync(self, session_key: str, snapshot: dict[str, Any]) -> None:
+        key = self._validate_session_key(session_key)
+        if not isinstance(snapshot, dict):
+            raise TypeError("context usage snapshot 必须是对象")
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT metadata FROM sessions WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"context usage session 不存在: {key}")
+            metadata = _load_json_object(row["metadata"])
+            # 只更新保留键，标题和其他业务 metadata 由各自调用方继续拥有。
+            metadata["context_usage"] = dict(snapshot)
+            self._conn.execute(
+                """
+                UPDATE sessions SET metadata = ?, updated_at = ? WHERE key = ?
+                """,
+                (json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), default=str), _now_iso(), key),
+            )
+            self._conn.commit()
+
+    def _get_context_usage_sync(self, session_key: str) -> dict[str, Any] | None:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT metadata FROM sessions WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = _load_json_object(row["metadata"]).get("context_usage")
+        return dict(value) if isinstance(value, dict) else None
+
+    def _save_session_usage_sync(
+        self,
+        session_key: str,
+        turn_id: str,
+        iteration: int,
+        usage: dict[str, Any],
+    ) -> dict[str, Any]:
+        key = self._validate_session_key(session_key)
+        clean_turn = str(turn_id or "").strip()
+        if not clean_turn:
+            raise ValueError("session usage turn_id 不能为空")
+        if not isinstance(usage, dict):
+            raise TypeError("session usage 必须是对象")
+        values = {
+            name: max(0, int(usage.get(name) or 0))
+            for name in (
+                "uncached_input_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "output_tokens",
+            )
+        }
+        safe_iteration = max(1, int(iteration))
+        with self._lock:
+            self._ensure_open()
+            if self._conn.execute("SELECT 1 FROM sessions WHERE key = ?", (key,)).fetchone() is None:
+                raise ValueError(f"session usage session 不存在: {key}")
+            self._conn.execute(
+                """
+                INSERT INTO session_usage(
+                    session_key, turn_id, iteration, uncached_input_tokens,
+                    cache_read_tokens, cache_write_tokens, output_tokens, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_key, turn_id, iteration) DO UPDATE SET
+                    uncached_input_tokens = excluded.uncached_input_tokens,
+                    cache_read_tokens = excluded.cache_read_tokens,
+                    cache_write_tokens = excluded.cache_write_tokens,
+                    output_tokens = excluded.output_tokens,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    key,
+                    clean_turn,
+                    safe_iteration,
+                    values["uncached_input_tokens"],
+                    values["cache_read_tokens"],
+                    values["cache_write_tokens"],
+                    values["output_tokens"],
+                    _now_iso(),
+                ),
+            )
+            self._conn.commit()
+            return self._aggregate_session_usage_locked(key)
+
+    def _get_session_usage_sync(self, session_key: str) -> dict[str, Any] | None:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            if self._conn.execute("SELECT 1 FROM sessions WHERE key = ?", (key,)).fetchone() is None:
+                return None
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS count FROM session_usage WHERE session_key = ?", (key,)
+            ).fetchone()
+            if row is None or int(row["count"] or 0) == 0:
+                return None
+            return self._aggregate_session_usage_locked(key)
+
+    def _aggregate_session_usage_locked(self, key: str) -> dict[str, Any]:
+        row = self._conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(uncached_input_tokens), 0) AS uncached,
+                COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
+                COALESCE(SUM(cache_write_tokens), 0) AS cache_write,
+                COALESCE(SUM(output_tokens), 0) AS output
+            FROM session_usage WHERE session_key = ?
+            """,
+            (key,),
+        ).fetchone()
+        uncached = int(row["uncached"] or 0)
+        cache_read = int(row["cache_read"] or 0)
+        cache_write = int(row["cache_write"] or 0)
+        output = int(row["output"] or 0)
+        total_input = uncached + cache_read + cache_write
+        # 输入总量包含缓存读写；命中率只有存在输入时才有定义。
+        return {
+            "total_uncached_input_tokens": uncached,
+            "total_cache_read_tokens": cache_read,
+            "total_cache_write_tokens": cache_write,
+            "total_input_tokens": total_input,
+            "cache_hit_rate": (cache_read / total_input if total_input else None),
+            "total_output_tokens": output,
+        }
 
     def _message_to_history(
         self,
@@ -1390,11 +2589,13 @@ class SessionStore:
         for group in message["tool_chain"]:
             calls = group.get("calls") or []
             if interrupted:
-                # 数据库保留全部已发起工具供前端恢复；给模型重建历史时只允许
-                # 具有最终结果的调用，避免产生缺少 tool result 的非法协议链。
+                # 数据库保留全部已发起工具供前端恢复；模型历史也保留调用，
+                # 对没有完整结果的调用补确定性占位，避免协议链断裂。
                 calls = [
                     call for call in calls
-                    if str(call.get("status") or "") in {"ok", "completed", "error"}
+                    if isinstance(call, dict)
+                    and str(call.get("status") or "")
+                    in {"ok", "completed", "error", "running", "interrupted"}
                 ]
             if not calls:
                 continue
@@ -1427,11 +2628,18 @@ class SessionStore:
                 ]
             result.append(assistant_message)
             for call in calls:
+                interrupted_call = interrupted and str(call.get("status") or "") in {
+                    "running", "interrupted"
+                }
                 result.append(
                     {
                         "role": "tool",
                         "tool_call_id": str(call.get("call_id", "")),
-                        "content": str(call.get("result", "")),
+                        "content": (
+                            INTERRUPTED_TOOL_RESULT_CONTENT
+                            if interrupted_call
+                            else str(call.get("result", ""))
+                        ),
                     }
                 )
 
@@ -1491,6 +2699,150 @@ class SessionStore:
         return message
 
     @staticmethod
+    def _row_to_surface_event(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            message = json.loads(str(row["content"]))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"surface 事件内容不是合法 JSON: {row['session_key']}:{row['surface_seq']}"
+            ) from error
+        if not isinstance(message, dict):
+            raise ValueError(
+                f"surface 事件内容必须是消息对象: {row['session_key']}:{row['surface_seq']}"
+            )
+        return {
+            "session_key": str(row["session_key"]),
+            "epoch_id": str(row["epoch_id"]),
+            "surface_seq": int(row["surface_seq"]),
+            "turn_id": str(row["turn_id"]),
+            "iteration": int(row["iteration"]),
+            "role": str(row["role"]),
+            "message": message,
+            "source_kind": str(row["source_kind"]),
+            "status": str(row["status"]),
+            "projection_version": int(row["projection_version"]),
+            "operation_key": str(row["operation_key"]),
+            "surface_op": str(row["surface_op"]),
+            "replace_start": (
+                int(row["replace_start"])
+                if row["replace_start"] is not None
+                else None
+            ),
+            "replace_end": (
+                int(row["replace_end"])
+                if row["replace_end"] is not None
+                else None
+            ),
+            "replace_generation": int(row["replace_generation"] or 0),
+            "source_event_seqs": _load_json_int_list(row["source_event_seqs"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    @staticmethod
+    def _row_to_session_event(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            data = json.loads(str(row["data"]))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"session event data 不是合法 JSON: {row['session_key']}:{row['event_seq']}"
+            ) from error
+        if not isinstance(data, dict):
+            raise ValueError("session event data 必须是对象")
+        return {
+            "session_key": str(row["session_key"]),
+            "event_seq": int(row["event_seq"]),
+            "event_type": str(row["event_type"]),
+            "turn_id": str(row["turn_id"]),
+            "step": int(row["step"]),
+            "data": data,
+            "operation_key": str(row["operation_key"]),
+            "status": str(row["status"]),
+            "source_event_seqs": _load_json_int_list(row["source_event_seqs"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    @staticmethod
+    def _decode_chunk_row(row: sqlite3.Row | None) -> list[dict[str, Any]]:
+        if row is None:
+            return []
+        try:
+            packed = json.loads(str(row["chunks"]))
+        except (TypeError, json.JSONDecodeError):
+            raise ValueError("session chunk row 不是合法 JSON")
+        if not isinstance(packed, dict) or not isinstance(packed.get("items"), list):
+            raise ValueError("session chunk row 格式无效")
+        columns = set(row.keys())
+        session_key = str(row["session_key"]) if "session_key" in columns else ""
+        row_created_at = str(row["created_at"]) if "created_at" in columns else ""
+        events: list[dict[str, Any]] = []
+        for item in packed["items"]:
+            if not isinstance(item, dict):
+                raise ValueError("session chunk row item 格式无效")
+            events.append({
+                "session_key": session_key,
+                "event_seq": int(item["event_seq"]),
+                "event_type": "assistant/chunk",
+                "turn_id": str(item.get("turn_id") or packed.get("turn_id") or ""),
+                "step": int(item.get("step", packed.get("step", 0))),
+                "data": dict(item.get("data") or {}),
+                "operation_key": str(item["operation_key"]),
+                "status": str(item.get("status") or "committed"),
+                "source_event_seqs": item.get("source_event_seqs"),
+                "created_at": str(item.get("created_at") or row_created_at),
+            })
+        return events
+
+    @staticmethod
+    def _row_to_prepare(row: sqlite3.Row) -> SessionCompactionPrepare:
+        return SessionCompactionPrepare(
+            session_key=str(row["session_key"]),
+            session_created_at=str(row["session_created_at"]),
+            generation=int(row["generation"]),
+            parent_generation=int(row["parent_generation"]),
+            source_ref=str(row["source_ref"]),
+            source_plan_digest=str(row["source_plan_digest"]),
+            source_mutation_digest=str(row["source_mutation_digest"]),
+            source_from_seq=int(row["source_from_seq"]),
+            consolidated_through_seq=int(row["consolidated_through_seq"]),
+            source_message_ids=_load_json_string_list(row["source_message_ids_json"]),
+            selected_source_messages=_load_json_dict_list(row["selected_source_messages_json"]),
+            retained_tail=_load_json_dict_list(row["retained_tail_json"]),
+            prepared_at=str(row["prepared_at"]),
+        )
+
+    @staticmethod
+    def _row_to_compaction(row: sqlite3.Row) -> SessionCompaction:
+        return SessionCompaction(
+            session_key=str(row["session_key"]),
+            session_created_at=str(row["session_created_at"]),
+            generation=int(row["generation"]),
+            parent_generation=int(row["parent_generation"]),
+            created_at=str(row["created_at"]),
+            trigger=str(row["trigger"]),
+            summary_format_version=int(row["summary_format_version"]),
+            summary=str(row["summary"]),
+            source_ref=str(row["source_ref"]),
+            source_plan_digest=str(row["source_plan_digest"]),
+            source_mutation_digest=str(row["source_mutation_digest"]),
+            source_from_seq=int(row["source_from_seq"]),
+            consolidated_through_seq=int(row["consolidated_through_seq"]),
+            source_message_ids=_load_json_string_list(row["source_message_ids_json"]),
+            selected_source_messages=_load_json_dict_list(row["selected_source_messages_json"]),
+            retained_tail=_load_json_dict_list(row["retained_tail_json"]),
+            model_runtime_id=str(row["model_runtime_id"]),
+            model=str(row["model"]),
+            context_window=int(row["context_window"]),
+            threshold_tokens=int(row["threshold_tokens"]),
+            hard_input_tokens=int(row["hard_input_tokens"]),
+            keep_recent_tokens=int(row["keep_recent_tokens"]),
+            tokens_before=int(row["tokens_before"]),
+            tokens_after=int(row["tokens_after"]),
+            summary_usage=_load_json_object(row["summary_usage_json"]),
+            invalidated_at=(str(row["invalidated_at"]) if row["invalidated_at"] else None),
+            invalidated_reason=(str(row["invalidated_reason"]) if row["invalidated_reason"] else None),
+        )
+
+    @staticmethod
     def _validate_session_key(session_key: str) -> str:
         key = str(session_key).strip()
         if not key:
@@ -1506,6 +2858,85 @@ def _now_iso() -> str:
     # Session 时间直接面向用户和前端展示，显式固定业务时区，避免服务进程
     # 在 UTC 容器或 Windows 时区数据缺失时写出不一致的偏移。
     return datetime.now(_LOCAL_TZ).isoformat()
+
+
+def turn_timing_from_events(
+    events: list[dict[str, Any]],
+    turn_id: str,
+) -> dict[str, Any]:
+    """按 turn/start 和最后一个 turn/end 计算可恢复的 Turn 计时。"""
+
+    key = str(turn_id or "")
+    if not key:
+        return {}
+    matching = [
+        event for event in events
+        if isinstance(event, dict) and str(event.get("turn_id") or "") == key
+    ]
+    starts = [event for event in matching if event.get("event_type") == "turn/start"]
+    ends = [event for event in matching if event.get("event_type") == "turn/end"]
+    if not starts and not ends:
+        return {}
+
+    start = starts[0] if starts else None
+    end = ends[-1] if ends else None
+    start_data = start.get("data") if isinstance(start, dict) else {}
+    end_data = end.get("data") if isinstance(end, dict) else {}
+    start_data = start_data if isinstance(start_data, dict) else {}
+    end_data = end_data if isinstance(end_data, dict) else {}
+    started_at = _event_time_value(start, start_data, "started_at")
+    ended_at = _event_time_value(end, end_data, "ended_at")
+    duration_ms: int | None = None
+    if started_at and ended_at:
+        started = _parse_event_datetime(started_at)
+        ended = _parse_event_datetime(ended_at)
+        if started is not None and ended is not None:
+            duration_ms = max(0, int(round((ended - started).total_seconds() * 1000)))
+    if duration_ms is None:
+        duration_ms = _non_negative_int(end_data.get("duration_ms"))
+
+    result: dict[str, Any] = {}
+    if started_at:
+        result["started_at"] = started_at
+    if ended_at:
+        result["ended_at"] = ended_at
+    if duration_ms is not None:
+        result["duration_ms"] = duration_ms
+    if end is not None and end.get("data"):
+        result["status"] = str(end_data.get("status") or end.get("status") or "") or None
+    return result
+
+
+def _event_time_value(
+    event: dict[str, Any] | None,
+    data: dict[str, Any],
+    field: str,
+) -> str | None:
+    value = str(data.get(field) or "").strip()
+    if value and _parse_event_datetime(value) is not None:
+        return value
+    if event is None:
+        return None
+    created_at = str(event.get("created_at") or "").strip()
+    return created_at if created_at and _parse_event_datetime(created_at) is not None else None
+
+
+def _parse_event_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_LOCAL_TZ)
+    return parsed
+
+
+def _non_negative_int(value: object) -> int | None:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
 
 
 def _select_columns(alias: str) -> str:
@@ -1534,4 +2965,68 @@ def _load_json_list(value: object) -> list[dict[str, Any]]:
     return [item for item in loaded if isinstance(item, dict)]
 
 
-__all__ = ["ConsolidationMessageWindow", "NewMessage", "SessionStore"]
+def _load_json_string_list(value: object) -> list[str]:
+    if not value:
+        return []
+    try:
+        loaded = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [str(item) for item in loaded] if isinstance(loaded, list) else []
+
+
+def _load_json_int_list(value: object) -> list[int] | None:
+    if value is None or value == "":
+        return None
+    try:
+        loaded = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(loaded, list):
+        return None
+    try:
+        return [int(item) for item in loaded]
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_json_dict_list(value: object) -> list[dict[str, Any]]:
+    if not value:
+        return []
+    try:
+        loaded = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [dict(item) for item in loaded if isinstance(item, dict)] if isinstance(loaded, list) else []
+
+
+def _prepare_matches_checkpoint(
+    prepare: SessionCompactionPrepare,
+    checkpoint: SessionCompaction,
+) -> bool:
+    """提交前只比较来源契约，允许 checkpoint 增加模型和 token 审计字段。"""
+
+    return (
+        prepare.session_key == checkpoint.session_key
+        and prepare.session_created_at == checkpoint.session_created_at
+        and prepare.generation == checkpoint.generation
+        and prepare.parent_generation == checkpoint.parent_generation
+        and prepare.source_ref == checkpoint.source_ref
+        and prepare.source_plan_digest == checkpoint.source_plan_digest
+        and prepare.source_mutation_digest == checkpoint.source_mutation_digest
+        and prepare.source_from_seq == checkpoint.source_from_seq
+        and prepare.consolidated_through_seq == checkpoint.consolidated_through_seq
+        and prepare.source_message_ids == checkpoint.source_message_ids
+        and prepare.selected_source_messages == checkpoint.selected_source_messages
+        and prepare.retained_tail == checkpoint.retained_tail
+    )
+
+
+__all__ = [
+    "NewMessage",
+    "NewSessionEvent",
+    "NewSurfaceEvent",
+    "SessionCompaction",
+    "SessionCompactionPrepare",
+    "SessionStore",
+]

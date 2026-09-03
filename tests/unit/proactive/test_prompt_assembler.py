@@ -8,6 +8,9 @@ from proactive.prompt_assembler import build_proactive_messages
 
 
 class _Memory:
+    def read_bean(self) -> str:
+        return "# Bean\n\n你是 BeanAgent。"
+
     def read_self(self) -> str:
         return "BeanAgent 保持克制主动。"
 
@@ -55,7 +58,7 @@ def test_proactive_prompt_orders_stable_blocks_before_memory_and_recent_messages
     )
 
     system_prompt = str(messages[0]["content"])
-    assert system_prompt.index("你是 BeanAgent") < system_prompt.index("## 主动聊天行为规则")
+    assert system_prompt.index("# Bean") < system_prompt.index("## 主动聊天行为规则")
     assert system_prompt.index("## 主动聊天行为规则") < system_prompt.index("## Skill 目录")
     assert system_prompt.index("## Skill 目录") < system_prompt.index("## 主动判断终止协议")
     assert system_prompt.index("## 主动判断终止协议") < system_prompt.index("## 自我认知")

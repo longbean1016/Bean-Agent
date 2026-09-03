@@ -30,6 +30,8 @@ class LLMConfig:
     api_key: str = ""  # 服务商密钥，推荐通过环境变量注入
     base_url: str | None = None  # 自定义兼容接口地址，空值时按 provider 推断
     max_tokens: int = 8192  # 单次模型回复允许生成的最大 token 数
+    context_window: int = 0  # Provider 输入上下文上限；0 表示模型容量未知
+    context_window_source: str = "unknown"  # 上下文能力来源，便于界面区分估算可靠性
     max_iterations: int = 10  # 单轮 ReAct 最大迭代次数，0 表示不限制
     system_prompt: str = ""  # 额外系统提示词，空值时由 PromptBlock 组装
     request_timeout_s: float = 90.0  # 单次模型请求超时秒数
@@ -95,42 +97,13 @@ class MemoryConfig:
 
     enabled: bool = False  # 是否启用长期记忆闭环
     engine_name: str = "default"  # 记忆引擎名称，当前最小版本仅支持 default
-    context_window: int = 40  # 活动历史窗口；压缩批次与积压阈值均从此值派生
+    # 旧配置字段仅为反序列化兼容保留；历史范围和压缩触发均由 Session
+    # checkpoint 边界及 LLM token gate 决定，不能再从这里派生消息数窗口。
+    context_window: int = 0
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)  # 向量配置
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)  # 整理配置
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)  # 检索配置
     dedup: DedupConfig = field(default_factory=DedupConfig)  # 去重配置
-
-    def __post_init__(self) -> None:
-        if self.context_window < 1:
-            raise ValueError("context_window 必须大于等于 1")
-
-    @property
-    def aligned_context_window(self) -> int:
-        """将活动窗口向上对齐到四消息边界。"""
-
-        return max(4, ((self.context_window + 3) // 4) * 4)
-
-    @property
-    def keep_count(self) -> int:
-        """返回 consolidation 后保留的热历史消息数。"""
-
-        return self.aligned_context_window // 2
-
-    @property
-    def consolidation_min_new_messages(self) -> int:
-        """返回触发一次增量归档所需的最少新消息数。"""
-
-        return max(5, self.keep_count // 2)
-
-    @property
-    def context_guard_threshold(self) -> int:
-        """返回 Turn 前必须处理压缩积压的未归档消息阈值。"""
-
-        background_threshold = self.keep_count + self.consolidation_min_new_messages
-        # 正常窗口达到配置上限后才同步等待；极小窗口若低于一次归档所需门槛，
-        # 仍以后者为准，避免尚无足够消息可压缩时提前阻塞 Turn。
-        return max(background_threshold, self.aligned_context_window)
 
 
 @dataclass

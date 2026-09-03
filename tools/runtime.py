@@ -38,15 +38,32 @@ def append_tool_result(
 ) -> None:
     """追加标准 tool 消息，并把图片块作为后续 user 多模态消息传入。"""
 
+    messages.extend(
+        serialize_tool_result_messages(
+            tool_call_id=tool_call_id,
+            content=content,
+            tool_name=tool_name,
+        )
+    )
+
+
+def serialize_tool_result_messages(
+    *,
+    tool_call_id: str,
+    content: str | ToolResult,
+    tool_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """生成实时和历史重放共用的完整工具消息序列。"""
+
     result = normalize_tool_result(content)
     model_text = _truncate_tool_text(result.text)
-    messages.append(
+    messages: list[dict[str, Any]] = [
         {
             "role": "tool",
             "tool_call_id": tool_call_id,
             "content": model_text or "工具执行完成。",
         }
-    )
+    ]
     if result.content_blocks:
         # OpenAI 工具消息的 content 保持文本；图片放在紧随其后的 user
         # 消息中，既保留 tool_call_id 配对，也让多模态模型真正看到图片。
@@ -64,6 +81,7 @@ def append_tool_result(
                 ],
             }
         )
+    return messages
 
 
-__all__ = ["append_tool_result"]
+__all__ = ["append_tool_result", "serialize_tool_result_messages"]

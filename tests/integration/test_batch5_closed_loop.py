@@ -275,19 +275,21 @@ async def test_two_turn_closed_loop_restores_history_and_memory(tmp_path: Path) 
         assert rows[1]["tool_chain"][0]["calls"][0]["name"] == "echo"
         assert any(item.get("role") == "tool" and "echo:第一轮" in item.get("content", "") for item in second_prompt)
         assert any("用户偏好中文回答" in str(item.get("content")) for item in second_prompt)
-        frame_index = next(
+        frame_indices = [
             index
             for index, item in enumerate(second_prompt)
             if str(item.get("content", "")).startswith(
                 '<system-reminder data-system-context-frame="true">'
             )
-        )
+        ]
         tool_index = next(
             index for index, item in enumerate(second_prompt)
             if item.get("role") == "tool"
         )
         assert second_prompt[0]["role"] == "system"
-        assert tool_index < frame_index == len(second_prompt) - 2
+        assert len(frame_indices) == 2
+        assert frame_indices[-1] == len(second_prompt) - 2
+        assert tool_index < frame_indices[-1]
         assert second_prompt[-1]["role"] == "user"
         assert str(second_prompt[-1]["content"]).endswith("\n你记得我的回答偏好吗")
         assert any(frame["type"] == "react.tool.completed" for frame in websocket.frames)
@@ -339,6 +341,8 @@ async def test_interrupted_turn_is_expanded_into_next_provider_messages(
         ),
         workspace=str(tmp_path),
         history_loader=sessions.load_history,
+        surface_loader=sessions.load_surface,
+        surface_appender=sessions.append_surface,
     )
     loop = AgentLoop(bus, events, pipeline, sessions)
 
@@ -354,21 +358,40 @@ async def test_interrupted_turn_is_expanded_into_next_provider_messages(
         # 中断完成后立即落库，刷新或进程退出不应丢失这一轮。
         interrupted_rows = sessions.store.fetch_session_messages("web:c")
         assert [row["content"] for row in interrupted_rows] == ["读取文件并分析", "[用户已停止生成]"]
+        assert all("llm_surface_messages" not in row for row in interrupted_rows)
+        surface_events = sessions.store.load_surface_events("web:c")
+        assert any(
+            event["source_kind"] == "assistant_tool_call"
+            for event in surface_events
+        )
         await bus.publish_inbound(InboundMessage("web", "u", "c", "继续"))
         await loop.run_once()
 
         model_messages = provider.messages[-1]
         history = [item for item in model_messages if item.get("role") != "system"]
-        assert history[0] == {"role": "user", "content": "读取文件并分析"}
-        assert history[1]["role"] == "assistant"
-        assert history[1]["tool_calls"][0]["function"]["name"] == "echo"
-        assert history[2] == {
+        assert history[0]["role"] == "user"
+        assert str(history[0]["content"]).startswith(
+            '<system-reminder data-system-context-frame="true">'
+        )
+        assert history[1]["role"] == "user"
+        assert str(history[1]["content"]).endswith("读取文件并分析")
+        assert history[2]["role"] == "assistant"
+        assert history[2]["tool_calls"][0]["function"]["name"] == "echo"
+        assert history[3] == {
             "role": "tool",
             "tool_call_id": "interrupted-call",
             "content": "echo:已读取内容",
         }
-        assert history[3]["role"] == "assistant"
-        assert history[3]["content"] == "[用户已停止生成]"
+        # interrupted 只保留在语义 assistant；模型 surface 在已闭合的工具结果后
+        # 直接追加下一轮动态 frame，不把 UI 占位文案插入缓存前缀。
+        assert history[4]["role"] == "user"
+        assert str(history[4]["content"]).startswith(
+            '<system-reminder data-system-context-frame="true">'
+        )
+        assert history[-2]["role"] == "user"
+        assert str(history[-2]["content"]).startswith(
+            '<system-reminder data-system-context-frame="true">'
+        )
         assert history[-1]["role"] == "user"
         assert str(history[-1]["content"]).endswith("\n继续")
     finally:

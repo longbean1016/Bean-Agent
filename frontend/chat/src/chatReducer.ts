@@ -1,4 +1,4 @@
-import type { ChatAction, ChatMessage, ChatState, MessageRow, ProactiveNotificationRow, ToolActivity, TurnRuntimeState } from "./types";
+import type { ChatAction, ChatMessage, ChatState, ContextUsage, MessageRow, ProactiveNotificationRow, SessionUsage, ToolActivity, TurnRuntimeState } from "./types";
 import { reconcileMessages } from "./timeline";
 
 export const idleTurnState: TurnRuntimeState = {
@@ -15,12 +15,21 @@ export const initialChatState: ChatState = {
   sessionMessages: {},
   error: "",
   turnStates: {},
+  contextUsage: {},
+  sessionUsage: {},
 };
+
+function isTurnActive(status: TurnRuntimeState["status"]): boolean {
+  return status === "submitting"
+    || status === "queued"
+    || status === "running"
+    || status === "compacting";
+}
 
 export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState {
   if (action.type === "ui.session.select") {
     const turn = state.turnStates[action.sessionId] ?? idleTurnState;
-    const active = turn.status === "submitting" || turn.status === "queued" || turn.status === "preparing" || turn.status === "running";
+    const active = isTurnActive(turn.status);
     const cached = state.sessionMessages[action.sessionId];
     // HTTP 历史可能在发送确认前返回空结果；只要本地有快照，就不能用空历史覆盖它。
     let messages = action.messages;
@@ -29,15 +38,15 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
         ? reconcileMessages([...action.messages, ...cached])
         : action.messages.length === 0 ? cached : action.messages;
     }
-    if (!action.replace && (turn.status === "preparing" || turn.status === "running") && turn.turnId
+    if (!action.replace && isTurnActive(turn.status) && turn.turnId
       && !messages.some((message) => message.turnId === turn.turnId)) {
-      messages = [...messages, createDraft(turn.turnId, turn.status === "preparing")];
+      messages = [...messages, createDraft(turn.turnId)];
     }
     messages = reconcileMessages(messages);
     return {
       ...state,
       sessionId: action.sessionId,
-      activeTurnId: turn.status === "running" ? turn.turnId : "",
+      activeTurnId: isTurnActive(turn.status) ? turn.turnId : "",
       messages,
       sessionMessages: setSessionMessages(state, action.sessionId, messages),
       error: "",
@@ -147,6 +156,110 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       error: "",
     };
   }
+  if (action.type === "context.compaction.started") {
+    const current = state.turnStates[action.session_id] ?? idleTurnState;
+    if (current.turnId && current.turnId !== action.turn_id) return state;
+    const turnStates = setTurnState(state, action.session_id, {
+      status: "compacting",
+      queuePosition: null,
+      turnId: action.turn_id,
+      requestId: current.requestId,
+    });
+    return {
+      ...state,
+      activeTurnId: action.session_id === state.sessionId ? action.turn_id : state.activeTurnId,
+      turnStates,
+    };
+  }
+  if (action.type === "context.compaction.completed") {
+    const current = state.turnStates[action.session_id] ?? idleTurnState;
+    if (current.turnId !== action.turn_id) return state;
+    return {
+      ...state,
+      turnStates: setTurnState(state, action.session_id, {
+        ...current,
+        status: "running",
+      }),
+    };
+  }
+  if (action.type === "context.compaction.failed") {
+    const current = state.turnStates[action.session_id] ?? idleTurnState;
+    if (current.turnId !== action.turn_id) return state;
+    return {
+      ...state,
+      activeTurnId: action.session_id === state.sessionId ? "" : state.activeTurnId,
+      turnStates: setTurnState(state, action.session_id, idleTurnState),
+    };
+  }
+  if (action.type === "context.usage.reset") {
+    if (!Object.prototype.hasOwnProperty.call(state.contextUsage, action.session_id)) return state;
+    const contextUsage = { ...state.contextUsage };
+    delete contextUsage[action.session_id];
+    return { ...state, contextUsage };
+  }
+  if (action.type === "context.usage.updated") {
+    const currentTurn = state.turnStates[action.session_id];
+    // 同一会话只能有一个运行中的 Turn；旧 Turn 的迟到估算不能覆盖新 Turn 的占用。
+    if (action.turn_id && currentTurn?.turnId && currentTurn.turnId !== action.turn_id) return state;
+    // 新协议的 heuristic 事件只用于 gate 和明细，不代表 Provider 已报告
+    // pressure；没有它时不创建圆圈状态，避免新会话打开就显示假占用。
+    if (action.model_runtime_id && action.pressure_tokens === undefined) return state;
+    const pressureTokens = action.pressure_tokens === undefined
+      ? undefined
+      : Math.max(0, Number(action.pressure_tokens) || 0);
+    const projectedTokens = action.projected_tokens === undefined
+      ? undefined
+      : Math.max(0, Number(action.projected_tokens) || 0);
+    const usage: ContextUsage = {
+      turnId: action.turn_id,
+      usedTokens: projectedTokens ?? pressureTokens ?? Math.max(0, Number(action.used_tokens) || 0),
+      pressureTokens,
+      projectedTokens,
+      surfaceTokens: action.surface_tokens === undefined ? undefined : Math.max(0, Number(action.surface_tokens) || 0),
+      systemTokens: action.system_tokens === undefined ? undefined : Math.max(0, Number(action.system_tokens) || 0),
+      toolsTokens: action.tools_tokens === undefined ? undefined : Math.max(0, Number(action.tools_tokens) || 0),
+      messageTokens: action.message_tokens === undefined ? undefined : Math.max(0, Number(action.message_tokens) || 0),
+      asOfSeq: action.as_of_seq === undefined ? undefined : Math.max(0, Number(action.as_of_seq) || 0),
+      modelRuntimeId: action.model_runtime_id,
+      model: action.model,
+      contextWindow: Math.max(0, Number(action.context_window) || 0),
+      softLimitTokens: Math.max(0, Number(action.soft_limit_tokens) || 0),
+      hardInputTokens: Math.max(0, Number(action.hard_input_tokens) || 0),
+      contextWindowSource: String(action.context_window_source || "unknown"),
+      estimateSource: String(action.estimate_source || "heuristic"),
+      breakdown: {
+        system_prompt_tokens: Math.max(0, Number(action.breakdown.system_prompt_tokens) || 0),
+        tools_tokens: Math.max(0, Number(action.breakdown.tools_tokens) || 0),
+        conversation_tokens: Math.max(0, Number(action.breakdown.conversation_tokens) || 0),
+        overhead_tokens: Math.max(0, Number(action.breakdown.overhead_tokens) || 0),
+      },
+      sections: Array.isArray(action.sections) ? action.sections.map((section) => ({
+        name: String(section.name || ""),
+        estimated_tokens: Math.max(0, Number(section.estimated_tokens) || 0),
+        static: Boolean(section.static),
+        cache_hit: Boolean(section.cache_hit),
+      })) : [],
+    };
+    return {
+      ...state,
+      contextUsage: { ...state.contextUsage, [action.session_id]: usage },
+    };
+  }
+  if (action.type === "session.usage.updated") {
+    const clean = (value: number) => Math.max(0, Number(value) || 0);
+    const sessionUsage: SessionUsage = {
+      totalUncachedInputTokens: clean(action.total_uncached_input_tokens),
+      totalCacheReadTokens: clean(action.total_cache_read_tokens),
+      totalCacheWriteTokens: clean(action.total_cache_write_tokens),
+      totalInputTokens: clean(action.total_input_tokens),
+      cacheHitRate: action.cache_hit_rate === null ? null : Math.max(0, Number(action.cache_hit_rate) || 0),
+      totalOutputTokens: clean(action.total_output_tokens),
+    };
+    return {
+      ...state,
+      sessionUsage: { ...state.sessionUsage, [action.session_id]: sessionUsage },
+    };
+  }
   if (action.type === "message.final" && action.turn_id) {
     const nextState = {
       ...state,
@@ -159,16 +272,26 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     const interruptedTurnId = action.turn_id
       || state.turnStates[action.session_id]?.turnId
       || (current ? state.activeTurnId : "");
+    const interruptedAt = action.ended_at || new Date().toISOString();
+    const source = getSessionMessages(state, action.session_id);
+    const turnUser = interruptedTurnId
+      ? source.find((message) => message.role === "user" && message.turnId === interruptedTurnId)
+      : undefined;
     const sessionMessages = interruptedTurnId
-      ? getSessionMessages(state, action.session_id).map((message) => message.turnId === interruptedTurnId
-        ? {
+      ? source.map((message) => {
+        if (message.turnId !== interruptedTurnId) return message;
+        const durationMs = message.role === "assistant"
+          ? message.durationMs ?? normalizeDuration(action.duration_ms) ?? (isRuntimeMessage(turnUser) ? elapsedDurationMs(turnUser?.timestamp, interruptedAt) : undefined)
+          : message.durationMs;
+        return {
           ...message,
           streaming: false,
           status: "interrupted",
           thinkingStatus: message.thinking ? "interrupted" : message.thinkingStatus,
-        }
-        : message)
-      : getSessionMessages(state, action.session_id);
+          ...(durationMs === undefined ? {} : { durationMs }),
+        };
+      })
+      : source;
     const nextState = {
       ...state,
       activeTurnId: current ? "" : state.activeTurnId,
@@ -181,49 +304,17 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       messages: sessionMessages,
     };
   }
-  if (action.type === "turn.preparing") {
-    const source = getSessionMessages(state, action.session_id);
-    const userId = `user-${action.request_id}`;
-    const existingUser = source.find((item) => item.role === "user" && (
-      item.id === userId || item.turnId === action.turn_id
-    ));
-    const user: ChatMessage = existingUser ? {
-      ...existingUser,
-      turnId: action.turn_id,
-    } : {
-      id: userId,
-      role: "user",
-      content: action.user_message,
-      thinking: "",
-      media: action.user_media,
-      tools: [],
-      turnId: action.turn_id,
-      streaming: false,
-      timestamp: new Date().toISOString(),
-    };
-    const draft = createDraft(action.turn_id, true);
-    const sessionMessages = [
-      ...source.filter((item) => item.turnId !== action.turn_id && item.id !== userId),
-      user,
-      draft,
-    ];
-    const current = action.session_id === state.sessionId;
-    return {
-      ...state,
-      activeTurnId: current ? action.turn_id : state.activeTurnId,
-      turnStates: setTurnState(state, action.session_id, {
-        status: "preparing", queuePosition: null, turnId: action.turn_id, requestId: action.request_id,
-      }),
-      messages: current ? sessionMessages : state.messages,
-      sessionMessages: setSessionMessages(state, action.session_id, sessionMessages),
-      error: current ? "" : state.error,
-    };
-  }
   if (action.type === "turn.snapshot") {
     const snapshotTimestamp = new Date().toISOString();
+    const startedAt = String(action.started_at || "") || snapshotTimestamp;
     const current = action.session_id === state.sessionId;
+    const previousTurn = state.turnStates[action.session_id];
     const turnStates = setTurnState(state, action.session_id, {
-      status: "running",
+      // 重连快照可能紧跟在压缩 started 帧之后到达；同一 Turn 仍处于
+      // checkpoint 等待时，不能让普通 running 快照覆盖前端状态提示。
+      status: previousTurn?.turnId === action.turn_id && previousTurn.status === "compacting"
+        ? "compacting"
+        : "running",
       queuePosition: null,
       turnId: action.turn_id,
       requestId: action.request_id ?? "",
@@ -239,7 +330,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       tools: [],
       turnId: action.turn_id,
       streaming: false,
-      timestamp: snapshotTimestamp,
+      timestamp: startedAt,
     };
     const incomingTools = action.tools.map((tool) => ({
       callId: tool.call_id,
@@ -343,6 +434,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
           source,
           scheduledAt: String(action.metadata.scheduled_at || "") || undefined,
           timestamp: String(action.metadata.generated_at || "") || undefined,
+          durationMs: durationFromMetadata(action.metadata),
         };
       const messages = [...existing, proactiveMessage];
       return {
@@ -352,15 +444,28 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       };
     }
     // final 是服务端的权威快照，必须覆盖草稿，不能继续追加 delta。
-    const next = updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
-      ...message,
-      content: action.content || message.content,
-      thinking: action.thinking || message.thinking,
-      thinkingStatus: (action.thinking || message.thinking) ? "completed" : message.thinkingStatus,
-      media: action.media ?? message.media,
-      streaming: false,
-      timestamp: String(action.metadata?.generated_at || "") || message.timestamp,
-    }));
+    const source = getSessionMessages(state, action.session_id);
+    const turnUser = source.find((message) => message.role === "user" && message.turnId === action.turn_id);
+    const finalReceivedAt = new Date().toISOString();
+    const metadataDuration = durationFromMetadata(action.metadata);
+    const next = updateSessionTurn(state, action.session_id, action.turn_id, (message) => {
+      const timestamp = String(action.metadata?.generated_at || "")
+        || (message.streaming ? finalReceivedAt : message.timestamp);
+      const durationMs = message.durationMs
+        ?? metadataDuration
+        ?? (isRuntimeMessage(turnUser) ? elapsedDurationMs(turnUser?.timestamp, timestamp) : undefined);
+      return {
+        ...message,
+        content: action.content || message.content,
+        thinking: action.thinking || message.thinking,
+        thinkingStatus: (action.thinking || message.thinking) ? "completed" : message.thinkingStatus,
+        media: action.media ?? message.media,
+        streaming: false,
+        timestamp,
+        status: String(action.metadata?.status || "") || message.status,
+        ...(durationMs === undefined ? {} : { durationMs }),
+      };
+    });
     return {
       ...next,
       activeTurnId: action.session_id === state.sessionId ? "" : next.activeTurnId,
@@ -369,7 +474,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
   return state;
 }
 
-function createDraft(turnId: string, preparing = false): ChatMessage {
+function createDraft(turnId: string): ChatMessage {
   return {
     id: turnId,
     turnId,
@@ -379,7 +484,6 @@ function createDraft(turnId: string, preparing = false): ChatMessage {
     media: [],
     tools: [],
     streaming: true,
-    preparing,
     timestamp: new Date().toISOString(),
   };
 }
@@ -475,12 +579,43 @@ export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {
       streaming: Boolean(row.metadata?.running) && row.role === "assistant",
       status: row.status,
       timestamp: row.timestamp,
+      durationMs: durationFromRow(row),
       proactive: Boolean(row.proactive),
       source: row.proactive
         ? (String(row.metadata?.source || "proactive_conversation") as ChatMessage["source"])
         : undefined,
     };
   });
+}
+
+function durationFromRow(row: MessageRow): number | undefined {
+  return normalizeDuration(row.duration_ms)
+    ?? normalizeDuration(row.elapsed_ms)
+    ?? durationFromMetadata(row.metadata);
+}
+
+function durationFromMetadata(metadata: Record<string, unknown> | undefined): number | undefined {
+  if (!metadata) return undefined;
+  return normalizeDuration(metadata.duration_ms)
+    ?? normalizeDuration(metadata.elapsed_ms)
+    ?? normalizeDuration(metadata.durationMs);
+}
+
+function normalizeDuration(value: unknown): number | undefined {
+  const duration = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(duration) && duration >= 0 ? duration : undefined;
+}
+
+function elapsedDurationMs(start: string | undefined, end: string | undefined): number | undefined {
+  if (!start || !end) return undefined;
+  const startTime = Date.parse(start);
+  const endTime = Date.parse(end);
+  if (Number.isNaN(startTime) || Number.isNaN(endTime)) return undefined;
+  return Math.max(0, endTime - startTime);
+}
+
+function isRuntimeMessage(message: ChatMessage | undefined): boolean {
+  return Boolean(message && (message.seq === undefined || message.seq < 0));
 }
 
 export function notificationRowsToMessages(rows: ProactiveNotificationRow[]): ChatMessage[] {

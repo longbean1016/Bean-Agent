@@ -23,14 +23,76 @@ class TurnStarted:
 
 
 @dataclass(frozen=True, slots=True)
-class TurnPreparing:
-    """Turn 在模型请求前同步整理会话上下文。"""
+class ContextCompactionStarted:
+    """当前 Turn 已命中 token gate，正在等待 checkpoint 摘要。"""
 
     session_key: str
     turn_id: str
-    request_id: str
-    content: str
-    media: list[str]
+    trigger: str
+    estimated_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCompactionCompleted:
+    """checkpoint 摘要和 ledger 提交完成，当前 Turn 可以继续请求业务模型。"""
+
+    session_key: str
+    turn_id: str
+    trigger: str
+    estimated_tokens: int
+    compacted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCompactionFailed:
+    """checkpoint 压缩失败；当前 Turn 会沿用既有错误处理。"""
+
+    session_key: str
+    turn_id: str
+    trigger: str
+    estimated_tokens: int
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class ContextUsageUpdated:
+    """上下文压力、投影和组成明细的观测快照。"""
+
+    session_key: str
+    turn_id: str
+    used_tokens: int
+    context_window: int
+    soft_limit_tokens: int
+    hard_input_tokens: int
+    context_window_source: str
+    estimate_source: str
+    breakdown: dict[str, int]
+    sections: tuple[dict[str, object], ...] = ()
+    # pressure 只接受供应商输入 usage；projected 是其相对当前 Prompt 表面的
+    # 估算投影。两者分开，避免近似明细被误当成圆圈的精确主指标。
+    pressure_tokens: int | None = None
+    projected_tokens: int | None = None
+    surface_tokens: int | None = None
+    system_tokens: int | None = None
+    tools_tokens: int | None = None
+    message_tokens: int | None = None
+    as_of_seq: int | None = None
+    model_runtime_id: str | None = None
+    model: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionUsageUpdated:
+    """一次真实 Provider usage 去重后，会话累计用量发生变化。"""
+
+    session_key: str
+    turn_id: str
+    total_uncached_input_tokens: int
+    total_cache_read_tokens: int
+    total_cache_write_tokens: int
+    total_input_tokens: int
+    cache_hit_rate: float | None
+    total_output_tokens: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +203,11 @@ def _handler_name(handler: EventHandler[object]) -> str:
 
 
 __all__ = [
+    "ContextCompactionCompleted",
+    "ContextCompactionFailed",
+    "ContextCompactionStarted",
+    "ContextUsageUpdated",
+    "SessionUsageUpdated",
     "EventBus",
     "EventHandler",
     "SessionUpdated",
@@ -150,6 +217,5 @@ __all__ = [
     "TurnCommitted",
     "TurnQueued",
     "TurnQueueRejected",
-    "TurnPreparing",
     "TurnStarted",
 ]

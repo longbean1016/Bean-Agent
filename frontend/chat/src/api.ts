@@ -1,5 +1,6 @@
 import type { MessagePage, MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile } from "./types";
 
+// 仅控制聊天页面的滚动分页，不参与模型上下文 token gate 或 checkpoint 边界。
 const MESSAGE_WINDOW_LIMIT = 60;
 
 export async function fetchSessions(): Promise<SessionSummary[]> {
@@ -40,13 +41,16 @@ export async function fetchMessagesAroundPage(sessionId: string, anchorSeq: numb
 export async function fetchTurns(sessionId: string): Promise<TurnNavigationEntry[]> {
   const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/turns`);
   if (!response.ok) throw new Error("无法加载会话导航");
-  const payload = await response.json() as { items?: Array<{ id?: string; seq?: number; turn_index?: number; question?: string; preview?: string }> };
+  const payload = await response.json() as { items?: Array<{ id?: string; seq?: number; turn_index?: number; question?: string; preview?: string; duration_ms?: number; started_at?: string; ended_at?: string }> };
   return (payload.items ?? []).filter((item) => typeof item.id === "string").map((item) => ({
     id: String(item.id),
     seq: typeof item.seq === "number" ? item.seq : undefined,
     turnIndex: typeof item.turn_index === "number" ? item.turn_index : undefined,
     question: String(item.question ?? item.preview ?? ""),
     preview: String(item.preview ?? item.question ?? ""),
+    durationMs: typeof item.duration_ms === "number" ? item.duration_ms : undefined,
+    startedAt: typeof item.started_at === "string" ? item.started_at : undefined,
+    endedAt: typeof item.ended_at === "string" ? item.ended_at : undefined,
   }));
 }
 

@@ -5,17 +5,23 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent.config_models import MemoryConfig
+from agent.context_budget import estimate_tokens
 from memory.consolidator import (
     ConsolidationDraft,
     ConsolidationExtractor,
-    ConsolidationResult,
-    Consolidator,
     render_consolidation_conversation,
+)
+from memory.compaction_worker import CompactionOutboxWorker
+from memory.checkpoint import (
+    flatten_units,
+    group_logical_units,
+    render_source_messages,
+    select_compaction_units,
 )
 from memory.contracts import (
     EvidenceRef, MemoryIngestRequest, MemoryIngestResult, MemoryMutation,
@@ -37,11 +43,16 @@ from memory.rule_schema import build_procedure_rule_schema
 from memory.store import MemoryStore2
 from memory.structured_output import (
     CONSOLIDATION_EVENTS_TOOL,
-    RECENT_CONTEXT_TOOL,
     complete_forced_function,
 )
 from memory.sufficiency_checker import should_enhance_retrieval
 from session.store import SessionStore
+from session.compaction import (
+    canonical_digest,
+    compaction_scope_id,
+    compaction_source_ref,
+)
+from session.store import NewSurfaceEvent, SessionCompaction, SessionCompactionPrepare
 
 if TYPE_CHECKING:
     from agent.event_bus import EventBus
@@ -53,6 +64,9 @@ class MemoryEngine:
     """组装记忆读写、归档和工具能力，不持有共享 LLMProvider 的所有权。"""
 
     def __init__(self, workspace: Path, embedder: Any, provider: Any, sessions: SessionStore, *, config: MemoryConfig | None = None, consolidation_extractor: ConsolidationExtractor | None = None, implicit_extractor: Any | None = None, keep_count: int | None = None, consolidation_threshold: int | None = None) -> None:
+        # 旧参数只保留调用兼容性，明确不参与 checkpoint 选择或 token gate；压缩
+        # 的唯一触发入口是 Pipeline 根据 Provider token 预算调用 compact_for_context。
+        del keep_count, consolidation_threshold
         self._config = config or MemoryConfig()
         self._embedder = embedder
         self._provider = provider
@@ -98,25 +112,7 @@ class MemoryEngine:
             provider,
             step_delay_seconds=self._config.optimizer.step_delay_seconds,
         )
-        # 生产运行只配置 context_window；显式覆盖仅用于小窗口确定性测试。
-        derived_keep_count = self._config.keep_count if keep_count is None else keep_count
-        derived_threshold = (
-            self._config.consolidation_min_new_messages
-            if consolidation_threshold is None
-            else consolidation_threshold
-        )
-        # 生产环境将后台压缩软门槛与 Turn 前积压保护分开：默认在 30 条启动后台
-        # 压缩，只有继续积压到 36 条才同步等待。显式覆盖继续服务小窗口测试。
-        self._context_guard_threshold = (
-            self._config.context_guard_threshold
-            if keep_count is None and consolidation_threshold is None
-            else derived_keep_count + derived_threshold
-        )
-        self._consolidator = Consolidator(
-            sessions, self._markdown,
-            consolidation_extractor or _LLMConsolidationExtractor(provider),
-            keep_count=derived_keep_count, threshold=derived_threshold,
-        )
+        self._consolidation_extractor = consolidation_extractor or _LLMConsolidationExtractor(provider)
         self._implicit_extractor = implicit_extractor or ImplicitLongTermExtractor(provider)
         self._post_response = PostResponseMemoryWorker(
             self._memorizer,
@@ -127,11 +123,12 @@ class MemoryEngine:
         # 第一次摄入 Turn 时启动，避免初始化阶段错误捕获不存在的 event loop。
         self._post_response_queue: asyncio.Queue[TurnIngested] = asyncio.Queue()
         self._post_response_task: asyncio.Task[None] | None = None
-        # 参考实现按 session_key 隔离维护队列：同一会话严格串行，不同会话各自拥有
-        # asyncio Task，可以并行等待 LLM/IO，避免慢会话阻塞全部用户。
-        self._maintenance_queues: dict[str, deque[TurnIngested]] = {}
-        self._maintenance_locks: dict[str, asyncio.Lock] = {}
-        self._maintenance_tasks: dict[str, asyncio.Task[None]] = {}
+        # checkpoint 副作用使用独立 worker；当前 Turn 只等待 summary 与 ledger commit，
+        # 记忆提取和向量/Markdown 写入不会占住当前请求的等待链。
+        self._compaction_worker = CompactionOutboxWorker(
+            self._process_compaction_payload,
+            max_concurrency=2,
+        )
         self._lifecycle_lock = asyncio.Lock()
         self._accepting = True
         self._closed = False
@@ -313,16 +310,235 @@ class MemoryEngine:
 
         return self._markdown.read_self()
 
+    def read_bean(self) -> str:
+        """供 PromptBlock 读取 workspace 人格真源。"""
+
+        return self._markdown.read_bean()
+
     def get_memory_context(self) -> str:
         """返回可直接注入稳定 Prompt 前缀的 Markdown 长期记忆。"""
 
         return self._markdown.get_memory_context()
 
-    def read_recent_context(self, session_key: str = "") -> str:
-        """读取当前会话的近期压缩上下文；普通 Prompt 不再读取全局 RECENT_CONTEXT.md。"""
+    def read_checkpoint_summary(self, session_key: str = "") -> str:
+        """读取 active generation 摘要，作为下一轮的动态 system context。"""
 
         key = str(session_key or "").strip()
-        return self._sessions.get_recent_context(key) if key else ""
+        if not key:
+            return ""
+        checkpoint = self._sessions.get_active_compaction(key)
+        return checkpoint.summary if checkpoint is not None else ""
+
+    async def compact_for_context(
+        self,
+        session_key: str,
+        *,
+        estimated_tokens: int = 0,
+        force: bool = False,
+    ) -> bool:
+        """按 token gate 归档完整 logical units，并提交可恢复 checkpoint。
+
+        该入口只处理已经落库的 closed Turns；当前正在推理的用户输入、ReAct
+        tool batch 和未完成内容不会进入 durable source plan。
+        """
+
+        key = str(session_key or "").strip()
+        if not key:
+            raise ValueError("session_key 不能为空")
+        meta = self._sessions.get_session_meta(key)
+        if meta is None:
+            return False
+        boundary = self._sessions.get_active_message_boundary(key)
+        raw_messages = [
+            item
+            for item in self._sessions.fetch_session_messages(key)
+            if int(item.get("seq", -1)) >= boundary
+        ]
+        units = group_logical_units(raw_messages)
+        if not units:
+            return False
+        context_window = max(0, int(getattr(self._provider, "context_window", 0) or 0))
+        if context_window > 0:
+            keep_recent_tokens = max(1, min(20_000, context_window // 5))
+        else:
+            # provider 容量未知时只有 force（通常来自实际超限）才尝试收敛，
+            # 并按当前估算保留较小尾部，避免重新引入固定消息窗口。
+            if not force:
+                return False
+            keep_recent_tokens = max(1, int(estimated_tokens or 1) // 5)
+        selected_units, retained_units = select_compaction_units(
+            units,
+            keep_recent_tokens=keep_recent_tokens,
+        )
+        if not selected_units:
+            return False
+
+        generation = self._sessions.next_compaction_generation(key)
+        scope_id = compaction_scope_id(key, str(meta["created_at"]))
+        source_ref = compaction_source_ref(scope_id, generation)
+        selected_messages = flatten_units(selected_units)
+        retained_tail = flatten_units(retained_units)
+        source_ids = [str(item["id"]) for item in selected_messages]
+        source_from_seq = int(selected_messages[0]["seq"])
+        consolidated_through_seq = int(selected_messages[-1]["seq"]) + 1
+        source_plan = {
+            "source_from_seq": source_from_seq,
+            "consolidated_through_seq": consolidated_through_seq,
+            "source_message_ids": source_ids,
+            "retained_message_ids": [str(item["id"]) for item in retained_tail],
+            "generation": generation,
+        }
+        source_plan_digest = canonical_digest(source_plan)
+        source_mutation_digest = canonical_digest(selected_messages)
+        previous_summary = self.read_checkpoint_summary(key)
+        conversation = render_source_messages(selected_units)
+        summary = await self._summarize_checkpoint(previous_summary, conversation)
+        # 记录压缩后仍会送入模型的摘要与保留尾部，避免 tokens_after 永远为 0，
+        # 也让诊断能区分“历史已归档”和“系统/工具静态开销”。
+        tokens_after = estimate_tokens([
+            {"role": "system", "content": summary},
+            *retained_tail,
+        ])
+        now = _now_iso()
+        prepare = SessionCompactionPrepare(
+            session_key=key,
+            session_created_at=str(meta["created_at"]),
+            generation=generation,
+            parent_generation=max(0, generation - 1),
+            source_ref=source_ref,
+            source_plan_digest=source_plan_digest,
+            source_mutation_digest=source_mutation_digest,
+            source_from_seq=source_from_seq,
+            consolidated_through_seq=consolidated_through_seq,
+            source_message_ids=source_ids,
+            selected_source_messages=selected_messages,
+            retained_tail=retained_tail,
+            prepared_at=now,
+        )
+        self._sessions.prepare_compaction(prepare)
+        checkpoint = SessionCompaction(
+            session_key=key,
+            session_created_at=str(meta["created_at"]),
+            generation=generation,
+            parent_generation=max(0, generation - 1),
+            created_at=now,
+            trigger="context_overflow" if force else "soft_limit",
+            summary_format_version=1,
+            summary=summary,
+            source_ref=source_ref,
+            source_plan_digest=source_plan_digest,
+            source_mutation_digest=source_mutation_digest,
+            source_from_seq=source_from_seq,
+            consolidated_through_seq=consolidated_through_seq,
+            source_message_ids=source_ids,
+            selected_source_messages=selected_messages,
+            retained_tail=retained_tail,
+            model_runtime_id=str(getattr(self._provider, "model", "beanagent")),
+            model=str(getattr(self._provider, "model", "")),
+            context_window=context_window,
+            threshold_tokens=(int(context_window * 0.74) if context_window else 0),
+            hard_input_tokens=max(0, context_window - int(getattr(self._provider, "max_tokens", 0) or 0)),
+            keep_recent_tokens=keep_recent_tokens,
+            tokens_before=max(0, int(estimated_tokens)),
+            tokens_after=max(0, int(tokens_after)),
+            summary_usage={},
+        )
+        # 先把不可变 source plan 写入 durable outbox，再推进 checkpoint；worker 只在
+        # ledger 成为 active generation 后消费，崩溃时不会丢失统一记忆提取任务。
+        job_payload: dict[str, object] = {
+            "kind": "checkpoint_memory",
+            "source_ref": source_ref,
+            "session_key": key,
+            "generation": generation,
+            "scope_channel": key.partition(":")[0],
+            "scope_chat_id": key.partition(":")[2],
+            "previous_summary": previous_summary,
+            "selected_source_messages": [dict(item) for item in selected_messages],
+        }
+        self._store.enqueue_consolidation(source_ref, job_payload)
+        # 这里才推进 active generation；之后的记忆副作用失败不能让原文重新回到
+        # 模型窗口，也不能生成另一代重复覆盖同一 source plan。
+        self._sessions.commit_compaction(checkpoint)
+        self._replace_provider_surface(checkpoint)
+        try:
+            # submit 只把 durable job 放入内存队列，不等待 LLM/Embedding/Markdown。
+            await self._compaction_worker.submit(job_payload)
+        except Exception:
+            # checkpoint 已 durable commit；outbox 仍可在启动恢复阶段重放。
+            logger.exception("checkpoint outbox 调度失败: source_ref=%s", source_ref)
+        return True
+
+    def _replace_provider_surface(self, checkpoint: SessionCompaction) -> None:
+        """把语义压缩映射成模型侧 surface 的单个 DSH 风格 replace 节点。"""
+
+        nodes = self._sessions.load_surface_events(checkpoint.session_key)
+        if not nodes:
+            # 没有模型侧 surface 时只可能是非 Provider 的历史维护调用；语义
+            # checkpoint 仍按原有逻辑提交，不凭空制造模型消息。
+            return
+        selected_turns = {
+            str(item.get("turn_id") or "")
+            for item in checkpoint.selected_source_messages
+            if str(item.get("turn_id") or "")
+        }
+        selected = [
+            node for node in nodes
+            if str(node.get("turn_id") or "") in selected_turns
+        ]
+        if not selected:
+            return
+        first_index = next(index for index, node in enumerate(nodes) if node is selected[0])
+        last_index = max(index for index, node in enumerate(nodes) if node is selected[-1])
+        shadowed = nodes[first_index:last_index + 1]
+        if not all(
+            str(node.get("turn_id") or "") in selected_turns
+            for node in shadowed
+        ):
+            raise ValueError("compaction surface replace 不能跨越未选中的 Turn")
+        start = int(shadowed[0]["surface_seq"])
+        end = int(shadowed[-1]["surface_seq"])
+        epoch_id = str(shadowed[0].get("epoch_id") or "default")
+        content = (
+            "<session-context-compaction>\n"
+            "以下是已归档历史的上下文摘要；与当前用户原文冲突时以原文为准。\n"
+            f"{checkpoint.summary.strip()}\n"
+            "</session-context-compaction>"
+        )
+        self._sessions.append_surface(NewSurfaceEvent(
+            session_key=checkpoint.session_key,
+            epoch_id=epoch_id,
+            turn_id=f"compaction:{checkpoint.generation}",
+            iteration=0,
+            role="user",
+            content={"role": "user", "content": content},
+            source_kind="compaction_summary",
+            operation_key=f"compaction:{checkpoint.source_ref}",
+            status="replaced",
+            surface_op="replace",
+            replace_start=start,
+            replace_end=end,
+            source_event_seqs=[int(node["surface_seq"]) for node in shadowed],
+        ))
+
+    async def _summarize_checkpoint(self, previous_summary: str, conversation: str) -> str:
+        """用上一代 summary + 本轮归档 source 生成稳定 checkpoint 摘要。"""
+
+        prompt = _checkpoint_summary_prompt(previous_summary, conversation)
+        complete = getattr(self._provider, "complete", None)
+        if not callable(complete):
+            return conversation[-12_000:]
+        response = await complete(
+            [
+                {"role": "system", "content": "你是上下文压缩摘要器，只输出可持续的中文摘要。"},
+                {"role": "user", "content": prompt},
+            ],
+            tools=[],
+            max_tokens=min(8192, max(256, int(getattr(self._provider, "max_tokens", 8192) or 8192))),
+            tool_choice="none",
+            disable_thinking=True,
+        )
+        summary = str(getattr(response, "content", "") or "").strip()
+        return summary or conversation[-12_000:]
 
     async def retrieve_for_turn(self, message: Any) -> str:
         text = str(getattr(message, "content", getattr(message, "text", "")) or "")
@@ -355,7 +571,7 @@ class MemoryEngine:
         return MemoryIngestResult(accepted=True, summary="Turn 已进入记忆后台处理队列")
 
     async def on_turn_committed(self, event: Any) -> None:
-        """将已持久化 Turn 快照投递给两条独立后台处理链。"""
+        """将已持久化 Turn 快照投递给每轮记忆链；checkpoint 由 token gate 触发。"""
 
         status = event.get("status") if isinstance(event, dict) else getattr(event, "status", "ok")
         if str(status or "ok") != "ok":
@@ -367,10 +583,9 @@ class MemoryEngine:
         # put_nowait 是 Turn 提交边界的关键：回复发送与 Session 提交不等待 LLM 提取、
         # 向量化或 Markdown IO，后台失败也不会回滚已经落库的对话。
         self._post_response_queue.put_nowait(snapshot)
-        self._enqueue_maintenance(snapshot)
 
     def bind_events(self, event_bus: EventBus) -> None:
-        """订阅正式 TurnCommitted；重复绑定同一总线保持幂等。"""
+        """只订阅正式 TurnCommitted；checkpoint 副作用统一由 outbox worker 调度。"""
 
         from agent.event_bus import TurnCommitted
 
@@ -378,7 +593,6 @@ class MemoryEngine:
             return
         self.unbind_events()
         event_bus.on(TurnCommitted, self.on_turn_committed)
-        event_bus.on(ConsolidationCommitted, self.on_consolidation_committed)
         self._event_bus = event_bus
 
     def unbind_events(self) -> None:
@@ -389,102 +603,123 @@ class MemoryEngine:
         from agent.event_bus import TurnCommitted
 
         self._event_bus.off(TurnCommitted, self.on_turn_committed)
-        self._event_bus.off(ConsolidationCommitted, self.on_consolidation_committed)
         self._event_bus = None
 
-    async def _run_consolidation(self, event: TurnIngested) -> ConsolidationResult | None:
-        await self.replay_pending_consolidations()
-        result = await self._consolidator.consolidate(event.session_key)
-        if result is None:
-            return None
-        committed = ConsolidationCommitted(
-            history_entry_payloads=[
-                (str(entry.get("summary") or ""), int(entry.get("emotional_weight", 0) or 0))
-                for entry in result.history_entries if str(entry.get("summary") or "").strip()
-            ],
-            source_ref=result.source_ref,
-            scope_channel=event.channel,
-            scope_chat_id=event.chat_id,
-            conversation=result.conversation,
-        )
-        # outbox 必须先于 cursor 和事件派发持久化；若进程在派发前崩溃，
-        # 下次 Turn 仍能从 SQLite 重放向量同步，而不会丢失已归档窗口的派生任务。
-        self._store.enqueue_consolidation(result.source_ref, _consolidation_payload(committed))
-        # cursor 是模型历史的排除边界，只有 Markdown 和 outbox 都可恢复后才能推进。
-        self._sessions.set_cursor(event.session_key, result.cursor)
-        if self._event_bus is not None:
-            await self._event_bus.emit(committed)
-        else:
-            await self.on_consolidation_committed(committed)
-        return result
-
     async def ensure_context_ready(self, session_key: str) -> bool:
-        """在普通 Turn 前确保未归档历史没有越过安全阈值。
+        """兼容旧 ContextGuard API；token gate 已在 Pipeline 组装完整 payload 时执行。"""
 
-        正常压缩仍由 TurnCommitted 后台触发；这里只处理后台尚未完成或曾经
-        失败的积压。cursor 必须真实推进才算恢复，避免压缩器静默跳过后继续
-        把过量原文送入模型。
-        """
-
-        key = str(session_key or "").strip()
-        if not key:
+        if not str(session_key or "").strip():
             raise ValueError("session_key 不能为空")
-        messages = self._sessions.fetch_session_messages(key)
-        before = max(0, min(self._sessions.get_cursor(key), len(messages)))
-        if len(messages) - before < self._context_guard_threshold:
-            return True
-
-        channel, _, chat_id = key.partition(":")
-        event = TurnIngested(
-            session_key=key,
-            channel=channel,
-            chat_id=chat_id,
-            user_message="",
-            assistant_response="",
-            tool_chain=[],
-            source_ref=key,
-        )
-        try:
-            await self._run_consolidation_serialized(event)
-        except Exception:
-            logger.exception("Turn 前记忆归档失败: session_key=%s", key)
-            return False
-        return self._sessions.get_cursor(key) > before
+        return True
 
     def needs_context_preparation(self, session_key: str) -> bool:
-        """只判断下一轮是否需要同步归档，不触发任何维护任务。"""
+        """旧 guard 保留为兼容探针，但不再根据消息数触发压缩。"""
 
-        key = str(session_key or "").strip()
-        if not key:
+        if not str(session_key or "").strip():
             raise ValueError("session_key 不能为空")
-        messages = self._sessions.fetch_session_messages(key)
-        cursor = max(0, min(self._sessions.get_cursor(key), len(messages)))
-        return len(messages) - cursor >= self._context_guard_threshold
-
-    async def _run_consolidation_serialized(
-        self,
-        event: TurnIngested,
-    ) -> ConsolidationResult | None:
-        """让后台维护与 Turn 前保护共享同一 Session 的压缩临界区。"""
-
-        lock = self._maintenance_locks.setdefault(event.session_key, asyncio.Lock())
-        async with lock:
-            return await self._run_consolidation(event)
+        return False
 
     async def on_consolidation_committed(self, event: ConsolidationCommitted) -> None:
-        # 事件向量写入与隐式记忆提取只共享归档原文，彼此没有数据依赖。并发等待
-        # 两类外部 IO，随后才写 implicit 并清理 outbox，保持原有提交边界。
+        pending_lines = [
+            f"- [{str(item.get('tag') or 'key_info')}] {str(item.get('content') or '').strip()}"
+            for item in event.pending_items
+            if isinstance(item, dict) and str(item.get("content") or "").strip()
+        ]
+        if pending_lines:
+            self._markdown.append_pending_once(
+                "\n".join(pending_lines),
+                source_ref=event.source_ref,
+            )
+        # 新 checkpoint 把隐式候选随 outbox 一并保存，重放时不再重新调用 LLM；
+        # 旧格式 outbox 没有该字段时才走兼容提取路径。
+        implicit = _implicit_from_payload(event.implicit_memory)
+        implicit_task = (
+            asyncio.sleep(0, result=implicit)
+            if event.implicit_memory
+            else self._implicit_extractor.extract(event.conversation, existing_profile="")
+        )
+        # 事件向量写入与隐式记忆保存没有数据依赖，允许并发等待，完成后再清理 outbox。
         async with asyncio.TaskGroup() as group:
             group.create_task(self._save_consolidation_events(event))
-            implicit_task = group.create_task(
-                self._implicit_extractor.extract(
-                    event.conversation,
-                    existing_profile="",
-                )
-            )
-        implicit = implicit_task.result()
+            implicit_task_group = group.create_task(implicit_task)
+        implicit = implicit_task_group.result()
         await self._save_implicit_long_term(implicit, event)
         self._store.complete_consolidation(event.source_ref)
+
+    async def _process_compaction_payload(self, payload: dict[str, object]) -> bool:
+        """消费一个 checkpoint source；提取失败时保留 outbox 供后续重放。"""
+
+        if payload.get("kind") != "checkpoint_memory":
+            # 兼容重构前已落盘的完整提取 payload；新任务不会走这条路径。
+            event = _consolidation_from_payload(payload)
+            if event.session_key and event.generation:
+                checkpoint = self._sessions.get_compaction(
+                    event.session_key,
+                    event.generation,
+                )
+                if checkpoint is None or checkpoint.source_ref != event.source_ref:
+                    # 没有对应 active checkpoint 的旧 payload 无法安全重建来源；它通常
+                    # 来自 outbox 落盘后进程在 ledger commit 前退出，清理后等待新的
+                    # token gate 重新生成合法 generation，不能把孤儿来源写入记忆。
+                    self._store.complete_consolidation(event.source_ref)
+                    return False
+            await self.on_consolidation_committed(event)
+            return True
+
+        session_key = str(payload.get("session_key") or "").strip()
+        source_ref = str(payload.get("source_ref") or "").strip()
+        generation = max(0, int(payload.get("generation") or 0))
+        if not session_key or not source_ref or generation <= 0:
+            raise ValueError("checkpoint outbox payload identity 无效")
+        checkpoint = self._sessions.get_compaction(session_key, generation)
+        if checkpoint is None or checkpoint.source_ref != source_ref:
+            # outbox 可能在 ledger commit 前落盘；不能把未激活 source 写入长期记忆。
+            self._store.complete_consolidation(source_ref)
+            return False
+
+        selected_messages = [dict(item) for item in checkpoint.selected_source_messages]
+        if not selected_messages:
+            raise ValueError("checkpoint source plan 不能为空")
+        conversation = render_consolidation_conversation(selected_messages)
+        previous_summary = str(payload.get("previous_summary") or "")
+        current_memory = await asyncio.to_thread(self._markdown.read_long_term)
+        # 三种记忆提取共享同一份已提交 source；并发只发生在后台 worker 内，
+        # 不再延长触发压缩的当前 Turn。
+        draft, implicit = await asyncio.gather(
+            self._consolidation_extractor.extract(
+                selected_messages,
+                previous_summary,
+                current_memory=current_memory.strip(),
+            ),
+            self._implicit_extractor.extract(
+                conversation,
+                existing_profile="",
+            ),
+        )
+        event = ConsolidationCommitted(
+            history_entry_payloads=[
+                (
+                    str(entry.get("summary") or ""),
+                    _emotional_weight(entry.get("emotional_weight")),
+                )
+                for entry in draft.history_entries
+                if str(entry.get("summary") or "").strip()
+            ],
+            source_ref=source_ref,
+            scope_channel=str(payload.get("scope_channel") or ""),
+            scope_chat_id=str(payload.get("scope_chat_id") or ""),
+            conversation=conversation,
+            session_key=session_key,
+            generation=generation,
+            pending_items=[
+                dict(item)
+                for item in draft.pending_items
+                if isinstance(item, dict)
+            ],
+            implicit_memory=_implicit_payload(implicit),
+        )
+        await self.on_consolidation_committed(event)
+        return True
 
     async def _save_consolidation_events(
         self,
@@ -510,13 +745,11 @@ class MemoryEngine:
                 )
 
     async def replay_pending_consolidations(self) -> None:
-        """重放未完成的向量事务；单条失败保留 outbox 并继续其它窗口。"""
+        """启动后台 worker 重放 durable outbox；启动阶段等待已有任务收敛。"""
 
-        for payload in self._store.list_pending_consolidations():
-            try:
-                await self.on_consolidation_committed(_consolidation_from_payload(payload))
-            except Exception:
-                logger.exception("Consolidation 向量同步重放失败: source_ref=%s", payload.get("source_ref"))
+        payloads = self._store.list_pending_consolidations()
+        await self._compaction_worker.submit_many(payloads)
+        await self._compaction_worker.drain()
 
     async def _save_implicit_long_term(
         self,
@@ -569,12 +802,10 @@ class MemoryEngine:
                 )
 
     async def drain(self) -> None:
-        """等待当前已接收的两类后台任务全部完成，主要用于关闭和确定性测试。"""
+        """等待 Turn 后台任务和 checkpoint outbox 任务清空。"""
 
         await self._post_response_queue.join()
-        # 新任务可能在一次 gather 快照完成前被追加，因此循环到任务表真正为空。
-        while self._maintenance_tasks:
-            await asyncio.gather(*list(self._maintenance_tasks.values()), return_exceptions=True)
+        await self._compaction_worker.drain()
 
     async def _ensure_workers(self) -> None:
         async with self._lifecycle_lock:
@@ -594,37 +825,6 @@ class MemoryEngine:
                 logger.exception("每轮记忆失效处理失败")
             finally:
                 self._post_response_queue.task_done()
-
-    def _enqueue_maintenance(self, event: TurnIngested) -> None:
-        queue = self._maintenance_queues.setdefault(event.session_key, deque())
-        queue.append(event)
-        if event.session_key in self._maintenance_tasks:
-            return
-        task = asyncio.create_task(
-            self._run_maintenance_queue(event.session_key),
-            name=f"memory-maintenance:{event.session_key}",
-        )
-        self._maintenance_tasks[event.session_key] = task
-
-    async def _run_maintenance_queue(self, session_key: str) -> None:
-        try:
-            while True:
-                queue = self._maintenance_queues.get(session_key)
-                if not queue:
-                    return
-                event = queue.popleft()
-                try:
-                    await self._run_consolidation_serialized(event)
-                except Exception:
-                    # Session 已提交，维护失败只保留 cursor 供后续重试，不能终止其它
-                    # Session 的独立任务，也不能回滚正常回复。
-                    logger.exception("会话记忆归档失败: session_key=%s", session_key)
-        finally:
-            current = asyncio.current_task()
-            if self._maintenance_tasks.get(session_key) is current:
-                self._maintenance_tasks.pop(session_key, None)
-            if not self._maintenance_queues.get(session_key):
-                self._maintenance_queues.pop(session_key, None)
 
     def _build_turn_snapshot(self, event: Any) -> TurnIngested:
         def value(name: str, default: Any = "") -> Any:
@@ -682,12 +882,12 @@ class MemoryEngine:
         # 先完成已接收任务，再取消等待新消息的常驻消费者；否则 SQLite/Markdown
         # 可能先关闭，造成尾部 Turn 丢失。取消仅发生在队列清空之后。
         await self.drain()
+        await self._compaction_worker.close(drain=False)
         tasks = [task for task in (self._post_response_task,) if task is not None]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self._maintenance_locks.clear()
         # 最后关闭本地数据库和 Embedder HTTP 客户端；Provider 由应用组装层共享。
         self._store.close()
         self._markdown.close()
@@ -701,43 +901,19 @@ class _LLMConsolidationExtractor:
     def __init__(self, provider: Any) -> None:
         self._provider = provider
 
-    async def extract(self, messages: list[dict[str, object]], previous_recent_context: str, *, recent_turns: str = "", current_memory: str = "") -> ConsolidationDraft:
+    async def extract(self, messages: list[dict[str, object]], previous_summary: str = "", *, current_memory: str = "") -> ConsolidationDraft:
         conversation = render_consolidation_conversation(messages)
-        # 两个提取器只读取相同证据，不互相消费结果；并发执行可把两次 LLM
-        # 网络等待从相加改为取较慢者，任一失败时 TaskGroup 会取消另一分支。
-        async with asyncio.TaskGroup() as group:
-            event_task = group.create_task(
-                complete_forced_function(
-                    self._provider,
-                    _event_extraction_prompt(
-                        conversation,
-                        current_memory=current_memory,
-                    ),
-                    CONSOLIDATION_EVENTS_TOOL,
-                    required_arrays=("history_entries", "pending_items"),
-                )
-            )
-            recent_task = group.create_task(
-                complete_forced_function(
-                    self._provider,
-                    _recent_context_prompt(
-                        conversation,
-                        previous_recent_context,
-                        recent_turns=recent_turns,
-                    ),
-                    RECENT_CONTEXT_TOOL,
-                    required_arrays=(
-                        "active_topics",
-                        "user_preferences",
-                        "follow_ups",
-                        "avoidances",
-                        "dormant_threads",
-                        "ongoing_threads",
-                    ),
-                )
-            )
-        event_data = event_task.result()
-        recent_data = recent_task.result()
+        # 事件摘要与 PENDING 候选必须由同一个函数调用生成；profile、preference、
+        # procedure 则在 checkpoint 中使用同一 conversation 进入隐式提取器。
+        event_data = await complete_forced_function(
+            self._provider,
+            _event_extraction_prompt(
+                conversation,
+                current_memory=current_memory,
+            ),
+            CONSOLIDATION_EVENTS_TOOL,
+            required_arrays=("history_entries", "pending_items"),
+        )
         history_entries = []
         for item in event_data.get("history_entries") or []:
             if not isinstance(item, dict) or not str(item.get("summary") or "").strip():
@@ -757,7 +933,6 @@ class _LLMConsolidationExtractor:
         return ConsolidationDraft(
             history_entries=history_entries,
             pending_items=pending_items,
-            recent_context=_render_recent_context(recent_data),
         )
 
 def _event_extraction_prompt(conversation: str, *, current_memory: str = "") -> str:
@@ -862,115 +1037,6 @@ history_entries.emotional_weight 规则：
 没有符合条件的内容时也必须调用，并将 history_entries 和 pending_items 设为空数组。"""
 
 
-def _recent_context_prompt(conversation: str, old_context: str, *, recent_turns: str = "") -> str:
-    return f"""你是近期语境压缩代理。你的任务不是自由总结，而是为后续上下文中保守地抽取近期语境。
-
-目标：
-1. 提取用户最近持续关注的话题
-2. 提取最近新暴露、但尚未沉淀为长期记忆的显式偏好
-3. 提取最近适合自然续接的话题
-4. 提取最近应避免打扰、应避免推荐、或明显不想聊的方向
-5. 提取跨窗口持续存在的重要现实线索（ongoing_threads）
-6. 提取已经离开最新主线但仍可能被用户回头追问的会话内旧话题（dormant_threads）
-
-规则：
-- 只允许依据 USER 明确表达过的内容输出；ASSISTANT 的建议、解释、命名、延伸，一律不得当作证据
-- recent_topics 可以总结“用户最近在讨论什么”，但必须贴近 USER 原话，不得升级成长期偏好
-- active_topics 和 follow_ups 要优先写“话题层级”的概括，不要写 JSON Schema、函数名、字段名、具体术语翻译这类实现细节，除非用户明确把该细节当作核心关注点反复强调
-- user_preferences 只允许在 USER 出现明确偏好/要求/禁忌表达时输出，例如：喜欢、偏好、希望、别、不要、避免、不想
-- 不要把技术方案讨论、架构设想、问题求证、头脑风暴自动写成“用户偏好”
-- 对技术讨论场景，只有当 USER 明确表达“以后都这样做 / 我就是偏好这种方式 / 我不要另一种方式 / 以后统一按这个来”时，才允许写 user_preferences；否则一律视为 active_topics 或 follow_ups
-- 用户用“为什么不……”“能不能……”“是不是可以……”“只要不是最后一轮就……”这类方式提出方案设想或追问时，默认视为设计提议，不视为稳定偏好
-- avoidances 只允许在 USER 明确表达“不要/别/避免/不想”时输出；没有明确否定表达就留空
-- 如果最新 recent turns 显示话题已经明显切换，不要把较早窗口的技术讨论升级成当前偏好或避免事项
-- 只保留未来几轮仍会影响辅助决策的信息
-- 不要记录工具细节、推理过程、普通寒暄
-- active_topics、user_preferences、follow_ups、avoidances 和 ongoing_threads 最多 3 条，每条尽量 1 句
-- dormant_threads 最多 5 条；最新话题切换时，旧的普通会话话题优先降级到 dormant_threads，而不是直接删除
-- 没有把握就留空；宁可漏掉，也不要脑补
-
-ongoing_threads 严格限制：
-- 只记录用户正在经历、推进或承受的重要事情
-- 必须是对用户当前生活、情绪、工作、学习、关系或健康有持续影响的线索
-- 普通提问、技术讨论、方案脑暴、一次性 ask、知识求证，一律不得写入 ongoing_threads
-- 若旧的 ongoing_threads 中已有某条重要线索，而当前窗口没有明确终结它，默认保留
-- 只有当用户明确表示这件事已解决、结束、过去了、不再关心，才允许删除
-- ongoing_threads 的写入门槛高于 active_topics；宁可少写，也不要把普通话题升级进去
-
-专项禁令：
-- 用户讨论“某个设计有没有依据/有没有实践/是否可行/为什么不这样做”，这是方案讨论，不是偏好；默认只能进入 active_topics 或 follow_ups，不能进入 user_preferences
-- 用户说“为什么不让前台……只要不是最后一轮就……”是在提出一种实现设想，不等于“用户偏好以后统一这样做”
-- 用户说“这样也不会引入额外延迟”“有没有这样的设计”，这是在分析方案目标，不等于稳定偏好
-- 用户讨论“零延迟”“预加载”“流式预取”“前瞻性检索”这类设计目标时，默认视为当前方案讨论，不得直接提炼成 user_preferences
-- 对方案讨论里的具体实现细节，优先上收一层概括，例如写“下一轮检索规划”“流式预取方案”，不要写“JSON Schema”“结构化预取指令”这类细碎实现点
-- 用户说“睡觉了”“头有点疼”“身体不适”，这只是当前状态；除非用户明确说“别再聊这个”“不要继续”“我不想讨论”，否则不得生成 avoidances
-- assistant 说“今晚先别想架构和代码了”“先休息”，这是 assistant 建议，不是用户 avoidances
-- 如果较早窗口是技术方案讨论，而最新 recent turns 已切到睡眠/头痛/身体状态，则 user_preferences 和 avoidances 默认应为空；技术方案最多保留在 active_topics / follow_ups
-- “最近在讨论前瞻性检索/流式预取方案”只能进入 active_topics / follow_ups，不能进入 ongoing_threads
-- “用户最近几天反复因面试失败而情绪低落”“用户近期持续受睡眠紊乱影响”这类重要现实线索，才允许进入 ongoing_threads
-
-反例：
-- 错误：把“在 React 过程中同时输出下一轮检索内容”写成“用户偏好在对话中实时生成下一轮检索指令”
-- 错误：把“这样也不会引入额外延迟”写成“用户偏好零延迟预加载”
-- 错误：把“为什么不让前台在进行时同时输出自己想要什么”写成“用户偏好实时生成下一轮检索指令”
-- 错误：把“睡觉了，吃了褪黑素头有点疼”写成“避免在身体不适时继续讨论技术架构”
-- 错误：把“最近在讨论 React / 流式预取方案”写成 ongoing_threads
-- 正确：active_topics 可写“用户最近在讨论前瞻性检索/流式预取方案”
-- 正确：ongoing_threads 可写“用户最近几天反复提到面试受挫，持续影响情绪”
-- 正确：如果用户没有明确说“希望/不要/避免/不想”，user_preferences 和 avoidances 可以为空
-
-输出前自检：
-1. 检查 user_preferences 中每一条，是否都能在 USER 原话里找到明确偏好/要求词（如“希望/不要/避免/不想/偏好/喜欢”）
-2. 若找不到明确偏好/要求词，删除该条
-3. 检查 avoidances 中每一条，是否都能在 USER 原话里找到明确否定/回避表达
-4. 若找不到明确否定/回避表达，删除该条
-5. 如果删除后为空，返回空数组，不要为了“信息完整”硬填
-
-【上一版 recent context（仅供延续，不要机械复述）】
-{old_context or '（空）'}
-
-【较早窗口（本次待压缩）】
-{conversation or '（空）'}
-
-【最新 Recent Turns（仅用于判断话题是否切换）】
-- `[user]` 表示近期用户消息，只用于判断近期正在讨论什么，以及话题是否已经切换
-- `[a-preview]` 表示 ASSISTANT 回复的截断预览，内容可能不完整，也不代表用户立场
-- Recent Turns 中的任何内容都不能替代待压缩窗口中的 USER 原文
-- 严禁将 `[a-preview]` 作为用户身份、事实、偏好、关系、回避事项或 ongoing thread 的证据
-{recent_turns or '（空）'}
-
-完成判断后必须且只能调用 submit_recent_context；不得通过普通正文返回结果。
-没有符合条件的内容时也必须调用，参数为：
-{{"active_topics": [], "user_preferences": [], "follow_ups": [], "avoidances": [], "dormant_threads": [], "ongoing_threads": []}}"""
-
-
-def _render_recent_context(data: dict[str, object]) -> str:
-    labels = (
-        ("active_topics", "最近持续关注"),
-        ("user_preferences", "最近明确偏好"),
-        ("follow_ups", "最近待延续话题"),
-        ("avoidances", "最近避免事项"),
-    )
-    lines = ["# Recent Context", "", "## Compression"]
-    for key, label in labels:
-        values = data.get(key)
-        items = [str(item).strip() for item in values if str(item).strip()][:3] if isinstance(values, list) else []
-        lines.append(f"- {label}：{'；'.join(items) if items else 'none'}")
-    lines.extend(["", "## Dormant Threads"])
-    dormant = data.get("dormant_threads")
-    items = [str(item).strip() for item in dormant if str(item).strip()][:5] if isinstance(dormant, list) else []
-    lines.extend(f"- {item}" for item in items)
-    if not items:
-        lines.append("- none")
-    lines.extend(["", "## Ongoing Threads"])
-    ongoing = data.get("ongoing_threads")
-    items = [str(item).strip() for item in ongoing if str(item).strip()][:3] if isinstance(ongoing, list) else []
-    lines.extend(f"- {item}" for item in items)
-    if not items:
-        lines.append("- none")
-    return "\n".join(lines) + "\n"
-
-
 def _scope(channel: str, chat_id: str):
     from memory.contracts import MemoryScope
     return MemoryScope(session_key=f"{channel}:{chat_id}" if channel and chat_id else "", channel=channel, chat_id=chat_id)
@@ -1004,6 +1070,26 @@ def _emotional_weight(value: object) -> int:
         return 0
 
 
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="microseconds")
+
+
+def _checkpoint_summary_prompt(previous_summary: str, conversation: str) -> str:
+    return f"""请更新上下文压缩摘要。
+
+只依据材料中出现的事实，不补充推测；摘要代表已经归档的旧历史，不能写入当前用户
+输入、未完成工具调用或尚未持久化的内容。保留目标、关键决定、已完成进展、阻塞点、
+下一步和仍需记住的技术细节。使用简洁中文 Markdown，上一代摘要为空时从本轮 source
+建立摘要；上一代摘要非空时要合并而不是机械复制。
+
+【上一代 checkpoint.summary】
+{previous_summary or "（空）"}
+
+【本轮 selected_source_messages】
+{conversation or "（空）"}
+"""
+
+
 def _consolidation_payload(event: ConsolidationCommitted) -> dict[str, object]:
     return {
         "history_entry_payloads": [list(item) for item in event.history_entry_payloads],
@@ -1011,6 +1097,14 @@ def _consolidation_payload(event: ConsolidationCommitted) -> dict[str, object]:
         "scope_channel": event.scope_channel,
         "scope_chat_id": event.scope_chat_id,
         "conversation": event.conversation,
+        "session_key": event.session_key,
+        "generation": event.generation,
+        "pending_items": [dict(item) for item in event.pending_items],
+        "implicit_memory": {
+            str(kind): [dict(item) for item in items]
+            for kind, items in event.implicit_memory.items()
+            if isinstance(items, list)
+        },
     }
 
 
@@ -1027,6 +1121,36 @@ def _consolidation_from_payload(payload: dict[str, object]) -> ConsolidationComm
         scope_channel=str(payload.get("scope_channel") or ""),
         scope_chat_id=str(payload.get("scope_chat_id") or ""),
         conversation=str(payload.get("conversation") or ""),
+        session_key=str(payload.get("session_key") or ""),
+        generation=max(0, int(payload.get("generation") or 0)),
+        pending_items=[dict(item) for item in payload.get("pending_items", []) if isinstance(item, dict)]
+        if isinstance(payload.get("pending_items"), list)
+        else [],
+        implicit_memory={
+            str(kind): [dict(item) for item in items if isinstance(item, dict)]
+            for kind, items in payload.get("implicit_memory", {}).items()
+            if isinstance(items, list)
+        }
+        if isinstance(payload.get("implicit_memory"), dict)
+        else {},
+    )
+
+
+def _implicit_payload(draft: ImplicitMemoryDraft) -> dict[str, list[dict[str, object]]]:
+    """把统一提取结果转为可 JSON 化 outbox，重放时不重新请求模型。"""
+
+    return {
+        "profile": [dict(item) for item in draft.profile],
+        "preference": [dict(item) for item in draft.preference],
+        "procedure": [dict(item) for item in draft.procedure],
+    }
+
+
+def _implicit_from_payload(payload: dict[str, list[dict[str, object]]]) -> ImplicitMemoryDraft:
+    return ImplicitMemoryDraft(
+        profile=[dict(item) for item in payload.get("profile", []) if isinstance(item, dict)],
+        preference=[dict(item) for item in payload.get("preference", []) if isinstance(item, dict)],
+        procedure=[dict(item) for item in payload.get("procedure", []) if isinstance(item, dict)],
     )
 
 

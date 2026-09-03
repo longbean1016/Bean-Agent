@@ -8,7 +8,7 @@ import pytest
 
 from agent.agent_loop import InterruptResult
 from agent.channel import WebChannel
-from agent.event_bus import EventBus, TurnPreparing, TurnQueued, TurnQueueRejected
+from agent.event_bus import ContextUsageUpdated, EventBus, TurnQueued, TurnQueueRejected
 from agent.message_bus import MessageBus
 
 
@@ -164,6 +164,68 @@ async def test_session_subscribe_replays_active_turn_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_subscribe_restores_context_usage_snapshot() -> None:
+    bus = MessageBus()
+
+    async def load_context_usage(session_key: str) -> dict:
+        assert session_key == "web:chat"
+        return {
+            "pressure_tokens": 1200,
+            "projected_tokens": 1400,
+            "context_window": 10000,
+            "soft_limit_tokens": 8000,
+            "hard_input_tokens": 9800,
+            "context_window_source": "provider_catalog",
+            "system_tokens": 100,
+            "tools_tokens": 200,
+            "message_tokens": 900,
+            "model_runtime_id": "provider:model",
+            "model": "model",
+        }
+
+    channel = WebChannel(
+        bus,
+        EventBus(),
+        Interrupt(),
+        context_usage_loader=load_context_usage,
+    )
+    socket = Socket()
+
+    await channel.handle_frame(socket, {
+        "type": "session.subscribe",
+        "request_id": "subscribe",
+        "session_id": "web:chat",
+    })
+
+    assert socket.frames[1] == {
+        "type": "context.usage.updated",
+        "session_id": "web:chat",
+        "turn_id": "",
+        "used_tokens": 1400,
+        "context_window": 10000,
+        "soft_limit_tokens": 8000,
+        "hard_input_tokens": 9800,
+        "context_window_source": "provider_catalog",
+        "estimate_source": "provider_projected",
+        "breakdown": {
+            "system_prompt_tokens": 100,
+            "tools_tokens": 200,
+            "conversation_tokens": 900,
+            "overhead_tokens": 0,
+        },
+        "sections": [],
+        "pressure_tokens": 1200,
+        "projected_tokens": 1400,
+        "system_tokens": 100,
+        "tools_tokens": 200,
+        "message_tokens": 900,
+        "model_runtime_id": "provider:model",
+        "model": "model",
+    }
+    await channel.close()
+
+
+@pytest.mark.asyncio
 async def test_web_channel_maps_turn_queue_events_to_websocket_frames() -> None:
     bus = MessageBus()
     events = EventBus()
@@ -191,19 +253,51 @@ async def test_web_channel_maps_turn_queue_events_to_websocket_frames() -> None:
 
 
 @pytest.mark.asyncio
-async def test_web_channel_maps_turn_preparing_to_websocket_frame() -> None:
+async def test_web_channel_maps_context_usage_event_to_websocket_frame() -> None:
     bus = MessageBus()
     events = EventBus()
     channel = WebChannel(bus, events, Interrupt())
     socket = Socket()
     await channel.handle_frame(socket, {
-        "type": "session.subscribe", "request_id": "subscribe", "session_id": "web:chat",
+        "type": "session.subscribe",
+        "request_id": "subscribe",
+        "session_id": "web:chat",
     })
 
-    await events.emit(TurnPreparing("web:chat", "turn-1", "r1", "question", ["image.png"]))
+    await events.emit(ContextUsageUpdated(
+        session_key="web:chat",
+        turn_id="turn-1",
+        used_tokens=65500,
+        context_window=1_000_000,
+        soft_limit_tokens=740_000,
+        hard_input_tokens=991_808,
+        context_window_source="provider_catalog",
+        estimate_source="heuristic",
+        breakdown={
+            "system_prompt_tokens": 1600,
+            "tools_tokens": 6900,
+            "conversation_tokens": 49700,
+            "overhead_tokens": 7300,
+        },
+        sections=({"name": "identity", "estimated_tokens": 120, "static": True, "cache_hit": True},),
+    ))
 
     assert socket.frames[-1] == {
-        "type": "turn.preparing", "request_id": "r1", "session_id": "web:chat", "turn_id": "turn-1",
-        "user_message": "question", "user_media": ["image.png"],
+        "type": "context.usage.updated",
+        "session_id": "web:chat",
+        "turn_id": "turn-1",
+        "used_tokens": 65500,
+        "context_window": 1_000_000,
+        "soft_limit_tokens": 740_000,
+        "hard_input_tokens": 991_808,
+        "context_window_source": "provider_catalog",
+        "estimate_source": "heuristic",
+        "breakdown": {
+            "system_prompt_tokens": 1600,
+            "tools_tokens": 6900,
+            "conversation_tokens": 49700,
+            "overhead_tokens": 7300,
+        },
+        "sections": [{"name": "identity", "estimated_tokens": 120, "static": True, "cache_hit": True}],
     }
     await channel.close()

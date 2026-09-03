@@ -12,14 +12,18 @@ from uuid import uuid4
 
 from agent.agent_loop import InterruptResult
 from agent.event_bus import (
+    ContextCompactionCompleted,
+    ContextCompactionFailed,
+    ContextCompactionStarted,
+    ContextUsageUpdated,
     EventBus,
+    SessionUsageUpdated,
     SessionUpdated,
     StreamDeltaReady,
     ToolCallCompleted,
     ToolCallStarted,
     TurnQueued,
     TurnQueueRejected,
-    TurnPreparing,
     TurnStarted,
 )
 from agent.message_bus import InboundMessage, MessageBus, OutboundMessage
@@ -51,6 +55,9 @@ class WebChannel:
         media_root: Path | None = None,
         proactive_store: ProactiveStore | None = None,
         ensure_session: Callable[[str], Awaitable[object]] | None = None,
+        context_usage_loader: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
+        session_usage_loader: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
+        context_runtime_id: str = "",
     ) -> None:
         self._bus = bus
         self._events = event_bus
@@ -58,6 +65,9 @@ class WebChannel:
         self._media_root = media_root.resolve() if media_root is not None else None
         self._proactive_store = proactive_store
         self._ensure_session = ensure_session
+        self._context_usage_loader = context_usage_loader
+        self._session_usage_loader = session_usage_loader
+        self._context_runtime_id = str(context_runtime_id or "")
         self._connections: dict[str, set[WebSocketApi]] = {}
         self._socket_send_locks: weakref.WeakKeyDictionary[WebSocketApi, asyncio.Lock] = (
             weakref.WeakKeyDictionary()
@@ -65,7 +75,11 @@ class WebChannel:
         self._lock = asyncio.Lock()
         bus.subscribe_outbound(self.name, self._on_response)
         event_bus.on(TurnStarted, self._on_turn_started)
-        event_bus.on(TurnPreparing, self._on_turn_preparing)
+        event_bus.on(ContextCompactionStarted, self._on_context_compaction_started)
+        event_bus.on(ContextCompactionCompleted, self._on_context_compaction_completed)
+        event_bus.on(ContextCompactionFailed, self._on_context_compaction_failed)
+        event_bus.on(ContextUsageUpdated, self._on_context_usage_updated)
+        event_bus.on(SessionUsageUpdated, self._on_session_usage_updated)
         event_bus.on(SessionUpdated, self._on_session_updated)
         event_bus.on(TurnQueued, self._on_turn_queued)
         event_bus.on(TurnQueueRejected, self._on_turn_queue_rejected)
@@ -104,6 +118,8 @@ class WebChannel:
                 "request_id": request_id,
                 "session_id": session_key,
             })
+            await self._send_context_usage_snapshot(session_key, websocket)
+            await self._send_session_usage_snapshot(session_key, websocket)
             # 订阅确认后只给当前连接补发运行中快照，用于刷新/重连恢复流式草稿。
             await self._send_active_turn_snapshot(session_key, websocket)
             await self._replay_pending_notifications(session_key, websocket)
@@ -129,7 +145,15 @@ class WebChannel:
             return
         if frame_type == "turn.stop" and session_key is not None:
             result = await self._interrupt.request_interrupt(session_key)
-            await self._send_json(websocket, {"type": "turn.interrupted", "request_id": request_id, "session_id": session_key, "turn_id": result.turn_id, "status": result.status})
+            await self._send_json(websocket, {
+                "type": "turn.interrupted",
+                "request_id": request_id,
+                "session_id": session_key,
+                "turn_id": result.turn_id,
+                "status": result.status,
+                **({"duration_ms": result.duration_ms} if result.duration_ms is not None else {}),
+                **({"ended_at": result.ended_at} if result.ended_at else {}),
+            })
             return
         await self._error(websocket, request_id, "invalid_frame", f"不支持的帧类型: {frame_type or 'empty'}")
 
@@ -209,17 +233,136 @@ class WebChannel:
             return
         await self._send_json(websocket, {"type": "turn.snapshot", **dict(snapshot)})
 
+    async def _send_context_usage_snapshot(self, session_key: str, websocket: WebSocketApi) -> None:
+        """订阅时恢复与当前模型身份匹配的计量快照。"""
+
+        if self._context_usage_loader is None:
+            return
+        try:
+            snapshot = await self._context_usage_loader(session_key)
+        except Exception as error:
+            logger.warning("读取 Web 上下文计量快照失败 session=%s error=%s", session_key, error)
+            await self._send_json(websocket, {
+                "type": "context.usage.reset",
+                "session_id": session_key,
+            })
+            return
+        if not isinstance(snapshot, dict):
+            await self._send_json(websocket, {
+                "type": "context.usage.reset",
+                "session_id": session_key,
+            })
+            return
+        runtime_id = str(snapshot.get("model_runtime_id") or "")
+        if self._context_runtime_id and runtime_id and runtime_id != self._context_runtime_id:
+            # 模型切换后的旧 pressure 不得与新容量合并；等新模型返回 usage。
+            await self._send_json(websocket, {
+                "type": "context.usage.reset",
+                "session_id": session_key,
+            })
+            return
+        if snapshot.get("pressure_tokens") is None:
+            await self._send_json(websocket, {
+                "type": "context.usage.reset",
+                "session_id": session_key,
+            })
+            return
+        await self._send_json(websocket, {
+            "type": "context.usage.updated",
+            "session_id": session_key,
+            "turn_id": "",
+            **_context_usage_frame(snapshot),
+        })
+
+    async def _send_session_usage_snapshot(self, session_key: str, websocket: WebSocketApi) -> None:
+        """订阅时恢复底栏累计用量；没有真实调用记录则保持隐藏。"""
+
+        if self._session_usage_loader is None:
+            return
+        try:
+            usage = await self._session_usage_loader(session_key)
+        except Exception as error:
+            logger.warning("读取会话累计用量失败 session=%s error=%s", session_key, error)
+            return
+        if isinstance(usage, dict):
+            await self._send_json(websocket, {
+                "type": "session.usage.updated",
+                "session_id": session_key,
+                "turn_id": "",
+                **_session_usage_frame(usage),
+            })
+
     async def _on_turn_started(self, event: TurnStarted) -> None:
         await self._broadcast(event.session_key, {"type": "turn.started", "request_id": event.request_id, "session_id": event.session_key, "turn_id": event.turn_id})
 
-    async def _on_turn_preparing(self, event: TurnPreparing) -> None:
+    async def _on_context_compaction_started(self, event: ContextCompactionStarted) -> None:
         await self._broadcast(event.session_key, {
-            "type": "turn.preparing",
-            "request_id": event.request_id,
+            "type": "context.compaction.started",
             "session_id": event.session_key,
             "turn_id": event.turn_id,
-            "user_message": event.content,
-            "user_media": list(event.media),
+            "trigger": event.trigger,
+            "estimated_tokens": event.estimated_tokens,
+        })
+
+    async def _on_context_compaction_completed(self, event: ContextCompactionCompleted) -> None:
+        await self._broadcast(event.session_key, {
+            "type": "context.compaction.completed",
+            "session_id": event.session_key,
+            "turn_id": event.turn_id,
+            "trigger": event.trigger,
+            "estimated_tokens": event.estimated_tokens,
+            "compacted": event.compacted,
+        })
+
+    async def _on_context_compaction_failed(self, event: ContextCompactionFailed) -> None:
+        await self._broadcast(event.session_key, {
+            "type": "context.compaction.failed",
+            "session_id": event.session_key,
+            "turn_id": event.turn_id,
+            "trigger": event.trigger,
+            "estimated_tokens": event.estimated_tokens,
+            "message": event.error,
+        })
+
+    async def _on_context_usage_updated(self, event: ContextUsageUpdated) -> None:
+        frame = {
+            "type": "context.usage.updated",
+            "session_id": event.session_key,
+            "turn_id": event.turn_id,
+            "used_tokens": event.used_tokens,
+            "context_window": event.context_window,
+            "soft_limit_tokens": event.soft_limit_tokens,
+            "hard_input_tokens": event.hard_input_tokens,
+            "context_window_source": event.context_window_source,
+            "estimate_source": event.estimate_source,
+            "breakdown": dict(event.breakdown),
+            "sections": [dict(section) for section in event.sections],
+        }
+        optional = {
+            "pressure_tokens": event.pressure_tokens,
+            "projected_tokens": event.projected_tokens,
+            "surface_tokens": event.surface_tokens,
+            "system_tokens": event.system_tokens,
+            "tools_tokens": event.tools_tokens,
+            "message_tokens": event.message_tokens,
+            "as_of_seq": event.as_of_seq,
+            "model_runtime_id": event.model_runtime_id,
+            "model": event.model,
+        }
+        frame.update({key: value for key, value in optional.items() if value is not None})
+        await self._broadcast(event.session_key, frame)
+
+    async def _on_session_usage_updated(self, event: SessionUsageUpdated) -> None:
+        await self._broadcast(event.session_key, {
+            "type": "session.usage.updated",
+            "session_id": event.session_key,
+            "turn_id": event.turn_id,
+            "total_uncached_input_tokens": event.total_uncached_input_tokens,
+            "total_cache_read_tokens": event.total_cache_read_tokens,
+            "total_cache_write_tokens": event.total_cache_write_tokens,
+            "total_input_tokens": event.total_input_tokens,
+            "cache_hit_rate": event.cache_hit_rate,
+            "total_output_tokens": event.total_output_tokens,
         })
 
     async def _on_session_updated(self, event: SessionUpdated) -> None:
@@ -309,7 +452,11 @@ class WebChannel:
     async def close(self) -> None:
         self._bus.unsubscribe_outbound(self.name, self._on_response)
         self._events.off(TurnStarted, self._on_turn_started)
-        self._events.off(TurnPreparing, self._on_turn_preparing)
+        self._events.off(ContextCompactionStarted, self._on_context_compaction_started)
+        self._events.off(ContextCompactionCompleted, self._on_context_compaction_completed)
+        self._events.off(ContextCompactionFailed, self._on_context_compaction_failed)
+        self._events.off(ContextUsageUpdated, self._on_context_usage_updated)
+        self._events.off(SessionUsageUpdated, self._on_session_usage_updated)
         self._events.off(SessionUpdated, self._on_session_updated)
         self._events.off(TurnQueued, self._on_turn_queued)
         self._events.off(TurnQueueRejected, self._on_turn_queue_rejected)
@@ -319,6 +466,51 @@ class WebChannel:
         async with self._lock:
             self._connections.clear()
             self._socket_send_locks.clear()
+
+
+def _context_usage_frame(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """把持久化快照转成兼容实时事件的 WebSocket 帧。"""
+
+    pressure = snapshot.get("pressure_tokens")
+    projected = snapshot.get("projected_tokens")
+    used = projected if projected is not None else pressure
+    breakdown = {
+        "system_prompt_tokens": int(snapshot.get("system_tokens") or 0),
+        "tools_tokens": int(snapshot.get("tools_tokens") or 0),
+        "conversation_tokens": int(snapshot.get("message_tokens") or 0),
+        "overhead_tokens": 0,
+    }
+    return {
+        "used_tokens": int(used or 0),
+        "context_window": int(snapshot.get("context_window") or 0),
+        "soft_limit_tokens": int(snapshot.get("soft_limit_tokens") or 0),
+        "hard_input_tokens": int(snapshot.get("hard_input_tokens") or 0),
+        "context_window_source": str(snapshot.get("context_window_source") or "unknown"),
+        "estimate_source": "provider_projected" if projected is not None else "unknown",
+        "breakdown": breakdown,
+        "sections": [],
+        **{key: snapshot[key] for key in (
+            "pressure_tokens", "projected_tokens", "surface_tokens", "system_tokens",
+            "tools_tokens", "message_tokens", "as_of_seq", "model_runtime_id", "model",
+        ) if snapshot.get(key) is not None},
+    }
+
+
+def _session_usage_frame(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """把累计字段限制在前端协议的明确命名和非负范围内。"""
+
+    values = {
+        "total_uncached_input_tokens": max(0, int(snapshot.get("total_uncached_input_tokens") or 0)),
+        "total_cache_read_tokens": max(0, int(snapshot.get("total_cache_read_tokens") or 0)),
+        "total_cache_write_tokens": max(0, int(snapshot.get("total_cache_write_tokens") or 0)),
+        "total_input_tokens": max(0, int(snapshot.get("total_input_tokens") or 0)),
+        "total_output_tokens": max(0, int(snapshot.get("total_output_tokens") or 0)),
+    }
+    values["cache_hit_rate"] = (
+        float(snapshot["cache_hit_rate"])
+        if snapshot.get("cache_hit_rate") is not None else None
+    )
+    return values
 
 
 def normalize_web_session_id(value: object) -> str | None:

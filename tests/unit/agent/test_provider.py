@@ -100,6 +100,23 @@ def test_constructor_injects_llm_config_into_openai_client(
     }
 
 
+def test_provider_exposes_context_budget_and_estimator() -> None:
+    provider = _provider(
+        _Client(),
+        model="budget-model",
+        max_tokens=200,
+        context_window=1000,
+    )
+
+    assert provider.model == "budget-model"
+    assert provider.max_tokens == 200
+    assert provider.context_window == 1000
+    assert provider.estimate_context_tokens(
+        [{"role": "user", "content": "问题"}],
+        [{"type": "function", "function": {"name": "tool"}}],
+    ) > 0
+
+
 def test_create_vision_provider_builds_independent_configured_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -306,6 +323,37 @@ async def test_leading_system_messages_are_merged() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_request_observer_sees_normalized_provider_messages() -> None:
+    response = _ns(
+        choices=[_ns(message=_ns(content="完成", tool_calls=[]))],
+        usage=None,
+    )
+    client = _Client(response)
+    provider = _provider(client, provider="openai", model="gpt-test")
+    observed: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+
+    await provider.chat(
+        [
+            {"role": "system", "content": "规则一"},
+            {"role": "system", "content": "规则二"},
+            {"role": "user", "content": "问题"},
+        ],
+        on_request=lambda messages, tools: observed.append((messages, tools)),
+    )
+
+    assert observed == [
+        (
+            [
+                {"role": "system", "content": "规则一\n\n规则二"},
+                {"role": "user", "content": "问题"},
+            ],
+            [],
+        )
+    ]
+    assert "on_request" not in client.completions.calls[-1]
+
+
 def test_base_url_removes_completion_endpoint_suffix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -509,14 +557,19 @@ async def test_chat_streams_deltas_and_assembles_fragmented_tool_calls() -> None
     client = _Client(stream)
     provider = _provider(client)
     deltas: list[dict[str, str]] = []
+    usages: list[tuple[int, int]] = []
 
     async def receive_delta(delta: dict[str, str]) -> None:
         deltas.append(delta)
+
+    async def receive_usage(usage: provider_module.ProviderUsage) -> None:
+        usages.append((usage.uncached_input_tokens, usage.cache_read_tokens))
 
     result = await provider.chat(
         messages=[{"role": "system", "content": "已有系统提示"}],
         tools=[],
         on_content_delta=receive_delta,
+        on_usage=receive_usage,
     )
 
     assert client.completions.calls[0]["stream"] is True
@@ -527,6 +580,7 @@ async def test_chat_streams_deltas_and_assembles_fragmented_tool_calls() -> None
         {"thinking_delta": "先思考"},
         {"content_delta": "正在"},
     ]
+    assert usages == [(30, 90)]
     assert result.content == "正在"
     assert result.thinking == "先思考"
     assert result.tool_calls[0].id == "call-1"
@@ -534,6 +588,43 @@ async def test_chat_streams_deltas_and_assembles_fragmented_tool_calls() -> None
     assert result.tool_calls[0].arguments == {"city": "上海"}
     assert result.cache_prompt_tokens == 120
     assert result.cache_hit_tokens == 90
+
+
+@pytest.mark.asyncio
+async def test_chat_preserves_usage_observed_before_stream_failure() -> None:
+    class FailingStream:
+        def __init__(self) -> None:
+            self.sent_usage = False
+
+        def __aiter__(self) -> "FailingStream":
+            return self
+
+        async def __anext__(self) -> object:
+            if not self.sent_usage:
+                self.sent_usage = True
+                return _ns(
+                    choices=[],
+                    usage=_ns(prompt_cache_hit_tokens=90, prompt_cache_miss_tokens=30),
+                )
+            raise RuntimeError("stream failed after usage")
+
+    provider = _provider(_Client(FailingStream()))
+    usages: list[tuple[int, int]] = []
+
+    async def receive_delta(_delta: dict[str, str]) -> None:
+        return None
+
+    async def receive_usage(usage: provider_module.ProviderUsage) -> None:
+        usages.append((usage.uncached_input_tokens, usage.cache_read_tokens))
+
+    with pytest.raises(RuntimeError, match="stream failed after usage"):
+        await provider.chat(
+            messages=[{"role": "user", "content": "测试"}],
+            on_content_delta=receive_delta,
+            on_usage=receive_usage,
+        )
+
+    assert usages == [(30, 90)]
 
 
 @pytest.mark.asyncio
@@ -859,3 +950,32 @@ async def test_stream_stops_forwarding_temporary_deltas_after_tool_call() -> Non
     assert result.thinking == "先想不应转发"
     assert result.content == "临时文本"
     assert result.provider_fields == {"reasoning_content": "先想不应转发"}
+
+
+def test_extract_provider_usage_normalizes_deepseek_fields() -> None:
+    usage = provider_module._extract_provider_usage(_ns(
+        prompt_tokens=1_000,
+        prompt_cache_hit_tokens=700,
+        prompt_cache_miss_tokens=300,
+        completion_tokens=42,
+    ))
+
+    assert usage is not None
+    assert usage.uncached_input_tokens == 300
+    assert usage.cache_read_tokens == 700
+    assert usage.cache_write_tokens == 0
+    assert usage.output_tokens == 42
+    assert usage.pressure_tokens == 1_000
+
+
+def test_extract_provider_usage_normalizes_openai_cached_details() -> None:
+    usage = provider_module._extract_provider_usage(_ns(
+        prompt_tokens=900,
+        prompt_tokens_details=_ns(cached_tokens=600),
+        completion_tokens=18,
+    ))
+
+    assert usage is not None
+    assert usage.uncached_input_tokens == 300
+    assert usage.cache_read_tokens == 600
+    assert usage.output_tokens == 18

@@ -66,6 +66,23 @@ _TEXT_SUFFIXES = {
 _IMAGE_FORMATS = {"PNG", "JPEG", "GIF", "WEBP", "BMP"}
 _MAX_TEXT_UPLOAD = 2 * 1024 * 1024
 _MAX_IMAGE_UPLOAD = 10 * 1024 * 1024
+_MODEL_ONLY_MESSAGE_FIELDS = frozenset({
+    "llm_user_content",
+    "llm_context_frame",
+    "llm_message_timestamp",
+    "llm_epoch_id",
+    "llm_surface_messages",
+})
+
+
+def _public_chat_message(message: dict[str, Any]) -> dict[str, Any]:
+    """聊天接口只返回语义消息，隐藏模型侧 Prompt 投影。"""
+
+    return {
+        key: value
+        for key, value in message.items()
+        if key not in _MODEL_ONLY_MESSAGE_FIELDS
+    }
 
 
 class MemoryMaintenanceLoop:
@@ -141,6 +158,13 @@ class AppRuntime:
             media_root=core.workspace / "uploads",
             proactive_store=core.proactive_store,
             ensure_session=core.sessions.get_or_create,
+            context_usage_loader=lambda session_key: asyncio.to_thread(
+                core.sessions.store.get_context_usage, session_key
+            ),
+            session_usage_loader=lambda session_key: asyncio.to_thread(
+                core.sessions.store.get_session_usage, session_key
+            ),
+            context_runtime_id=str(getattr(core.provider, "runtime_id", "") or ""),
         )
         self.maintenance = (
             MemoryMaintenanceLoop(
@@ -250,7 +274,7 @@ def build_core_runtime(
     # 主 Provider 是应用级共享资源，由 Runtime 最终关闭；MemoryEngine 只借用它执行
     # QueryRewriter/Consolidation，不拥有其生命周期。
     main_provider = provider or LLMProvider(config.llm)
-    sessions = SessionManager(root, history_window=config.memory.context_window)
+    sessions = SessionManager(root)
     events = EventBus()
     messages = MessageBus()
     proactive_store = ProactiveStore(root / "proactive.db")
@@ -314,7 +338,19 @@ def build_core_runtime(
         skills=skills,
         prompt_cache_log=prompt_cache_log,
         history_loader=sessions.load_history,
-        history_limit=config.memory.context_window,
+        surface_loader=sessions.load_surface,
+        surface_appender=sessions.append_surface,
+        event_appender=sessions.append_session_event,
+        context_compactor=(memory.compact_for_context if memory is not None else None),
+        context_usage_loader=lambda session_key: asyncio.to_thread(
+            sessions.store.get_context_usage, session_key
+        ),
+        context_usage_writer=lambda session_key, snapshot: asyncio.to_thread(
+            sessions.store.save_context_usage, session_key, snapshot
+        ),
+        session_usage_writer=lambda session_key, turn_id, iteration, usage: asyncio.to_thread(
+            sessions.store.save_session_usage, session_key, turn_id, iteration, usage
+        ),
         max_iterations=config.llm.max_iterations or 10,
         # 主模型和独立视觉模型是两条互斥的图片消费路径：前者直接接收图片块，
         # 后者只通过 read_image_vision 工具读取本地上传路径。
@@ -326,7 +362,6 @@ def build_core_runtime(
         events,
         pipeline,
         sessions,
-        context_guard=memory,
         max_concurrent_turns=config.agent.max_concurrent_turns,
         max_queued_turns=config.agent.max_queued_turns,
     )
@@ -438,6 +473,7 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             limit=limit,
         )
         items = _append_running_snapshot(items, application.core.agent_loop.get_active_turn_snapshot(session_key))
+        items = [_public_chat_message(item) for item in items]
         return {
             "items": items,
             "total": total,
@@ -457,7 +493,7 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             limit=limit,
         )
         return {
-            "items": items,
+            "items": [_public_chat_message(item) for item in items],
             "has_more": has_more,
             "next_before_seq": next_before_seq,
         }
@@ -474,7 +510,7 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             limit=limit,
         )
         return {
-            "items": items,
+            "items": [_public_chat_message(item) for item in items],
             "has_before": has_before,
             "has_after": has_after,
             "next_before_seq": next_before_seq,
@@ -688,9 +724,11 @@ def _append_running_snapshot(
     if any(str(item.get("turn_id") or "") == turn_id for item in items):
         return items
     now = datetime.now().astimezone().isoformat()
+    started_at = str(snapshot.get("started_at") or "").strip() or now
     metadata = {
         "running": True,
         "request_id": str(snapshot.get("request_id") or ""),
+        "started_at": started_at,
     }
     tools = []
     for tool in snapshot.get("tools") or []:
@@ -712,7 +750,7 @@ def _append_running_snapshot(
             "role": "user",
             "content": str(snapshot.get("user_message") or ""),
             "tool_chain": [],
-            "timestamp": now,
+            "timestamp": started_at,
             "turn_id": turn_id,
             "reasoning_content": "",
             "status": "running",

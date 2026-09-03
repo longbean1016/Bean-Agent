@@ -7,13 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from agent.agent_loop import AgentLoop
-from agent.event_bus import EventBus, SessionUpdated, TurnCommitted, TurnPreparing, TurnStarted
+from agent.agent_loop import AgentLoop, TurnInterruptState, _repair_interrupted_surface
+from agent.event_bus import EventBus, SessionUpdated, TurnCommitted, TurnStarted
 from agent.message_bus import InboundMessage, MessageBus, PipelineResult
 from agent.config_models import MemoryConfig
 from memory.consolidator import ConsolidationDraft
 from memory.engine import MemoryEngine
 from session.manager import SessionManager
+from session.store import NewSessionEvent, NewSurfaceEvent
 
 
 class Pipeline:
@@ -37,7 +38,96 @@ class PreparingContextGuard(BlockingContextGuard):
 
 
 @pytest.mark.asyncio
-async def test_context_guard_emits_preparing_before_ensuring_context(tmp_path: Path) -> None:
+async def test_durable_surface_repair_adds_unknown_tool_result_without_semantic_projection(
+    tmp_path: Path,
+) -> None:
+    sessions = SessionManager(tmp_path)
+    loop = AgentLoop(MessageBus(), EventBus(), Pipeline(), sessions)
+    try:
+        await sessions.append_surface(NewSurfaceEvent(
+            session_key="web:repair",
+            epoch_id="epoch-a",
+            turn_id="turn-1",
+            iteration=1,
+            role="user",
+            content={"role": "user", "content": "查询"},
+            source_kind="user_message",
+            operation_key="turn-1:1:user",
+        ))
+        await sessions.append_surface(NewSurfaceEvent(
+            session_key="web:repair",
+            epoch_id="epoch-a",
+            turn_id="turn-1",
+            iteration=1,
+            role="assistant",
+            content={
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-pending",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }],
+            },
+            source_kind="assistant_tool_call",
+            operation_key="turn-1:1:assistant",
+        ))
+        await loop._repair_durable_surface(
+            TurnInterruptState(
+                session_key="web:repair",
+                original_user_message="查询",
+                llm_epoch_id="epoch-a",
+                llm_surface_persisted=True,
+                iteration=1,
+            ),
+            "turn-1",
+        )
+
+        surface = await sessions.load_surface("web:repair")
+        assert surface[-1]["role"] == "tool"
+        assert surface[-1]["tool_call_id"] == "call-pending"
+        assert "结果未知" in surface[-1]["content"]
+        assert (await sessions.get_or_create("web:repair")).messages == []
+    finally:
+        await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_surface_repair_recovers_snapshot_when_append_was_not_observed(
+    tmp_path: Path,
+) -> None:
+    sessions = SessionManager(tmp_path)
+    loop = AgentLoop(MessageBus(), EventBus(), Pipeline(), sessions)
+    try:
+        await loop._repair_durable_surface(
+            TurnInterruptState(
+                session_key="web:repair-missing",
+                original_user_message="查询",
+                llm_epoch_id="epoch-a",
+                llm_surface_persisted=True,
+                llm_surface_messages=[{
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-missing",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }],
+                }],
+                iteration=1,
+            ),
+            "turn-missing",
+        )
+
+        surface = await sessions.load_surface("web:repair-missing")
+        assert surface[0]["role"] == "assistant"
+        assert surface[1]["tool_call_id"] == "call-missing"
+    finally:
+        await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_context_guard_is_not_called_before_pipeline(tmp_path: Path) -> None:
     class OrderedGuard(PreparingContextGuard):
         def __init__(self) -> None:
             super().__init__(True)
@@ -56,15 +146,14 @@ async def test_context_guard_emits_preparing_before_ensuring_context(tmp_path: P
     sessions = SessionManager(tmp_path)
     guard = OrderedGuard()
     received: list[object] = []
-    events.on(TurnPreparing, lambda event: received.append(event))
     events.on(TurnStarted, lambda event: received.append(event))
     loop = AgentLoop(bus, events, Pipeline(), sessions, context_guard=guard)
     await bus.publish_inbound(InboundMessage("web", "u", "c", "question", metadata={"request_id": "r1"}))
 
     await loop.run_once()
 
-    assert [type(event) for event in received] == [TurnPreparing, TurnStarted]
-    assert guard.order == ["preflight", "ensure"]
+    assert [type(event) for event in received] == [TurnStarted]
+    assert guard.order == []
     await sessions.close()
 
 
@@ -178,6 +267,132 @@ async def test_pipeline_failure_persists_error_turn_without_committed(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_complete_turn_persists_duration_in_message_and_outbound(tmp_path: Path) -> None:
+    class TimedPipeline:
+        async def process(self, message, *, turn_id):
+            started_at = "2026-09-02T10:00:00+08:00"
+            ended_at = "2026-09-02T10:00:02.500000+08:00"
+            await sessions.append_session_event(NewSessionEvent(
+                session_key=message.session_key,
+                event_type="turn/start",
+                turn_id=turn_id,
+                step=0,
+                data={"started_at": started_at},
+                operation_key=f"{turn_id}:turn-start",
+            ))
+            await sessions.append_session_event(NewSessionEvent(
+                session_key=message.session_key,
+                event_type="turn/end",
+                turn_id=turn_id,
+                step=1,
+                data={"started_at": started_at, "ended_at": ended_at, "status": "completed"},
+                operation_key=f"{turn_id}:turn-end",
+            ))
+            return PipelineResult(
+                "回答",
+                duration_ms=2500,
+                turn_started_at=started_at,
+                turn_ended_at=ended_at,
+            )
+
+    bus = MessageBus()
+    sessions = SessionManager(tmp_path)
+    loop = AgentLoop(bus, EventBus(), TimedPipeline(), sessions)
+    await bus.publish_inbound(InboundMessage("web", "u", "c", "问题"))
+
+    await loop.run_once()
+
+    rows = sessions.store.fetch_session_messages("web:c")
+    outbound = await bus.consume_outbound()
+    assert rows[1]["metadata"]["duration_ms"] == 2500
+    assert rows[1]["timestamp"] == "2026-09-02T10:00:02.500000+08:00"
+    assert outbound.metadata["duration_ms"] == 2500
+    assert outbound.metadata["generated_at"] == "2026-09-02T10:00:02.500000+08:00"
+    await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_failure_persists_model_surface_for_replay(tmp_path: Path) -> None:
+    class FailingPipeline:
+        async def process(self, message, *, turn_id):
+            raise RuntimeError("模型失败")
+
+        def snapshot_interrupt_state(self, turn_id: str):
+            frame = '<system-reminder data-system-context-frame="true">frame</system-reminder>'
+            wrapped = "[当前消息时间: 2026-09-01T10:00:00+08:00]\n问题"
+            return {
+                "llm_context_frame": frame,
+                "llm_user_content": wrapped,
+                "llm_message_timestamp": "2026-09-01T10:00:00+08:00",
+                "llm_epoch_id": "epoch-1",
+                "llm_surface_messages": [
+                    {"role": "user", "content": frame},
+                    {"role": "user", "content": wrapped},
+                ],
+            }
+
+    bus = MessageBus()
+    sessions = SessionManager(tmp_path)
+    loop = AgentLoop(bus, EventBus(), FailingPipeline(), sessions)
+    await bus.publish_inbound(InboundMessage(channel="web", sender="u", chat_id="c", content="问题"))
+
+    await loop.run_once()
+
+    row = sessions.store.fetch_session_messages("web:c")[0]
+    assert row["llm_epoch_id"] == "epoch-1"
+    assert row["llm_surface_messages"][-1]["content"] == "[当前消息时间: 2026-09-01T10:00:00+08:00]\n问题"
+    history = await sessions.load_history("web:c")
+    assert history == row["llm_surface_messages"]
+    await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_failure_repairs_persisted_surface_tool_call(tmp_path: Path) -> None:
+    sessions = SessionManager(tmp_path)
+
+    class FailingSurfacePipeline:
+        async def process(self, message, *, turn_id):
+            await sessions.append_surface(NewSurfaceEvent(
+                session_key=message.session_key,
+                epoch_id="epoch-error",
+                turn_id=turn_id,
+                iteration=1,
+                role="assistant",
+                content={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-error",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }],
+                },
+                source_kind="assistant_tool_call",
+                operation_key=f"{turn_id}:assistant",
+            ))
+            raise RuntimeError("模型失败")
+
+        def snapshot_interrupt_state(self, turn_id: str):
+            return {
+                "llm_epoch_id": "epoch-error",
+                "llm_surface_persisted": True,
+                "iteration": 1,
+            }
+
+    bus = MessageBus()
+    loop = AgentLoop(bus, EventBus(), FailingSurfacePipeline(), sessions)
+    await bus.publish_inbound(InboundMessage("web", "u", "error-surface", "问题"))
+
+    await loop.run_once()
+
+    surface = sessions.store.load_surface("web:error-surface")
+    assert surface[-1]["role"] == "tool"
+    assert surface[-1]["tool_call_id"] == "call-error"
+    assert "结果未知" in surface[-1]["content"]
+    await sessions.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_persists_and_dispatches_context_retry_trace(
     tmp_path: Path,
 ) -> None:
@@ -210,20 +425,16 @@ async def test_agent_loop_persists_and_dispatches_context_retry_trace(
 
 
 @pytest.mark.asyncio
-async def test_context_guard_blocks_pipeline_without_persisting_error_turn(
+async def test_context_guard_does_not_block_pipeline(
     tmp_path: Path,
 ) -> None:
-    class ForbiddenPipeline:
-        async def process(self, message, *, turn_id):
-            raise AssertionError("积压保护失败时不应进入 Pipeline")
-
     bus = MessageBus()
     sessions = SessionManager(tmp_path)
     guard = BlockingContextGuard(False)
     loop = AgentLoop(
         bus,
         EventBus(),
-        ForbiddenPipeline(),
+        Pipeline(),
         sessions,
         context_guard=guard,
     )
@@ -234,9 +445,11 @@ async def test_context_guard_blocks_pipeline_without_persisting_error_turn(
     await loop.run_once()
 
     outbound = await bus.consume_outbound()
-    assert guard.calls == ["web:c"]
-    assert "记忆归档" in outbound.content
-    assert sessions.store.fetch_session_messages("web:c") == []
+    assert guard.calls == []
+    assert outbound.content == "回答"
+    assert [row["role"] for row in sessions.store.fetch_session_messages("web:c")] == [
+        "user", "assistant"
+    ]
     await sessions.close()
 
 
@@ -347,13 +560,213 @@ async def test_interrupt_immediately_persists_marker_and_completed_tools(tmp_pat
                 "id": "call-1",
                 "type": "function",
                 "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+            }, {
+                "id": "call-2",
+                "type": "function",
+                "function": {"name": "long_running_tool", "arguments": "{}"},
             }],
             "reasoning_content": "先读取文件",
         },
         {"role": "tool", "tool_call_id": "call-1", "content": "文件内容"},
+        {
+            "role": "tool",
+            "tool_call_id": "call-2",
+            "content": "工具调用在中断前已经发出，但没有记录完整结果；结果未知。请根据工具语义决定是否重试：只有只读或幂等操作可以重试；可能产生副作用时先核验外部状态或询问用户，不要盲目重试。",
+        },
         {"role": "assistant", "content": "[用户已停止生成]"},
     ]
     await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_persists_duration_from_turn_boundaries(tmp_path: Path) -> None:
+    class TimedBlockingPipeline:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def process(self, message, *, turn_id):
+            await sessions.append_session_event(NewSessionEvent(
+                session_key=message.session_key,
+                event_type="turn/start",
+                turn_id=turn_id,
+                step=0,
+                data={"started_at": "2026-09-02T10:00:00+08:00"},
+                operation_key=f"{turn_id}:turn-start",
+            ))
+            self.started.set()
+            await asyncio.Event().wait()
+
+        def snapshot_interrupt_state(self, turn_id: str):
+            return {"partial_reply": "半截", "turn_started_at": "2026-09-02T10:00:00+08:00"}
+
+        def discard_interrupt_snapshot(self, turn_id: str) -> None:
+            pass
+
+    sessions = SessionManager(tmp_path)
+    pipeline = TimedBlockingPipeline()
+    loop = AgentLoop(MessageBus(), EventBus(), pipeline, sessions)
+    await loop._bus.publish_inbound(InboundMessage("web", "u", "timed", "问题"))
+    running = asyncio.create_task(loop.run_once())
+    await pipeline.started.wait()
+
+    result = await loop.request_interrupt("web:timed")
+    await running
+
+    rows = sessions.store.fetch_session_messages("web:timed")
+    events = sessions.store.fetch_session_events("web:timed")
+    ends = [event for event in events if event["event_type"] == "turn/end"]
+    assert result.duration_ms is not None and result.duration_ms >= 0
+    assert rows[1]["metadata"]["duration_ms"] == result.duration_ms
+    assert ends[0]["data"]["status"] == "interrupted"
+    assert ends[0]["data"]["duration_ms"] == result.duration_ms
+    await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_repairs_model_surface_for_next_question(tmp_path: Path) -> None:
+    class BlockingPipeline:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def process(self, message, *, turn_id):
+            self.started.set()
+            await asyncio.Event().wait()
+
+        def snapshot_interrupt_state(self, turn_id: str):
+            frame = '<system-reminder data-system-context-frame="true">frame</system-reminder>'
+            wrapped = "[当前消息时间: 2026-09-01T10:00:00+08:00]\n问题"
+            return {
+                "llm_context_frame": frame,
+                "llm_user_content": wrapped,
+                "llm_surface_messages": [
+                    {"role": "user", "content": frame},
+                    {"role": "user", "content": wrapped},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "complete-call",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": "{}"},
+                            },
+                            {
+                                "id": "pending-call",
+                                "type": "function",
+                                "function": {"name": "write_file", "arguments": "{}"},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "complete-call",
+                        "content": "完整文件内容",
+                    },
+                ],
+                "tool_chain_partial": [
+                    {
+                        "iteration": 1,
+                        "calls": [
+                            {
+                                "call_id": "complete-call",
+                                "name": "read_file",
+                                "arguments": {},
+                                "result": "完整文件内容",
+                                "status": "ok",
+                            }
+                        ],
+                    }
+                ],
+                "tools": [
+                    {
+                        "call_id": "pending-call",
+                        "name": "write_file",
+                        "arguments": {},
+                        "result_preview": "部分写入",
+                        "status": "running",
+                    }
+                ],
+            }
+
+        def discard_interrupt_snapshot(self, turn_id: str) -> None:
+            pass
+
+    sessions = SessionManager(tmp_path)
+    blocking = BlockingPipeline()
+    loop = AgentLoop(MessageBus(), EventBus(), blocking, sessions)
+    await loop._bus.publish_inbound(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="问题")
+    )
+    running = asyncio.create_task(loop.run_once())
+    await blocking.started.wait()
+
+    result = await loop.request_interrupt("web:c")
+    await running
+
+    rows = sessions.store.fetch_session_messages("web:c")
+    surface = rows[0]["llm_surface_messages"]
+    assert [item.get("role") for item in surface] == [
+        "user", "user", "assistant", "tool", "tool"
+    ]
+    assert surface[3]["content"] == "完整文件内容"
+    assert surface[4]["tool_call_id"] == "pending-call"
+    assert "结果未知" in surface[4]["content"]
+    assert rows[1]["content"] == "[用户已停止生成]"
+
+    history = await sessions.load_history("web:c")
+    assert history == surface
+
+    captured: list[list[dict[str, Any]]] = []
+
+    class ContinuationPipeline:
+        async def process(self, message, *, turn_id):
+            captured.append(await sessions.load_history(message.session_key, None))
+            return PipelineResult("继续回答")
+
+    loop._pipeline = ContinuationPipeline()
+    await loop._bus.publish_inbound(
+        InboundMessage(channel="web", sender="u", chat_id="c", content="继续")
+    )
+    await loop.run_once()
+
+    assert captured == [surface]
+    await sessions.close()
+
+
+def test_repair_interrupted_surface_is_idempotent() -> None:
+    surface = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "pending-call",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        }
+    ]
+    _repair_interrupted_surface(surface)
+    _repair_interrupted_surface(surface)
+
+    assert len(surface) == 2
+    assert surface[1]["tool_call_id"] == "pending-call"
+
+
+def test_interrupted_surface_keeps_partial_assistant_separate_from_semantic_marker() -> None:
+    surface = [
+        {"role": "user", "content": "当前问题"},
+        {"role": "assistant", "content": "已经输出的一半"},
+    ]
+
+    _repair_interrupted_surface(surface)
+
+    # 模型侧继续看到已发送内容；[用户已停止生成] 只由语义 assistant 展示。
+    assert surface == [
+        {"role": "user", "content": "当前问题"},
+        {"role": "assistant", "content": "已经输出的一半"},
+    ]
 
 
 @pytest.mark.asyncio

@@ -3,29 +3,6 @@ import { describe, expect, it } from "vitest";
 import { initialChatState, mergeTimeline, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
 
 describe("reduceChatFrame", () => {
-  it("marks a turn as preparing until it starts running", () => {
-    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
-      type: "turn.preparing", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
-      user_message: "question", user_media: [],
-    });
-
-    expect(state.turnStates["web:one"]).toMatchObject({ status: "preparing", turnId: "turn-1" });
-    expect(state.messages).toMatchObject([
-      { role: "user", content: "question", turnId: "turn-1" },
-      { role: "assistant", turnId: "turn-1", preparing: true, streaming: true },
-    ]);
-
-    state = reduceChatFrame(state, {
-      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
-    });
-
-    expect(state.turnStates["web:one"].status).toBe("running");
-    expect(state.messages).toMatchObject([
-      { role: "user", content: "question", turnId: "turn-1" },
-      { role: "assistant", turnId: "turn-1", preparing: false, streaming: true },
-    ]);
-  });
-
   it("maps interrupted display snapshots without exposing placeholder content", () => {
     const [message] = rowsToMessages([{
       id: "web:one:1", seq: 1, role: "assistant", content: "[用户已停止生成]",
@@ -162,12 +139,8 @@ describe("reduceChatFrame", () => {
     });
   });
 
-  it("renders the next turn after a context-preparing turn completes", () => {
+  it("renders the next turn after a completed turn", () => {
     let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
-      type: "turn.preparing", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
-      user_message: "first", user_media: [],
-    });
-    state = reduceChatFrame(state, {
       type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
     });
     state = reduceChatFrame(state, {
@@ -187,7 +160,7 @@ describe("reduceChatFrame", () => {
 
     expect(state.turnStates["web:one"].status).toBe("running");
     expect(state.messages.find((message) => message.turnId === "turn-2" && message.role === "assistant"))
-      .toMatchObject({ content: "second answer", streaming: true, preparing: false });
+      .toMatchObject({ content: "second answer", streaming: true });
   });
   it("提交确认后会从提交中切换到排队状态", () => {
     let state = { ...initialChatState, sessionId: "web:one" };
@@ -198,6 +171,81 @@ describe("reduceChatFrame", () => {
       type: "turn.queued", session_id: "web:one", request_id: "r1", position: 1,
     });
     expect(state.turnStates["web:one"].status).toBe("queued");
+  });
+
+  it("压缩上下文期间保留当前 Turn，并在完成后恢复运行态", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+    state = reduceChatFrame(state, {
+      type: "context.compaction.started", session_id: "web:one", turn_id: "turn-1",
+      trigger: "soft_limit", estimated_tokens: 800,
+    });
+    expect(state.turnStates["web:one"]).toMatchObject({ status: "compacting", turnId: "turn-1" });
+    expect(state.activeTurnId).toBe("turn-1");
+
+    state = reduceChatFrame(state, {
+      type: "context.compaction.completed", session_id: "web:one", turn_id: "turn-1",
+      trigger: "soft_limit", estimated_tokens: 800, compacted: true,
+    });
+    expect(state.turnStates["web:one"]).toMatchObject({ status: "running", turnId: "turn-1" });
+  });
+
+  it("按会话保存完整上下文用量并拒绝旧 Turn 的迟到估算", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+    state = reduceChatFrame(state, {
+      type: "context.usage.updated", session_id: "web:one", turn_id: "turn-1",
+      used_tokens: 65500, context_window: 1000000, soft_limit_tokens: 740000,
+      hard_input_tokens: 991808, context_window_source: "provider_catalog", estimate_source: "heuristic",
+      breakdown: { system_prompt_tokens: 1600, tools_tokens: 6900, conversation_tokens: 49700, overhead_tokens: 7300 },
+      sections: [{ name: "identity", estimated_tokens: 120, static: true, cache_hit: true }],
+    });
+    expect(state.contextUsage["web:one"]).toMatchObject({
+      usedTokens: 65500, contextWindow: 1000000, contextWindowSource: "provider_catalog",
+    });
+
+    const unchanged = reduceChatFrame(state, {
+      type: "context.usage.updated", session_id: "web:one", turn_id: "turn-old",
+      used_tokens: 1, context_window: 2, soft_limit_tokens: 1, hard_input_tokens: 1,
+      context_window_source: "unknown", estimate_source: "heuristic",
+      breakdown: {}, sections: [],
+    });
+    expect(unchanged).toBe(state);
+  });
+
+  it("压缩失败会清理当前 Turn 状态", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+    state = reduceChatFrame(state, {
+      type: "context.compaction.started", session_id: "web:one", turn_id: "turn-1",
+      trigger: "context_overflow", estimated_tokens: 1000,
+    });
+    state = reduceChatFrame(state, {
+      type: "context.compaction.failed", session_id: "web:one", turn_id: "turn-1",
+      trigger: "context_overflow", estimated_tokens: 1000, message: "压缩失败",
+    });
+
+    expect(state.turnStates["web:one"]).toMatchObject({ status: "idle", turnId: "" });
+    expect(state.activeTurnId).toBe("");
+  });
+
+  it("重连快照不会覆盖同一 Turn 的压缩状态", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
+      type: "turn.started", request_id: "r1", session_id: "web:one", turn_id: "turn-1",
+    });
+    state = reduceChatFrame(state, {
+      type: "context.compaction.started", session_id: "web:one", turn_id: "turn-1",
+      trigger: "soft_limit", estimated_tokens: 800,
+    });
+    state = reduceChatFrame(state, {
+      type: "turn.snapshot", session_id: "web:one", turn_id: "turn-1", request_id: "r1",
+      user_message: "当前问题", user_media: [], content: "", thinking: "", tools: [], status: "running",
+    });
+
+    expect(state.turnStates["web:one"].status).toBe("compacting");
   });
 
   it("排队会话切走再切回仍保留用户问题", () => {

@@ -12,7 +12,16 @@ import pytest
 from PIL import Image
 
 from agent.attachment_content import build_current_user_content
-from agent.event_bus import EventBus, StreamDeltaReady, ToolCallCompleted, ToolCallStarted
+from agent.event_bus import (
+    ContextCompactionCompleted,
+    ContextCompactionFailed,
+    ContextCompactionStarted,
+    ContextUsageUpdated,
+    EventBus,
+    StreamDeltaReady,
+    ToolCallCompleted,
+    ToolCallStarted,
+)
 from agent.message_bus import InboundMessage
 from agent.pipeline import Pipeline
 from agent.prompt_cache_log import PromptCacheLogWriter
@@ -20,6 +29,7 @@ from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
 from agent.provider import ContextLengthError, LLMResponse, ToolCall
 from agent.skills import SkillsLoader
+from session.manager import SessionManager
 from tools.base import Tool
 from tools.registry import ToolRegistry
 from tools.tool_search import ToolSearchTool
@@ -81,6 +91,96 @@ class Memory:
     def read_self(self): return ""
     def get_memory_context(self): return ""
     def read_recent_context(self): return ""
+
+
+@pytest.mark.asyncio
+async def test_durable_surface_is_the_only_production_history_source(tmp_path: Path) -> None:
+    class TwoTurnProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.messages: list[list[dict[str, object]]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.calls += 1
+            self.messages.append([dict(item) for item in messages])
+            return LLMResponse(f"回答-{self.calls}")
+
+    sessions = SessionManager(tmp_path)
+    try:
+        provider = TwoTurnProvider()
+        registry = ToolRegistry()
+        assembler = PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        )
+        pipeline = Pipeline(
+            provider,
+            registry,
+            EventBus(),
+            assembler,
+            workspace=str(tmp_path),
+            surface_loader=sessions.load_surface,
+            surface_appender=sessions.append_surface,
+        )
+
+        first = await pipeline.process(
+            InboundMessage("web", "u", "surface-chat", "第一问"),
+            turn_id="turn-1",
+        )
+        second = await pipeline.process(
+            InboundMessage("web", "u", "surface-chat", "第二问"),
+            turn_id="turn-2",
+        )
+
+        assert first.llm_surface_persisted is True
+        assert second.llm_surface_persisted is True
+        surface = await sessions.load_surface("web:surface-chat")
+        assert [item["content"] for item in surface if item.get("role") == "assistant"] == [
+            "回答-1",
+            "回答-2",
+        ]
+        assert first.llm_surface_messages
+        # Semantic persistence is owned by AgentLoop; Pipeline only writes surface.
+        assert (await sessions.get_or_create("web:surface-chat")).messages == []
+        assert provider.messages[1][:len(provider.messages[0])] == provider.messages[0]
+    finally:
+        await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_persists_turn_boundaries_and_duration(tmp_path: Path) -> None:
+    class DelayedProvider:
+        async def chat(self, messages, tools=None, **kwargs):
+            await asyncio.sleep(0.01)
+            return LLMResponse("完成")
+
+    sessions = SessionManager(tmp_path)
+    try:
+        pipeline = Pipeline(
+            DelayedProvider(),
+            ToolRegistry(),
+            EventBus(),
+            PromptAssembler(
+                SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+                MessageEnvelopeBuilder(),
+            ),
+            workspace=str(tmp_path),
+            event_appender=sessions.append_session_event,
+        )
+        result = await pipeline.process(
+            InboundMessage("web", "u", "timed", "问题"),
+            turn_id="turn-timed",
+        )
+
+        events = await sessions.fetch_session_events("web:timed")
+        starts = [event for event in events if event["event_type"] == "turn/start"]
+        ends = [event for event in events if event["event_type"] == "turn/end"]
+        assert len(starts) == len(ends) == 1
+        assert result.duration_ms is not None and result.duration_ms >= 0
+        assert ends[0]["data"]["duration_ms"] == result.duration_ms
+        assert ends[0]["data"]["started_at"] == starts[0]["data"]["started_at"]
+    finally:
+        await sessions.close()
 
 
 @pytest.mark.asyncio
@@ -361,6 +461,10 @@ async def test_pipeline_persists_each_provider_cache_result_for_session(
         (1, 40),
         (2, 80),
     ]
+    assert all(len(str(row["canonical_hash"])) == 64 for row in rows)
+    assert rows[0]["common_prefix_messages"] == 0
+    assert rows[1]["common_prefix_messages"] >= 1
+    assert all("测试缓存日志" not in json.dumps(row, ensure_ascii=False) for row in rows)
 
 
 @pytest.mark.asyncio
@@ -736,7 +840,229 @@ def _assembler(tmp_path: Path) -> PromptAssembler:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_trims_history_by_complete_turn_after_prompt_sections(
+async def test_pipeline_emits_compaction_lifecycle_events(tmp_path: Path) -> None:
+    class GateProvider:
+        context_window = 100
+        max_tokens = 10
+
+        def __init__(self) -> None:
+            self.compacted = False
+
+        def estimate_context_tokens(self, messages, tools):
+            return 10 if self.compacted else 80
+
+        async def chat(self, messages, tools=None, **kwargs):
+            return LLMResponse("完成")
+
+    provider = GateProvider()
+    event_bus = EventBus()
+    lifecycle: list[str] = []
+    event_bus.on(ContextCompactionStarted, lambda _event: lifecycle.append("started"))
+    event_bus.on(ContextCompactionCompleted, lambda _event: lifecycle.append("completed"))
+
+    async def compact(_session_key: str, **kwargs) -> bool:
+        provider.compacted = True
+        return True
+
+    async def history(_session_key: str, _limit: int | None) -> list[dict[str, object]]:
+        return []
+
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        event_bus,
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        history_loader=history,
+        context_compactor=compact,
+    )
+
+    result = await pipeline.process(
+        InboundMessage("web", "u", "c", "当前问题"),
+        turn_id="compaction-events",
+    )
+
+    assert result.content == "完成"
+    assert lifecycle == ["started", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_surface_compaction_reload_does_not_duplicate_current_turn(
+    tmp_path: Path,
+) -> None:
+    class GateProvider:
+        context_window = 100
+        max_tokens = 10
+
+        def __init__(self) -> None:
+            self.compacted = False
+            self.messages: list[list[dict[str, object]]] = []
+
+        def estimate_context_tokens(self, messages, tools):
+            return 10 if self.compacted else 80
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages.append([dict(item) for item in messages])
+            return LLMResponse("完成")
+
+    sessions = SessionManager(tmp_path)
+    provider = GateProvider()
+
+    async def compact(_session_key: str, **kwargs) -> bool:
+        provider.compacted = True
+        return True
+
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        surface_loader=sessions.load_surface,
+        surface_appender=sessions.append_surface,
+        context_compactor=compact,
+    )
+    try:
+        await pipeline.process(
+            InboundMessage("web", "u", "surface-compact", "当前问题"),
+            turn_id="surface-compaction-turn",
+        )
+    finally:
+        await sessions.close()
+
+    request = provider.messages[-1]
+    current_user = [
+        item for item in request
+        if item.get("role") == "user" and str(item.get("content", "")).endswith("当前问题")
+    ]
+    frames = [
+        item for item in request
+        if item.get("role") == "user"
+        and str(item.get("content", "")).startswith(
+            '<system-reminder data-system-context-frame="true">'
+        )
+    ]
+    assert len(current_user) == 1
+    assert len(frames) == 1
+
+
+@pytest.mark.asyncio
+async def test_pipeline_emits_complete_context_usage_breakdown(tmp_path: Path) -> None:
+    class UsageProvider:
+        context_window = 1000
+        context_window_source = "explicit"
+        max_tokens = 200
+
+        async def chat(self, messages, tools=None, **kwargs):
+            return LLMResponse("完成")
+
+    events: list[ContextUsageUpdated] = []
+    event_bus = EventBus()
+    event_bus.on(ContextUsageUpdated, events.append)
+    pipeline = Pipeline(
+        UsageProvider(),
+        ToolRegistry(),
+        event_bus,
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+    )
+
+    await pipeline.process(
+        InboundMessage("web", "u", "c", "当前问题"),
+        turn_id="usage-turn",
+    )
+
+    assert len(events) == 1
+    usage = events[0]
+    assert usage.context_window == 1000
+    assert usage.context_window_source == "explicit"
+    assert usage.used_tokens > 0
+    assert usage.soft_limit_tokens == 740
+    assert usage.hard_input_tokens == 800
+    assert sum(usage.breakdown.values()) == usage.used_tokens
+    assert any(item["name"] == "behavior_rules" for item in usage.sections)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_anchors_provider_pressure_and_persists_snapshot(tmp_path: Path) -> None:
+    class UsageProvider:
+        context_window = 1000
+        context_window_source = "explicit"
+        max_tokens = 200
+        model = "meter-model"
+        provider_name = "test"
+
+        async def chat(self, messages, tools=None, **kwargs):
+            return LLMResponse("完成", cache_prompt_tokens=120, cache_hit_tokens=80)
+
+    events: list[ContextUsageUpdated] = []
+    snapshots: list[dict[str, object]] = []
+    event_bus = EventBus()
+    event_bus.on(ContextUsageUpdated, events.append)
+
+    async def write(_session_key: str, snapshot: dict[str, object]) -> None:
+        snapshots.append(snapshot)
+
+    pipeline = Pipeline(
+        UsageProvider(),
+        ToolRegistry(),
+        event_bus,
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        context_usage_writer=write,
+    )
+
+    await pipeline.process(
+        InboundMessage("web", "u", "c", "当前问题"),
+        turn_id="provider-pressure",
+    )
+
+    assert events[-1].estimate_source == "provider_usage"
+    assert events[-1].pressure_tokens == 120
+    assert events[-1].projected_tokens == 120
+    assert snapshots[-1]["pressure_tokens"] == 120
+    assert snapshots[-1]["model_runtime_id"] == "test:meter-model:1000"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_emits_compaction_failed_event(tmp_path: Path) -> None:
+    class GateProvider:
+        context_window = 100
+        max_tokens = 10
+
+        def estimate_context_tokens(self, messages, tools):
+            return 80
+
+        async def chat(self, messages, tools=None, **kwargs):
+            raise AssertionError("压缩失败后不应调用业务模型")
+
+    event_bus = EventBus()
+    errors: list[str] = []
+    event_bus.on(ContextCompactionFailed, lambda event: errors.append(event.error))
+
+    async def compact(_session_key: str, **kwargs) -> bool:
+        raise RuntimeError("checkpoint 失败")
+
+    pipeline = Pipeline(
+        GateProvider(),
+        ToolRegistry(),
+        event_bus,
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        context_compactor=compact,
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint 失败"):
+        await pipeline.process(
+            InboundMessage("web", "u", "c", "当前问题"),
+            turn_id="compaction-failed",
+        )
+
+    assert errors == ["checkpoint 失败"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_does_not_trim_history_after_prompt_overflow(
     tmp_path: Path,
 ) -> None:
     class OverflowProvider:
@@ -779,36 +1105,19 @@ async def test_pipeline_trims_history_by_complete_turn_after_prompt_sections(
         history_loader=history,
     )
 
-    result = await pipeline.process(
-        InboundMessage(channel="web", sender="u", chat_id="c", content="当前问题"),
-        turn_id="trim-history",
-    )
+    with pytest.raises(ContextLengthError, match="maximum context length exceeded"):
+        await pipeline.process(
+            InboundMessage(channel="web", sender="u", chat_id="c", content="当前问题"),
+            turn_id="trim-history",
+        )
 
-    assert result.content == "裁剪成功"
-    assert [item["role"] for item in provider.messages[5][1:5]] == [
-        "user",
-        "assistant",
-        "tool",
-        "assistant",
-    ]
-    assert "历史工具结果" in str(provider.messages[5])
-    assert "最近问题" in str(provider.messages[5])
-    assert "当前问题" in str(provider.messages[5])
-    assert "必须保留的长期记忆" not in str(provider.messages[5][0]["content"])
-    assert "用户偏好简洁" not in str(provider.messages[5])
-    assert result.context_retry["selected_plan"] == "half_history"
-    assert [item["name"] for item in result.context_retry["attempts"]] == [
-        "full",
-        "trim_skills_catalog",
-        "trim_auxiliary_context",
-        "trim_retrieved_memory",
-        "trim_long_term_memory",
-        "half_history",
-    ]
+    assert len(provider.messages) == 1
+    assert "历史工具结果" in str(provider.messages[0])
+    assert "当前问题" in str(provider.messages[0])
 
 
 @pytest.mark.asyncio
-async def test_pipeline_disables_low_priority_sections_after_latest_turn(
+async def test_pipeline_does_not_disable_prompt_sections_after_overflow(
     tmp_path: Path,
 ) -> None:
     class SectionProvider:
@@ -845,21 +1154,16 @@ async def test_pipeline_disables_low_priority_sections_after_latest_turn(
         history_loader=history,
     )
 
-    await pipeline.process(
-        InboundMessage(channel="web", sender="u", chat_id="c", content="当前问题"),
-        turn_id="trim-sections",
-    )
+    with pytest.raises(ContextLengthError, match="too many tokens"):
+        await pipeline.process(
+            InboundMessage(channel="web", sender="u", chat_id="c", content="当前问题"),
+            turn_id="trim-sections",
+        )
 
-    final_payload = str(provider.messages[-1])
-    assert "最近问题" in final_payload
-    assert "最近回答" in final_payload
-    assert "当前问题" in final_payload
+    assert len(provider.messages) == 1
+    final_payload = str(provider.messages[0])
     assert "关键长期记忆" in final_payload
-    assert "用户偏好简洁" not in final_payload
-    assert "当前活跃工具" not in final_payload
-    assert "可裁剪的近期上下文" in final_payload
-    assert "会话环境" not in final_payload
-    assert "可裁剪的自我认知" not in final_payload
+    assert "可裁剪的自我认知" in final_payload
 
 
 @pytest.mark.asyncio
@@ -889,7 +1193,7 @@ async def test_pipeline_context_trimming_is_finite_and_reraises_original_error(
             turn_id="trim-bottom",
         )
 
-    assert provider.calls == 7
+    assert provider.calls == 1
 
 
 @pytest.mark.asyncio
@@ -928,11 +1232,11 @@ async def test_pipeline_context_retry_after_tool_does_not_execute_tool_twice(
         workspace=str(tmp_path),
     )
 
-    result = await pipeline.process(
-        InboundMessage(channel="web", sender="u", chat_id="c", content="调用一次工具"),
-        turn_id="trim-tool",
-    )
+    with pytest.raises(ContextLengthError, match="tool continuation overflow"):
+        await pipeline.process(
+            InboundMessage(channel="web", sender="u", chat_id="c", content="调用一次工具"),
+            turn_id="trim-tool",
+        )
 
-    assert result.content == "工具续轮成功"
     assert tool.calls == 1
-    assert result.context_retry["selected_plan"] == "trim_skills_catalog"
+    assert provider.calls == 2

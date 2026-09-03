@@ -9,11 +9,9 @@ from agent.prompt_block import SectionCache, SystemPromptBuilder, TurnContext, d
 
 
 class Memory:
+    def read_bean(self) -> str: return "# Bean\n你是 BeanAgent。"
     def read_self(self) -> str: return "保持直接"
     def get_memory_context(self) -> str: return "用户是开发者"
-    def read_recent_context(self, session_key: str = "") -> str:
-        assert session_key in {"", "web:c", "web:other"}
-        return "## Compression\n- 项目开发\n\n## Recent Turns\n- [user] 重复消息"
 
 
 class Skills:
@@ -42,14 +40,17 @@ def test_static_prefix_cache_and_dynamic_context_frame_are_separated() -> None:
 
     assert first.messages[0]["role"] == "system"
     assert first.messages[0]["content"] == second.messages[0]["content"]
-    assert "会话近期摘要" in str(first.messages[0]["content"])
-    assert "项目开发" in str(first.messages[0]["content"])
-    assert "重复消息" not in str(first.messages[0]["content"])
+    assert "你是 BeanAgent" not in str(first.messages[0]["content"])
+    assert "会话近期摘要" not in str(first.messages[0]["content"])
     assert {item.name for item in second.debug_breakdown if item.cache_hit} == {
-        "identity", "behavior_rules"
+        "behavior_rules"
     }
     reminder = first.messages[-2]["content"]
     assert reminder.startswith('<system-reminder data-system-context-frame="true">')
+    assert "你是 BeanAgent" in str(reminder)
+    assert "保持直接" in str(reminder)
+    assert "用户是开发者" in str(reminder)
+    assert "## 会话环境" in str(reminder)
     assert "用户偏好中文" in reminder
     assert "项目开发" not in reminder
     assert "重复消息" not in reminder
@@ -106,7 +107,21 @@ def test_envelope_order_is_system_history_reminder_current_message() -> None:
     )
 
 
-def test_recent_context_is_in_system_before_history() -> None:
+def test_checkpoint_summary_is_dynamic_system_message_before_history() -> None:
+    envelope = MessageEnvelopeBuilder().build(
+        history=[{"role": "user", "content": "保留的原文"}],
+        current_message="当前问题",
+        system_prompt="稳定系统提示",
+        checkpoint_summary="## Progress\n已完成第一步",
+        context_frame="",
+    )
+
+    assert [item["role"] for item in envelope] == ["system", "system", "user", "user"]
+    assert "已完成第一步" in str(envelope[1]["content"])
+    assert envelope[2]["content"] == "保留的原文"
+
+
+def test_checkpoint_summary_is_the_only_compaction_context_before_history() -> None:
     assembler = PromptAssembler(
         SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
         MessageEnvelopeBuilder(),
@@ -117,15 +132,16 @@ def test_recent_context_is_in_system_before_history() -> None:
             channel="web",
             chat_id="c",
             memory=Memory(),
+            checkpoint_summary="## Progress\n已完成第一步",
         ),
         history=[{"role": "assistant", "content": "旧回答"}],
         current_message="当前问题",
     )
 
     assert result.messages[0]["role"] == "system"
-    assert "会话近期摘要" in str(result.messages[0]["content"])
-    assert "项目开发" in str(result.messages[0]["content"])
-    assert result.messages[1] == {"role": "assistant", "content": "旧回答"}
+    assert "会话近期摘要" not in str(result.messages[0]["content"])
+    assert "已完成第一步" in str(result.messages[1]["content"])
+    assert result.messages[2] == {"role": "assistant", "content": "旧回答"}
 
 
 def test_stable_behavior_rules_request_chinese_answer_and_reasoning() -> None:

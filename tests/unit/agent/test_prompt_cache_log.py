@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agent.prompt_cache_diagnostics import PromptCacheDiagnostics
 from agent.prompt_cache_log import PromptCacheLogWriter
 
 
@@ -74,3 +75,88 @@ def test_writer_rotates_each_session_independently(tmp_path: Path) -> None:
     assert any(path.name.endswith(".log.1") for path in files)
     assert not any(path.name.endswith(".log.3") for path in files)
     assert all(path.stat().st_size <= 220 for path in files)
+
+
+def test_diagnostics_hashes_canonical_payload_and_isolates_sessions() -> None:
+    diagnostics = PromptCacheDiagnostics()
+    first = diagnostics.observe(
+        "web:a",
+        [
+            {"role": "system", "content": "固定"},
+            {"role": "user", "content": [{"type": "text", "text": "第一轮"}]},
+        ],
+        [{"function": {"name": "echo", "description": "回显"}, "type": "function"}],
+    )
+    second = diagnostics.observe(
+        "web:a",
+        [
+            {"content": "固定", "role": "system"},
+            {"role": "user", "content": [{"text": "第一轮", "type": "text"}]},
+            {"role": "assistant", "content": "完成"},
+        ],
+        [{"type": "function", "function": {"description": "回显", "name": "echo"}}],
+    )
+    other = diagnostics.observe(
+        "web:b",
+        [{"role": "system", "content": "固定"}],
+        [],
+    )
+
+    assert second.canonical_hash != first.canonical_hash
+    assert second.common_prefix_messages == 2
+    assert second.common_prefix_tokens > 0
+    assert other.common_prefix_messages == 0
+
+
+def test_writer_persists_structure_only_diagnostics(tmp_path: Path) -> None:
+    diagnostics = PromptCacheDiagnostics()
+    snapshot = diagnostics.observe(
+        "web:a",
+        [{"role": "system", "content": "固定"}],
+    )
+    writer = PromptCacheLogWriter(tmp_path)
+    path = writer.write(
+        session_key="web:a",
+        turn_id="turn-1",
+        iteration=1,
+        prompt_tokens=10,
+        hit_tokens=5,
+        diagnostics=snapshot,
+    )
+    row = _read_rows(path)[0]
+
+    assert row["canonical_hash"] == snapshot.canonical_hash
+    assert row["epoch_id"] == "default"
+    assert row["message_count"] == 1
+    assert row["common_prefix_messages"] == 0
+    assert "固定" not in json.dumps(row, ensure_ascii=False)
+
+
+def test_header_change_starts_a_new_cache_epoch() -> None:
+    diagnostics = PromptCacheDiagnostics()
+    first = diagnostics.observe(
+        "web:a",
+        [{"role": "system", "content": "固定"}],
+        header={"provider": "fake", "model": "m1", "system": "固定"},
+    )
+    second = diagnostics.observe(
+        "web:a",
+        [{"role": "system", "content": "固定"}, {"role": "user", "content": "新"}],
+        header={"provider": "fake", "model": "m2", "system": "固定"},
+    )
+
+    assert first.epoch_id != second.epoch_id
+    assert second.common_prefix_messages == 0
+    assert second.header_hash
+
+
+def test_diagnostics_can_anchor_request_to_surface_sequence() -> None:
+    diagnostics = PromptCacheDiagnostics()
+    snapshot = diagnostics.observe(
+        "web:a",
+        [{"role": "system", "content": "固定"}],
+        surface_seq=7,
+    )
+
+    assert snapshot.surface_seq == 7
+    assert snapshot.as_log_fields()["surface_seq"] == 7

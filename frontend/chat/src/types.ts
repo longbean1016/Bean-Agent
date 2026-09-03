@@ -21,9 +21,10 @@ export interface ChatMessage {
   turnId?: string;
   streaming?: boolean;
   thinkingStatus?: ThinkingStatus;
-  preparing?: boolean;
   status?: string;
   timestamp?: string;
+  /** 本轮从用户发送到 assistant 完成/中断的前端展示耗时。 */
+  durationMs?: number;
   proactive?: boolean;
   source?: "scheduled_reminder" | "scheduled_soft" | "proactive_conversation";
   scheduledAt?: string;
@@ -36,10 +37,52 @@ export interface ChatState {
   sessionMessages: Record<string, ChatMessage[]>;
   error: string;
   turnStates: Record<string, TurnRuntimeState>;
+  contextUsage: Record<string, ContextUsage>;
+  sessionUsage: Record<string, SessionUsage>;
+}
+
+export interface SessionUsage {
+  totalUncachedInputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+  totalInputTokens: number;
+  cacheHitRate: number | null;
+  totalOutputTokens: number;
+}
+
+export interface ContextUsage {
+  turnId: string;
+  usedTokens: number;
+  pressureTokens?: number;
+  projectedTokens?: number;
+  surfaceTokens?: number;
+  systemTokens?: number;
+  toolsTokens?: number;
+  messageTokens?: number;
+  asOfSeq?: number;
+  modelRuntimeId?: string;
+  model?: string;
+  contextWindow: number;
+  softLimitTokens: number;
+  hardInputTokens: number;
+  contextWindowSource: string;
+  estimateSource: string;
+  breakdown: {
+    system_prompt_tokens: number;
+    tools_tokens: number;
+    conversation_tokens: number;
+    overhead_tokens?: number;
+  };
+  sections: Array<{
+    name: string;
+    estimated_tokens: number;
+    static: boolean;
+    cache_hit: boolean;
+  }>;
 }
 
 export interface TurnRuntimeState {
-  status: "idle" | "submitting" | "queued" | "preparing" | "running";
+  status: "idle" | "submitting" | "queued" | "running" | "compacting";
   queuePosition: number | null;
   turnId: string;
   requestId: string;
@@ -68,6 +111,8 @@ export interface MessageRow {
   tool_chain?: Array<{ calls?: Array<{ call_id?: string; name?: string; arguments?: unknown; result?: string; status?: string }> }>;
   status?: string;
   timestamp?: string;
+  duration_ms?: number;
+  elapsed_ms?: number;
   proactive?: boolean;
   metadata?: Record<string, unknown>;
 }
@@ -87,6 +132,9 @@ export interface TurnNavigationEntry {
   turnIndex?: number;
   question: string;
   preview: string;
+  durationMs?: number;
+  startedAt?: string;
+  endedAt?: string;
 }
 
 export interface UploadedFile {
@@ -138,16 +186,21 @@ export type ChatFrame =
   | { type: "session.created"; request_id: string; session_id: string }
   | { type: "session.updated"; session: SessionSummary }
   | { type: "session.subscribed"; request_id: string; session_id: string }
-  | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message: string; user_media: string[]; content: string; thinking: string; tools: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments: unknown; result_preview: string }>; status: "running" }
+  | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message: string; user_media: string[]; content: string; thinking: string; tools: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments: unknown; result_preview: string }>; started_at?: string; status: "running" }
   | { type: "turn.queued"; request_id: string; session_id: string; position: number }
-  | { type: "turn.preparing"; request_id: string; session_id: string; turn_id: string; user_message: string; user_media: string[] }
   | { type: "turn.started"; request_id?: string; session_id: string; turn_id: string }
+  | { type: "context.compaction.started"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number }
+  | { type: "context.compaction.completed"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number; compacted: boolean }
+  | { type: "context.compaction.failed"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number; message: string }
+  | { type: "context.usage.reset"; session_id: string }
+  | { type: "context.usage.updated"; session_id: string; turn_id: string; used_tokens: number; context_window: number; soft_limit_tokens: number; hard_input_tokens: number; context_window_source: string; estimate_source: string; breakdown: Record<string, number>; sections: Array<{ name: string; estimated_tokens: number; static: boolean; cache_hit: boolean }>; pressure_tokens?: number; projected_tokens?: number; surface_tokens?: number; system_tokens?: number; tools_tokens?: number; message_tokens?: number; as_of_seq?: number; model_runtime_id?: string; model?: string }
+  | { type: "session.usage.updated"; session_id: string; turn_id: string; total_uncached_input_tokens: number; total_cache_read_tokens: number; total_cache_write_tokens: number; total_input_tokens: number; cache_hit_rate: number | null; total_output_tokens: number }
   | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.thinking.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.tool.started"; session_id: string; turn_id: string; call_id: string; tool_name: string; arguments: unknown }
   | { type: "react.tool.completed"; session_id: string; turn_id: string; call_id: string; tool_name: string; status: string; result_preview: string }
   | { type: "message.final"; request_id?: string; session_id: string; turn_id: string; content: string; thinking?: string; media?: string[]; message_id?: string; metadata?: Record<string, unknown> }
-  | { type: "turn.interrupted"; request_id: string; session_id: string; turn_id?: string; status: string; message?: string }
+  | { type: "turn.interrupted"; request_id: string; session_id: string; turn_id?: string; status: string; message?: string; duration_ms?: number; ended_at?: string }
   | { type: "error"; request_id: string; session_id?: string; code?: string; message: string }
   | { type: "pong"; request_id: string };
 

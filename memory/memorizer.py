@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from typing import Any, Protocol
@@ -71,10 +72,17 @@ class Memorizer:
         results: list[str] = []
         for item, vector in zip(items, vectors):
             summary, memory_type, extra, source_ref, happened_at, emotional_weight = item
+            if self._store.has_consolidation_write(source_ref):
+                results.append(f"skipped:{source_ref}")
+                continue
             results.append(await self._save_semantic(
                 summary, memory_type, extra, source_ref, vector,
                 happened_at=happened_at, emotional_weight=emotional_weight,
             ))
+            self._store.record_consolidation_write(
+                source_ref,
+                _write_digest(memory_type, summary),
+            )
         return results
 
     async def merge_item(self, item_id: str, merged_summary: str, extra_patch: dict[str, object] | None = None) -> None:
@@ -108,7 +116,7 @@ class Memorizer:
 
     async def save_from_consolidation(self, history_entry: str, behavior_updates: list[dict[str, object]], source_ref: str, scope_channel: str, scope_chat_id: str, emotional_weight: int = 0) -> None:
         text = str(history_entry or "").strip()
-        if not text or self._store.has_consolidation_source_ref(source_ref):
+        if not text or self._store.has_consolidation_source_ref(source_ref) or self._store.has_consolidation_write(source_ref):
             return
         try:
             embedding = await self._embedder.embed(text)
@@ -119,6 +127,7 @@ class Memorizer:
                 happened_at=parse_happened_at(text), emotional_weight=emotional_weight,
             )
             self._store.record_consolidation_source_ref(source_ref, result.split(":", 1)[1])
+            self._store.record_consolidation_write(source_ref, _write_digest("event", text))
             return
         except Exception as error:
             # consolidation 的单次向量写入失败由 cursor 机制重试，不能写半条事件。
@@ -141,13 +150,14 @@ class Memorizer:
             else [await self._embedder.embed(event[0]) for event in events]
         )
         for (summary, source_ref, scope_channel, scope_chat_id, weight), vector in zip(events, vectors):
-            if self._store.has_consolidation_source_ref(source_ref):
+            if self._store.has_consolidation_source_ref(source_ref) or self._store.has_consolidation_write(source_ref):
                 continue
             result = await self._save_semantic(
                 summary, "event", {"scope_channel": scope_channel, "scope_chat_id": scope_chat_id},
                 source_ref, vector, happened_at=parse_happened_at(summary), emotional_weight=weight,
             )
             self._store.record_consolidation_source_ref(source_ref, result.split(":", 1)[1])
+            self._store.record_consolidation_write(source_ref, _write_digest("event", summary))
 
     async def _save_semantic(
         self,
@@ -202,6 +212,10 @@ def parse_happened_at(summary: str) -> str | None:
     if not match:
         return None
     return f"{match.group('date')}T{match.group('hour') or '00'}:{match.group('minute') or '00'}:{match.group('second') or '00'}"
+
+
+def _write_digest(memory_type: str, summary: str) -> str:
+    return hashlib.sha256(f"{memory_type}\0{summary.strip()}".encode("utf-8")).hexdigest()
 
 
 def _emotional_weight(value: object) -> int:

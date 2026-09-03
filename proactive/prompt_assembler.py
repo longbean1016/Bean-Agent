@@ -7,7 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from agent.prompt_block import (
-    IdentityPromptBlock,
+    BeanPromptBlock,
     LongTermMemoryPromptBlock,
     SelfModelPromptBlock,
     SkillsCatalogPromptBlock,
@@ -73,7 +73,7 @@ def build_proactive_messages(
         skills=skills,
     )
     blocks = [
-        IdentityPromptBlock(),
+        BeanPromptBlock(),
         ProactiveBehaviorRulesBlock(),
         SkillsCatalogPromptBlock(),
         ProactiveDecisionProtocolBlock(),

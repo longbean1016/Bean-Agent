@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from agent.prompt_cache_diagnostics import PromptCacheRequestDiagnostics
+
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
@@ -44,6 +46,7 @@ class PromptCacheLogWriter:
         iteration: int,
         prompt_tokens: int | None,
         hit_tokens: int | None,
+        diagnostics: PromptCacheRequestDiagnostics | None = None,
         timestamp: datetime | None = None,
     ) -> Path:
         """追加一条缓存记录并返回目标文件路径。
@@ -75,6 +78,9 @@ class PromptCacheLogWriter:
                     ),
                 }
             )
+        if diagnostics is not None:
+            # 只写结构摘要，避免把用户正文、动态 frame 或工具结果带入日志。
+            row.update(diagnostics.as_log_fields())
         line = json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
         encoded_size = len(line.encode("utf-8"))
 

@@ -31,7 +31,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { ComponentPropsWithoutRef, ReactNode } from "react";
+import type { ComponentPropsWithoutRef, CSSProperties, ReactNode } from "react";
 import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import type { StickToBottomContext } from "use-stick-to-bottom";
@@ -44,7 +44,7 @@ import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
 import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupSessionsByUpdatedAt } from "./sessionGroups";
-import type { ChatFrame, ChatMessage, ConnectionStatus, MessageRow, ProactiveSettings, ScheduledReminder, SessionSummary, ToolActivity, TurnNavigationEntry } from "./types";
+import type { ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ProactiveSettings, ScheduledReminder, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry } from "./types";
 import { groupMessagesIntoNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
 
@@ -54,6 +54,7 @@ const MAX_ATTACHMENTS = 8;
 const MAX_TEXT_ATTACHMENT_SIZE = 2 * 1024 * 1024;
 const MAX_IMAGE_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const TURN_CONTEXT_BEFORE_MESSAGES = 20;
+const COMPACTION_NOTICE_MIN_MS = 900;
 const IMAGE_SUFFIXES = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
 const TEXT_SUFFIXES = new Set([
   ".txt", ".md", ".markdown", ".py", ".json", ".toml", ".yaml", ".yml",
@@ -196,19 +197,29 @@ export function App() {
   const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
+  const [compactionNotice, setCompactionNotice] = useState({ sessionId: "", visible: false });
   const clientRef = useRef<BeanWebSocketClient | null>(null);
   const stickToBottomRef = useRef<StickToBottomContext | null>(null);
   const chatRef = useRef(chat);
   const messageWindowsRef = useRef(messageWindows);
   const loadingMessageWindowRef = useRef("");
+  const compactionStartedAtRef = useRef<Record<string, number>>({});
+  const compactionNoticeTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const routeSessionRef = useRef(routeSession);
   const sessionLoadVersionsRef = useRef<Record<string, number>>({});
   const reloadSessionRef = useRef<(sessionId: string) => void>(() => undefined);
   chatRef.current = chat;
   messageWindowsRef.current = messageWindows;
   routeSessionRef.current = routeSession;
+
+  useEffect(() => () => {
+    for (const timer of Object.values(compactionNoticeTimersRef.current)) clearTimeout(timer);
+  }, []);
+
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
-  const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "preparing" || currentTurn.status === "running";
+  const currentContextUsage = chat.contextUsage[chat.sessionId];
+  const currentSessionUsage = chat.sessionUsage[chat.sessionId];
+  const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running" || currentTurn.status === "compacting";
   const restoringSession = Boolean(chat.sessionId && loadingSessionId === chat.sessionId && chat.messages.length === 0);
   const displayMessages = useMemo(() => composeTimeline(
     messageWindows[chat.sessionId]?.hasTailWindow === false
@@ -289,6 +300,30 @@ export function App() {
   const handleFrame = useCallback((frame: ChatFrame) => {
     if (handleNotificationFrame(frame)) return;
     dispatch(frame);
+    if (frame.type === "context.compaction.started") {
+      compactionStartedAtRef.current[frame.session_id] = Date.now();
+      const previousTimer = compactionNoticeTimersRef.current[frame.session_id];
+      if (previousTimer) clearTimeout(previousTimer);
+      if (frame.session_id === routeSessionRef.current || frame.session_id === chatRef.current.sessionId) {
+        setCompactionNotice({ sessionId: frame.session_id, visible: true });
+      }
+    }
+    if (frame.type === "context.compaction.completed" || frame.type === "context.compaction.failed") {
+      const startedAt = compactionStartedAtRef.current[frame.session_id] ?? Date.now();
+      const remaining = Math.max(0, COMPACTION_NOTICE_MIN_MS - (Date.now() - startedAt));
+      const hide = () => {
+        delete compactionStartedAtRef.current[frame.session_id];
+        delete compactionNoticeTimersRef.current[frame.session_id];
+        setCompactionNotice((current) => current.sessionId === frame.session_id
+          ? { ...current, visible: false }
+          : current);
+      };
+      if (remaining > 0) {
+        compactionNoticeTimersRef.current[frame.session_id] = setTimeout(hide, remaining);
+      } else {
+        hide();
+      }
+    }
     if (frame.type === "session.created") {
       localStorage.setItem(SESSION_STORAGE_KEY, frame.session_id);
       const createdAt = new Date().toISOString();
@@ -579,6 +614,11 @@ export function App() {
     if (!chat.sessionId) return;
     const scroller = document.querySelector<HTMLElement>(".conversation-scroll");
     if (!scroller) return;
+    const handleWheel = (event: WheelEvent) => {
+      // use-stick-to-bottom 无法从 `hidden auto` shorthand 识别滚动容器，
+      // 首次向上滚动时可能仍被吸底动画覆盖，主动解除锁定保证立即响应。
+      if (event.deltaY < 0) stickToBottomRef.current?.stopScroll();
+    };
     const handleScroll = () => {
       if (scroller.scrollTop <= 48) {
         void loadOlderMessages();
@@ -587,8 +627,12 @@ export function App() {
       const distanceFromBottom = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
       if (distanceFromBottom <= 48) void loadNewerMessages();
     };
+    scroller.addEventListener("wheel", handleWheel, { passive: true });
     scroller.addEventListener("scroll", handleScroll, { passive: true });
-    return () => scroller.removeEventListener("scroll", handleScroll);
+    return () => {
+      scroller.removeEventListener("wheel", handleWheel);
+      scroller.removeEventListener("scroll", handleScroll);
+    };
   }, [chat.sessionId, loadNewerMessages, loadOlderMessages]);
 
   useEffect(() => {
@@ -831,6 +875,10 @@ export function App() {
           files={files}
           input={input}
           sessionId={chat.sessionId}
+          contextUsage={currentContextUsage}
+          sessionUsage={currentSessionUsage}
+          compacting={currentTurn.status === "compacting"
+            || (compactionNotice.sessionId === chat.sessionId && compactionNotice.visible)}
           sending={sending}
           onFiles={(next) => {
             setFiles(next);
@@ -871,7 +919,9 @@ function ConversationAutoScroll({ sessionId, messages, navigating }: {
     if (sessionId && messages.length > 0 && previousSessionRef.current !== sessionId) {
       previousSessionRef.current = sessionId;
       previousRuntimeUserIdRef.current = latestRuntimeUserId;
-      void scrollToBottom({ animation: "instant", ignoreEscapes: true });
+      // 恢复历史时先定位到末尾，但允许用户立即向上滚动；
+      // ignoreEscapes=true 会在虚拟列表测量期间吞掉首个滚轮事件。
+      void scrollToBottom({ animation: "instant" });
       return;
     }
 
@@ -1276,9 +1326,43 @@ function ThemeControl({ value, onChange }: { value: ThemePreference; onChange: (
   );
 }
 
-function MessageView({ message, navigationTurnId }: { message: ChatMessage; navigationTurnId: string }) {
+function MessageView({ message, navigationTurnId, turnDurationMs }: {
+  message: ChatMessage;
+  navigationTurnId: string;
+  turnDurationMs?: number;
+}) {
   const isUser = message.role === "user";
   const parsed = useMemo(() => parseMemoryCitations(message.content), [message.content]);
+  const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyText = isUser || message.content !== "[用户已停止生成]" ? message.content : "";
+  const assistantComplete = !isUser
+    && !message.streaming
+    && message.status !== "interrupted"
+    && message.status !== "error"
+    && Boolean(copyText.trim());
+  const messageTime = formatMessageTime(message.timestamp);
+  const duration = !isUser ? formatDuration(message.durationMs ?? turnDurationMs) : null;
+  const metaClassName = isUser
+    ? "message-meta user-message-meta"
+    : `message-meta assistant-message-meta${assistantComplete ? " assistant-message-meta-complete" : ""}`;
+  const handleCopy = useCallback(async () => {
+    if (!copyText || !navigator.clipboard?.writeText) return;
+    try {
+      await navigator.clipboard.writeText(copyText);
+      setCopied(true);
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => {
+        copyTimerRef.current = null;
+        setCopied(false);
+      }, 1200);
+    } catch {
+      // 剪贴板权限失败不应改变消息内容或打断滚动。
+    }
+  }, [copyText]);
+  useEffect(() => () => {
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+  }, []);
   // Streamdown 在 isAnimating 期间会禁用复制和全屏按钮。Mermaid fence 一旦
   // 闭合就已经具备稳定源码，应立即放开查看大图，而不必等待 final 帧。
   const markdownAnimating = Boolean(message.streaming && !containsClosedMermaidFence(message.content));
@@ -1287,9 +1371,11 @@ function MessageView({ message, navigationTurnId }: { message: ChatMessage; navi
     <article
       className={`message ${isUser ? "user-message" : "assistant-message"}`}
       data-turn-anchor={isUser ? navigationTurnId : undefined}
+      tabIndex={0}
     >
-      <div className="message-label">{isUser ? "你" : "BeanAgent"}</div>
+      {!isUser ? <div className="message-label">BeanAgent</div> : null}
       <div className="message-body">
+        {isUser ? <div className="message-label user-message-label">你</div> : null}
         {!isUser && message.source ? <MessageSourceBadge message={message} /> : null}
         {message.media.length ? <AttachmentGallery paths={message.media} /> : null}
         {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} status={message.thinkingStatus} /> : null}
@@ -1309,12 +1395,66 @@ function MessageView({ message, navigationTurnId }: { message: ChatMessage; navi
               {prepareMessageMarkdown(parsed.markdown)}
             </Streamdown>
           </div>
-        ) : message.preparing ? <span className="queue-status" role="status">正在整理会话上下文...</span> : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
+        ) : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
+        {isUser && (messageTime || Boolean(copyText.trim())) ? (
+          <div className={metaClassName}>
+            {messageTime ? <time dateTime={message.timestamp}>{messageTime}</time> : null}
+            {copyText.trim() ? (
+              <button
+                type="button"
+                className="message-copy-button"
+                aria-label={copied ? "已复制" : "复制问题"}
+                title={copied ? "已复制" : "复制问题"}
+                onClick={handleCopy}
+              >
+                {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
         {!isUser && parsed.citations.length ? <MemoryCitationList citations={parsed.citations} /> : null}
         {!isUser && message.status === "interrupted" ? <span className="interrupted-label">已停止</span> : null}
+        {!isUser && (messageTime || duration || assistantComplete) ? (
+          <div className={metaClassName}>
+            {assistantComplete ? (
+              <button
+                type="button"
+                className="message-copy-button"
+                aria-label={copied ? "已复制" : "复制回答"}
+                title={copied ? "已复制" : "复制回答"}
+                onClick={handleCopy}
+              >
+                {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+              </button>
+            ) : null}
+            {messageTime ? <time dateTime={message.timestamp}>{messageTime}{duration ? ` · ${duration}` : ""}</time> : null}
+          </div>
+        ) : null}
       </div>
     </article>
   );
+}
+
+function formatMessageTime(timestamp?: string): string | null {
+  if (!timestamp) return null;
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return null;
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${month}月${day}日 ${hours}:${minutes}`;
+}
+
+function formatDuration(durationMs?: number): string | null {
+  if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs < 0) return null;
+  if (durationMs < 1000) return "用时不到1秒";
+  return `用时${Math.max(1, Math.round(durationMs / 1000))}秒`;
+}
+
+function deriveTurnDuration(messages: ChatMessage[]): number | undefined {
+  const assistant = messages.find((message) => message.role === "assistant");
+  return assistant?.durationMs;
 }
 
 function MessageSourceBadge({ message }: { message: ChatMessage }) {
@@ -1432,7 +1572,7 @@ function AttachmentGallery({ paths }: { paths: string[] }) {
 }
 
 function Composer(props: {
-  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "preparing" | "running"; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string;
+  input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running" | "compacting"; compacting: boolean; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string; contextUsage?: ContextUsage; sessionUsage?: SessionUsage;
   onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
@@ -1705,7 +1845,14 @@ function Composer(props: {
           disabled={!props.connected}
           rows={2}
         />
+        {props.compacting ? (
+          <div className="compaction-notice" role="status" aria-live="polite">
+            <RefreshCw size={15} aria-hidden="true" />
+            <span>正在压缩上下文</span>
+          </div>
+        ) : null}
         <div className="composer-actions">
+          <ContextUsageIndicator usage={props.contextUsage} compacting={props.compacting} />
           <label className="icon-button composer-tool-button attach-button" title="添加文本或图片">
             <Paperclip size={18} /><span className="sr-only">添加附件</span>
             <input type="file" multiple accept={ATTACHMENT_ACCEPT} onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />
@@ -1737,9 +1884,103 @@ function Composer(props: {
           )}
         </div>
       </div>
+      <SessionUsageStats usage={props.sessionUsage} />
       </footer>
     </>
   );
+}
+
+function SessionUsageStats({ usage }: { usage?: SessionUsage }) {
+  if (!usage || (usage.totalInputTokens <= 0 && usage.totalOutputTokens <= 0)) return null;
+  const hitRate = usage.totalInputTokens > 0 && usage.cacheHitRate !== null
+    ? `${Math.round(usage.cacheHitRate * 100)}%`
+    : "-";
+  const detail = `累计输入 ${usage.totalInputTokens.toLocaleString()} token（未缓存 ${usage.totalUncachedInputTokens.toLocaleString()}，缓存读取 ${usage.totalCacheReadTokens.toLocaleString()}）\n累计输出 ${usage.totalOutputTokens.toLocaleString()} token`;
+  return (
+    <div className="session-usage-stats" title={detail} aria-label={detail}>
+      <span>缓存命中 {hitRate}</span><span aria-hidden="true">|</span>
+      <span>输入 {formatTokenCount(usage.totalInputTokens)} token</span><span aria-hidden="true">·</span>
+      <span>输出 {formatTokenCount(usage.totalOutputTokens)} token</span>
+    </div>
+  );
+}
+
+export function ContextUsageIndicator({ usage, compacting }: { usage?: ContextUsage; compacting: boolean }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointerDown = (event: PointerEvent) => {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const contextWindow = usage?.contextWindow ?? 0;
+  const usedTokens = usage?.usedTokens ?? 0;
+  const known = Boolean(usage && contextWindow > 0 && usage.pressureTokens !== undefined);
+  // DSH 只在真实 pressure 与模型容量同时存在时显示圆圈，避免估算值伪装成供应商用量。
+  if (!known) return null;
+  const percent = Math.min(100, Math.max(0, Math.round((usedTokens / contextWindow) * 100)));
+  const level = percent >= 90 ? "danger" : percent >= 74 ? "warning" : "normal";
+  const label = `上下文已用 ${percent}%`;
+  const style = { "--usage-progress": `${percent}%` } as CSSProperties;
+  const breakdown = usage?.breakdown;
+
+  return (
+    <div ref={rootRef} className={`context-usage-indicator ${level}${compacting ? " compacting" : ""}${open ? " open" : ""}`}>
+      <button
+        type="button"
+        className="context-usage-button"
+        style={style}
+        aria-label={label}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className="context-usage-ring" aria-hidden="true"><span /></span>
+      </button>
+      <span className="context-usage-tooltip" role="tooltip">{label}</span>
+      {open ? (
+        <div className="context-usage-popover" role="dialog" aria-label="上下文占用详情">
+          <div className="context-usage-popover-header">
+            <strong>上下文占用</strong>
+            <span>~{formatTokenCount(usedTokens)} / {formatTokenCount(contextWindow)}</span>
+          </div>
+          <div className="context-usage-meter" aria-label={label}>
+            <span style={{ width: `${percent}%` }} />
+          </div>
+          {compacting ? <p className="context-usage-state">正在压缩上下文，当前数值保持不变</p> : null}
+          {breakdown ? (
+            <dl className="context-usage-breakdown">
+              <div><dt>系统提示词</dt><dd>{formatTokenCount(breakdown.system_prompt_tokens)}</dd></div>
+              <div><dt>工具</dt><dd>{formatTokenCount(breakdown.tools_tokens)}</dd></div>
+              <div><dt>对话消息</dt><dd>{formatTokenCount(breakdown.conversation_tokens)}</dd></div>
+            </dl>
+          ) : <p className="context-usage-empty">等待本轮上下文估算</p>}
+          <small className="context-usage-source">
+            {usage?.estimateSource === "provider_usage" ? "Provider usage" : usage?.estimateSource === "provider_projected" ? "投影值" : "估算值"}
+            {" · "}{usage?.contextWindowSource || "unknown"}
+          </small>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function formatTokenCount(value: number): string {
+  const count = Math.max(0, Math.round(value));
+  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(count >= 10_000_000 ? 0 : 1).replace(/\.0$/, "")}M`;
+  if (count >= 1_000) return `${(count / 1_000).toFixed(count >= 100_000 ? 0 : 1).replace(/\.0$/, "")}K`;
+  return String(count);
 }
 
 function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositioned }: {
@@ -1794,6 +2035,7 @@ function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositio
     >
       {virtualizer.getVirtualItems().map((item) => {
         const group = groups[item.index];
+        const turnDurationMs = deriveTurnDuration(group.messages);
         return (
           <section
             key={item.key}
@@ -1804,7 +2046,12 @@ function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositio
             style={{ transform: `translateY(${item.start}px)` }}
           >
             {group.messages.map((message) => (
-              <MessageView key={message.id} message={message} navigationTurnId={group.navigationTurnId} />
+              <MessageView
+                key={message.id}
+                message={message}
+                navigationTurnId={group.navigationTurnId}
+                turnDurationMs={turnDurationMs}
+              />
             ))}
           </section>
         );

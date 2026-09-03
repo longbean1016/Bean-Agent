@@ -175,38 +175,6 @@ CONSOLIDATION_EVENTS_TOOL: dict[str, Any] = {
 }
 
 
-RECENT_CONTEXT_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "submit_recent_context",
-        "description": (
-            "提交当前会话的近期语境压缩结果。完成分析后必须且只能调用一次；"
-            "每个类别没有内容时传空数组。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "active_topics": {"type": "array", "items": {"type": "string"}, "description": "用户最近持续关注的话题，最多 3 条。"},
-                "user_preferences": {"type": "array", "items": {"type": "string"}, "description": "用户近期明确表达的偏好或要求，最多 3 条。"},
-                "follow_ups": {"type": "array", "items": {"type": "string"}, "description": "后续适合自然续接的话题，最多 3 条。"},
-                "avoidances": {"type": "array", "items": {"type": "string"}, "description": "用户明确要求避免或不想讨论的方向，最多 3 条。"},
-                "dormant_threads": {"type": "array", "items": {"type": "string"}, "description": "已离开主线但仍可能被回头追问的话题，最多 5 条。"},
-                "ongoing_threads": {"type": "array", "items": {"type": "string"}, "description": "对用户现实生活仍有持续影响的重要线索，最多 3 条。"},
-            },
-            "required": [
-                "active_topics",
-                "user_preferences",
-                "follow_ups",
-                "avoidances",
-                "dormant_threads",
-                "ongoing_threads",
-            ],
-            "additionalProperties": False,
-        },
-    },
-}
-
-
 IMPLICIT_MEMORY_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -284,7 +252,6 @@ IMPLICIT_MEMORY_TOOL: dict[str, Any] = {
 __all__ = [
     "CONSOLIDATION_EVENTS_TOOL",
     "IMPLICIT_MEMORY_TOOL",
-    "RECENT_CONTEXT_TOOL",
     "StructuredOutputError",
     "complete_forced_function",
 ]
