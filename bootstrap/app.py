@@ -15,7 +15,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, WebSocket
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
 
@@ -42,6 +42,21 @@ from bootstrap.native_folder_picker import (
 )
 from memory.embedder import Embedder
 from memory.engine import MemoryEngine
+from model_settings.adapters import AdapterRegistry
+from model_settings.catalog import ModelCatalogService
+from model_settings.catalog import CatalogUpdateError
+from model_settings.discovery import (
+    ModelAuthenticationError,
+    ModelDiscoveryError,
+    ModelDiscoveryTimeout,
+    ModelDiscoveryUnsupported,
+    OpenAIModelDiscovery,
+)
+from model_settings.models import ModelRoute
+from model_settings.provider_manager import ProviderManager
+from model_settings.secrets import SecretStore, SecretStoreError, create_system_secret_store
+from model_settings.service import ModelSettingsNotFound, ModelSettingsService, ModelSettingsValidationError
+from model_settings.store import ModelSettingsConflict, ModelSettingsStore
 from proactive.agent_tools import ProactiveToolFactory
 from proactive.chat_loop import ProactiveChatLoop
 from proactive.models import SessionProactiveSettings
@@ -177,13 +192,19 @@ class AppRuntime:
             session_usage_loader=lambda session_key: asyncio.to_thread(
                 core.sessions.store.get_session_usage, session_key
             ),
-            context_runtime_id=str(getattr(core.provider, "runtime_id", "") or ""),
             sandbox_loader=lambda session_key: asyncio.to_thread(
                 core.sessions.store.get_session_sandbox, session_key
             ),
             sandbox_mode_writer=core.sessions.set_sandbox_mode,
             workspace_writer=core.sessions.set_workspace,
             approvals=core.sandbox_approvals,
+            # 页面模型可按会话切换，WebChannel 不能再用启动 Provider 身份过滤快照。
+            context_runtime_id="",
+            route_resolver=lambda session_key, requested: core.provider_manager.freeze(
+                core.model_settings,
+                session_key=session_key,
+                requested=(ModelRoute(**requested) if requested is not None else None),
+            ).metadata(),
         )
         self.maintenance = (
             MemoryMaintenanceLoop(
@@ -242,7 +263,9 @@ class AppRuntime:
             await _cleanup_step("sessions.close", self.core.sessions.close)
             if self.core.vision_provider is not None:
                 await _cleanup_step("vision_provider.close", self.core.vision_provider.close)
+            await _cleanup_step("provider_manager.close", self.core.provider_manager.close)
             await _cleanup_step("provider.close", self.core.provider.close)
+            await _cleanup_step("model_settings_store.close", asyncio.to_thread, self.core.model_store.close)
 
 
 async def _cleanup_step(name: str, callback: Any, *args: Any) -> None:
@@ -279,6 +302,9 @@ class CoreRuntime:
     sandbox_approvals: ApprovalCoordinator
     sandbox_guard: SandboxGuard
     sandbox_runtime: SandboxProcessRuntime
+    model_store: ModelSettingsStore
+    model_settings: ModelSettingsService
+    provider_manager: ProviderManager
     vision_provider: Any | None = None
 
 
@@ -288,6 +314,7 @@ def build_core_runtime(
     *,
     provider: Any | None = None,
     embedder: Any | None = None,
+    model_secret_store: SecretStore | None = None,
 ) -> CoreRuntime:
     """按依赖方向构造核心组件，不启动任务或监听端口。"""
 
@@ -316,6 +343,16 @@ def build_core_runtime(
     sandbox_guard = SandboxGuard(sandbox_policy, sandbox_approvals)
     sandbox_runtime = SandboxProcessRuntime(sandbox_policy)
     mutation_broker = FilesystemMutationBroker(sandbox_policy, sandbox_runtime)
+    model_store = ModelSettingsStore(root / "model-settings.db")
+    secrets = model_secret_store or create_system_secret_store()
+    model_settings = ModelSettingsService(
+        model_store,
+        secrets,
+        OpenAIModelDiscovery(),
+        ModelCatalogService(root / "catalog" / "models-dev-catalog.json"),
+    )
+    _import_legacy_model_settings(model_settings, config)
+    provider_manager = ProviderManager(model_store, secrets, AdapterRegistry(), config.llm)
 
     memory: MemoryEngine | None = None
     actual_embedder = embedder
@@ -398,6 +435,7 @@ def build_core_runtime(
         multimodal=config.llm.multimodal,
         vl_available=vision_provider is not None,
         sandbox_guard=sandbox_guard,
+        provider_manager=provider_manager,
     )
     agent_loop = AgentLoop(
         messages,
@@ -448,8 +486,48 @@ def build_core_runtime(
         sandbox_approvals=sandbox_approvals,
         sandbox_guard=sandbox_guard,
         sandbox_runtime=sandbox_runtime,
+        model_store=model_store,
+        model_settings=model_settings,
+        provider_manager=provider_manager,
         vision_provider=vision_provider,
     )
+
+
+def _import_legacy_model_settings(settings: ModelSettingsService, config: Config) -> None:
+    """首次启动可导入 TOML 主模型；失败时保留 legacy Provider 可用。"""
+
+    if settings.store.list_connections() or not config.llm.api_key or not config.llm.model:
+        return
+    base_url = str(config.llm.base_url or "").strip()
+    if not base_url and config.llm.provider.lower() == "openai":
+        base_url = "https://api.openai.com/v1"
+    if not base_url:
+        return
+    text = f"{config.llm.provider} {base_url} {config.llm.model}".lower()
+    adapter = (
+        "deepseek" if "deepseek" in text
+        else "qwen_dashscope" if "qwen" in text or "dashscope" in text
+        else "generic_openai"
+    )
+    try:
+        connection = settings.create_connection({
+            "name": "原配置模型",
+            "provider": config.llm.provider,
+            "base_url": base_url,
+            "api_key": config.llm.api_key,
+            "default_adapter": adapter,
+        })
+        model = settings.save_manual_model(connection["id"], {
+            "model_id": config.llm.model,
+            "display_name": config.llm.model,
+            "context_window": config.llm.context_window or None,
+            "max_output_tokens": config.llm.max_tokens,
+            "supports_vision": config.llm.multimodal,
+            "adapter": adapter,
+        })
+        settings.set_route(ModelRoute(connection["id"], model["model_id"]))
+    except Exception as error:
+        logger.warning("导入原模型配置失败，将继续使用启动配置: %s", type(error).__name__)
 
 
 def create_fastapi_app(
@@ -477,6 +555,7 @@ def create_fastapi_app(
     app.state.core_runtime = application.core
     app.state.app_runtime = application
     app.state.web_channel = channel
+    settings = application.core.model_settings
     project_root = Path(__file__).resolve().parent.parent
     static_dir = project_root / "static" / "chat"
     index_file = static_dir / "index.html"
@@ -487,6 +566,124 @@ def create_fastapi_app(
         StaticFiles(directory=static_dir, check_dir=False),
         name="chat_assets",
     )
+
+    def settings_error(status: int, code: str, error: Exception) -> JSONResponse:
+        return JSONResponse(status_code=status, content={"code": code, "detail": str(error)})
+
+    app.add_exception_handler(
+        ModelSettingsValidationError,
+        lambda _request, error: settings_error(400, "invalid_settings", error),
+    )
+    app.add_exception_handler(
+        ModelSettingsNotFound,
+        lambda _request, error: settings_error(404, "settings_not_found", error),
+    )
+    app.add_exception_handler(
+        ModelSettingsConflict,
+        lambda _request, error: settings_error(409, "settings_conflict", error),
+    )
+    app.add_exception_handler(
+        SecretStoreError,
+        lambda _request, error: settings_error(503, "secret_store_unavailable", error),
+    )
+    app.add_exception_handler(
+        ModelAuthenticationError,
+        lambda _request, error: settings_error(401, error.code, error),
+    )
+    app.add_exception_handler(
+        ModelDiscoveryTimeout,
+        lambda _request, error: settings_error(504, error.code, error),
+    )
+    app.add_exception_handler(
+        ModelDiscoveryUnsupported,
+        lambda _request, error: settings_error(422, error.code, error),
+    )
+    app.add_exception_handler(
+        ModelDiscoveryError,
+        lambda _request, error: settings_error(502, error.code, error),
+    )
+    app.add_exception_handler(
+        CatalogUpdateError,
+        lambda _request, error: settings_error(502, "catalog_update_failed", error),
+    )
+
+    @app.get("/api/settings")
+    async def get_model_settings() -> dict[str, Any]:
+        route = settings.get_route()
+        return {
+            "connections": settings.list_connections(),
+            "default_route": route.public_dict() if route else None,
+            "catalog": settings.store.get_catalog_state(),
+        }
+
+    @app.post("/api/settings/connections", status_code=201)
+    async def create_model_connection(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return settings.create_connection(payload)
+
+    @app.put("/api/settings/connections/{connection_id}")
+    async def update_model_connection(
+        connection_id: str, payload: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        return settings.update_connection(connection_id, payload)
+
+    @app.delete("/api/settings/connections/{connection_id}", status_code=204)
+    async def delete_model_connection(connection_id: str) -> Response:
+        settings.delete_connection(connection_id)
+        return Response(status_code=204)
+
+    @app.post("/api/settings/connections/{connection_id}/test")
+    async def test_model_connection(connection_id: str) -> dict[str, Any]:
+        return await settings.test_connection(connection_id)
+
+    @app.post("/api/settings/connections/{connection_id}/models/refresh")
+    async def refresh_connection_models(connection_id: str) -> dict[str, Any]:
+        return {"items": await settings.discover_models(connection_id)}
+
+    @app.post("/api/settings/connections/{connection_id}/models", status_code=201)
+    async def create_manual_model(
+        connection_id: str, payload: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        return settings.save_manual_model(connection_id, payload)
+
+    @app.patch("/api/settings/connections/{connection_id}/models/{model_id:path}")
+    async def update_connection_model(
+        connection_id: str, model_id: str, payload: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        return settings.update_model(connection_id, model_id, payload)
+
+    @app.get("/api/settings/routes/default")
+    async def get_default_model_route() -> dict[str, Any]:
+        route = settings.get_route()
+        return {"route": route.public_dict() if route else None}
+
+    @app.put("/api/settings/routes/default")
+    async def set_default_model_route(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        route = settings.set_route(ModelRoute(
+            str(payload.get("connection_id") or ""),
+            str(payload.get("model_id") or ""),
+            str(payload.get("reasoning_effort") or "") or None,
+        ))
+        return {"route": route.public_dict()}
+
+    @app.get("/api/settings/routes/session/{session_key:path}")
+    async def get_session_model_route(session_key: str) -> dict[str, Any]:
+        route = settings.get_route(session_key)
+        return {"route": route.public_dict() if route else None}
+
+    @app.put("/api/settings/routes/session/{session_key:path}")
+    async def set_session_model_route(
+        session_key: str, payload: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        route = settings.set_route(ModelRoute(
+            str(payload.get("connection_id") or ""),
+            str(payload.get("model_id") or ""),
+            str(payload.get("reasoning_effort") or "") or None,
+        ), session_key=session_key)
+        return {"route": route.public_dict()}
+
+    @app.post("/api/settings/catalog/update")
+    async def update_model_catalog() -> dict[str, Any]:
+        return await settings.update_catalog()
 
     @app.get("/", response_model=None)
     def chat_index() -> FileResponse | dict[str, str]:

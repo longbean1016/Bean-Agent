@@ -157,6 +157,16 @@ class ModelSettingsService:
 
     async def update_catalog(self) -> dict[str, Any]:
         state = await self._catalog.update()
+        for connection in self.store.list_connections():
+            for profile in self.store.list_models(connection.id):
+                enriched = self._catalog.enrich(
+                    profile,
+                    provider=connection.provider,
+                    default_adapter=connection.default_adapter,
+                )
+                if profile.user_overrides:
+                    enriched = enriched.with_overrides(profile.user_overrides)
+                self.store.save_model(enriched)
         self.store.set_catalog_state(updated_at=str(state["updated_at"]))
         return state
 
