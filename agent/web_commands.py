@@ -14,6 +14,8 @@ from agent.message_bus import InboundMessage, MessageBus
 MAX_MESSAGE_LENGTH = 32 * 1024
 MAX_MEDIA_COUNT = 8
 
+RouteResolver = Callable[[str, dict[str, Any] | None], dict[str, Any]]
+
 
 class InterruptController(Protocol):
     async def request_interrupt(self, session_key: str) -> InterruptResult: ...
@@ -52,6 +54,7 @@ class WebCommandService:
         sandbox_mode_writer: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None,
         workspace_writer: Callable[[str, str | None], Awaitable[dict[str, Any]]] | None = None,
         approvals: Any | None = None,
+        route_resolver: RouteResolver | None = None,
     ) -> None:
         self._bus = bus
         self._interrupt = interrupt_controller
@@ -61,6 +64,7 @@ class WebCommandService:
         self._sandbox_mode_writer = sandbox_mode_writer
         self._workspace_writer = workspace_writer
         self._approvals = approvals
+        self._route_resolver = route_resolver
 
     async def create_session(
         self,
@@ -68,6 +72,7 @@ class WebCommandService:
         workspace_id: str | None = None,
         sandbox_mode: str = "read-only",
         risk_confirmed: bool = False,
+        model_route: object = None,
     ) -> str:
         """先持久化空会话，使创建响应后的查询不会短暂返回 404。"""
 
@@ -104,6 +109,21 @@ class WebCommandService:
         if not self._media_is_allowed(attachments):
             raise WebCommandError("invalid_media", "附件路径无效或不属于当前 workspace")
 
+        metadata: dict[str, Any] = {"request_id": request_id}
+        if self._route_resolver is not None:
+            if model_route is not None and not isinstance(model_route, dict):
+                raise WebCommandError("invalid_model_route", "模型路由格式无效")
+            requested: dict[str, Any] | None = None
+            if isinstance(model_route, dict):
+                # 只允许连接、模型和思考强度穿过消息边界，密钥等敏感字段由服务端解析。
+                requested = {
+                    "connection_id": str(model_route.get("connection_id") or "").strip(),
+                    "model_id": str(model_route.get("model_id") or "").strip(),
+                    "reasoning_effort": str(model_route.get("reasoning_effort") or "").strip() or None,
+                }
+                if not requested["connection_id"] or not requested["model_id"]:
+                    raise WebCommandError("invalid_model_route", "请选择有效模型")
+
         session_key = normalize_web_session_id(session_id)
         created_session = session_key is None
         if session_key is None:
@@ -114,13 +134,18 @@ class WebCommandService:
                 risk_confirmed=risk_confirmed,
             )
         chat_id = session_key.split(":", 1)[1]
+        if self._route_resolver is not None:
+            try:
+                metadata["model_route"] = self._route_resolver(session_key, requested)
+            except (LookupError, ValueError, RuntimeError) as error:
+                raise WebCommandError("invalid_model_route", str(error)) from error
         message = InboundMessage(
             "web",
             "web",
             chat_id,
             content,
             attachments,
-            {"request_id": request_id},
+            metadata,
         )
         return PreparedWebMessage(session_key, request_id, created_session, message)
 
@@ -247,6 +272,7 @@ def normalize_web_session_id(value: object) -> str | None:
 
 __all__ = [
     "InterruptController",
+    "RouteResolver",
     "PreparedWebMessage",
     "WebCommandError",
     "WebCommandService",

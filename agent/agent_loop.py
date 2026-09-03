@@ -284,6 +284,9 @@ class AgentLoop:
             "user", message.content, media=message.media, **user_fields,
         )
         assistant_metadata: dict[str, Any] = {"context_retry": context_retry}
+        route_metadata = _public_model_route(message.metadata.get("model_route"))
+        if route_metadata:
+            assistant_metadata["model_route"] = route_metadata
         if duration_ms is not None:
             assistant_metadata["duration_ms"] = duration_ms
         assistant_fields: dict[str, Any] = {
@@ -326,6 +329,7 @@ class AgentLoop:
                 "request_id": request_id,
                 "status": "ok",
                 "context_retry": context_retry,
+                **({"model_route": route_metadata} if route_metadata else {}),
                 **({"duration_ms": duration_ms} if duration_ms is not None else {}),
                 **({"generated_at": turn_ended_at} if turn_ended_at else {}),
             },
@@ -1074,6 +1078,18 @@ def _duration_value(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return duration if duration >= 0 else None
+
+
+def _public_model_route(value: object) -> dict[str, Any]:
+    """移除仅供进程内 lease 查找的键，再写入消息和 WebSocket。"""
+
+    if not isinstance(value, dict):
+        return {}
+    allowed = {
+        "connection_id", "connection_revision", "model_id", "model_revision",
+        "adapter", "reasoning_effort", "model_runtime_id",
+    }
+    return {key: value[key] for key in allowed if key in value}
 
 
 def _elapsed_duration_ms(started_at: str, ended_at: str) -> int | None:
