@@ -145,7 +145,15 @@ class WebChannel:
             return
         if frame_type == "turn.stop" and session_key is not None:
             result = await self._interrupt.request_interrupt(session_key)
-            await self._send_json(websocket, {"type": "turn.interrupted", "request_id": request_id, "session_id": session_key, "turn_id": result.turn_id, "status": result.status})
+            await self._send_json(websocket, {
+                "type": "turn.interrupted",
+                "request_id": request_id,
+                "session_id": session_key,
+                "turn_id": result.turn_id,
+                "status": result.status,
+                **({"duration_ms": result.duration_ms} if result.duration_ms is not None else {}),
+                **({"ended_at": result.ended_at} if result.ended_at else {}),
+            })
             return
         await self._error(websocket, request_id, "invalid_frame", f"不支持的帧类型: {frame_type or 'empty'}")
 

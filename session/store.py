@@ -218,6 +218,12 @@ class SessionStore:
             events.extend(self._decode_chunk_row(row))
         return sorted(events, key=lambda item: int(item["event_seq"]))
 
+    def get_turn_timing(self, session_key: str, turn_id: str) -> dict[str, Any]:
+        """从持久化 turn 边界恢复真实起止时间和耗时。"""
+
+        key = self._validate_session_key(session_key)
+        return turn_timing_from_events(self.fetch_session_events(key), turn_id)
+
     def load_surface(
         self,
         session_key: str,
@@ -595,6 +601,12 @@ class SessionStore:
                   AND NOT EXISTS (
                       SELECT 1 FROM surface_events WHERE session_key = sessions.key
                   )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_events WHERE session_key = sessions.key
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_chunk_rows WHERE session_key = sessions.key
+                  )
                 """,
                 (key,),
             )
@@ -752,19 +764,32 @@ class SessionStore:
                 (key,),
             ).fetchall()
         turns: list[dict[str, Any]] = []
+        events = self.fetch_session_events(key)
+        timing_by_turn: dict[str, dict[str, Any]] = {}
+        for event in events:
+            event_turn_id = str(event.get("turn_id") or "")
+            if not event_turn_id or event_turn_id in timing_by_turn:
+                continue
+            timing_by_turn[event_turn_id] = turn_timing_from_events(events, event_turn_id)
         for index, row in enumerate(rows, start=1):
             message = self._row_to_message(row)
+            turn_id = str(message.get("turn_id") or message["id"])
+            timing = timing_by_turn.get(turn_id, {})
             question = " ".join(str(message.get("content") or "").split()) or "附件消息"
             preview = question[:80].rstrip()
-            turns.append({
-                "id": str(message.get("turn_id") or message["id"]),
+            turn = {
+                "id": turn_id,
                 "message_id": message["id"],
                 "seq": int(message["seq"]),
                 "turn_index": index,
                 "question": question[:240].rstrip(),
                 "preview": preview,
                 "timestamp": message["timestamp"],
-            })
+            }
+            for field in ("started_at", "ended_at", "duration_ms", "status"):
+                if timing.get(field) is not None:
+                    turn[field] = timing[field]
+            turns.append(turn)
         return turns
 
     def get_last_chat_message_timestamp(self, session_key: str) -> str | None:
@@ -1870,9 +1895,9 @@ class SessionStore:
                 "SELECT metadata FROM sessions WHERE key = ?", (key,)
             ).fetchone()
             existing = _load_json_object(existing_row["metadata"]) if existing_row else {}
-            # 计量快照由独立 writer 更新，Session 缓存可能尚未感知；普通
-            # metadata 保存不得用旧快照覆盖这个保留键。
-            if "context_usage" not in incoming and "context_usage" in existing:
+            # 计量快照只由 save_context_usage() 更新；Session 缓存可能长期持有
+            # 旧快照，普通 metadata upsert 必须始终保留数据库中的最新计量值。
+            if "context_usage" in existing:
                 incoming["context_usage"] = existing["context_usage"]
             payload = json.dumps(incoming, ensure_ascii=False)
             # Consolidation 在后台直接推进 cursor，而 Session 缓存可能仍持有旧值；普通
@@ -2833,6 +2858,85 @@ def _now_iso() -> str:
     # Session 时间直接面向用户和前端展示，显式固定业务时区，避免服务进程
     # 在 UTC 容器或 Windows 时区数据缺失时写出不一致的偏移。
     return datetime.now(_LOCAL_TZ).isoformat()
+
+
+def turn_timing_from_events(
+    events: list[dict[str, Any]],
+    turn_id: str,
+) -> dict[str, Any]:
+    """按 turn/start 和最后一个 turn/end 计算可恢复的 Turn 计时。"""
+
+    key = str(turn_id or "")
+    if not key:
+        return {}
+    matching = [
+        event for event in events
+        if isinstance(event, dict) and str(event.get("turn_id") or "") == key
+    ]
+    starts = [event for event in matching if event.get("event_type") == "turn/start"]
+    ends = [event for event in matching if event.get("event_type") == "turn/end"]
+    if not starts and not ends:
+        return {}
+
+    start = starts[0] if starts else None
+    end = ends[-1] if ends else None
+    start_data = start.get("data") if isinstance(start, dict) else {}
+    end_data = end.get("data") if isinstance(end, dict) else {}
+    start_data = start_data if isinstance(start_data, dict) else {}
+    end_data = end_data if isinstance(end_data, dict) else {}
+    started_at = _event_time_value(start, start_data, "started_at")
+    ended_at = _event_time_value(end, end_data, "ended_at")
+    duration_ms: int | None = None
+    if started_at and ended_at:
+        started = _parse_event_datetime(started_at)
+        ended = _parse_event_datetime(ended_at)
+        if started is not None and ended is not None:
+            duration_ms = max(0, int(round((ended - started).total_seconds() * 1000)))
+    if duration_ms is None:
+        duration_ms = _non_negative_int(end_data.get("duration_ms"))
+
+    result: dict[str, Any] = {}
+    if started_at:
+        result["started_at"] = started_at
+    if ended_at:
+        result["ended_at"] = ended_at
+    if duration_ms is not None:
+        result["duration_ms"] = duration_ms
+    if end is not None and end.get("data"):
+        result["status"] = str(end_data.get("status") or end.get("status") or "") or None
+    return result
+
+
+def _event_time_value(
+    event: dict[str, Any] | None,
+    data: dict[str, Any],
+    field: str,
+) -> str | None:
+    value = str(data.get(field) or "").strip()
+    if value and _parse_event_datetime(value) is not None:
+        return value
+    if event is None:
+        return None
+    created_at = str(event.get("created_at") or "").strip()
+    return created_at if created_at and _parse_event_datetime(created_at) is not None else None
+
+
+def _parse_event_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_LOCAL_TZ)
+    return parsed
+
+
+def _non_negative_int(value: object) -> int | None:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
 
 
 def _select_columns(alias: str) -> str:

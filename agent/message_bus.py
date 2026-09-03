@@ -63,6 +63,11 @@ class PipelineResult:
     # 生产链路使用独立 durable surface 后，语义消息不再携带隐藏模型投影。
     # 旧的测试 Pipeline 未提供 surface 写入器时仍保留默认 False 兼容行为。
     llm_surface_persisted: bool = False
+    # 参考实现按 turn/start 与 turn/end 事件计算真实模型执行耗时；这两个字段
+    # 供 AgentLoop 把同一份计时写入语义消息和最终出站帧。
+    duration_ms: int | None = None
+    turn_started_at: str = ""
+    turn_ended_at: str = ""
 
 
 OutboundCallback: TypeAlias = Callable[[OutboundMessage], Awaitable[None] | None]

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent.config_models import MemoryConfig
+from agent.context_budget import estimate_tokens
 from memory.consolidator import (
     ConsolidationDraft,
     ConsolidationExtractor,
@@ -392,6 +393,12 @@ class MemoryEngine:
         previous_summary = self.read_checkpoint_summary(key)
         conversation = render_source_messages(selected_units)
         summary = await self._summarize_checkpoint(previous_summary, conversation)
+        # 记录压缩后仍会送入模型的摘要与保留尾部，避免 tokens_after 永远为 0，
+        # 也让诊断能区分“历史已归档”和“系统/工具静态开销”。
+        tokens_after = estimate_tokens([
+            {"role": "system", "content": summary},
+            *retained_tail,
+        ])
         now = _now_iso()
         prepare = SessionCompactionPrepare(
             session_key=key,
@@ -433,7 +440,7 @@ class MemoryEngine:
             hard_input_tokens=max(0, context_window - int(getattr(self._provider, "max_tokens", 0) or 0)),
             keep_recent_tokens=keep_recent_tokens,
             tokens_before=max(0, int(estimated_tokens)),
-            tokens_after=0,
+            tokens_after=max(0, int(tokens_after)),
             summary_usage={},
         )
         # 先把不可变 source plan 写入 durable outbox，再推进 checkpoint；worker 只在

@@ -724,9 +724,11 @@ def _append_running_snapshot(
     if any(str(item.get("turn_id") or "") == turn_id for item in items):
         return items
     now = datetime.now().astimezone().isoformat()
+    started_at = str(snapshot.get("started_at") or "").strip() or now
     metadata = {
         "running": True,
         "request_id": str(snapshot.get("request_id") or ""),
+        "started_at": started_at,
     }
     tools = []
     for tool in snapshot.get("tools") or []:
@@ -748,7 +750,7 @@ def _append_running_snapshot(
             "role": "user",
             "content": str(snapshot.get("user_message") or ""),
             "tool_chain": [],
-            "timestamp": now,
+            "timestamp": started_at,
             "turn_id": turn_id,
             "reasoning_content": "",
             "status": "running",

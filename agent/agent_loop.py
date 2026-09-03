@@ -6,8 +6,10 @@ import asyncio
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Protocol
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from agent.event_bus import (
     EventBus,
@@ -25,10 +27,11 @@ from session.model_surface import (
     TOOL_NOT_STARTED_RESULT_CONTENT,
     TOOL_OUTCOME_UNKNOWN_RESULT_CONTENT,
 )
-from session.store import NewSessionEvent, NewSurfaceEvent
+from session.store import NewSessionEvent, NewSurfaceEvent, turn_timing_from_events
 from tools.runtime import serialize_tool_result_messages
 
 logger = logging.getLogger(__name__)
+_LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 INTERRUPTED_ASSISTANT_CONTENT = "[用户已停止生成]"
 
@@ -50,6 +53,8 @@ class InterruptResult:
     status: str
     session_key: str
     turn_id: str = ""
+    duration_ms: int | None = None
+    ended_at: str = ""
 
 
 @dataclass(slots=True)
@@ -71,6 +76,7 @@ class TurnInterruptState:
     llm_epoch_id: str = ""
     llm_surface_messages: list[dict[str, Any]] = field(default_factory=list)
     llm_surface_persisted: bool = False
+    turn_started_at: str = ""
     iteration: int = 0
 
 
@@ -215,7 +221,7 @@ class AgentLoop:
             logger.exception("Agent 推理异常: session_key=%s", message.session_key)
             snapshotter = getattr(self._pipeline, "snapshot_interrupt_state", None)
             snapshot = snapshotter(turn_id) if callable(snapshotter) else {}
-            await self._persist_terminal_turn(
+            terminal_timing = await self._persist_terminal_turn(
                 message,
                 turn_id,
                 "error",
@@ -224,12 +230,32 @@ class AgentLoop:
             )
             await self._bus.publish_outbound(OutboundMessage(
                 message.channel, message.chat_id, f"出错：{error}",
-                metadata={"turn_id": turn_id, "request_id": request_id, "status": "error"},
+                metadata={
+                    "turn_id": turn_id,
+                    "request_id": request_id,
+                    "status": "error",
+                    **({"duration_ms": terminal_timing.get("duration_ms")} if terminal_timing.get("duration_ms") is not None else {}),
+                    **({"generated_at": terminal_timing.get("ended_at")} if terminal_timing.get("ended_at") else {}),
+                },
             ))
             return
 
         session = await self._sessions.get_or_create(message.session_key)
         context_retry = dict(getattr(result, "context_retry", {}) or {})
+        persisted_timing = await self._load_turn_timing(message.session_key, turn_id)
+        duration_ms = _duration_value(getattr(result, "duration_ms", None))
+        if duration_ms is None:
+            duration_ms = _duration_value(persisted_timing.get("duration_ms"))
+        turn_started_at = str(
+            getattr(result, "turn_started_at", "")
+            or persisted_timing.get("started_at")
+            or ""
+        )
+        turn_ended_at = str(
+            getattr(result, "turn_ended_at", "")
+            or persisted_timing.get("ended_at")
+            or ""
+        )
         user_projection: dict[str, Any] = {}
         llm_user_content = getattr(result, "llm_user_content", None)
         if llm_user_content is not None:
@@ -251,18 +277,28 @@ class AgentLoop:
             user_projection["llm_surface_messages"] = deepcopy(
                 [item for item in llm_surface_messages if isinstance(item, dict)]
             )
+        user_fields: dict[str, Any] = {"turn_id": turn_id, **user_projection}
+        if turn_started_at:
+            user_fields["timestamp"] = turn_started_at
         user = session.add_message(
-            "user",
-            message.content,
-            media=message.media,
-            turn_id=turn_id,
-            **user_projection,
+            "user", message.content, media=message.media, **user_fields,
         )
+        assistant_metadata: dict[str, Any] = {"context_retry": context_retry}
+        if duration_ms is not None:
+            assistant_metadata["duration_ms"] = duration_ms
+        assistant_fields: dict[str, Any] = {
+            "turn_id": turn_id,
+            "reasoning_content": result.thinking,
+            "tool_chain": result.tool_chain,
+            "tools_used": result.tools_used,
+            "status": "ok",
+            "metadata": assistant_metadata,
+        }
+        if turn_ended_at:
+            # assistant 的展示时间取 turn/end，而不是消息批量写入完成时间。
+            assistant_fields["timestamp"] = turn_ended_at
         assistant = session.add_message(
-            "assistant", result.content, media=result.media, turn_id=turn_id,
-            reasoning_content=result.thinking, tool_chain=result.tool_chain,
-            tools_used=result.tools_used, status="ok",
-            metadata={"context_retry": context_retry},
+            "assistant", result.content, media=result.media, **assistant_fields,
             # 终答轮单独思考写入 message dict；SessionManager.append_messages
             # 会把不在 fixed_fields 中的键自动归类到 extra，落库到
             # ``extra.final_reasoning_content``。下次 Turn 重建历史时优先读
@@ -290,6 +326,8 @@ class AgentLoop:
                 "request_id": request_id,
                 "status": "ok",
                 "context_retry": context_retry,
+                **({"duration_ms": duration_ms} if duration_ms is not None else {}),
+                **({"generated_at": turn_ended_at} if turn_ended_at else {}),
             },
         ))
     async def _persist_terminal_turn(
@@ -300,7 +338,7 @@ class AgentLoop:
         assistant_content: str,
         *,
         snapshot: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         session = await self._sessions.get_or_create(message.session_key)
         if snapshot and bool(snapshot.get("llm_surface_persisted")):
             # Provider/工具异常也可能留下已发送但未闭合的 tool-call；错误路径
@@ -321,10 +359,19 @@ class AgentLoop:
                         [item for item in snapshot.get("llm_surface_messages") or [] if isinstance(item, dict)]
                     ),
                     llm_surface_persisted=True,
+                    turn_started_at=str(snapshot.get("turn_started_at") or ""),
                     iteration=max(0, int(snapshot.get("iteration") or 0)),
                 ),
                 turn_id,
             )
+        timing = await self._finish_turn_event(
+            message.session_key,
+            turn_id,
+            status=status,
+            step=max(0, int(snapshot.get("iteration") or 0)) if isinstance(snapshot, dict) else 0,
+        )
+        duration_ms = _duration_value(timing.get("duration_ms"))
+        ended_at = str(timing.get("ended_at") or "")
         projection = _model_projection_from_snapshot(snapshot or {})
         partial_tool_chain = snapshot.get("tool_chain_partial") if isinstance(snapshot, dict) else []
         live_tools = snapshot.get("tools") if isinstance(snapshot, dict) else []
@@ -339,34 +386,77 @@ class AgentLoop:
             for call in group.get("calls", [])
             if isinstance(call, dict) and str(call.get("name") or "")
         ))
-        user = session.add_message(
-            "user",
-            message.content,
-            media=message.media,
-            turn_id=turn_id,
-            **projection,
-        )
-        assistant = session.add_message(
-            "assistant",
-            assistant_content,
-            turn_id=turn_id,
-            status=status,
-            tools_used=tools_used,
-            tool_chain=tool_chain,
-        )
+        user_fields: dict[str, Any] = {"turn_id": turn_id, **projection}
+        started_at = str(timing.get("started_at") or "")
+        if started_at:
+            user_fields["timestamp"] = started_at
+        user = session.add_message("user", message.content, media=message.media, **user_fields)
+        assistant_fields: dict[str, Any] = {
+            "turn_id": turn_id,
+            "status": status,
+            "tools_used": tools_used,
+            "tool_chain": tool_chain,
+        }
+        if duration_ms is not None:
+            assistant_fields["metadata"] = {"duration_ms": duration_ms}
+        if ended_at:
+            assistant_fields["timestamp"] = ended_at
+        assistant = session.add_message("assistant", assistant_content, **assistant_fields)
         await self._sessions.append_messages(session, [user, assistant])
-        append_event = getattr(self._sessions, "append_session_event", None)
-        if callable(append_event):
-            await append_event(NewSessionEvent(
-                session_key=message.session_key,
-                event_type="turn/end",
-                turn_id=turn_id,
-                step=max(0, int(snapshot.get("iteration") or 0)) if isinstance(snapshot, dict) else 0,
-                data={"status": status},
-                operation_key=f"{turn_id}:{status}-turn-end",
-            ))
         # error/interrupted 表示推理结果不完整，不发 TurnCommitted，避免记忆模块把错误文本
         # 当作正常 assistant 证据进行归档或隐式提取。
+        return timing
+
+    async def _load_turn_timing(self, session_key: str, turn_id: str) -> dict[str, Any]:
+        fetch_events = getattr(self._sessions, "fetch_session_events", None)
+        if not callable(fetch_events):
+            return {}
+        events = await fetch_events(session_key)
+        return turn_timing_from_events(events, turn_id)
+
+    async def _finish_turn_event(
+        self,
+        session_key: str,
+        turn_id: str,
+        *,
+        status: str,
+        step: int,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """为异常/中断路径补写唯一 turn/end，并返回可展示计时。"""
+
+        timing = await self._load_turn_timing(session_key, turn_id)
+        if timing.get("ended_at"):
+            return timing
+        append_event = getattr(self._sessions, "append_session_event", None)
+        if not callable(append_event):
+            return timing
+        ended_at = datetime.now(_LOCAL_TZ).isoformat()
+        data: dict[str, Any] = {"status": status, "ended_at": ended_at}
+        started_at = str(timing.get("started_at") or "")
+        if started_at:
+            data["started_at"] = started_at
+            duration_ms = _elapsed_duration_ms(started_at, ended_at)
+            if duration_ms is not None:
+                data["duration_ms"] = duration_ms
+        if reason:
+            data["reason"] = reason
+        try:
+            await append_event(NewSessionEvent(
+                session_key=session_key,
+                event_type="turn/end",
+                turn_id=turn_id,
+                step=max(0, int(step)),
+                data=data,
+                # 所有终态共用同一个 key，重复恢复只返回原事件，不制造第二个边界。
+                operation_key=f"{turn_id}:turn-end",
+            ))
+        except ValueError:
+            # 并发恢复可能同时计算出不同的当前时间；已提交的幂等事件才是权威结果。
+            current = await self._load_turn_timing(session_key, turn_id)
+            if not current.get("ended_at"):
+                raise
+        return await self._load_turn_timing(session_key, turn_id)
 
     async def request_interrupt(self, session_key: str) -> InterruptResult:
         task = self._active_tasks.get(session_key)
@@ -394,13 +484,21 @@ class AgentLoop:
                     [item for item in snapshot.get("llm_surface_messages") or [] if isinstance(item, dict)]
                 ),
                 llm_surface_persisted=bool(snapshot.get("llm_surface_persisted")),
+                turn_started_at=str(snapshot.get("turn_started_at") or ""),
                 iteration=max(0, int(snapshot.get("iteration") or 0)),
             )
         result = await self._scheduler.cancel(session_key)
         if result.status == "interrupted" and task is not None and interrupted is not None:
             await asyncio.gather(task, return_exceptions=True)
             await self._persist_interrupted_turn(interrupted, turn_id)
-        return InterruptResult(result.status, session_key, turn_id)
+        timing = await self._load_turn_timing(session_key, turn_id) if turn_id else {}
+        return InterruptResult(
+            result.status,
+            session_key,
+            turn_id,
+            _duration_value(timing.get("duration_ms")),
+            str(timing.get("ended_at") or ""),
+        )
 
     async def _persist_interrupted_turn(self, state: TurnInterruptState, turn_id: str) -> None:
         """立即保存中断轮，避免刷新或进程退出后丢失可见历史。"""
@@ -410,6 +508,14 @@ class AgentLoop:
             return
         if state.llm_surface_persisted:
             await self._repair_durable_surface(state, turn_id)
+        timing = await self._finish_turn_event(
+            state.session_key,
+            turn_id,
+            status="interrupted",
+            step=max(0, self._interrupt_iteration(state)),
+        )
+        duration_ms = _duration_value(timing.get("duration_ms"))
+        ended_at = str(timing.get("ended_at") or "")
         tool_chain = interrupted_tool_chain(state.tool_chain_partial, state.tools)
         has_unfinished_tool = any(
             str(call.get("status") or "") in {"running", "interrupted"}
@@ -438,12 +544,15 @@ class AgentLoop:
                     and str(item.get("status") or "") in {"running", "completed", "error"}
                 },
             )
-        user = session.add_message(
-            "user",
-            state.original_user_message,
-            media=state.original_media,
-            turn_id=turn_id,
+        user_fields: dict[str, Any] = {
+            "turn_id": turn_id,
             **projection,
+        }
+        started_at = str(timing.get("started_at") or state.turn_started_at or "")
+        if started_at:
+            user_fields["timestamp"] = started_at
+        user = session.add_message(
+            "user", state.original_user_message, media=state.original_media, **user_fields,
         )
         assistant = session.add_message(
             "assistant",
@@ -452,6 +561,8 @@ class AgentLoop:
             status="interrupted",
             tools_used=tools_used,
             tool_chain=tool_chain,
+            **({"metadata": {"duration_ms": duration_ms}} if duration_ms is not None else {}),
+            **({"timestamp": ended_at} if ended_at else {}),
             interrupted_display_content=state.partial_reply,
             interrupted_display_reasoning=state.partial_thinking or "",
             # 模型可能先输出过渡正文、随后才返回 tool_calls，不能仅凭 partial_reply
@@ -464,16 +575,6 @@ class AgentLoop:
         )
         # 中断轮不发 TurnCommitted，避免未完成内容参与长期记忆提取。
         await self._sessions.append_messages(session, [user, assistant])
-        append_event = getattr(self._sessions, "append_session_event", None)
-        if callable(append_event):
-            await append_event(NewSessionEvent(
-                session_key=state.session_key,
-                event_type="turn/end",
-                turn_id=turn_id,
-                step=max(0, self._interrupt_iteration(state)),
-                data={"status": "interrupted"},
-                operation_key=f"{turn_id}:interrupt-turn-end",
-            ))
 
     async def _repair_durable_surface(
         self,
@@ -705,14 +806,6 @@ class AgentLoop:
                 data={"status": "interrupted", "repaired": True},
                 operation_key=f"{turn_id}:{recovery_iteration}:repair-step-end",
             ))
-            await append_event(NewSessionEvent(
-                session_key=state.session_key,
-                event_type="turn/end",
-                turn_id=turn_id,
-                step=recovery_iteration,
-                data={"status": "interrupted", "repaired": True},
-                operation_key=f"{turn_id}:repair-turn-end",
-            ))
 
     @staticmethod
     def _interrupt_iteration(state: TurnInterruptState) -> int:
@@ -754,6 +847,7 @@ class AgentLoop:
             "content": str(snapshot.get("partial_reply") or ""),
             "thinking": str(snapshot.get("partial_thinking") or ""),
             "tools": tools,
+            "started_at": str(snapshot.get("turn_started_at") or ""),
             "status": "running",
         }
 
@@ -972,6 +1066,27 @@ def _normalize_snapshot_tool_status(value: object) -> str:
     if text == "running":
         return "running"
     return "completed"
+
+
+def _duration_value(value: object) -> int | None:
+    try:
+        duration = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return duration if duration >= 0 else None
+
+
+def _elapsed_duration_ms(started_at: str, ended_at: str) -> int | None:
+    try:
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        ended = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=_LOCAL_TZ)
+    if ended.tzinfo is None:
+        ended = ended.replace(tzinfo=_LOCAL_TZ)
+    return max(0, int(round((ended - started).total_seconds() * 1000)))
 
 
 __all__ = ["AgentLoop", "InterruptResult", "TurnInterruptState", "interrupted_tool_chain"]

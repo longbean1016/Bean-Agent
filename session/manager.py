@@ -407,6 +407,14 @@ class SessionManager:
         async with self._lock_for(key):
             return await asyncio.to_thread(self._store.fetch_session_events, key)
 
+    async def get_turn_timing(self, session_key: str, turn_id: str) -> dict[str, Any]:
+        """读取持久化 Turn 起止时间，供语义消息和 API 共用。"""
+
+        self._ensure_open()
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(self._store.get_turn_timing, key, turn_id)
+
     async def load_surface(
         self,
         session_key: str,

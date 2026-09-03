@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-from session.store import NewMessage, NewSurfaceEvent, SessionStore
+from session.store import NewMessage, NewSessionEvent, NewSurfaceEvent, SessionStore
 
 
 @pytest_asyncio.fixture
@@ -61,6 +61,25 @@ def test_context_usage_snapshot_is_persisted_without_overwriting_metadata(
         second.close()
 
 
+def test_metadata_upsert_does_not_restore_stale_context_usage(tmp_path: Path) -> None:
+    db_path = tmp_path / "context-usage-upsert.db"
+    session_store = SessionStore(db_path)
+    try:
+        session_store.create_session("web:usage-upsert")
+        fresh = {"pressure_tokens": 640, "projected_tokens": 640}
+        session_store.save_context_usage("web:usage-upsert", fresh)
+        session_store.upsert_session(
+            "web:usage-upsert",
+            created_at="2026-01-01T00:00:00+08:00",
+            updated_at="2026-01-01T00:01:00+08:00",
+            last_consolidated=0,
+            metadata={"title": "旧内存快照", "context_usage": {"pressure_tokens": 9000}},
+        )
+        assert session_store.get_context_usage("web:usage-upsert") == fresh
+    finally:
+        session_store.close()
+
+
 @pytest.mark.asyncio
 async def test_add_message_allocates_seq_and_preserves_turn_fields(
     store: SessionStore,
@@ -97,6 +116,92 @@ async def test_add_message_allocates_seq_and_preserves_turn_fields(
     )
     assert [item["seq"] for item in fetched] == [0, 1]
     assert fetched[1]["turn_id"] == "turn-1"
+
+
+def test_turn_timing_is_recovered_from_start_and_end_events(store: SessionStore) -> None:
+    store.append_session_event(NewSessionEvent(
+        session_key="web:timing",
+        event_type="turn/start",
+        turn_id="turn-1",
+        step=0,
+        data={"started_at": "2026-09-02T10:00:00+08:00"},
+        operation_key="turn-1:turn-start",
+    ))
+    store.append_session_event(NewSessionEvent(
+        session_key="web:timing",
+        event_type="turn/end",
+        turn_id="turn-1",
+        step=1,
+        data={
+            "status": "completed",
+            "started_at": "2026-09-02T10:00:00+08:00",
+            "ended_at": "2026-09-02T10:00:01.250000+08:00",
+        },
+        operation_key="turn-1:turn-end",
+    ))
+
+    assert store.get_turn_timing("web:timing", "turn-1") == {
+        "started_at": "2026-09-02T10:00:00+08:00",
+        "ended_at": "2026-09-02T10:00:01.250000+08:00",
+        "duration_ms": 1250,
+        "status": "completed",
+    }
+
+
+def test_turn_timing_uses_event_creation_time_for_invalid_boundary_values(
+    store: SessionStore,
+) -> None:
+    start = store.append_session_event(NewSessionEvent(
+        session_key="web:timing-fallback",
+        event_type="turn/start",
+        turn_id="turn-1",
+        step=0,
+        data={"started_at": "not-a-timestamp"},
+        operation_key="turn-1:turn-start",
+    ))
+    end = store.append_session_event(NewSessionEvent(
+        session_key="web:timing-fallback",
+        event_type="turn/end",
+        turn_id="turn-1",
+        step=1,
+        data={"status": "completed", "ended_at": "also-invalid"},
+        operation_key="turn-1:turn-end",
+    ))
+
+    timing = store.get_turn_timing("web:timing-fallback", "turn-1")
+    assert timing["started_at"] == start["created_at"]
+    assert timing["ended_at"] == end["created_at"]
+    assert timing["duration_ms"] >= 0
+
+
+def test_chat_turn_navigation_includes_persisted_duration(store: SessionStore) -> None:
+    store.add_message(NewMessage(
+        session_key="web:timing-nav",
+        role="user",
+        content="问题",
+        turn_id="turn-1",
+    ))
+    store.append_session_event(NewSessionEvent(
+        session_key="web:timing-nav",
+        event_type="turn/start",
+        turn_id="turn-1",
+        step=0,
+        data={"started_at": "2026-09-02T10:00:00+08:00"},
+        operation_key="turn-1:turn-start",
+    ))
+    store.append_session_event(NewSessionEvent(
+        session_key="web:timing-nav",
+        event_type="turn/end",
+        turn_id="turn-1",
+        step=1,
+        data={"ended_at": "2026-09-02T10:00:02+08:00", "status": "completed"},
+        operation_key="turn-1:turn-end",
+    ))
+
+    turns = store.list_chat_turns("web:timing-nav")
+    assert turns[0]["duration_ms"] == 2000
+    assert turns[0]["started_at"] == "2026-09-02T10:00:00+08:00"
+    assert turns[0]["ended_at"] == "2026-09-02T10:00:02+08:00"
 
 
 def _surface_event(

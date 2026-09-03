@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from copy import deepcopy
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -132,6 +133,8 @@ class Pipeline:
         self._context_measurements: dict[str, dict[str, Any]] = {}
 
     async def process(self, message: InboundMessage, *, turn_id: str) -> PipelineResult:
+        turn_started_at = datetime.now(_LOCAL_TZ).isoformat()
+        turn_started_monotonic = time.perf_counter()
         self._interrupt_snapshots[turn_id] = {
             "partial_reply": "",
             "partial_thinking": "",
@@ -144,6 +147,7 @@ class Pipeline:
             "llm_message_timestamp": "",
             "llm_epoch_id": "",
             "llm_surface_persisted": False,
+            "turn_started_at": turn_started_at,
         }
         if self._event_appender is not None:
             await self._event_appender(NewSessionEvent(
@@ -151,7 +155,11 @@ class Pipeline:
                 event_type="turn/start",
                 turn_id=turn_id,
                 step=0,
-                data={"channel": message.channel, "chat_id": message.chat_id},
+                data={
+                    "channel": message.channel,
+                    "chat_id": message.chat_id,
+                    "started_at": turn_started_at,
+                },
                 operation_key=f"{turn_id}:turn-start",
             ))
         raw_allowed_tools = message.metadata.get("allowed_tools")
@@ -267,6 +275,46 @@ class Pipeline:
                 operation_key=f"{turn_id}:{operation_suffix}",
                 source_event_seqs=source_event_seqs,
             ))
+
+        turn_end: dict[str, Any] | None = None
+
+        async def append_turn_end(
+            *,
+            iteration: int,
+            status: str,
+            reason: str | None = None,
+        ) -> dict[str, Any]:
+            """记录一次幂等 Turn 结束，并把真实计时同步到中断快照。"""
+
+            nonlocal turn_end
+            if turn_end is not None:
+                return turn_end
+            ended_at = datetime.now(_LOCAL_TZ).isoformat()
+            duration_ms = max(
+                0,
+                int(round((time.perf_counter() - turn_started_monotonic) * 1000)),
+            )
+            data: dict[str, Any] = {
+                "status": status,
+                "started_at": turn_started_at,
+                "ended_at": ended_at,
+                "duration_ms": duration_ms,
+            }
+            if reason:
+                data["reason"] = reason
+            await append_session_event(
+                "turn/end",
+                iteration=iteration,
+                data=data,
+                operation_suffix="turn-end",
+            )
+            turn_end = {
+                "duration_ms": duration_ms,
+                "turn_started_at": turn_started_at,
+                "turn_ended_at": ended_at,
+            }
+            self._interrupt_snapshots[turn_id].update(turn_end)
+            return turn_end
 
         async def append_surface_message(
             model_message: dict[str, Any],
@@ -596,17 +644,20 @@ class Pipeline:
                     model_runtime_id=provider_runtime_id,
                     model=provider_model,
                 ))
+                # 已有 Provider pressure 时，压缩门控必须使用校准后的投影；
+                # 仅使用本地 heuristic 会在实际输入已越过阈值时漏触发压缩。
+                gate_tokens = projected_tokens if projected_tokens is not None else estimate
                 if (
                     not react_messages
                     and self._context_compactor is not None
                     and should_compact(
-                        estimate,
+                        gate_tokens,
                         context_window=provider_window,
                         max_output_tokens=provider_output,
                     )
                 ):
                     compacted = await compact_with_status(
-                        estimated_tokens=estimate,
+                        estimated_tokens=gate_tokens,
                         force=False,
                     )
                     if compacted and (self._surface_loader or self._history_loader) is not None:
@@ -902,12 +953,7 @@ class Pipeline:
                     data={"status": "completed", "reason": "assistant_final"},
                     operation_suffix=f"{iteration}:step-end",
                 )
-                await append_session_event(
-                    "turn/end",
-                    iteration=iteration,
-                    data={"status": "completed"},
-                    operation_suffix="turn-end",
-                )
+                timing = await append_turn_end(iteration=iteration, status="completed")
                 return PipelineResult(
                     content=str(content or ""),
                     thinking=merged_turn_thinking(),
@@ -924,6 +970,7 @@ class Pipeline:
                     llm_epoch_id=llm_epoch_id,
                     llm_surface_messages=deepcopy(llm_surface_messages),
                     llm_surface_persisted=surface_persisted,
+                    **timing,
                 )
 
             # 工具调用 assistant 消息必须原样进入下一轮，尤其要保留 DeepSeek 的
@@ -1066,6 +1113,11 @@ class Pipeline:
             iteration=self._max_iterations,
             tools_used=tools_used,
         )
+        timing = await append_turn_end(
+            iteration=self._max_iterations,
+            status="incomplete",
+            reason="max_iterations",
+        )
         return PipelineResult(
             content=summary,
             thinking=merged_turn_thinking(),
@@ -1082,12 +1134,7 @@ class Pipeline:
             llm_epoch_id=llm_epoch_id,
             llm_surface_messages=deepcopy(llm_surface_messages),
             llm_surface_persisted=surface_persisted,
-        )
-        await append_session_event(
-            "turn/end",
-            iteration=self._max_iterations,
-            data={"status": "incomplete", "reason": "max_iterations"},
-            operation_suffix="turn-end",
+            **timing,
         )
 
     def snapshot_interrupt_state(self, turn_id: str) -> dict[str, Any]:

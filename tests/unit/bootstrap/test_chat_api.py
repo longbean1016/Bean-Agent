@@ -11,7 +11,7 @@ from PIL import Image
 
 from agent.config_models import Config
 from bootstrap.app import build_core_runtime, create_fastapi_app
-from session.store import NewMessage
+from session.store import NewMessage, NewSessionEvent
 
 
 class Provider:
@@ -126,6 +126,46 @@ def test_chat_api_lists_global_user_turn_navigation(tmp_path: Path) -> None:
     assert [item["seq"] for item in turns["items"]] == [0, 3]
     assert [item["id"] for item in turns["items"]] == ["turn-1", "turn-2"]
     assert [item["preview"] for item in turns["items"]] == ["第一问", "第二问"]
+
+
+def test_chat_api_exposes_persisted_turn_duration(tmp_path: Path) -> None:
+    client, runtime = _client(tmp_path)
+    runtime.sessions.store.add_message(
+        NewMessage(session_key="web:timing", role="user", content="问题", turn_id="turn-1")
+    )
+    runtime.sessions.store.add_message(
+        NewMessage(
+            session_key="web:timing",
+            role="assistant",
+            content="回答",
+            turn_id="turn-1",
+            metadata={"duration_ms": 1750},
+        )
+    )
+    runtime.sessions.store.append_session_event(NewSessionEvent(
+        session_key="web:timing",
+        event_type="turn/start",
+        turn_id="turn-1",
+        step=0,
+        data={"started_at": "2026-09-02T10:00:00+08:00"},
+        operation_key="turn-1:turn-start",
+    ))
+    runtime.sessions.store.append_session_event(NewSessionEvent(
+        session_key="web:timing",
+        event_type="turn/end",
+        turn_id="turn-1",
+        step=1,
+        data={"ended_at": "2026-09-02T10:00:01.750000+08:00", "status": "completed"},
+        operation_key="turn-1:turn-end",
+    ))
+
+    with client:
+        messages = client.get("/api/chat/sessions/web:timing/messages").json()
+        turns = client.get("/api/chat/sessions/web:timing/turns").json()
+
+    assert messages["items"][1]["metadata"]["duration_ms"] == 1750
+    assert turns["items"][0]["duration_ms"] == 1750
+    assert turns["items"][0]["ended_at"] == "2026-09-02T10:00:01.750000+08:00"
 
 
 def test_chat_api_messages_around_returns_window_from_anchor(tmp_path: Path) -> None:

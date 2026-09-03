@@ -14,7 +14,7 @@ from agent.config_models import MemoryConfig
 from memory.consolidator import ConsolidationDraft
 from memory.engine import MemoryEngine
 from session.manager import SessionManager
-from session.store import NewSurfaceEvent
+from session.store import NewSessionEvent, NewSurfaceEvent
 
 
 class Pipeline:
@@ -263,6 +263,51 @@ async def test_pipeline_failure_persists_error_turn_without_committed(tmp_path: 
     assert rows[1]["status"] == "error"
     assert committed == []
     assert "模型失败" in outbound.content
+    await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_complete_turn_persists_duration_in_message_and_outbound(tmp_path: Path) -> None:
+    class TimedPipeline:
+        async def process(self, message, *, turn_id):
+            started_at = "2026-09-02T10:00:00+08:00"
+            ended_at = "2026-09-02T10:00:02.500000+08:00"
+            await sessions.append_session_event(NewSessionEvent(
+                session_key=message.session_key,
+                event_type="turn/start",
+                turn_id=turn_id,
+                step=0,
+                data={"started_at": started_at},
+                operation_key=f"{turn_id}:turn-start",
+            ))
+            await sessions.append_session_event(NewSessionEvent(
+                session_key=message.session_key,
+                event_type="turn/end",
+                turn_id=turn_id,
+                step=1,
+                data={"started_at": started_at, "ended_at": ended_at, "status": "completed"},
+                operation_key=f"{turn_id}:turn-end",
+            ))
+            return PipelineResult(
+                "回答",
+                duration_ms=2500,
+                turn_started_at=started_at,
+                turn_ended_at=ended_at,
+            )
+
+    bus = MessageBus()
+    sessions = SessionManager(tmp_path)
+    loop = AgentLoop(bus, EventBus(), TimedPipeline(), sessions)
+    await bus.publish_inbound(InboundMessage("web", "u", "c", "问题"))
+
+    await loop.run_once()
+
+    rows = sessions.store.fetch_session_messages("web:c")
+    outbound = await bus.consume_outbound()
+    assert rows[1]["metadata"]["duration_ms"] == 2500
+    assert rows[1]["timestamp"] == "2026-09-02T10:00:02.500000+08:00"
+    assert outbound.metadata["duration_ms"] == 2500
+    assert outbound.metadata["generated_at"] == "2026-09-02T10:00:02.500000+08:00"
     await sessions.close()
 
 
@@ -530,6 +575,50 @@ async def test_interrupt_immediately_persists_marker_and_completed_tools(tmp_pat
         },
         {"role": "assistant", "content": "[用户已停止生成]"},
     ]
+    await sessions.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_persists_duration_from_turn_boundaries(tmp_path: Path) -> None:
+    class TimedBlockingPipeline:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def process(self, message, *, turn_id):
+            await sessions.append_session_event(NewSessionEvent(
+                session_key=message.session_key,
+                event_type="turn/start",
+                turn_id=turn_id,
+                step=0,
+                data={"started_at": "2026-09-02T10:00:00+08:00"},
+                operation_key=f"{turn_id}:turn-start",
+            ))
+            self.started.set()
+            await asyncio.Event().wait()
+
+        def snapshot_interrupt_state(self, turn_id: str):
+            return {"partial_reply": "半截", "turn_started_at": "2026-09-02T10:00:00+08:00"}
+
+        def discard_interrupt_snapshot(self, turn_id: str) -> None:
+            pass
+
+    sessions = SessionManager(tmp_path)
+    pipeline = TimedBlockingPipeline()
+    loop = AgentLoop(MessageBus(), EventBus(), pipeline, sessions)
+    await loop._bus.publish_inbound(InboundMessage("web", "u", "timed", "问题"))
+    running = asyncio.create_task(loop.run_once())
+    await pipeline.started.wait()
+
+    result = await loop.request_interrupt("web:timed")
+    await running
+
+    rows = sessions.store.fetch_session_messages("web:timed")
+    events = sessions.store.fetch_session_events("web:timed")
+    ends = [event for event in events if event["event_type"] == "turn/end"]
+    assert result.duration_ms is not None and result.duration_ms >= 0
+    assert rows[1]["metadata"]["duration_ms"] == result.duration_ms
+    assert ends[0]["data"]["status"] == "interrupted"
+    assert ends[0]["data"]["duration_ms"] == result.duration_ms
     await sessions.close()
 
 

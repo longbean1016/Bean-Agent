@@ -148,6 +148,42 @@ async def test_durable_surface_is_the_only_production_history_source(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_pipeline_persists_turn_boundaries_and_duration(tmp_path: Path) -> None:
+    class DelayedProvider:
+        async def chat(self, messages, tools=None, **kwargs):
+            await asyncio.sleep(0.01)
+            return LLMResponse("完成")
+
+    sessions = SessionManager(tmp_path)
+    try:
+        pipeline = Pipeline(
+            DelayedProvider(),
+            ToolRegistry(),
+            EventBus(),
+            PromptAssembler(
+                SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+                MessageEnvelopeBuilder(),
+            ),
+            workspace=str(tmp_path),
+            event_appender=sessions.append_session_event,
+        )
+        result = await pipeline.process(
+            InboundMessage("web", "u", "timed", "问题"),
+            turn_id="turn-timed",
+        )
+
+        events = await sessions.fetch_session_events("web:timed")
+        starts = [event for event in events if event["event_type"] == "turn/start"]
+        ends = [event for event in events if event["event_type"] == "turn/end"]
+        assert len(starts) == len(ends) == 1
+        assert result.duration_ms is not None and result.duration_ms >= 0
+        assert ends[0]["data"]["duration_ms"] == result.duration_ms
+        assert ends[0]["data"]["started_at"] == starts[0]["data"]["started_at"]
+    finally:
+        await sessions.close()
+
+
+@pytest.mark.asyncio
 async def test_tool_search_unlocks_only_the_current_turn_schema() -> None:
     class HiddenTool(Tool):
         name = "mcp_demo__lookup"
