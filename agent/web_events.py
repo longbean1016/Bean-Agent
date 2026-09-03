@@ -12,6 +12,7 @@ from agent.event_bus import (
     ContextCompactionFailed,
     ContextCompactionStarted,
     ContextUsageUpdated,
+    SandboxApprovalRequested,
     SessionUsageUpdated,
     SessionUpdated,
     StreamDeltaReady,
@@ -37,6 +38,7 @@ WebLifecycleEvent: TypeAlias = (
     | StreamDeltaReady
     | ToolCallStarted
     | ToolCallCompleted
+    | SandboxApprovalRequested
 )
 
 
@@ -198,6 +200,12 @@ class WebEventMapper:
                 "tool_name": event.tool_name,
                 "status": event.status,
                 "result_preview": event.result_preview,
+            })
+        if isinstance(event, SandboxApprovalRequested):
+            return _mapped(event.session_key, {
+                "type": "approval.requested",
+                "session_id": event.session_key,
+                "approval": dict(event.request),
             })
         raise TypeError(f"不支持的 Web 事件: {type(event).__name__}")
 

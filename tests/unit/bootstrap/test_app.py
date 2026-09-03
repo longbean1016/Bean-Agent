@@ -96,15 +96,33 @@ async def test_build_core_runtime_allows_unrestricted_reads_but_keeps_writes_sco
     outside.write_text("class Main {}", encoding="utf-8")
 
     runtime = build_core_runtime(config, workspace, provider=Provider())
-    result = await runtime.tools.execute("read_file", {"path": str(outside)})
-    rejected_write = await runtime.tools.execute(
-        "write_file",
-        {"path": str(tmp_path / "outside" / "created.txt"), "content": "blocked"},
+    project = tmp_path / "source"
+    project.mkdir()
+    registered = runtime.sessions.store.create_workspace(str(project))
+    await runtime.sessions.get_or_create(
+        "web:scoped",
+        workspace_id=str(registered["id"]),
+        sandbox_mode="workspace-write",
     )
+    context = {"session_key": "web:scoped", "turn_id": "turn-1", "call_id": "call-1"}
+    try:
+        result = await runtime.tools.execute(
+            "read_file",
+            {"path": str(outside)},
+            context=context,
+        )
+        rejected_write = await runtime.tools.execute(
+            "write_file",
+            {"path": str(tmp_path / "outside" / "created.txt"), "content": "blocked"},
+            context=context,
+        )
 
-    assert "class Main {}" in str(result)
-    assert "超出允许目录" in str(rejected_write)
-    assert not (tmp_path / "outside" / "created.txt").exists()
+        assert "class Main {}" in str(result)
+        assert "审批界面" in str(rejected_write)
+        assert not (tmp_path / "outside" / "created.txt").exists()
+    finally:
+        await runtime.sandbox_runtime.close()
+        await runtime.sessions.close()
 
 
 def test_fastapi_exposes_real_websocket_route(tmp_path: Path) -> None:

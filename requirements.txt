@@ -26,5 +26,8 @@ Pillow>=11.0.0
 # 向量检索
 sqlite-vec>=0.1.6
 
+# Windows Restricted Token、ACL 与 Job Object 沙箱
+pywin32>=312; sys_platform == "win32"
+
 # 模型能力快照，用于在未显式配置时解析上下文窗口
 litellm>=1.95.0,<2

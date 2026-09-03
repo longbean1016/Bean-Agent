@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Protocol
 
 from memory.contracts import MemoryRetrievalApi, MemoryToolProfile, MemoryWriteApi
 from session.store import SessionStore
+from sandbox.filesystem import FilesystemMutationBroker
+from sandbox.guard import SandboxGuard
+from sandbox.runtime import SandboxProcessRuntime
 from tools.forget_memory import ForgetMemoryTool
 from tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from tools.memorize import MemorizeTool
@@ -37,6 +40,8 @@ def register_filesystem_tools(
     multimodal: bool,
     vl_provider: LLMProvider | None = None,
     vl_model: str = "",
+    sandbox_guard: SandboxGuard | None = None,
+    mutation_broker: FilesystemMutationBroker | None = None,
 ) -> ToolRegistry:
     """注册文件工具，并按主模型能力决定是否增加独立视觉工具。"""
 
@@ -47,11 +52,26 @@ def register_filesystem_tools(
             allowed_dir=None,
             multimodal=multimodal,
             vl_available=vl_available,
+            sandbox_guard=sandbox_guard,
         )
     )
-    registry.register(WriteFileTool(allowed_dir))
-    registry.register(EditFileTool(allowed_dir))
-    registry.register(ListDirTool(allowed_dir))
+    registry.register(
+        WriteFileTool(
+            allowed_dir,
+            sandbox_guard=sandbox_guard,
+            mutation_broker=mutation_broker,
+        ),
+        risk="write",
+    )
+    registry.register(
+        EditFileTool(
+            allowed_dir,
+            sandbox_guard=sandbox_guard,
+            mutation_broker=mutation_broker,
+        ),
+        risk="write",
+    )
+    registry.register(ListDirTool(allowed_dir, sandbox_guard=sandbox_guard))
     if vl_available:
         # Channel 上传可能落在 workspace/uploads 或系统临时目录，
         # 它们不一定属于 agent.workdir。视觉工具因此不继承普通文件工具的路径根
@@ -73,6 +93,9 @@ def register_all(
     session_store: SessionStore | None = None,
     memory_engine: MemoryToolsApi | None = None,
     skills: SkillsLoader | None = None,
+    sandbox_guard: SandboxGuard | None = None,
+    sandbox_runtime: SandboxProcessRuntime | None = None,
+    mutation_broker: FilesystemMutationBroker | None = None,
 ) -> ToolRegistry:
     """注册当前依赖实际支持的全部内置工具。"""
 
@@ -82,6 +105,8 @@ def register_all(
             allow_network=allow_shell_network,
             working_dir=allowed_dir,
             restricted_dir=allowed_dir,
+            sandbox_guard=sandbox_guard,
+            sandbox_runtime=sandbox_runtime,
         )
     )
     register_filesystem_tools(
@@ -90,6 +115,8 @@ def register_all(
         multimodal=multimodal,
         vl_provider=vl_provider,
         vl_model=vl_model,
+        sandbox_guard=sandbox_guard,
+        mutation_broker=mutation_broker,
     )
     registry.register(WebSearchTool(client=search_client))
     registry.register(WebFetchTool(client=fetch_client))

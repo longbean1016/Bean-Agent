@@ -100,6 +100,21 @@ class SandboxPolicyResolver:
         if target.exists():
             shutil.rmtree(target)
 
+    def close(self) -> None:
+        """应用退出时清理本进程独占的临时根。"""
+
+        import shutil
+
+        if self._runtime_temp_root.exists():
+            shutil.rmtree(self._runtime_temp_root)
+
+    def validate_workspace(self, path: str | Path) -> Path:
+        """注册前验证真实目录不会覆盖 Bean 数据或运行时内部目录。"""
+
+        workspace = canonical_directory(path)
+        self._assert_disjoint(workspace, self._runtime_temp_root)
+        return workspace
+
     def _session_temp_dir(self, session_key: str, *, create: bool = True) -> Path:
         import hashlib
 

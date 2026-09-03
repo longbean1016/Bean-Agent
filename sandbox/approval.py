@@ -72,6 +72,7 @@ class ApprovalCoordinator:
         self._publisher = publisher
         self._timeout_seconds = max(1.0, float(timeout_seconds))
         self._pending: dict[str, tuple[ApprovalRequest, asyncio.Future[ApprovalState]]] = {}
+        self._resolved: dict[str, tuple[str, ApprovalState]] = {}
         self._available_sessions: set[str] = set()
         self._lock = asyncio.Lock()
 
@@ -113,7 +114,7 @@ class ApprovalCoordinator:
             call_id=call_id,
             tool_name=tool_name,
             operation=operation,
-            arguments=dict(arguments),
+            arguments=_display_arguments(tool_name, arguments),
             reason=reason,
             requested_mode=requested_mode,
             fingerprint=fingerprint,
@@ -139,7 +140,11 @@ class ApprovalCoordinator:
             self._pending[request.id] = (request, future)
             self._store.create_sandbox_approval(request.to_wire())
 
-        await self._publisher(request)
+        try:
+            await self._publisher(request)
+        except Exception as error:
+            await self._finish(request.id, "unavailable")
+            raise ApprovalUnavailable("审批请求发送失败，已拒绝越权操作") from error
         try:
             return await asyncio.wait_for(future, timeout=self._timeout_seconds)
         except asyncio.TimeoutError:
@@ -160,12 +165,22 @@ class ApprovalCoordinator:
         async with self._lock:
             current = self._pending.get(request_id)
             if current is None:
-                raise KeyError("审批请求不存在或已经结束")
+                resolved = self._resolved.get(request_id)
+                if resolved is None:
+                    raise KeyError("审批请求不存在或已经结束")
+                resolved_session, resolved_state = resolved
+                if resolved_session != session_id:
+                    raise PermissionError("审批请求不属于当前会话")
+                if resolved_state in ("allowed-once", "rejected"):
+                    return resolved_state
+                raise KeyError("审批请求已经失效")
             request, _ = current
             if request.session_id != session_id:
                 raise PermissionError("审批请求不属于当前会话")
-        await self._finish(request_id, decision)
-        return decision
+        outcome = await self._finish(request_id, decision)
+        if outcome in ("allowed-once", "rejected"):
+            return outcome
+        raise KeyError("审批请求已经失效")
 
     async def pending_for_session(self, session_id: str) -> list[ApprovalRequest]:
         async with self._lock:
@@ -192,16 +207,23 @@ class ApprovalCoordinator:
         for request_id in request_ids:
             await self._finish(request_id, "unavailable")
 
-    async def _finish(self, request_id: str, state: ApprovalState) -> None:
+    async def _finish(
+        self,
+        request_id: str,
+        state: ApprovalState,
+    ) -> ApprovalState | None:
         async with self._lock:
             current = self._pending.pop(request_id, None)
             if current is None:
-                return
-            _, future = current
+                resolved = self._resolved.get(request_id)
+                return resolved[1] if resolved is not None else None
+            request, future = current
             decided_at = datetime.now(tz=_LOCAL_TZ).isoformat()
             self._store.resolve_sandbox_approval(request_id, state, decided_at)
+            self._resolved[request_id] = (request.session_id, state)
             if not future.done():
                 future.set_result(state)
+            return state
 
 
 def operation_fingerprint(
@@ -223,6 +245,30 @@ def operation_fingerprint(
         default=str,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _display_arguments(
+    tool_name: str,
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    """审批只展示执行边界，不把待写正文复制到 UI 和审计表。"""
+
+    if tool_name == "write_file":
+        content = str(arguments.get("content") or "")
+        return {
+            "path": str(arguments.get("path") or ""),
+            "content_length": len(content),
+        }
+    if tool_name == "edit_file":
+        old_text = str(arguments.get("old_text") or "")
+        new_text = str(arguments.get("new_text") or "")
+        return {
+            "path": str(arguments.get("path") or ""),
+            "replace_all": bool(arguments.get("replace_all", False)),
+            "old_text_length": len(old_text),
+            "new_text_length": len(new_text),
+        }
+    return dict(arguments)
 
 
 __all__ = [

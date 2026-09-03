@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -46,6 +47,31 @@ class Socket:
 
     async def send_json(self, data: dict) -> None:
         self.frames.append(data)
+
+
+class Approvals:
+    def __init__(self) -> None:
+        self.available: list[tuple[str, bool]] = []
+        self.decisions: list[tuple[str, str, str]] = []
+
+    async def set_session_available(self, session_id: str, available: bool) -> None:
+        self.available.append((session_id, available))
+
+    async def pending_for_session(self, session_id: str) -> list[object]:
+        if session_id != "web:chat":
+            return []
+        return [SimpleNamespace(to_wire=lambda: {
+            "id": "approval-1",
+            "session_id": session_id,
+            "state": "pending",
+        })]
+
+    async def decide(self, request_id: str, session_id: str, decision: str) -> str:
+        self.decisions.append((request_id, session_id, decision))
+        return decision
+
+    async def cancel_session(self, _session_id: str) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -160,6 +186,94 @@ async def test_session_subscribe_replays_active_turn_snapshot() -> None:
         "tools": [],
         "status": "running",
     }
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_web_channel_handles_sandbox_workspace_and_approval_protocol() -> None:
+    bus = MessageBus()
+    approvals = Approvals()
+    mode_updates: list[tuple[str, str]] = []
+    workspace_updates: list[tuple[str, str | None]] = []
+
+    async def load_sandbox(session_id: str) -> dict:
+        return {
+            "session_id": session_id,
+            "workspace_id": "workspace-1",
+            "workspace_path": "D:/project",
+            "sandbox_mode": "workspace-write",
+            "workspace_valid": True,
+        }
+
+    async def set_mode(session_id: str, mode: str) -> dict:
+        mode_updates.append((session_id, mode))
+        return {**await load_sandbox(session_id), "sandbox_mode": mode}
+
+    async def set_workspace(session_id: str, workspace_id: str | None) -> dict:
+        workspace_updates.append((session_id, workspace_id))
+        return {**await load_sandbox(session_id), "workspace_id": workspace_id}
+
+    channel = WebChannel(
+        bus,
+        EventBus(),
+        Interrupt(),
+        sandbox_loader=load_sandbox,
+        sandbox_mode_writer=set_mode,
+        workspace_writer=set_workspace,
+        approvals=approvals,  # type: ignore[arg-type]
+    )
+    socket = Socket()
+
+    await channel.handle_frame(socket, {
+        "type": "session.subscribe",
+        "request_id": "subscribe",
+        "session_id": "web:chat",
+    })
+
+    assert [frame["type"] for frame in socket.frames[:3]] == [
+        "session.subscribed",
+        "sandbox.updated",
+        "approval.requested",
+    ]
+    assert approvals.available[-1] == ("web:chat", True)
+
+    await channel.handle_frame(socket, {
+        "type": "sandbox.mode.set",
+        "request_id": "mode-denied",
+        "session_id": "web:chat",
+        "sandbox_mode": "danger-full-access",
+    })
+    assert socket.frames[-1]["code"] == "invalid_sandbox"
+
+    await channel.handle_frame(socket, {
+        "type": "sandbox.mode.set",
+        "request_id": "mode-ok",
+        "session_id": "web:chat",
+        "sandbox_mode": "danger-full-access",
+        "risk_confirmed": True,
+    })
+    assert mode_updates == [("web:chat", "danger-full-access")]
+    assert socket.frames[-1]["sandbox"]["sandbox_mode"] == "danger-full-access"
+
+    await channel.handle_frame(socket, {
+        "type": "workspace.bind",
+        "request_id": "workspace",
+        "session_id": "web:chat",
+        "workspace_id": "workspace-2",
+    })
+    assert workspace_updates == [("web:chat", "workspace-2")]
+
+    await channel.handle_frame(socket, {
+        "type": "approval.decide",
+        "request_id": "approval",
+        "session_id": "web:chat",
+        "approval_id": "approval-1",
+        "decision": "allowed-once",
+    })
+    assert approvals.decisions == [
+        ("approval-1", "web:chat", "allowed-once")
+    ]
+    assert socket.frames[-1]["type"] == "approval.resolved"
     await channel.close()
 
 

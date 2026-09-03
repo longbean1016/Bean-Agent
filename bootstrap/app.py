@@ -22,7 +22,7 @@ from PIL import Image, UnidentifiedImageError
 from agent.agent_loop import AgentLoop
 from agent.channel import WebChannel
 from agent.config_models import Config
-from agent.event_bus import EventBus
+from agent.event_bus import EventBus, SandboxApprovalRequested
 from agent.message_bus import MessageBus
 from agent.mcp.manage_tools import McpAddTool, McpListTool, McpRemoveTool
 from agent.mcp.registry import McpServerRegistry
@@ -43,6 +43,11 @@ from proactive.soft_executor import SoftTaskExecutor
 from proactive.store import ProactiveStore
 from proactive.turn_service import ProactiveTurnService
 from session.manager import SessionManager
+from sandbox.approval import ApprovalCoordinator
+from sandbox.filesystem import FilesystemMutationBroker
+from sandbox.guard import SandboxGuard
+from sandbox.policy import SandboxPolicyResolver
+from sandbox.runtime import SandboxProcessRuntime, create_runtime_temp_root
 from tools import ToolRegistry, register_all
 from tools.schedule import (
     CancelScheduleTool,
@@ -165,6 +170,12 @@ class AppRuntime:
                 core.sessions.store.get_session_usage, session_key
             ),
             context_runtime_id=str(getattr(core.provider, "runtime_id", "") or ""),
+            sandbox_loader=lambda session_key: asyncio.to_thread(
+                core.sessions.store.get_session_sandbox, session_key
+            ),
+            sandbox_mode_writer=core.sessions.set_sandbox_mode,
+            workspace_writer=core.sessions.set_workspace,
+            approvals=core.sandbox_approvals,
         )
         self.maintenance = (
             MemoryMaintenanceLoop(
@@ -206,6 +217,7 @@ class AppRuntime:
             # 顺序与参考 AppRuntime 一致：先阻止新工作进入，再等待/取消执行任务，
             # 最后按所有权从上层服务向底层 HTTP/SQLite 资源释放。
             await _cleanup_step("web_channel.close", self.channel.close)
+            await _cleanup_step("sandbox_approvals.close", self.core.sandbox_approvals.close)
             await _cleanup_step("proactive_chat.close", self.core.proactive_chat.close)
             await _cleanup_step("proactive_scheduler.close", self.core.scheduler.close)
             await _cleanup_step("agent_loop.close", self.core.agent_loop.close)
@@ -213,6 +225,7 @@ class AppRuntime:
                 self.agent_task.cancel()
                 await asyncio.gather(self.agent_task, return_exceptions=True)
             await _cleanup_step("mcp_registry.shutdown", self.core.mcp_registry.shutdown)
+            await _cleanup_step("sandbox_runtime.close", self.core.sandbox_runtime.close)
             if self.maintenance is not None:
                 await _cleanup_step("memory_maintenance.close", self.maintenance.close)
             if self.core.memory is not None:
@@ -254,6 +267,10 @@ class CoreRuntime:
     scheduler: SchedulerService
     proactive_chat: ProactiveChatLoop
     proactive_tools: ProactiveToolFactory
+    sandbox_policy: SandboxPolicyResolver
+    sandbox_approvals: ApprovalCoordinator
+    sandbox_guard: SandboxGuard
+    sandbox_runtime: SandboxProcessRuntime
     vision_provider: Any | None = None
 
 
@@ -268,9 +285,6 @@ def build_core_runtime(
 
     root = Path(workspace).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    workdir = Path(config.agent.workdir).expanduser().resolve()
-    workdir.mkdir(parents=True, exist_ok=True)
-
     # 主 Provider 是应用级共享资源，由 Runtime 最终关闭；MemoryEngine 只借用它执行
     # QueryRewriter/Consolidation，不拥有其生命周期。
     main_provider = provider or LLMProvider(config.llm)
@@ -278,6 +292,22 @@ def build_core_runtime(
     events = EventBus()
     messages = MessageBus()
     proactive_store = ProactiveStore(root / "proactive.db")
+    sandbox_policy = SandboxPolicyResolver(
+        sessions.store,
+        data_root=root,
+        runtime_temp_root=create_runtime_temp_root(),
+    )
+    sandbox_approvals = ApprovalCoordinator(sessions.store)
+
+    async def publish_approval(request: Any) -> None:
+        await events.emit(
+            SandboxApprovalRequested(request.session_id, request.to_wire())
+        )
+
+    sandbox_approvals.set_publisher(publish_approval)
+    sandbox_guard = SandboxGuard(sandbox_policy, sandbox_approvals)
+    sandbox_runtime = SandboxProcessRuntime(sandbox_policy)
+    mutation_broker = FilesystemMutationBroker(sandbox_policy, sandbox_runtime)
 
     memory: MemoryEngine | None = None
     actual_embedder = embedder
@@ -300,13 +330,16 @@ def build_core_runtime(
     tools = ToolRegistry()
     register_all(
         tools,
-        allowed_dir=workdir,
+        allowed_dir=None,
         multimodal=config.llm.multimodal,
         vl_provider=vision_provider,
         vl_model=config.llm.vl.model if config.llm.vl else "",
         session_store=sessions.store,
         memory_engine=memory,
         skills=skills,
+        sandbox_guard=sandbox_guard,
+        sandbox_runtime=sandbox_runtime,
+        mutation_broker=mutation_broker,
     )
     # 提醒工具从当前 Turn 的系统执行上下文取得 session_key，模型不需要也不能
     # 选择其他 Web 会话作为目标。
@@ -356,6 +389,7 @@ def build_core_runtime(
         # 后者只通过 read_image_vision 工具读取本地上传路径。
         multimodal=config.llm.multimodal,
         vl_available=vision_provider is not None,
+        sandbox_guard=sandbox_guard,
     )
     agent_loop = AgentLoop(
         messages,
@@ -402,6 +436,10 @@ def build_core_runtime(
         scheduler=scheduler,
         proactive_chat=proactive_chat,
         proactive_tools=proactive_tools,
+        sandbox_policy=sandbox_policy,
+        sandbox_approvals=sandbox_approvals,
+        sandbox_guard=sandbox_guard,
+        sandbox_runtime=sandbox_runtime,
         vision_provider=vision_provider,
     )
 
@@ -463,6 +501,31 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
         )
         return {"items": items, "total": total}
 
+    @app.get("/api/chat/workspaces")
+    def list_workspaces() -> dict[str, Any]:
+        return {"items": application.core.sessions.store.list_workspaces()}
+
+    @app.post("/api/chat/workspaces", status_code=201)
+    def register_workspace(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        path = str(payload.get("path") or "").strip()
+        if not path:
+            raise HTTPException(status_code=400, detail="工作目录路径不能为空")
+        try:
+            resolved = application.core.sandbox_policy.validate_workspace(path)
+            return application.core.sessions.store.create_workspace(
+                str(resolved),
+                str(payload.get("title") or ""),
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.delete("/api/chat/workspaces/{workspace_id}", status_code=204)
+    async def unregister_workspace(workspace_id: str) -> Response:
+        if not application.core.sessions.store.delete_workspace(workspace_id):
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        # 删除关系可能让多个缓存策略失效；Policy 每次回源，不需要全局缓存失效。
+        return Response(status_code=204)
+
     @app.get("/api/chat/sessions/{session_key:path}/messages")
     def list_messages(
         session_key: str,
@@ -519,6 +582,14 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
     @app.get("/api/chat/sessions/{session_key:path}/turns")
     def list_turns(session_key: str) -> dict[str, Any]:
         return {"items": application.core.sessions.store.list_chat_turns(session_key)}
+
+    @app.get("/api/chat/sessions/{session_key:path}/sandbox")
+    def get_session_sandbox(session_key: str) -> dict[str, Any]:
+        require_web_session(session_key)
+        snapshot = application.core.sessions.store.get_session_sandbox(session_key)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return snapshot
 
     def require_web_session(session_key: str) -> None:
         """主动设置只属于当前 Web channel，禁止借 path 参数访问其他渠道。"""
@@ -620,8 +691,10 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
         channel = application.core.config.channels.chat.channel_name
         if not session_key.startswith(f"{channel}:"):
             raise HTTPException(status_code=404, detail="会话不存在")
+        await application.core.sandbox_approvals.cancel_session(session_key)
         if not await application.core.sessions.delete(session_key):
             raise HTTPException(status_code=404, detail="会话不存在")
+        await application.core.sandbox_runtime.close_session(session_key)
         return Response(status_code=204)
 
     @app.post("/api/chat/uploads")

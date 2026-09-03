@@ -65,6 +65,59 @@ def test_chat_api_lists_sessions_and_messages(tmp_path: Path) -> None:
     assert not any(key.startswith("llm_") for key in messages["items"][0])
 
 
+def test_workspace_api_and_session_sandbox_closed_loop(tmp_path: Path) -> None:
+    client, runtime = _client(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+
+    with client:
+        registered = client.post(
+            "/api/chat/workspaces",
+            json={"path": str(project), "title": "Bean 项目"},
+        )
+        assert registered.status_code == 201
+        workspace = registered.json()
+        assert workspace["canonical_path"] == str(project.resolve())
+        assert workspace["valid"] is True
+        assert client.get("/api/chat/workspaces").json()["items"] == [workspace]
+
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "session.create",
+                "request_id": "create-sandbox",
+                "workspace_id": workspace["id"],
+                "sandbox_mode": "workspace-write",
+            })
+            created = websocket.receive_json()
+            snapshot_frame = websocket.receive_json()
+
+        assert created["type"] == "session.created"
+        assert snapshot_frame["type"] == "sandbox.updated"
+        assert snapshot_frame["sandbox"]["workspace_id"] == workspace["id"]
+        assert snapshot_frame["sandbox"]["sandbox_mode"] == "workspace-write"
+        session_id = created["session_id"]
+        assert client.get(
+            f"/api/chat/sessions/{session_id}/sandbox"
+        ).json()["workspace_path"] == str(project.resolve())
+
+        removed = client.delete(f"/api/chat/workspaces/{workspace['id']}")
+        assert removed.status_code == 204
+        detached = client.get(
+            f"/api/chat/sessions/{session_id}/sandbox"
+        ).json()
+        assert detached["workspace_id"] is None
+        assert detached["sandbox_mode"] == "read-only"
+
+        overlap = client.post(
+            "/api/chat/workspaces",
+            json={"path": str(runtime.workspace)},
+        )
+        assert overlap.status_code == 422
+        assert "数据目录重叠" in overlap.json()["detail"]
+
+    assert project.exists()
+
+
 def test_chat_api_lists_titled_running_session_without_messages(tmp_path: Path) -> None:
     client, runtime = _client(tmp_path)
     runtime.sessions.store.ensure_default_chat_session_title(

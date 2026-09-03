@@ -7,6 +7,7 @@ import json
 import logging
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -91,6 +92,59 @@ class Memory:
     def read_self(self): return ""
     def get_memory_context(self): return ""
     def read_recent_context(self): return ""
+
+
+@pytest.mark.asyncio
+async def test_restricted_session_does_not_execute_mcp_tool(tmp_path: Path) -> None:
+    class McpTool(Tool):
+        name = "mcp_demo__write"
+        description = "外部扩展写入"
+        parameters = {"type": "object", "properties": {}}
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, **kwargs):
+            self.calls += 1
+            return "should-not-run"
+
+    class McpProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.messages: list[list[dict[str, object]]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.calls += 1
+            self.messages.append([dict(item) for item in messages])
+            if self.calls == 1:
+                return LLMResponse(
+                    None,
+                    [ToolCall("mcp-call", "mcp_demo__write", {})],
+                )
+            return LLMResponse("完成")
+
+    tool = McpTool()
+    registry = ToolRegistry()
+    registry.register(tool, source_type="mcp", source_name="demo")
+    provider = McpProvider()
+    pipeline = Pipeline(
+        provider,
+        registry,
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        sandbox_guard=SimpleNamespace(
+            policy=lambda _session_key: SimpleNamespace(mode="read-only")
+        ),
+    )
+
+    await pipeline.process(
+        InboundMessage("web", "u", "restricted", "调用扩展"),
+        turn_id="turn-mcp",
+    )
+
+    assert tool.calls == 0
+    assert "完全访问会话" in str(provider.messages[1])
 
 
 @pytest.mark.asyncio
