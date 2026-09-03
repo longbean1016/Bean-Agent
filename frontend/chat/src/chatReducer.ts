@@ -272,16 +272,26 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     const interruptedTurnId = action.turn_id
       || state.turnStates[action.session_id]?.turnId
       || (current ? state.activeTurnId : "");
+    const interruptedAt = action.ended_at || new Date().toISOString();
+    const source = getSessionMessages(state, action.session_id);
+    const turnUser = interruptedTurnId
+      ? source.find((message) => message.role === "user" && message.turnId === interruptedTurnId)
+      : undefined;
     const sessionMessages = interruptedTurnId
-      ? getSessionMessages(state, action.session_id).map((message) => message.turnId === interruptedTurnId
-        ? {
+      ? source.map((message) => {
+        if (message.turnId !== interruptedTurnId) return message;
+        const durationMs = message.role === "assistant"
+          ? message.durationMs ?? normalizeDuration(action.duration_ms) ?? (isRuntimeMessage(turnUser) ? elapsedDurationMs(turnUser?.timestamp, interruptedAt) : undefined)
+          : message.durationMs;
+        return {
           ...message,
           streaming: false,
           status: "interrupted",
           thinkingStatus: message.thinking ? "interrupted" : message.thinkingStatus,
-        }
-        : message)
-      : getSessionMessages(state, action.session_id);
+          ...(durationMs === undefined ? {} : { durationMs }),
+        };
+      })
+      : source;
     const nextState = {
       ...state,
       activeTurnId: current ? "" : state.activeTurnId,
@@ -296,6 +306,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
   }
   if (action.type === "turn.snapshot") {
     const snapshotTimestamp = new Date().toISOString();
+    const startedAt = String(action.started_at || "") || snapshotTimestamp;
     const current = action.session_id === state.sessionId;
     const previousTurn = state.turnStates[action.session_id];
     const turnStates = setTurnState(state, action.session_id, {
@@ -319,7 +330,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       tools: [],
       turnId: action.turn_id,
       streaming: false,
-      timestamp: snapshotTimestamp,
+      timestamp: startedAt,
     };
     const incomingTools = action.tools.map((tool) => ({
       callId: tool.call_id,
@@ -423,6 +434,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
           source,
           scheduledAt: String(action.metadata.scheduled_at || "") || undefined,
           timestamp: String(action.metadata.generated_at || "") || undefined,
+          durationMs: durationFromMetadata(action.metadata),
         };
       const messages = [...existing, proactiveMessage];
       return {
@@ -432,15 +444,28 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       };
     }
     // final 是服务端的权威快照，必须覆盖草稿，不能继续追加 delta。
-    const next = updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
-      ...message,
-      content: action.content || message.content,
-      thinking: action.thinking || message.thinking,
-      thinkingStatus: (action.thinking || message.thinking) ? "completed" : message.thinkingStatus,
-      media: action.media ?? message.media,
-      streaming: false,
-      timestamp: String(action.metadata?.generated_at || "") || message.timestamp,
-    }));
+    const source = getSessionMessages(state, action.session_id);
+    const turnUser = source.find((message) => message.role === "user" && message.turnId === action.turn_id);
+    const finalReceivedAt = new Date().toISOString();
+    const metadataDuration = durationFromMetadata(action.metadata);
+    const next = updateSessionTurn(state, action.session_id, action.turn_id, (message) => {
+      const timestamp = String(action.metadata?.generated_at || "")
+        || (message.streaming ? finalReceivedAt : message.timestamp);
+      const durationMs = message.durationMs
+        ?? metadataDuration
+        ?? (isRuntimeMessage(turnUser) ? elapsedDurationMs(turnUser?.timestamp, timestamp) : undefined);
+      return {
+        ...message,
+        content: action.content || message.content,
+        thinking: action.thinking || message.thinking,
+        thinkingStatus: (action.thinking || message.thinking) ? "completed" : message.thinkingStatus,
+        media: action.media ?? message.media,
+        streaming: false,
+        timestamp,
+        status: String(action.metadata?.status || "") || message.status,
+        ...(durationMs === undefined ? {} : { durationMs }),
+      };
+    });
     return {
       ...next,
       activeTurnId: action.session_id === state.sessionId ? "" : next.activeTurnId,
@@ -554,12 +579,43 @@ export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {
       streaming: Boolean(row.metadata?.running) && row.role === "assistant",
       status: row.status,
       timestamp: row.timestamp,
+      durationMs: durationFromRow(row),
       proactive: Boolean(row.proactive),
       source: row.proactive
         ? (String(row.metadata?.source || "proactive_conversation") as ChatMessage["source"])
         : undefined,
     };
   });
+}
+
+function durationFromRow(row: MessageRow): number | undefined {
+  return normalizeDuration(row.duration_ms)
+    ?? normalizeDuration(row.elapsed_ms)
+    ?? durationFromMetadata(row.metadata);
+}
+
+function durationFromMetadata(metadata: Record<string, unknown> | undefined): number | undefined {
+  if (!metadata) return undefined;
+  return normalizeDuration(metadata.duration_ms)
+    ?? normalizeDuration(metadata.elapsed_ms)
+    ?? normalizeDuration(metadata.durationMs);
+}
+
+function normalizeDuration(value: unknown): number | undefined {
+  const duration = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(duration) && duration >= 0 ? duration : undefined;
+}
+
+function elapsedDurationMs(start: string | undefined, end: string | undefined): number | undefined {
+  if (!start || !end) return undefined;
+  const startTime = Date.parse(start);
+  const endTime = Date.parse(end);
+  if (Number.isNaN(startTime) || Number.isNaN(endTime)) return undefined;
+  return Math.max(0, endTime - startTime);
+}
+
+function isRuntimeMessage(message: ChatMessage | undefined): boolean {
+  return Boolean(message && (message.seq === undefined || message.seq < 0));
 }
 
 export function notificationRowsToMessages(rows: ProactiveNotificationRow[]): ChatMessage[] {

@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -172,6 +172,52 @@ it("中断消息只显示状态标签，不渲染持久化占位正文", async (
   fireEvent.click(stoppedLabels.find((label) => label.closest("button"))!.closest("button")!);
   expect(screen.getByText("partial thinking")).toBeVisible();
   expect(screen.queryByText("[用户已停止生成]")).not.toBeInTheDocument();
+});
+
+it("消息悬浮展示时间和操作，完整回答固定显示复制按钮", async () => {
+  window.history.replaceState({}, "", "/chat/message-chrome");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input).includes("/messages")) {
+      return { ok: true, json: async () => ({ items: [
+        {
+          id: "web:chrome:0",
+          seq: 0,
+          role: "user",
+          content: "检查消息操作区",
+          turn_id: "turn-chrome",
+          timestamp: "2026-08-18T16:31:00+08:00",
+        },
+        {
+          id: "web:chrome:1",
+          seq: 1,
+          role: "assistant",
+          content: "这是完整回答",
+          turn_id: "turn-chrome",
+          timestamp: "2026-08-18T16:31:19+08:00",
+          metadata: { duration_ms: 19000 },
+        },
+      ], total: 2 }) } as Response;
+    }
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+
+  render(<App />);
+
+  const userArticle = (await screen.findByText("检查消息操作区", { selector: ".user-text" })).closest("article");
+  const assistantArticle = screen.getByText("这是完整回答").closest("article");
+  expect(userArticle).toHaveClass("user-message");
+  expect(assistantArticle).toHaveClass("assistant-message");
+  expect(assistantArticle).not.toBeNull();
+  expect(within(assistantArticle!).getByRole("button", { name: "复制回答" })).toBeVisible();
+
+  fireEvent.mouseEnter(userArticle!);
+  expect(within(userArticle!).getByRole("button", { name: "复制问题" })).toBeVisible();
+  expect(within(userArticle!).getByRole("time")).toBeInTheDocument();
+  fireEvent.mouseEnter(assistantArticle!);
+  expect(within(assistantArticle!).getByText(/用时19秒/)).toBeInTheDocument();
+
+  fireEvent.click(within(assistantArticle!).getByRole("button", { name: "复制回答" }));
+  await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith("这是完整回答"));
 });
 
 it("运行中新会话收到标题更新后替换侧栏占位", async () => {

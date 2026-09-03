@@ -23,6 +23,8 @@ export interface ChatMessage {
   thinkingStatus?: ThinkingStatus;
   status?: string;
   timestamp?: string;
+  /** 本轮从用户发送到 assistant 完成/中断的前端展示耗时。 */
+  durationMs?: number;
   proactive?: boolean;
   source?: "scheduled_reminder" | "scheduled_soft" | "proactive_conversation";
   scheduledAt?: string;
@@ -109,6 +111,8 @@ export interface MessageRow {
   tool_chain?: Array<{ calls?: Array<{ call_id?: string; name?: string; arguments?: unknown; result?: string; status?: string }> }>;
   status?: string;
   timestamp?: string;
+  duration_ms?: number;
+  elapsed_ms?: number;
   proactive?: boolean;
   metadata?: Record<string, unknown>;
 }
@@ -128,6 +132,9 @@ export interface TurnNavigationEntry {
   turnIndex?: number;
   question: string;
   preview: string;
+  durationMs?: number;
+  startedAt?: string;
+  endedAt?: string;
 }
 
 export interface UploadedFile {
@@ -179,7 +186,7 @@ export type ChatFrame =
   | { type: "session.created"; request_id: string; session_id: string }
   | { type: "session.updated"; session: SessionSummary }
   | { type: "session.subscribed"; request_id: string; session_id: string }
-  | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message: string; user_media: string[]; content: string; thinking: string; tools: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments: unknown; result_preview: string }>; status: "running" }
+  | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message: string; user_media: string[]; content: string; thinking: string; tools: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments: unknown; result_preview: string }>; started_at?: string; status: "running" }
   | { type: "turn.queued"; request_id: string; session_id: string; position: number }
   | { type: "turn.started"; request_id?: string; session_id: string; turn_id: string }
   | { type: "context.compaction.started"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number }
@@ -193,7 +200,7 @@ export type ChatFrame =
   | { type: "react.tool.started"; session_id: string; turn_id: string; call_id: string; tool_name: string; arguments: unknown }
   | { type: "react.tool.completed"; session_id: string; turn_id: string; call_id: string; tool_name: string; status: string; result_preview: string }
   | { type: "message.final"; request_id?: string; session_id: string; turn_id: string; content: string; thinking?: string; media?: string[]; message_id?: string; metadata?: Record<string, unknown> }
-  | { type: "turn.interrupted"; request_id: string; session_id: string; turn_id?: string; status: string; message?: string }
+  | { type: "turn.interrupted"; request_id: string; session_id: string; turn_id?: string; status: string; message?: string; duration_ms?: number; ended_at?: string }
   | { type: "error"; request_id: string; session_id?: string; code?: string; message: string }
   | { type: "pong"; request_id: string };
 
