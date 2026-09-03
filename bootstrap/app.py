@@ -200,11 +200,9 @@ class AppRuntime:
             approvals=core.sandbox_approvals,
             # 页面模型可按会话切换，WebChannel 不能再用启动 Provider 身份过滤快照。
             context_runtime_id="",
-            route_resolver=lambda session_key, requested: core.provider_manager.freeze(
-                core.model_settings,
-                session_key=session_key,
-                requested=(ModelRoute(**requested) if requested is not None else None),
-            ).metadata(),
+            route_resolver=lambda session_key, requested: _freeze_web_model_route(
+                core, session_key, requested
+            ),
         )
         self.maintenance = (
             MemoryMaintenanceLoop(
@@ -305,6 +303,7 @@ class CoreRuntime:
     model_store: ModelSettingsStore
     model_settings: ModelSettingsService
     provider_manager: ProviderManager
+    legacy_model_available: bool
     vision_provider: Any | None = None
 
 
@@ -322,6 +321,7 @@ def build_core_runtime(
     root.mkdir(parents=True, exist_ok=True)
     # 主 Provider 是应用级共享资源，由 Runtime 最终关闭；MemoryEngine 只借用它执行
     # QueryRewriter/Consolidation，不拥有其生命周期。
+    legacy_model_available = provider is not None or bool(config.llm.api_key and config.llm.model)
     main_provider = provider or LLMProvider(config.llm)
     sessions = SessionManager(root)
     events = EventBus()
@@ -489,6 +489,7 @@ def build_core_runtime(
         model_store=model_store,
         model_settings=model_settings,
         provider_manager=provider_manager,
+        legacy_model_available=legacy_model_available,
         vision_provider=vision_provider,
     )
 
@@ -528,6 +529,25 @@ def _import_legacy_model_settings(settings: ModelSettingsService, config: Config
         settings.set_route(ModelRoute(connection["id"], model["model_id"]))
     except Exception as error:
         logger.warning("导入原模型配置失败，将继续使用启动配置: %s", type(error).__name__)
+
+
+def _freeze_web_model_route(
+    core: CoreRuntime,
+    session_key: str,
+    requested: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    route = ModelRoute(**requested) if requested is not None else None
+    # 首轮发送可能刚创建会话，前端此前没有 session_key 可调用 REST 保存；
+    # 因此在入队边界持久化显式选择，再冻结同一条路由。
+    if route is not None:
+        core.model_settings.set_route(route, session_key=session_key)
+    elif core.model_settings.get_route(session_key) is None and core.legacy_model_available:
+        return None
+    return core.provider_manager.freeze(
+        core.model_settings,
+        session_key=session_key,
+        requested=route,
+    ).metadata()
 
 
 def create_fastapi_app(
@@ -614,6 +634,10 @@ def create_fastapi_app(
             "connections": settings.list_connections(),
             "default_route": route.public_dict() if route else None,
             "catalog": settings.store.get_catalog_state(),
+            "routing_required": not (
+                application.core.legacy_model_available
+                and not settings.store.list_connections()
+            ),
         }
 
     @app.post("/api/settings/connections", status_code=201)
@@ -667,6 +691,7 @@ def create_fastapi_app(
 
     @app.get("/api/settings/routes/session/{session_key:path}")
     async def get_session_model_route(session_key: str) -> dict[str, Any]:
+        _validate_settings_session_key(session_key)
         route = settings.get_route(session_key)
         return {"route": route.public_dict() if route else None}
 
@@ -674,6 +699,7 @@ def create_fastapi_app(
     async def set_session_model_route(
         session_key: str, payload: dict[str, Any] = Body(...)
     ) -> dict[str, Any]:
+        _validate_settings_session_key(session_key)
         route = settings.set_route(ModelRoute(
             str(payload.get("connection_id") or ""),
             str(payload.get("model_id") or ""),
@@ -1076,6 +1102,16 @@ def create_fastapi_app(
         await channel.handle_websocket(websocket)
 
     return app
+
+
+def _validate_settings_session_key(session_key: str) -> None:
+    if (
+        not session_key.startswith("web:")
+        or not session_key[4:]
+        or len(session_key) > 200
+        or any(char in session_key for char in ("/", "\\", "\x00"))
+    ):
+        raise ModelSettingsValidationError("会话标识无效")
 
 
 def _scheduled_job_payload(job: Any) -> dict[str, Any]:

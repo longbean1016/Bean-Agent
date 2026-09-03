@@ -89,7 +89,7 @@ class ProviderManager:
             profile.adapter, route.reasoning_effort, runtime_id, key,
         )
         if key not in self._providers:
-            self._providers[key] = self._create_provider(connection, profile, route)
+            self._providers[key] = self._create_provider(connection, profile, route, runtime_id)
         self._routes[key] = frozen
         return frozen
 
@@ -142,7 +142,7 @@ class ProviderManager:
         return connection, profile
 
     def _create_provider(
-        self, connection: ModelConnection, profile: ModelProfile, route: ModelRoute
+        self, connection: ModelConnection, profile: ModelProfile, route: ModelRoute, runtime_id: str
     ) -> LLMProvider:
         api_key = self._secrets.get(connection.secret_ref) or ""
         if not api_key:
@@ -162,7 +162,11 @@ class ProviderManager:
             multimodal=bool(profile.supports_vision),
             extra_body=extra_body,
         )
-        return LLMProvider(config, strategy=self._adapters.create(profile.adapter))
+        return LLMProvider(
+            config,
+            strategy=self._adapters.create(profile.adapter),
+            runtime_id=runtime_id,
+        )
 
 
 __all__ = ["FrozenModelRoute", "ProviderLease", "ProviderManager"]

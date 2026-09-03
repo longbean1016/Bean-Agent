@@ -176,6 +176,7 @@ class WebChannel:
                     workspace_id=str(frame.get("workspace_id") or "") or None,
                     sandbox_mode=str(frame.get("sandbox_mode") or "read-only"),
                     risk_confirmed=frame.get("risk_confirmed") is True,
+                    model_route=frame.get("model_route"),
                 )
             except WebCommandError as error:
                 await self._error(websocket, request_id, error.code, error.message)

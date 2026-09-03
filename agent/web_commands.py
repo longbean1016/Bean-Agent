@@ -14,7 +14,7 @@ from agent.message_bus import InboundMessage, MessageBus
 MAX_MESSAGE_LENGTH = 32 * 1024
 MAX_MEDIA_COUNT = 8
 
-RouteResolver = Callable[[str, dict[str, Any] | None], dict[str, Any]]
+RouteResolver = Callable[[str, dict[str, Any] | None], dict[str, Any] | None]
 
 
 class InterruptController(Protocol):
@@ -72,7 +72,6 @@ class WebCommandService:
         workspace_id: str | None = None,
         sandbox_mode: str = "read-only",
         risk_confirmed: bool = False,
-        model_route: object = None,
     ) -> str:
         """先持久化空会话，使创建响应后的查询不会短暂返回 404。"""
 
@@ -99,6 +98,7 @@ class WebCommandService:
         workspace_id: str | None = None,
         sandbox_mode: str = "read-only",
         risk_confirmed: bool = False,
+        model_route: object = None,
     ) -> PreparedWebMessage:
         content = str(text or "")
         attachments = _normalize_media(media)
@@ -136,7 +136,9 @@ class WebCommandService:
         chat_id = session_key.split(":", 1)[1]
         if self._route_resolver is not None:
             try:
-                metadata["model_route"] = self._route_resolver(session_key, requested)
+                resolved_route = self._route_resolver(session_key, requested)
+                if resolved_route is not None:
+                    metadata["model_route"] = resolved_route
             except (LookupError, ValueError, RuntimeError) as error:
                 raise WebCommandError("invalid_model_route", str(error)) from error
         message = InboundMessage(

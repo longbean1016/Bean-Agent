@@ -3,7 +3,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from agent.config_models import Config
-from bootstrap.app import build_core_runtime, create_fastapi_app
+from bootstrap.app import _freeze_web_model_route, build_core_runtime, create_fastapi_app
 from model_settings.secrets import MemorySecretStore
 
 
@@ -76,3 +76,26 @@ def test_settings_api_validates_url_and_adapter(tmp_path: Path) -> None:
         })
     assert invalid_url.status_code == 400
     assert invalid_adapter.status_code == 400
+
+
+def test_first_web_turn_persists_and_freezes_requested_session_route(tmp_path: Path) -> None:
+    test_client, runtime = client(tmp_path)
+    with test_client:
+        connection = runtime.model_settings.create_connection({
+            "name": "route", "base_url": "https://example.com/v1", "api_key": "secret",
+        })
+        runtime.model_settings.save_manual_model(connection["id"], {"model_id": "model-a"})
+        frozen = _freeze_web_model_route(runtime, "web:new", {
+            "connection_id": connection["id"], "model_id": "model-a", "reasoning_effort": None,
+        })
+
+        assert runtime.model_settings.get_route("web:new").model_id == "model-a"
+        assert frozen["connection_id"] == connection["id"]
+        assert "secret" not in str(frozen)
+
+
+def test_session_route_api_rejects_non_web_scope(tmp_path: Path) -> None:
+    test_client, _runtime = client(tmp_path)
+    with test_client:
+        response = test_client.get("/api/settings/routes/session/global")
+    assert response.status_code == 400

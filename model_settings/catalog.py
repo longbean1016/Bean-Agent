@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from model_settings.models import ModelProfile, utc_now
+from model_settings.models import REASONING_EFFORT_ORDER, REASONING_EFFORTS, ModelProfile, utc_now
 
 
 CATALOG_URL = "https://models.dev/catalog.json"
@@ -42,7 +42,7 @@ class ModelCatalogService:
         provider: str,
         default_adapter: str,
     ) -> ModelProfile:
-        catalog = self._load_cache()
+        catalog = _provider_catalog(self._load_cache())
         match = _find_model(catalog, provider.strip().lower(), profile.model_id)
         if match is None:
             return replace(profile, adapter=default_adapter, metadata_source="unknown")
@@ -93,10 +93,11 @@ class ModelCatalogService:
         )
         os.replace(temporary, self.cache_path)
         self._catalog = payload
-        providers = len(payload)
+        catalog = _provider_catalog(payload)
+        providers = len(catalog)
         models = sum(
             len(item.get("models", {}))
-            for item in payload.values()
+            for item in catalog.values()
             if isinstance(item, dict) and isinstance(item.get("models"), dict)
         )
         return {"updated_at": utc_now(), "providers": providers, "models": models}
@@ -140,16 +141,18 @@ def _find_model(
 def _reasoning_values(value: Any) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
-    values: list[str] = []
+    values: set[str] = set()
     for option in value:
         if not isinstance(option, dict):
             continue
         if option.get("type") == "toggle":
-            values.extend(["none", "high"])
+            values.update(("none", "high"))
         raw_values = option.get("values")
         if isinstance(raw_values, list):
-            values.extend(str(item) for item in raw_values if str(item))
-    return tuple(dict.fromkeys(values))
+            values.update(
+                str(item) for item in raw_values if str(item) in REASONING_EFFORTS
+            )
+    return tuple(item for item in REASONING_EFFORT_ORDER if item in values)
 
 
 def _suggest_adapter(
@@ -177,12 +180,20 @@ def _optional_bool(value: Any) -> bool | None:
     return None if value is None else bool(value)
 
 
+def _provider_catalog(payload: dict[str, Any]) -> dict[str, Any]:
+    """兼容公共目录的新包装结构和历史缓存的扁平结构。"""
+
+    providers = payload.get("providers")
+    return providers if isinstance(providers, dict) else payload
+
+
 def _validate_catalog(payload: Any) -> None:
     if not isinstance(payload, dict) or not payload:
         raise CatalogUpdateError("公共模型目录根节点无效")
+    catalog = _provider_catalog(payload)
     if not any(
         isinstance(item, dict) and isinstance(item.get("models"), dict)
-        for item in payload.values()
+        for item in catalog.values()
     ):
         raise CatalogUpdateError("公共模型目录不包含模型")
 

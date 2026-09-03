@@ -42,3 +42,35 @@ def test_catalog_does_not_guess_ambiguous_provider_independent_model(tmp_path: P
 
     assert result.metadata_source == "unknown"
     assert result.context_window is None
+
+
+def test_catalog_accepts_wrapped_models_dev_catalog(tmp_path: Path) -> None:
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps({
+        "models": {"deepseek/deepseek-v4-flash": {"limit": {"context": 1000000}}},
+        "providers": {
+            "deepseek": {"models": {"deepseek-v4-flash": {
+                "name": "DeepSeek V4 Flash",
+                "reasoning": True,
+                "reasoning_options": [
+                    {"type": "toggle"},
+                    {"type": "effort", "values": ["low", "high", "max"]},
+                ],
+                "tool_call": True,
+                "limit": {"context": 1000000, "output": 384000},
+            }}},
+        },
+    }), encoding="utf-8")
+
+    result = ModelCatalogService(path).enrich(
+        ModelProfile("c", "deepseek-v4-flash", "deepseek-v4-flash"),
+        provider="deepseek",
+        default_adapter="generic_openai",
+    )
+
+    assert result.display_name == "DeepSeek V4 Flash"
+    assert result.context_window == 1000000
+    assert result.max_output_tokens == 384000
+    assert result.reasoning_options == ("none", "low", "high", "max")
+    assert result.adapter == "deepseek"
+    assert result.metadata_source == "models.dev:deepseek"

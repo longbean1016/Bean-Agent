@@ -13,7 +13,8 @@ ADAPTER_IDS = frozenset({
     "qwen_dashscope",
     "openai_reasoning",
 })
-REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
+REASONING_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+REASONING_EFFORTS = frozenset(REASONING_EFFORT_ORDER)
 
 
 def utc_now() -> str:
@@ -119,6 +120,7 @@ class ModelRoute:
 
 __all__ = [
     "ADAPTER_IDS",
+    "REASONING_EFFORT_ORDER",
     "REASONING_EFFORTS",
     "ModelConnection",
     "ModelProfile",

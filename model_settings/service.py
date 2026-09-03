@@ -11,7 +11,7 @@ from model_settings.catalog import ModelCatalogService
 from model_settings.discovery import OpenAIModelDiscovery
 from model_settings.models import ADAPTER_IDS, REASONING_EFFORTS, ModelConnection, ModelProfile, ModelRoute
 from model_settings.secrets import SecretStore, SecretStoreError
-from model_settings.store import ModelSettingsStore
+from model_settings.store import ModelSettingsConflict, ModelSettingsStore
 
 
 class ModelSettingsValidationError(ValueError):
@@ -80,16 +80,33 @@ class ModelSettingsService:
             enabled=bool(values.get("enabled", current.enabled)),
             default_adapter=_adapter(values.get("default_adapter", current.default_adapter)),
         )
+        previous_key = self._secrets.get(current.secret_ref)
         if api_key:
             self._secrets.set(current.secret_ref, api_key)
-        saved = self.store.save_connection(updated)
+        try:
+            saved = self.store.save_connection(updated)
+        except Exception:
+            if api_key:
+                if previous_key:
+                    self._secrets.set(current.secret_ref, previous_key)
+                else:
+                    self._secrets.delete(current.secret_ref)
+            raise
         return saved.public_dict(has_api_key=bool(self._secrets.get(saved.secret_ref)))
 
     def delete_connection(self, connection_id: str) -> None:
         current = self._connection(connection_id)
-        if not self.store.delete_connection(connection_id):
-            raise ModelSettingsNotFound("连接不存在")
+        if self.store.connection_is_referenced(connection_id):
+            raise ModelSettingsConflict("连接仍被默认路由或会话引用")
+        previous_key = self._secrets.get(current.secret_ref)
         self._secrets.delete(current.secret_ref)
+        try:
+            if not self.store.delete_connection(connection_id):
+                raise ModelSettingsNotFound("连接不存在")
+        except Exception:
+            if previous_key:
+                self._secrets.set(current.secret_ref, previous_key)
+            raise
 
     async def discover_models(self, connection_id: str) -> list[dict[str, Any]]:
         connection = self._connection(connection_id)

@@ -86,17 +86,21 @@ class ModelSettingsStore:
 
     def delete_connection(self, connection_id: str) -> bool:
         with self._lock:
-            route = self._db.execute(
-                "SELECT scope FROM model_routes WHERE connection_id = ? LIMIT 1",
-                (connection_id,),
-            ).fetchone()
-            if route:
+            if self.connection_is_referenced(connection_id):
                 raise ModelSettingsConflict("连接仍被默认路由或会话引用")
             cursor = self._db.execute(
                 "DELETE FROM model_connections WHERE id = ?", (connection_id,)
             )
             self._db.commit()
         return cursor.rowcount > 0
+
+    def connection_is_referenced(self, connection_id: str) -> bool:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM model_routes WHERE connection_id = ? LIMIT 1",
+                (connection_id,),
+            ).fetchone()
+        return row is not None
 
     def list_models(
         self, connection_id: str | None = None, *, include_unavailable: bool = True

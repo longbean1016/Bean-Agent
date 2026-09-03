@@ -56,6 +56,8 @@ async def test_frozen_route_keeps_original_provider_after_connection_update(tmp_
     assert first_lease.provider is not second_lease.provider
     assert first_lease.provider._base_url == "https://example.com/v1"
     assert second_lease.provider._base_url == "https://changed.example/v1"
+    assert first_lease.provider.runtime_id == first.runtime_id
+    assert second_lease.provider.runtime_id == second.runtime_id
     assert "secret-value" not in str(first.metadata())
     await manager.release(first_lease)
     await manager.release(second_lease)
