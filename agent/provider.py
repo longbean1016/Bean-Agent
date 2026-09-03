@@ -317,6 +317,30 @@ class DashScopeStrategy(ProviderStrategy):
             request["extra_body"] = extra_body
 
 
+class OpenAIReasoningStrategy(ProviderStrategy):
+    """适配 OpenAI reasoning Chat Completions 的顶层参数。"""
+
+    def prepare_request(
+        self,
+        request: dict[str, Any],
+        extra_body: dict[str, Any],
+        *,
+        disable_thinking: bool,
+    ) -> None:
+        effort = extra_body.pop("reasoning_effort", None)
+        _drop_thinking_keys(extra_body)
+        if disable_thinking:
+            effort = "none"
+        if effort:
+            request["reasoning_effort"] = str(effort)
+        # 新 reasoning 模型使用 max_completion_tokens；保留这一差异在适配器内。
+        max_tokens = request.pop("max_tokens", None)
+        if max_tokens is not None:
+            request["max_completion_tokens"] = max_tokens
+        if extra_body:
+            request["extra_body"] = extra_body
+
+
 class LLMProvider:
     """封装 OpenAI Chat Completions 兼容接口。
 
@@ -328,6 +352,7 @@ class LLMProvider:
         self,
         config: LLMConfig,
         *,
+        strategy: ProviderStrategy | None = None,
         stream_idle_timeout_s: float | None = None,
         max_retries: int = 1,
         force_disable_thinking: bool = False,
@@ -354,6 +379,7 @@ class LLMProvider:
         self._context_window_source = context_resolution.source
         self._system_prompt = config.system_prompt
         self._extra_body = dict(config.extra_body)
+        self._strategy = strategy
 
         # request_timeout 限制“创建请求/获取响应”的等待时间；stream idle
         # timeout 限制流建立后相邻两个 chunk 之间的等待时间，两者含义不同。
@@ -447,7 +473,9 @@ class LLMProvider:
 
         # 只复制外层列表；策略会逐条复制消息，避免污染 Session 历史。
         selected_model = model or self._model
-        strategy = _select_provider_strategy(
+        # 页面设置生成的 Provider 固定使用显式适配器；仅 legacy TOML 继续
+        # 使用文本特征推断，避免第三方网关因 URL 不含厂商名而选错协议。
+        strategy = self._strategy or _select_provider_strategy(
             provider_name=self._provider_name,
             base_url=self._base_url,
             model=selected_model,
@@ -1174,6 +1202,7 @@ __all__ = [
     "DashScopeStrategy",
     "DeepSeekStrategy",
     "LLMProvider",
+    "OpenAIReasoningStrategy",
     "LLMResponse",
     "ProviderStrategy",
     "ToolCall",
