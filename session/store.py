@@ -312,8 +312,9 @@ class SessionStore:
             self._conn.execute(
                 """
                 INSERT INTO workspaces (
-                    id, canonical_path, canonical_key, title, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    id, canonical_path, canonical_key, title, pinned_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?)
                 """,
                 (workspace_id, canonical_path, canonical_key, clean_title, now, now),
             )
@@ -331,9 +332,61 @@ class SessionStore:
         with self._lock:
             self._ensure_open()
             rows = self._conn.execute(
-                "SELECT * FROM workspaces ORDER BY updated_at DESC, id DESC"
+                """
+                SELECT * FROM workspaces
+                ORDER BY
+                    CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END ASC,
+                    pinned_at ASC,
+                    created_at DESC,
+                    id DESC
+                """
             ).fetchall()
         return [self._row_to_workspace(row) for row in rows]
+
+    def update_workspace(
+        self,
+        workspace_id: str,
+        *,
+        title: str | None = None,
+        pinned: bool | None = None,
+    ) -> dict[str, Any] | None:
+        """幂等更新工作目录展示属性，不改变路径、创建时间或会话归属。"""
+
+        clean_id = str(workspace_id or "").strip()
+        if not clean_id:
+            return None
+        clean_title = None if title is None else str(title).strip()
+        if clean_title is not None and (not clean_title or len(clean_title) > 80):
+            raise ValueError("工作区名称长度必须为 1-80 个字符")
+        if title is None and pinned is None:
+            raise ValueError("至少需要修改一个工作区字段")
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT * FROM workspaces WHERE id = ?", (clean_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            next_title = clean_title if clean_title is not None else str(row["title"])
+            current_pinned_at = row["pinned_at"]
+            next_pinned_at = current_pinned_at
+            if pinned is True and current_pinned_at is None:
+                next_pinned_at = _now_iso()
+            elif pinned is False:
+                next_pinned_at = None
+            self._conn.execute(
+                """
+                UPDATE workspaces
+                SET title = ?, pinned_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (next_title, next_pinned_at, _now_iso(), clean_id),
+            )
+            self._conn.commit()
+            updated = self._conn.execute(
+                "SELECT * FROM workspaces WHERE id = ?", (clean_id,)
+            ).fetchone()
+        return self._row_to_workspace(updated) if updated is not None else None
 
     def get_workspace(self, workspace_id: str) -> dict[str, Any] | None:
         clean_id = str(workspace_id or "").strip()
@@ -479,6 +532,35 @@ class SessionStore:
         if result is None:
             raise RuntimeError("权限更新后无法读取会话")
         return result
+
+    def set_chat_session_pinned(
+        self,
+        session_key: str,
+        pinned: bool,
+    ) -> dict[str, Any] | None:
+        """只在所属工作目录内置顶会话，不改变对话活动时间。"""
+
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT workspace_id, pinned_at FROM sessions WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                return None
+            if row["workspace_id"] is None:
+                raise ValueError("最近会话不能置顶，请先在工作目录中创建会话")
+            next_pinned_at = row["pinned_at"]
+            if pinned and next_pinned_at is None:
+                next_pinned_at = _now_iso()
+            elif not pinned:
+                next_pinned_at = None
+            self._conn.execute(
+                "UPDATE sessions SET pinned_at = ? WHERE key = ?",
+                (next_pinned_at, key),
+            )
+            self._conn.commit()
+        return self.get_session_meta(key)
 
     def get_session_sandbox(self, session_key: str) -> dict[str, Any] | None:
         key = self._validate_session_key(session_key)
@@ -719,7 +801,7 @@ class SessionStore:
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
-        """按第一次用户提问时间列出聊天会话，并包含运行中但尚未落消息的标题会话。"""
+        """按置顶与对话活动时间列出聊天会话，并保留运行中标题会话。"""
 
         safe_limit = max(1, min(int(limit), 200))
         safe_offset = max(0, int(offset))
@@ -738,6 +820,8 @@ class SessionStore:
                            LIMIT 1
                        ), s.created_at) AS created_at,
                        s.updated_at,
+                       COALESCE(s.last_activity_at, s.created_at) AS last_activity_at,
+                       s.pinned_at,
                        s.metadata,
                        s.workspace_id,
                        s.cwd_snapshot,
@@ -757,10 +841,16 @@ class SessionStore:
                 LEFT JOIN messages m ON m.session_key = s.key
                 LEFT JOIN workspaces w ON w.id = s.workspace_id
                 WHERE s.key LIKE ?
-                 GROUP BY s.key, s.created_at, s.updated_at, s.metadata,
+                 GROUP BY s.key, s.created_at, s.updated_at, s.last_activity_at,
+                          s.pinned_at, s.metadata,
                           s.workspace_id, s.cwd_snapshot, s.sandbox_mode,
                           w.title, w.canonical_path
-                ORDER BY created_at DESC, s.key DESC
+                ORDER BY
+                    CASE WHEN s.workspace_id IS NOT NULL AND s.pinned_at IS NOT NULL
+                        THEN 0 ELSE 1 END ASC,
+                    CASE WHEN s.workspace_id IS NOT NULL THEN s.pinned_at END ASC,
+                    COALESCE(s.last_activity_at, s.created_at) DESC,
+                    s.key DESC
                 """,
                 (prefix,),
             ).fetchall()
@@ -794,10 +884,11 @@ class SessionStore:
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO sessions (
-                    key, created_at, updated_at, last_consolidated, next_seq, metadata
-                ) VALUES (?, ?, ?, 0, 0, '{}')
+                    key, created_at, updated_at, last_activity_at,
+                    last_consolidated, next_seq, metadata
+                ) VALUES (?, ?, ?, ?, 0, 0, '{}')
                 """,
-                (key, now, now),
+                (key, now, now, now),
             )
             row = self._conn.execute(
                 "SELECT metadata FROM sessions WHERE key = ?",
@@ -815,7 +906,9 @@ class SessionStore:
             self._conn.commit()
             summary = self._conn.execute(
                 """
-                SELECT s.key, s.created_at, s.updated_at, s.metadata,
+                SELECT s.key, s.created_at, s.updated_at,
+                       COALESCE(s.last_activity_at, s.created_at) AS last_activity_at,
+                       s.pinned_at, s.metadata,
                        s.workspace_id, s.cwd_snapshot, s.sandbox_mode,
                        w.title AS workspace_title,
                        w.canonical_path AS workspace_path,
@@ -832,7 +925,8 @@ class SessionStore:
                 LEFT JOIN messages m ON m.session_key = s.key
                 LEFT JOIN workspaces w ON w.id = s.workspace_id
                 WHERE s.key = ?
-                GROUP BY s.key, s.created_at, s.updated_at, s.metadata,
+                GROUP BY s.key, s.created_at, s.updated_at, s.last_activity_at,
+                         s.pinned_at, s.metadata,
                          s.workspace_id, s.cwd_snapshot, s.sandbox_mode,
                          w.title, w.canonical_path
                 """,
@@ -1187,6 +1281,7 @@ class SessionStore:
                     canonical_path TEXT NOT NULL,
                     canonical_key  TEXT NOT NULL UNIQUE,
                     title          TEXT NOT NULL,
+                    pinned_at      TEXT,
                     created_at     TEXT NOT NULL,
                     updated_at     TEXT NOT NULL
                 );
@@ -1195,6 +1290,8 @@ class SessionStore:
                     key               TEXT PRIMARY KEY,
                     created_at        TEXT NOT NULL,
                     updated_at        TEXT NOT NULL,
+                    last_activity_at  TEXT,
+                    pinned_at         TEXT,
                     last_consolidated INTEGER NOT NULL DEFAULT 0,
                     next_seq          INTEGER NOT NULL DEFAULT 0,
                     metadata          TEXT NOT NULL DEFAULT '{}',
@@ -1398,8 +1495,40 @@ class SessionStore:
                 self._conn.execute(
                     "ALTER TABLE sessions ADD COLUMN sandbox_mode TEXT NOT NULL DEFAULT 'read-only'"
                 )
+            if "last_activity_at" not in session_columns:
+                self._conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN last_activity_at TEXT"
+                )
+            if "pinned_at" not in session_columns:
+                self._conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN pinned_at TEXT"
+                )
+            workspace_columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(workspaces)")
+            }
+            if "pinned_at" not in workspace_columns:
+                self._conn.execute(
+                    "ALTER TABLE workspaces ADD COLUMN pinned_at TEXT"
+                )
+            # 活动时间只随语义消息推进；旧库从最后一条消息回填，不能继承权限、
+            # 重命名或压缩维护造成的 updated_at 噪声。
             self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id, updated_at)"
+                """
+                UPDATE sessions
+                SET last_activity_at = COALESCE(
+                    (SELECT MAX(messages.ts) FROM messages
+                     WHERE messages.session_key = sessions.key),
+                    sessions.created_at
+                )
+                WHERE last_activity_at IS NULL OR last_activity_at = ''
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_workspace_activity ON sessions(workspace_id, last_activity_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_pinned ON sessions(workspace_id, pinned_at)"
             )
             surface_columns = {
                 str(row["name"])
@@ -1508,17 +1637,19 @@ class SessionStore:
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO sessions (
-                    key, created_at, updated_at, last_consolidated, next_seq,
-                    metadata, workspace_id, cwd_snapshot, sandbox_mode
-                ) VALUES (?, ?, ?, 0, 0, '{}', ?, ?, ?)
+                    key, created_at, updated_at, last_activity_at,
+                    last_consolidated, next_seq, metadata, workspace_id,
+                    cwd_snapshot, sandbox_mode
+                ) VALUES (?, ?, ?, ?, 0, 0, '{}', ?, ?, ?)
                 """,
-                (key, now, now, clean_workspace_id, workspace_path, mode),
+                (key, now, now, now, clean_workspace_id, workspace_path, mode),
             )
             self._conn.commit()
             row = self._conn.execute(
                 """
-                SELECT key, created_at, updated_at, last_consolidated,
-                       next_seq, metadata, workspace_id, cwd_snapshot, sandbox_mode
+                SELECT key, created_at, updated_at, last_activity_at, pinned_at,
+                       last_consolidated, next_seq, metadata, workspace_id,
+                       cwd_snapshot, sandbox_mode
                 FROM sessions WHERE key = ?
                 """,
                 (key,),
@@ -1562,11 +1693,11 @@ class SessionStore:
                 self._conn.execute(
                     """
                     INSERT OR IGNORE INTO sessions (
-                        key, created_at, updated_at, last_consolidated,
-                        next_seq, metadata
-                    ) VALUES (?, ?, ?, 0, 0, '{}')
+                        key, created_at, updated_at, last_activity_at,
+                        last_consolidated, next_seq, metadata
+                    ) VALUES (?, ?, ?, ?, 0, 0, '{}')
                     """,
-                    (session_key, now, now),
+                    (session_key, now, now, now),
                 )
                 session_row = self._conn.execute(
                     "SELECT next_seq, metadata FROM sessions WHERE key = ?",
@@ -1616,10 +1747,10 @@ class SessionStore:
                 self._conn.execute(
                     """
                     UPDATE sessions
-                    SET next_seq = ?, updated_at = ?
+                    SET next_seq = ?, updated_at = ?, last_activity_at = ?
                     WHERE key = ?
                     """,
-                    (seq + 1, timestamp, session_key),
+                    (seq + 1, timestamp, timestamp, session_key),
                 )
                 self._conn.commit()
             except Exception:
@@ -2228,8 +2359,9 @@ class SessionStore:
             self._ensure_open()
             row = self._conn.execute(
                 """
-                SELECT key, created_at, updated_at, last_consolidated,
-                       next_seq, metadata, workspace_id, cwd_snapshot, sandbox_mode
+                SELECT key, created_at, updated_at, last_activity_at, pinned_at,
+                       last_consolidated, next_seq, metadata, workspace_id,
+                       cwd_snapshot, sandbox_mode
                 FROM sessions WHERE key = ?
                 """,
                 (key,),
@@ -3047,6 +3179,14 @@ class SessionStore:
             "metadata": _load_json_object(row["metadata"]),
         }
         columns = set(row.keys())
+        if "last_activity_at" in columns:
+            item["last_activity_at"] = str(
+                row["last_activity_at"] or row["created_at"]
+            )
+        if "pinned_at" in columns:
+            item["pinned_at"] = (
+                str(row["pinned_at"]) if row["pinned_at"] is not None else None
+            )
         if "workspace_id" in columns:
             item["workspace_id"] = (
                 str(row["workspace_id"]) if row["workspace_id"] is not None else None
@@ -3066,6 +3206,9 @@ class SessionStore:
             "id": str(row["id"]),
             "canonical_path": path,
             "title": str(row["title"]),
+            "pinned_at": (
+                str(row["pinned_at"]) if row["pinned_at"] is not None else None
+            ),
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
             "valid": Path(path).is_dir(),

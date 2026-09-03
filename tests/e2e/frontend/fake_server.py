@@ -28,6 +28,7 @@ DEMO_WORKSPACE = {
     "title": "Bean Demo",
     "created_at": "2026-09-03T08:00:00+08:00",
     "updated_at": "2026-09-03T08:00:00+08:00",
+    "pinned_at": None,
     "valid": True,
 }
 
@@ -44,6 +45,8 @@ def sessions() -> dict[str, object]:
             "key": "web:history",
             "created_at": "2026-07-16T08:00:00+08:00",
             "updated_at": "2026-07-16T09:00:00+08:00",
+            "last_activity_at": "2026-07-16T09:00:00+08:00",
+            "pinned_at": None,
             "message_count": 2,
             "first_message_content": "历史问题",
             "workspace_id": DEMO_WORKSPACE["id"],
@@ -74,9 +77,46 @@ async def register_workspace(request: Request) -> dict[str, object]:
     }
 
 
+@app.post("/api/chat/workspaces/pick")
+def pick_workspace() -> dict[str, str]:
+    return {"path": "D:/projects/picked-by-native-dialog"}
+
+
+@app.patch("/api/chat/workspaces/{workspace_id}")
+async def update_workspace(workspace_id: str, request: Request) -> dict[str, object]:
+    payload = await request.json()
+    return {
+        **DEMO_WORKSPACE,
+        "id": workspace_id,
+        "title": str(payload.get("title") or DEMO_WORKSPACE["title"]),
+        "pinned_at": (
+            "2026-09-03T12:00:00+08:00" if payload.get("pinned") else None
+        ),
+    }
+
+
+@app.post("/api/chat/workspaces/{workspace_id}/open", status_code=204)
+def open_workspace(workspace_id: str) -> None:
+    return None
+
+
 @app.delete("/api/chat/workspaces/{workspace_id}", status_code=204)
 def delete_workspace(workspace_id: str) -> None:
     return None
+
+
+@app.patch("/api/chat/sessions/{session_key:path}")
+async def update_session(session_key: str, request: Request) -> dict[str, object]:
+    payload = await request.json()
+    return {
+        "key": session_key,
+        "title": str(payload.get("title") or ""),
+        "updated_at": "2026-09-03T12:00:00+08:00",
+        "last_activity_at": "2026-07-16T09:00:00+08:00",
+        "pinned_at": (
+            "2026-09-03T12:00:00+08:00" if payload.get("pinned") else None
+        ),
+    }
 
 
 @app.get("/api/chat/sessions/{session_key:path}/messages")

@@ -328,9 +328,14 @@ it("工作区列表加载不到关联目录时仍显示原有会话", async () =
   expect(screen.getByRole("button", { name: "保留的会话" })).toBeVisible();
 });
 
-it("工作目录通过绝对路径注册且移除时明确保留磁盘文件", async () => {
+it("工作目录通过原生选择器注册且移除时明确保留磁盘文件", async () => {
+  let finishPicking: ((response: Response) => void) | undefined;
+  const picking = new Promise<Response>((resolve) => { finishPicking = resolve; });
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
+    if (url.endsWith("/api/chat/workspaces/pick") && init?.method === "POST") {
+      return picking;
+    }
     if (url.endsWith("/api/chat/workspaces") && init?.method === "POST") {
       const body = JSON.parse(String(init.body)) as { path: string; title: string };
       return { ok: true, json: async () => ({
@@ -347,12 +352,20 @@ it("工作目录通过绝对路径注册且移除时明确保留磁盘文件", a
   await screen.findByText("已连接");
 
   fireEvent.click(screen.getByRole("button", { name: "添加工作目录" }));
-  fireEvent.change(screen.getByLabelText("绝对路径"), { target: { value: "D:\\code\\bean" } });
+  fireEvent.click(screen.getByRole("button", { name: /选择 Bean 可读取和编辑的文件夹/ }));
+  expect(screen.getByRole("button", { name: /选择 Bean 可读取和编辑的文件夹/ })).toBeDisabled();
+  expect(screen.queryByText(/正在打开文件夹选择器/)).not.toBeInTheDocument();
+  await act(async () => {
+    finishPicking?.({ ok: true, json: async () => ({ path: "D:\\code\\bean" }) } as Response);
+    await picking;
+  });
+  await screen.findByText("D:\\code\\bean");
   fireEvent.change(screen.getByLabelText(/显示名称/), { target: { value: "Bean 工程" } });
   fireEvent.click(screen.getByRole("button", { name: "添加" }));
   expect(await screen.findByText("Bean 工程")).toBeVisible();
 
-  fireEvent.click(screen.getByRole("button", { name: "移除工作目录“Bean 工程”" }));
+  fireEvent.click(screen.getByRole("button", { name: "打开工作目录“Bean 工程”的菜单" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "移除工作目录" }));
   expect(screen.getByText(/磁盘上的目录和文件不会被删除/)).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "确认移除" }));
   await waitFor(() => expect(screen.queryByText("Bean 工程")).not.toBeInTheDocument());
@@ -1050,31 +1063,30 @@ it("切回后台运行会话时恢复用户问题流式内容和工具状态", a
   expect(screen.queryByText("排队中 · 即将开始")).not.toBeInTheDocument();
 });
 
-it("会话列表使用最近更新时间分组", async () => {
+it("最近会话按对话活动时间倒序且不再创建时间小组", async () => {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages")
       ? { items: [], total: 0 }
       : {
-          items: [{
-            key: "web:first-time",
-            first_message_content: "固定创建时间",
-            created_at: "2026-01-02T10:00:00+08:00",
-            updated_at: "2026-06-10T10:00:00+08:00",
-          }],
-          total: 1,
+          items: [
+            { key: "web:older", first_message_content: "较早活动", created_at: "2026-06-01T10:00:00+08:00", updated_at: "2026-07-01T10:00:00+08:00", last_activity_at: "2026-06-10T10:00:00+08:00" },
+            { key: "web:newer", first_message_content: "较晚活动", created_at: "2026-01-02T10:00:00+08:00", updated_at: "2026-01-02T10:00:00+08:00", last_activity_at: "2026-07-10T10:00:00+08:00" },
+          ],
+          total: 2,
         };
     return { ok: true, json: async () => payload } as Response;
   }));
 
   const { container } = render(<App />);
 
-  await screen.findByText("固定创建时间");
-  expect(screen.getByText("2026-06", { selector: ".session-group-title" })).toBeVisible();
-  expect(screen.queryByText("2026-01", { selector: ".session-group-title" })).not.toBeInTheDocument();
+  const newer = await screen.findByRole("button", { name: "较晚活动" });
+  const older = screen.getByRole("button", { name: "较早活动" });
+  expect(newer.compareDocumentPosition(older) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(container.querySelector(".session-group-title")).toBeNull();
   expect(container.querySelector(".session-row time")).toBeNull();
 });
 
-it("会话列表显示时间分组标题", async () => {
+it("最近分区保持在项目之后且会话按活动时间倒序", async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-07-19T18:00:00+08:00"));
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
@@ -1090,9 +1102,81 @@ it("会话列表显示时间分组标题", async () => {
 
   render(<App />);
 
-  expect(await screen.findByText("今天", { selector: ".session-group-title" })).toBeVisible();
-  expect(screen.getByText("昨天", { selector: ".session-group-title" })).toBeVisible();
+  const today = await screen.findByRole("button", { name: "今天会话" });
+  const yesterday = screen.getByRole("button", { name: "昨天会话" });
+  expect(today.compareDocumentPosition(yesterday) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "最近" })).toBeVisible();
   vi.useRealTimers();
+});
+
+it("侧栏按置顶项目、普通项目和最近的固定规则排序", async () => {
+  const session = (
+    key: string,
+    title: string,
+    workspaceId: string | null,
+    activity: string,
+    pinnedAt: string | null = null,
+  ) => ({
+    key,
+    title,
+    created_at: activity,
+    updated_at: activity,
+    last_activity_at: activity,
+    pinned_at: pinnedAt,
+    message_count: 1,
+    first_message_content: title,
+    workspace_id: workspaceId,
+  });
+  const workspace = (
+    id: string,
+    title: string,
+    createdAt: string,
+    pinnedAt: string | null = null,
+  ) => ({
+    id,
+    title,
+    canonical_path: `D:/projects/${id}`,
+    created_at: createdAt,
+    updated_at: createdAt,
+    pinned_at: pinnedAt,
+    valid: true,
+  });
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/chat/workspaces")) {
+      return { ok: true, json: async () => ({ items: [
+        workspace("project-old", "旧项目", "2026-01-01T10:00:00+08:00"),
+        workspace("pinned-later", "后置顶", "2026-04-01T10:00:00+08:00", "2026-07-02T10:00:00+08:00"),
+        workspace("project-new", "新项目", "2026-06-01T10:00:00+08:00"),
+        workspace("pinned-first", "先置顶", "2026-03-01T10:00:00+08:00", "2026-07-01T10:00:00+08:00"),
+      ] }) } as Response;
+    }
+    if (url.includes("/api/chat/sessions")) {
+      return { ok: true, json: async () => ({ items: [
+        session("web:normal-old", "普通较早", "pinned-first", "2026-05-01T10:00:00+08:00"),
+        session("web:pinned-later", "后置顶会话", "pinned-first", "2026-08-01T10:00:00+08:00", "2026-07-04T10:00:00+08:00"),
+        session("web:recent", "最近会话", null, "2026-08-03T10:00:00+08:00"),
+        session("web:normal-new", "普通较新", "pinned-first", "2026-06-01T10:00:00+08:00"),
+        session("web:pinned-first", "先置顶会话", "pinned-first", "2026-04-01T10:00:00+08:00", "2026-07-03T10:00:00+08:00"),
+      ], total: 5 }) } as Response;
+    }
+    return { ok: true, json: async () => ({ items: [] }) } as Response;
+  }));
+
+  const { container } = render(<App />);
+  await screen.findByText("最近会话");
+
+  expect([...container.querySelectorAll(".sidebar-section-label")].map((node) => node.textContent)).toEqual([
+    "置顶", "项目", "最近",
+  ]);
+  expect([...container.querySelectorAll("[data-workspace-id]")].map((node) => node.getAttribute("data-workspace-id"))).toEqual([
+    "pinned-first", "pinned-later", "project-new", "project-old", "none",
+  ]);
+  const pinnedProject = container.querySelector('[data-workspace-id="pinned-first"]');
+  expect(pinnedProject).not.toBeNull();
+  expect([...pinnedProject!.querySelectorAll(".session-row-select")].map((node) => node.textContent)).toEqual([
+    "先置顶会话", "后置顶会话", "普通较新", "普通较早",
+  ]);
 });
 
 it("通过会话菜单重命名且不触发会话切换", async () => {

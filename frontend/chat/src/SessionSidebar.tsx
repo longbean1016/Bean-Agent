@@ -3,10 +3,13 @@ import {
   AlertCircle,
   Bell,
   Folder,
+  FolderOpen,
   FolderPlus,
   MessageSquarePlus,
   MoreHorizontal,
   Pencil,
+  Pin,
+  PinOff,
   Trash2,
   Unlink,
   X,
@@ -18,9 +21,9 @@ import {
   deleteReminder,
   fetchProactiveSettings,
   fetchReminders,
+  pickWorkspaceDirectory,
   saveProactiveSettings,
 } from "./api";
-import { groupSessionsByUpdatedAt } from "./sessionGroups";
 import type {
   ProactiveSettings,
   ScheduledReminder,
@@ -35,11 +38,15 @@ export function SessionSidebar(props: {
   onCreate: (workspaceId?: string | null) => void;
   onDelete: (id: string) => Promise<void>;
   onDeleteWorkspace: (id: string) => Promise<void>;
+  onOpenWorkspace: (id: string) => Promise<void>;
   onRegisterWorkspace: (path: string, title: string) => Promise<Workspace>;
   onRename: (id: string, title: string) => Promise<void>;
+  onSetSessionPinned: (id: string, pinned: boolean) => Promise<void>;
+  onUpdateWorkspace: (id: string, patch: { title?: string; pinned?: boolean }) => Promise<void>;
   onSelect: (id: string) => void;
 }) {
   const [menuSessionId, setMenuSessionId] = useState("");
+  const [menuWorkspaceId, setMenuWorkspaceId] = useState("");
   const [editingSessionId, setEditingSessionId] = useState("");
   const [titleDraft, setTitleDraft] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
@@ -48,6 +55,10 @@ export function SessionSidebar(props: {
   const [workspacePath, setWorkspacePath] = useState("");
   const [workspaceTitle, setWorkspaceTitle] = useState("");
   const [workspaceError, setWorkspaceError] = useState("");
+  const [pickingWorkspace, setPickingWorkspace] = useState(false);
+  const [renameWorkspaceTarget, setRenameWorkspaceTarget] = useState<Workspace | null>(null);
+  const [workspaceTitleDraft, setWorkspaceTitleDraft] = useState("");
+  const [updatingWorkspace, setUpdatingWorkspace] = useState(false);
   const [proactiveTarget, setProactiveTarget] = useState<SessionSummary | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deletingWorkspace, setDeletingWorkspace] = useState(false);
@@ -90,17 +101,21 @@ export function SessionSidebar(props: {
   };
 
   useEffect(() => {
-    if (!menuSessionId) return;
+    if (!menuSessionId && !menuWorkspaceId) return;
     const closeMenuOutside = (event: PointerEvent) => {
-      const owner = event.target instanceof Element
+      const sessionOwner = event.target instanceof Element
         ? event.target.closest<HTMLElement>("[data-session-menu-owner]")
         : null;
-      if (owner?.dataset.sessionMenuOwner !== menuSessionId) setMenuSessionId("");
+      const workspaceOwner = event.target instanceof Element
+        ? event.target.closest<HTMLElement>("[data-workspace-menu-owner]")
+        : null;
+      if (sessionOwner?.dataset.sessionMenuOwner !== menuSessionId) setMenuSessionId("");
+      if (workspaceOwner?.dataset.workspaceMenuOwner !== menuWorkspaceId) setMenuWorkspaceId("");
     };
     // 捕获阶段先收起菜单，再执行目标控件自己的动作。
     document.addEventListener("pointerdown", closeMenuOutside, true);
     return () => document.removeEventListener("pointerdown", closeMenuOutside, true);
-  }, [menuSessionId]);
+  }, [menuSessionId, menuWorkspaceId]);
 
   const beginRename = (session: SessionSummary) => {
     setMenuSessionId("");
@@ -119,7 +134,7 @@ export function SessionSidebar(props: {
     await props.onRename(session.key, title).catch(() => setEditingSessionId(session.key));
   };
 
-  const renderSessionRows = (sessions: SessionSummary[]) => sessions.map((session) => {
+  const renderSessionRows = (sessions: SessionSummary[]) => sortSessions(sessions).map((session) => {
     const title = session.title || session.first_message_content || "未命名会话";
     const active = session.key === props.activeSessionId;
     return (
@@ -144,7 +159,7 @@ export function SessionSidebar(props: {
           />
         ) : (
           <button className="session-row-select" onClick={() => props.onSelect(session.key)}>
-            <span>{title}</span>
+            <span>{session.pinned_at ? <Pin className="session-row-pin" size={13} /> : null}{title}</span>
           </button>
         )}
         <button
@@ -157,6 +172,12 @@ export function SessionSidebar(props: {
         </button>
         {menuSessionId === session.key ? (
           <div className="session-menu" role="menu">
+            {session.workspace_id ? (
+              <button role="menuitem" onClick={() => {
+                setMenuSessionId("");
+                void props.onSetSessionPinned(session.key, !session.pinned_at).catch(() => undefined);
+              }}>{session.pinned_at ? <PinOff size={15} /> : <Pin size={15} />}{session.pinned_at ? "取消置顶" : "置顶会话"}</button>
+            ) : null}
             <button role="menuitem" onClick={() => { setMenuSessionId(""); setProactiveTarget(session); }}><Bell size={15} />主动设置</button>
             <button role="menuitem" onClick={() => beginRename(session)}><Pencil size={15} />重命名</button>
             <button className="danger" role="menuitem" onClick={() => { setMenuSessionId(""); setDeleteTarget(session); }}><Trash2 size={15} />删除</button>
@@ -166,12 +187,23 @@ export function SessionSidebar(props: {
     );
   });
 
-  const renderSessions = (sessions: SessionSummary[]) => sessions.length ? groupSessionsByUpdatedAt(sessions).map((group) => (
-    <div className="session-group" key={group.label}>
-      <h3 className="session-group-title">{group.label}</h3>
-      {renderSessionRows(group.sessions)}
-    </div>
-  )) : <p className="workspace-session-empty">尚无会话</p>;
+  const renderSessions = (sessions: SessionSummary[]) => sessions.length
+    ? renderSessionRows(sessions)
+    : <p className="workspace-session-empty">尚无会话</p>;
+
+  const chooseWorkspace = async () => {
+    if (pickingWorkspace || registeringWorkspace) return;
+    setPickingWorkspace(true);
+    setWorkspaceError("");
+    try {
+      const selected = await pickWorkspaceDirectory();
+      if (selected !== null) setWorkspacePath(selected);
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : "无法选择工作目录");
+    } finally {
+      setPickingWorkspace(false);
+    }
+  };
 
   const submitWorkspace = async () => {
     const path = workspacePath.trim();
@@ -191,6 +223,12 @@ export function SessionSidebar(props: {
   };
 
   const unassignedSessions = props.sessions.filter((session) => !session.workspace_id);
+  const pinnedWorkspaces = props.workspaces
+    .filter((workspace) => workspace.pinned_at)
+    .sort(comparePinned);
+  const projectWorkspaces = props.workspaces
+    .filter((workspace) => !workspace.pinned_at)
+    .sort((left, right) => compareDateDesc(left.created_at, right.created_at, left.id, right.id));
   const registeredWorkspaceIds = new Set(props.workspaces.map((workspace) => workspace.id));
   const unavailableByWorkspace = new Map<string, {
     id: string;
@@ -217,6 +255,29 @@ export function SessionSidebar(props: {
   }
   const unavailableWorkspaceGroups = [...unavailableByWorkspace.values()];
 
+  const renderWorkspace = (workspace: Workspace) => (
+    <section className="workspace-group" key={workspace.id} data-workspace-id={workspace.id}>
+      <header className="workspace-group-header" data-workspace-menu-owner={workspace.id}>
+        <span className={`workspace-group-icon${workspace.valid ? "" : " invalid"}`}><Folder size={15} /></span>
+        <span className="workspace-group-copy" title={workspace.canonical_path}>
+          <strong>{workspace.title || workspaceName(workspace.canonical_path)}</strong>
+          <small>{workspace.valid ? workspace.canonical_path : "目录不可用"}</small>
+        </span>
+        <button className="workspace-header-action" aria-label={`在“${workspace.title || workspaceName(workspace.canonical_path)}”中新建会话`} title="新建会话" disabled={!workspace.valid} onClick={() => props.onCreate(workspace.id)}><MessageSquarePlus size={15} /></button>
+        <button className="workspace-header-action" aria-label={`打开工作目录“${workspace.title || workspaceName(workspace.canonical_path)}”的菜单`} aria-expanded={menuWorkspaceId === workspace.id} title="工作目录菜单" onClick={() => setMenuWorkspaceId((current) => current === workspace.id ? "" : workspace.id)}><MoreHorizontal size={16} /></button>
+        {menuWorkspaceId === workspace.id ? (
+          <div className="workspace-menu" role="menu">
+            <button role="menuitem" onClick={() => { setMenuWorkspaceId(""); void props.onUpdateWorkspace(workspace.id, { pinned: !workspace.pinned_at }).catch(() => undefined); }}>{workspace.pinned_at ? <PinOff size={15} /> : <Pin size={15} />}{workspace.pinned_at ? "取消置顶" : "置顶项目"}</button>
+            <button role="menuitem" onClick={() => { setMenuWorkspaceId(""); setWorkspaceTitleDraft(workspace.title); setRenameWorkspaceTarget(workspace); }}><Pencil size={15} />修改名称</button>
+            <button role="menuitem" disabled={!workspace.valid} onClick={() => { setMenuWorkspaceId(""); void props.onOpenWorkspace(workspace.id).catch(() => undefined); }}><FolderOpen size={15} />在资源管理器中打开</button>
+            <button className="danger" role="menuitem" onClick={() => { setMenuWorkspaceId(""); setDeleteWorkspaceTarget(workspace); }}><Unlink size={15} />移除工作目录</button>
+          </div>
+        ) : null}
+      </header>
+      <div className="workspace-sessions">{renderSessions(props.sessions.filter((session) => session.workspace_id === workspace.id))}</div>
+    </section>
+  );
+
   return (
     <div className="session-panel">
       <div className="brand-lockup">
@@ -225,7 +286,12 @@ export function SessionSidebar(props: {
       </div>
       <div className="sidebar-primary-actions">
         <button className="new-chat-button" onClick={() => props.onCreate(null)}><MessageSquarePlus size={17} />新建会话</button>
-        <button className="add-workspace-button" onClick={() => { setWorkspaceError(""); setWorkspaceDialogOpen(true); }}><FolderPlus size={17} />添加工作目录</button>
+        <button className="add-workspace-button" onClick={() => {
+          setWorkspaceError("");
+          setWorkspacePath("");
+          setWorkspaceTitle("");
+          setWorkspaceDialogOpen(true);
+        }}><FolderPlus size={17} />添加工作目录</button>
       </div>
       <nav
         ref={sessionListRef}
@@ -234,31 +300,13 @@ export function SessionSidebar(props: {
         onPointerEnter={showSessionScrollbar}
         onPointerLeave={scheduleSessionScrollbarHide}
       >
-        <section className="workspace-group" data-workspace-id="none">
-          <header className="workspace-group-header">
-            <span className="workspace-group-icon"><Folder size={15} /></span>
-            <span className="workspace-group-copy"><strong>无工作目录</strong><small>会话私有临时目录</small></span>
-            <button className="workspace-header-action" aria-label="在无工作目录中新建会话" title="新建会话" onClick={() => props.onCreate(null)}><MessageSquarePlus size={15} /></button>
-          </header>
-          <div className="workspace-sessions">{renderSessions(unassignedSessions)}</div>
-        </section>
-        {props.workspaces.map((workspace) => (
-          <section className="workspace-group" key={workspace.id} data-workspace-id={workspace.id}>
-            <header className="workspace-group-header">
-              <span className={`workspace-group-icon${workspace.valid ? "" : " invalid"}`}><Folder size={15} /></span>
-              <span className="workspace-group-copy" title={workspace.canonical_path}>
-                <strong>{workspace.title || workspaceName(workspace.canonical_path)}</strong>
-                <small>{workspace.valid ? workspace.canonical_path : "目录不可用"}</small>
-              </span>
-              <button className="workspace-header-action" aria-label={`在“${workspace.title || workspaceName(workspace.canonical_path)}”中新建会话`} title="新建会话" disabled={!workspace.valid} onClick={() => props.onCreate(workspace.id)}><MessageSquarePlus size={15} /></button>
-              <button className="workspace-header-action" aria-label={`移除工作目录“${workspace.title || workspaceName(workspace.canonical_path)}”`} title="移除工作目录" onClick={() => setDeleteWorkspaceTarget(workspace)}><Unlink size={15} /></button>
-            </header>
-            <div className="workspace-sessions">{renderSessions(props.sessions.filter((session) => session.workspace_id === workspace.id))}</div>
-          </section>
-        ))}
+        {pinnedWorkspaces.length ? <h2 className="sidebar-section-label">置顶</h2> : null}
+        {pinnedWorkspaces.map(renderWorkspace)}
+        {projectWorkspaces.length || unavailableWorkspaceGroups.length ? <h2 className="sidebar-section-label">项目</h2> : null}
+        {projectWorkspaces.map(renderWorkspace)}
         {unavailableWorkspaceGroups.map((workspace) => (
           <section className="workspace-group" key={`unavailable:${workspace.id}`} data-workspace-id={workspace.id}>
-            <header className="workspace-group-header">
+            <header className="workspace-group-header unavailable-header">
               <span className="workspace-group-icon invalid"><Folder size={15} /></span>
               <span className="workspace-group-copy" title={workspace.path || undefined}>
                 <strong>{workspace.title}</strong>
@@ -268,6 +316,11 @@ export function SessionSidebar(props: {
             <div className="workspace-sessions">{renderSessions(workspace.sessions)}</div>
           </section>
         ))}
+        <div className="sidebar-section-heading recent-heading">
+          <h2 className="sidebar-section-label recent-label">最近</h2>
+          <button className="workspace-header-action" aria-label="在最近中新建会话" title="新建会话" onClick={() => props.onCreate(null)}><MessageSquarePlus size={15} /></button>
+        </div>
+        <div className="recent-sessions" data-workspace-id="none">{renderSessions(unassignedSessions)}</div>
       </nav>
       <Dialog.Root open={deleteTarget !== null} onOpenChange={(open) => { if (!open && !deleting) setDeleteTarget(null); }}>
         <Dialog.Portal>
@@ -298,24 +351,82 @@ export function SessionSidebar(props: {
         </Dialog.Portal>
       </Dialog.Root>
       <Dialog.Root open={workspaceDialogOpen} onOpenChange={(open) => {
-        if (registeringWorkspace) return;
+        if (registeringWorkspace || pickingWorkspace) return;
         setWorkspaceDialogOpen(open);
         if (!open) setWorkspaceError("");
       }}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
-          <Dialog.Content className="workspace-dialog">
+          <Dialog.Content className="workspace-dialog workspace-create-dialog">
             <div className="workspace-dialog-header">
-              <div><Dialog.Title>添加工作目录</Dialog.Title><Dialog.Description>注册本机已有目录，用于限定会话的可写范围。</Dialog.Description></div>
-              <Dialog.Close asChild><button className="icon-button" aria-label="关闭" disabled={registeringWorkspace}><X size={17} /></button></Dialog.Close>
+              <div><Dialog.Title>添加工作目录</Dialog.Title><Dialog.Description className="sr-only">注册本机已有目录，用于限定会话的可写范围。</Dialog.Description></div>
+              <Dialog.Close asChild><button className="icon-button" aria-label="关闭" disabled={registeringWorkspace || pickingWorkspace}><X size={17} /></button></Dialog.Close>
             </div>
             <form onSubmit={(event) => { event.preventDefault(); void submitWorkspace(); }}>
-              <label>绝对路径<input autoFocus value={workspacePath} onChange={(event) => setWorkspacePath(event.target.value)} placeholder="D:\code\project" /></label>
-              <label>显示名称 <span>可选</span><input value={workspaceTitle} maxLength={80} onChange={(event) => setWorkspaceTitle(event.target.value)} placeholder="默认使用文件夹名称" /></label>
+              <label className="workspace-name-field">
+                <span className="sr-only">显示名称（可选）</span>
+                <Folder size={20} aria-hidden="true" />
+                <input
+                  value={workspaceTitle}
+                  maxLength={80}
+                  onChange={(event) => setWorkspaceTitle(event.target.value)}
+                  placeholder="项目名称（可选）"
+                />
+              </label>
+              <div className="workspace-picker-field">
+                <span className="workspace-field-label">源文件夹</span>
+                <button
+                  type="button"
+                  className={`workspace-picker-card${workspacePath ? " selected" : ""}`}
+                  disabled={pickingWorkspace || registeringWorkspace}
+                  onClick={() => void chooseWorkspace()}
+                  title={workspacePath || "选择工作目录"}
+                  aria-label={workspacePath ? `重新选择工作目录，当前为 ${workspacePath}` : "选择 Bean 可读取和编辑的文件夹"}
+                >
+                  <span className="workspace-picker-icon">
+                    {workspacePath ? <FolderOpen size={26} /> : <FolderPlus size={26} />}
+                  </span>
+                  <span className="workspace-picker-copy">
+                    <strong>{workspacePath
+                      ? workspaceName(workspacePath)
+                      : "添加 Bean 可读取和编辑的文件夹"}</strong>
+                    {workspacePath ? <small>{workspacePath}</small> : null}
+                  </span>
+                </button>
+              </div>
               {workspaceError ? <p className="workspace-form-error" role="alert">{workspaceError}</p> : null}
               <footer className="workspace-dialog-actions">
-                <Dialog.Close asChild><button type="button" className="secondary-action" disabled={registeringWorkspace}>取消</button></Dialog.Close>
-                <button type="submit" className="primary-action" disabled={registeringWorkspace || !workspacePath.trim()}>{registeringWorkspace ? "添加中…" : "添加"}</button>
+                <Dialog.Close asChild><button type="button" className="secondary-action" disabled={registeringWorkspace || pickingWorkspace}>取消</button></Dialog.Close>
+                <button type="submit" className="primary-action" disabled={registeringWorkspace || pickingWorkspace || !workspacePath.trim()}>{registeringWorkspace ? "添加中…" : "添加"}</button>
+              </footer>
+            </form>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+      <Dialog.Root open={renameWorkspaceTarget !== null} onOpenChange={(open) => {
+        if (!open && !updatingWorkspace) setRenameWorkspaceTarget(null);
+      }}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="workspace-dialog rename-workspace-dialog">
+            <div className="workspace-dialog-header">
+              <div><Dialog.Title>修改项目名称</Dialog.Title><Dialog.Description>只修改 BeanAgent 中显示的名称，不会重命名磁盘文件夹。</Dialog.Description></div>
+              <Dialog.Close asChild><button className="icon-button" aria-label="关闭" disabled={updatingWorkspace}><X size={17} /></button></Dialog.Close>
+            </div>
+            <form onSubmit={(event) => {
+              event.preventDefault();
+              const title = workspaceTitleDraft.trim();
+              if (!renameWorkspaceTarget || !title || updatingWorkspace) return;
+              setUpdatingWorkspace(true);
+              void props.onUpdateWorkspace(renameWorkspaceTarget.id, { title })
+                .then(() => setRenameWorkspaceTarget(null))
+                .catch(() => undefined)
+                .finally(() => setUpdatingWorkspace(false));
+            }}>
+              <label>项目名称<input autoFocus value={workspaceTitleDraft} maxLength={80} onChange={(event) => setWorkspaceTitleDraft(event.target.value)} /></label>
+              <footer className="workspace-dialog-actions">
+                <Dialog.Close asChild><button type="button" className="secondary-action" disabled={updatingWorkspace}>取消</button></Dialog.Close>
+                <button type="submit" className="primary-action" disabled={updatingWorkspace || !workspaceTitleDraft.trim()}>{updatingWorkspace ? "保存中…" : "保存"}</button>
               </footer>
             </form>
           </Dialog.Content>
@@ -498,4 +609,32 @@ function NumberSetting({ value, min, max, suffix, onChange }: { value: number; m
 function workspaceName(path: string): string {
   const normalized = path.replace(/[\\/]+$/, "");
   return normalized.split(/[\\/]/).pop() || path || "工作目录";
+}
+
+function compareDateDesc(left: string, right: string, leftId: string, rightId: string): number {
+  const byDate = Date.parse(right) - Date.parse(left);
+  return Number.isNaN(byDate) || byDate === 0 ? rightId.localeCompare(leftId) : byDate;
+}
+
+function comparePinned<T extends { pinned_at?: string | null; id?: string; key?: string }>(left: T, right: T): number {
+  const leftTime = left.pinned_at ? Date.parse(left.pinned_at) : Number.POSITIVE_INFINITY;
+  const rightTime = right.pinned_at ? Date.parse(right.pinned_at) : Number.POSITIVE_INFINITY;
+  const byDate = leftTime - rightTime;
+  return Number.isNaN(byDate) || byDate === 0
+    ? (left.id ?? left.key ?? "").localeCompare(right.id ?? right.key ?? "")
+    : byDate;
+}
+
+function sortSessions(sessions: SessionSummary[]): SessionSummary[] {
+  return [...sessions].sort((left, right) => {
+    if (left.pinned_at && right.pinned_at) return comparePinned(left, right);
+    if (left.pinned_at) return -1;
+    if (right.pinned_at) return 1;
+    return compareDateDesc(
+      left.last_activity_at || left.created_at,
+      right.last_activity_at || right.created_at,
+      left.key,
+      right.key,
+    );
+  });
 }

@@ -32,6 +32,14 @@ from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt
 from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import LLMProvider, create_vision_provider
 from agent.skills import SkillsLoader
+from bootstrap.native_folder_picker import (
+    DirectoryPicker,
+    NativeHostError,
+    NativeHostUnavailable,
+    NativePickerBusy,
+    WindowsDirectoryPicker,
+    is_loopback_client,
+)
 from memory.embedder import Embedder
 from memory.engine import MemoryEngine
 from proactive.agent_tools import ProactiveToolFactory
@@ -444,10 +452,15 @@ def build_core_runtime(
     )
 
 
-def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
+def create_fastapi_app(
+    runtime: CoreRuntime | AppRuntime,
+    *,
+    directory_picker: DirectoryPicker | None = None,
+) -> FastAPI:
     """为已组装 Runtime 暴露 WebSocket 路由，不复制或隐式替换依赖。"""
 
     application = runtime if isinstance(runtime, AppRuntime) else AppRuntime(runtime)
+    host_directories = directory_picker or WindowsDirectoryPicker()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -505,6 +518,34 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
     def list_workspaces() -> dict[str, Any]:
         return {"items": application.core.sessions.store.list_workspaces()}
 
+    def require_local_host(request: Request) -> None:
+        client_host = request.client.host if request.client is not None else None
+        if not is_loopback_client(client_host):
+            raise HTTPException(
+                status_code=403,
+                detail="本机目录能力只允许从回环地址调用",
+            )
+
+    @app.post("/api/chat/workspaces/pick")
+    def pick_workspace_directory(request: Request) -> dict[str, str | None]:
+        """打开系统选择器；选择阶段不创建工作目录或会话记录。"""
+
+        require_local_host(request)
+        try:
+            selected = host_directories.pick_directory()
+            if selected is None:
+                return {"path": None}
+            resolved = application.core.sandbox_policy.validate_workspace(selected)
+            return {"path": str(resolved)}
+        except NativePickerBusy as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except NativeHostUnavailable as error:
+            raise HTTPException(status_code=501, detail=str(error)) from error
+        except NativeHostError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except (OSError, ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
     @app.post("/api/chat/workspaces", status_code=201)
     def register_workspace(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         path = str(payload.get("path") or "").strip()
@@ -518,6 +559,46 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             )
         except (OSError, ValueError, RuntimeError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.patch("/api/chat/workspaces/{workspace_id}")
+    def update_workspace(
+        workspace_id: str,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        allowed = {"title", "pinned"}
+        if not payload or any(key not in allowed for key in payload):
+            raise HTTPException(status_code=400, detail="工作区更新字段无效")
+        title = payload.get("title") if "title" in payload else None
+        pinned = payload.get("pinned") if "pinned" in payload else None
+        if pinned is not None and not isinstance(pinned, bool):
+            raise HTTPException(status_code=400, detail="pinned 必须是布尔值")
+        try:
+            updated = application.core.sessions.store.update_workspace(
+                workspace_id,
+                title=title,
+                pinned=pinned,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        if updated is None:
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        return updated
+
+    @app.post("/api/chat/workspaces/{workspace_id}/open", status_code=204)
+    def open_workspace(workspace_id: str, request: Request) -> Response:
+        require_local_host(request)
+        workspace = application.core.sessions.store.get_workspace(workspace_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        if not workspace["valid"]:
+            raise HTTPException(status_code=409, detail="工作区目录当前不可用")
+        try:
+            host_directories.open_directory(Path(str(workspace["canonical_path"])))
+        except NativeHostUnavailable as error:
+            raise HTTPException(status_code=501, detail=str(error)) from error
+        except NativeHostError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        return Response(status_code=204)
 
     @app.delete("/api/chat/workspaces/{workspace_id}", status_code=204)
     async def unregister_workspace(workspace_id: str) -> Response:
@@ -673,26 +754,48 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
         return Response(status_code=204)
 
     @app.patch("/api/chat/sessions/{session_key:path}")
-    async def rename_session(
+    async def update_session(
         session_key: str,
-        title: str = Body(embed=True),
-    ) -> dict[str, str]:
-        """修改会话展示标题；原始消息和长期记忆均不参与该操作。"""
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        """修改会话标题或目录内置顶状态，不改变对话活动时间。"""
 
-        clean_title = str(title).strip()
-        if not clean_title or len(clean_title) > 60:
-            raise HTTPException(status_code=400, detail="会话标题长度必须为 1-60 个字符")
+        allowed = {"title", "pinned"}
+        if len(payload) != 1 or any(key not in allowed for key in payload):
+            raise HTTPException(status_code=400, detail="会话更新字段无效")
         channel = application.core.config.channels.chat.channel_name
         if not session_key.startswith(f"{channel}:"):
             raise HTTPException(status_code=404, detail="会话不存在")
-        updated = await application.core.sessions.update_title(session_key, clean_title)
-        if updated is None:
+        if "title" in payload:
+            clean_title = str(payload.get("title") or "").strip()
+            if not clean_title or len(clean_title) > 60:
+                raise HTTPException(status_code=400, detail="会话标题长度必须为 1-60 个字符")
+            updated = await application.core.sessions.update_title(session_key, clean_title)
+            if updated is None:
+                raise HTTPException(status_code=404, detail="会话不存在")
+        if "pinned" in payload:
+            pinned = payload.get("pinned")
+            if not isinstance(pinned, bool):
+                raise HTTPException(status_code=400, detail="pinned 必须是布尔值")
+            try:
+                updated = await asyncio.to_thread(
+                    application.core.sessions.store.set_chat_session_pinned,
+                    session_key,
+                    pinned,
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            if updated is None:
+                raise HTTPException(status_code=404, detail="会话不存在")
+        meta = application.core.sessions.store.get_session_meta(session_key)
+        if meta is None:
             raise HTTPException(status_code=404, detail="会话不存在")
-        # 前端按最近活动时间分组，重命名也属于一次活动，必须把持久化后的时间一并返回。
         return {
             "key": session_key,
-            "title": clean_title,
-            "updated_at": str(updated["updated_at"]),
+            "title": str(meta.get("metadata", {}).get("title") or ""),
+            "updated_at": str(meta["updated_at"]),
+            "last_activity_at": str(meta.get("last_activity_at") or meta["created_at"]),
+            "pinned_at": meta.get("pinned_at"),
         }
 
     @app.delete("/api/chat/sessions/{session_key:path}", status_code=204)

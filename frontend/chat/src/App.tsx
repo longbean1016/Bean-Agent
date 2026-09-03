@@ -33,7 +33,7 @@ import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import type { StickToBottomContext } from "use-stick-to-bottom";
 
-import { deleteSession, deleteWorkspace, fetchMessagePage, fetchMessagesAroundPage, fetchNotifications, fetchOlderMessages, fetchSessions, fetchTurns, fetchWorkspaces, mediaUrl, registerWorkspace, renameSession, uploadAttachment } from "./api";
+import { deleteSession, deleteWorkspace, fetchMessagePage, fetchMessagesAroundPage, fetchNotifications, fetchOlderMessages, fetchSessions, fetchTurns, fetchWorkspaces, mediaUrl, openWorkspaceDirectory, registerWorkspace, renameSession, setSessionPinned, updateWorkspace, uploadAttachment } from "./api";
 import { idleTurnState, initialChatState, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
 import { composeTimeline, reconcileMessages } from "./timeline";
 import { parseMemoryCitations } from "./citations";
@@ -451,6 +451,7 @@ export function App() {
             title: "新对话",
             created_at: createdAt,
             updated_at: createdAt,
+            last_activity_at: createdAt,
             message_count: 0,
             first_message_content: "",
             workspace_id: newSessionConfigRef.current.workspaceId,
@@ -468,7 +469,7 @@ export function App() {
       const acknowledgedAt = new Date().toISOString();
       setSessions((current) => current.map((session) => (
         session.key === frame.session_id
-          ? { ...session, updated_at: acknowledgedAt }
+          ? { ...session, updated_at: acknowledgedAt, last_activity_at: acknowledgedAt }
           : session
       )));
     }
@@ -657,6 +658,44 @@ export function App() {
         setNewSessionWorkspaceId(null);
         if (newSessionMode === "workspace-write") setNewSessionMode("read-only");
       }
+    } catch (error) {
+      dispatch(errorFrame(error));
+      throw error;
+    }
+  };
+
+  const handleUpdateWorkspace = async (workspaceId: string, patch: { title?: string; pinned?: boolean }) => {
+    try {
+      const updated = await updateWorkspace(workspaceId, patch);
+      setWorkspaces((current) => current.map((workspace) => (
+        workspace.id === workspaceId ? updated : workspace
+      )));
+      if (Object.hasOwn(patch, "title")) {
+        setSessions((current) => current.map((session) => (
+          session.workspace_id === workspaceId
+            ? { ...session, workspace_title: updated.title }
+            : session
+        )));
+      }
+    } catch (error) {
+      dispatch(errorFrame(error));
+      throw error;
+    }
+  };
+
+  const handleOpenWorkspace = async (workspaceId: string) => {
+    try {
+      await openWorkspaceDirectory(workspaceId);
+    } catch (error) {
+      dispatch(errorFrame(error));
+      throw error;
+    }
+  };
+
+  const handleSetSessionPinned = async (sessionId: string, pinned: boolean) => {
+    try {
+      await setSessionPinned(sessionId, pinned);
+      await refreshSessions();
     } catch (error) {
       dispatch(errorFrame(error));
       throw error;
@@ -983,6 +1022,7 @@ export function App() {
             title: "新对话",
             created_at: submittedAt,
             updated_at: submittedAt,
+            last_activity_at: submittedAt,
             message_count: 0,
             first_message_content: "",
           }, ...current]);
@@ -1026,8 +1066,11 @@ export function App() {
       onCreate={createSession}
       onDelete={handleDeleteSession}
       onDeleteWorkspace={handleDeleteWorkspace}
+      onOpenWorkspace={handleOpenWorkspace}
       onRegisterWorkspace={handleRegisterWorkspace}
       onRename={handleRenameSession}
+      onSetSessionPinned={handleSetSessionPinned}
+      onUpdateWorkspace={handleUpdateWorkspace}
       onSelect={selectSession}
     />
   );

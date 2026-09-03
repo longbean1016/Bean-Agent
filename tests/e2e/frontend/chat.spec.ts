@@ -120,6 +120,16 @@ test("工作目录与会话权限可以在输入框切换", async ({ page }) => 
   await expect(page.getByRole("button", { name: "权限：工作区可写" })).toBeVisible();
 });
 
+test("添加工作目录使用本机选择器返回路径", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "桌面侧栏覆盖即可");
+  await page.getByRole("button", { name: "添加工作目录" }).click();
+  const dialog = page.getByRole("dialog", { name: "添加工作目录" });
+  await expect(dialog.getByLabel("绝对路径")).toHaveCount(0);
+  await dialog.getByRole("button", { name: /选择 Bean 可读取和编辑的文件夹/ }).click();
+  await expect(dialog.getByText("D:/projects/picked-by-native-dialog")).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "添加" })).toBeEnabled();
+});
+
 test("完全访问需要显式风险确认", async ({ page }) => {
   await page.getByRole("button", { name: "权限：只读" }).click();
   await page.getByRole("menuitemradio", { name: /完全访问/ }).click();

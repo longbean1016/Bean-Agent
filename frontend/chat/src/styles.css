@@ -164,9 +164,14 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .session-list.scrollbar-visible::-webkit-scrollbar-thumb { background-color: rgba(116, 126, 122, .36); }
 .session-list.scrollbar-visible::-webkit-scrollbar-thumb:hover { background-color: rgba(116, 126, 122, .52); }
 .session-list::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+.sidebar-section-label { margin: 16px 6px 7px; color: var(--text-subtle); font-size: 11px; font-weight: 650; line-height: 1.2; }
+.sidebar-section-label:first-child { margin-top: 2px; }
+.sidebar-section-heading { display: flex; min-height: 32px; align-items: end; justify-content: space-between; }
+.sidebar-section-heading .sidebar-section-label { flex: 1; }
+.sidebar-section-heading .workspace-header-action { margin: 0 2px 2px 0; }
 .workspace-group + .workspace-group { margin-top: 14px; }
-.workspace-group-header { display: grid; grid-template-columns: 24px minmax(0, 1fr) 26px 26px; min-height: 40px; align-items: center; gap: 2px; padding: 3px 2px 5px; }
-.workspace-group:first-child .workspace-group-header { grid-template-columns: 24px minmax(0, 1fr) 26px; }
+.workspace-group-header { position: relative; display: grid; grid-template-columns: 24px minmax(0, 1fr) 26px 26px; min-height: 40px; align-items: center; gap: 2px; padding: 3px 2px 5px; }
+.workspace-group-header.unavailable-header { grid-template-columns: 24px minmax(0, 1fr); }
 .workspace-group-icon { display: grid; width: 24px; height: 24px; place-items: center; color: var(--primary-icon); }
 .workspace-group-icon.invalid { color: var(--warning); }
 .workspace-group-copy { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
@@ -176,7 +181,13 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .workspace-header-action { display: grid; width: 26px; height: 26px; padding: 0; place-items: center; border: 0; border-radius: 4px; background: transparent; color: var(--text-subtle); cursor: pointer; }
 .workspace-header-action:hover:not(:disabled) { background: var(--surface-hover); color: var(--primary-hover); }
 .workspace-header-action:disabled { cursor: default; opacity: .38; }
+.workspace-menu { position: absolute; z-index: 6; top: 35px; right: 0; min-width: 190px; padding: 4px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); box-shadow: 0 8px 20px rgba(28, 43, 38, .16); }
+.workspace-menu button { display: flex; width: 100%; min-height: 32px; align-items: center; gap: 8px; padding: 0 8px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; font-size: 13px; text-align: left; }
+.workspace-menu button:hover:not(:disabled) { background: var(--surface-3); }
+.workspace-menu button:disabled { cursor: default; opacity: .45; }
+.workspace-menu button.danger { color: var(--danger); }
 .workspace-sessions { padding-left: 6px; }
+.recent-sessions { padding-left: 6px; }
 .workspace-session-empty { margin: 3px 7px 5px; color: var(--text-faint); font-size: 11px; }
 .session-group + .session-group { margin-top: 11px; }
 .session-group-title { margin: 2px 8px 4px; color: var(--text-subtle); font-size: 10px; font-weight: 600; letter-spacing: 0; }
@@ -185,6 +196,7 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .session-row.active { background: var(--primary-wash); }
 .session-row-select { display: block; min-width: 0; min-height: 42px; padding: 9px 5px 9px 7px; overflow: hidden; border: 0; background: transparent; cursor: pointer; text-align: left; }
 .session-row-select > span { display: block; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.session-row-pin { margin-right: 5px; vertical-align: -2px; color: var(--primary-icon); }
 .session-menu-trigger { display: grid; align-self: center; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 4px; background: transparent; cursor: pointer; opacity: 0; }
 .session-row:hover .session-menu-trigger, .session-row.active .session-menu-trigger, .session-menu-trigger:focus-visible, .session-menu-trigger[aria-expanded="true"] { opacity: 1; }
 .session-menu-trigger:hover { background: #dfe7e3; }
@@ -210,6 +222,28 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .workspace-dialog form > label > span { margin-left: 3px; color: var(--text-faint); font-size: 11px; font-weight: 400; }
 .workspace-dialog input { width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--border-input); border-radius: 5px; outline: none; background: var(--surface-2); color: var(--text); }
 .workspace-dialog input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-tint); }
+.workspace-create-dialog { width: min(510px, calc(100vw - 32px)); padding: 26px; }
+.workspace-create-dialog .workspace-dialog-header { margin-bottom: 22px; }
+.workspace-create-dialog form { gap: 20px; }
+.workspace-name-field { position: relative; display: block; }
+.workspace-name-field > svg { position: absolute; z-index: 1; top: 50%; left: 16px; color: var(--primary-icon); transform: translateY(-50%); pointer-events: none; }
+.workspace-create-dialog .workspace-name-field > input { height: 48px; padding: 0 16px 0 49px; border-radius: 6px; background: var(--surface); font-size: 14px; }
+.workspace-picker-field { display: grid; gap: 10px; }
+.workspace-field-label { color: var(--text-strong); font-size: 14px; font-weight: 650; }
+.workspace-picker-card { display: flex; width: 100%; min-height: 142px; align-items: center; justify-content: center; flex-direction: column; gap: 10px; padding: 24px; border: 1px solid var(--border-input); border-radius: 8px; background: var(--surface); cursor: pointer; text-align: center; transition: border-color .15s ease, background .15s ease, box-shadow .15s ease; }
+.workspace-picker-card:hover:not(:disabled), .workspace-picker-card:focus-visible { border-color: var(--primary-border); background: var(--primary-soft-2); box-shadow: 0 0 0 2px var(--primary-tint); outline: none; }
+.workspace-picker-card.selected { border-color: var(--primary-border); background: var(--primary-soft-2); }
+.workspace-picker-card:disabled { cursor: default; opacity: .7; }
+.workspace-picker-icon { display: grid; width: 32px; height: 32px; place-items: center; color: var(--primary-icon); }
+.workspace-picker-copy { display: flex; width: 100%; min-width: 0; align-items: center; flex-direction: column; gap: 5px; }
+.workspace-picker-copy strong, .workspace-picker-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-picker-copy strong { max-width: 100%; color: var(--text-strong); font-size: 15px; font-weight: 600; }
+.workspace-picker-copy small { max-width: 100%; color: var(--text-subtle); font-size: 12px; font-weight: 400; }
+.workspace-create-dialog .workspace-dialog-actions { margin-top: 0; }
+.workspace-create-dialog .workspace-dialog-actions button { min-height: 42px; padding: 0 18px; }
+.workspace-create-dialog .workspace-dialog-actions .secondary-action { border-color: transparent; color: var(--text-muted); background: transparent; }
+.workspace-create-dialog .workspace-dialog-actions .secondary-action:hover { color: var(--text); background: var(--surface-3); }
+.rename-workspace-dialog { width: min(420px, calc(100vw - 32px)); }
 .workspace-form-error { margin: -4px 0 0; color: var(--danger-text); font-size: 12px; line-height: 1.45; }
 .workspace-dialog-actions, .risk-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 5px; }
 .workspace-dialog-actions button, .risk-dialog-actions button, .approval-actions button { min-height: 36px; padding: 0 14px; border-radius: 5px; cursor: pointer; font-weight: 600; }
@@ -658,10 +692,12 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 :root[data-theme="dark"] .user-message .message-body { border-color: var(--border-soft); background: var(--surface-3); }
 :root[data-theme="dark"] .session-row:hover { background: var(--surface-hover); }
 :root[data-theme="dark"] .session-row.active { background: var(--primary-wash); }
-:root[data-theme="dark"] .session-menu { box-shadow: 0 8px 20px rgba(0, 0, 0, .28); }
+:root[data-theme="dark"] .session-menu,
+:root[data-theme="dark"] .workspace-menu { box-shadow: 0 8px 20px rgba(0, 0, 0, .28); }
 :root[data-theme="dark"] .delete-session-dialog { box-shadow: var(--shadow-lg); }
 :root[data-theme="dark"] .delete-session-dialog p { color: var(--text-faint); }
-:root[data-theme="dark"] .workspace-dialog input { border-color: var(--border-input); background: var(--surface-2); }
+:root[data-theme="dark"] .workspace-dialog input,
+:root[data-theme="dark"] .workspace-picker-card { border-color: var(--border-input); background: var(--surface-2); }
 :root[data-theme="dark"] .risk-acknowledgement { border-color: var(--warning-border); background: var(--warning-soft); color: var(--warning-text); }
 
 @media (max-width: 760px) {
@@ -698,6 +734,8 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
   .approval-body { max-height: min(190px, 28vh); }
   .approval-arguments > div { grid-template-columns: 76px minmax(0, 1fr); }
   .speech-toast { top: 9px; left: 50%; }
+  .workspace-create-dialog { padding: 22px; }
+  .workspace-picker-card { min-height: 132px; padding: 20px 14px; }
   .composer-hint { display: none; }
   .send-button { min-width: 38px; width: 38px; padding: 0; }
   .send-button span { display: none; }

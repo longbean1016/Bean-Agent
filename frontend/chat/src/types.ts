@@ -9,6 +9,7 @@ export interface Workspace {
   title: string;
   created_at: string;
   updated_at: string;
+  pinned_at?: string | null;
   valid: boolean;
 }
 
@@ -130,6 +131,8 @@ export interface SessionSummary {
   title?: string;
   created_at: string;
   updated_at: string;
+  last_activity_at?: string;
+  pinned_at?: string | null;
   message_count: number;
   first_message_content: string;
   workspace_id?: string | null;
