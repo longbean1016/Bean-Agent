@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from datetime import datetime
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
@@ -168,10 +170,20 @@ class SessionStore:
         self._has_fts = False
         self._init_schema()
 
-    def create_session(self, session_key: str) -> dict[str, Any]:
+    def create_session(
+        self,
+        session_key: str,
+        *,
+        workspace_id: str | None = None,
+        sandbox_mode: str = "read-only",
+    ) -> dict[str, Any]:
         """幂等创建会话并返回当前元数据。"""
 
-        return self._create_session_sync(session_key)
+        return self._create_session_sync(
+            session_key,
+            workspace_id=workspace_id,
+            sandbox_mode=sandbox_mode,
+        )
 
     def add_message(self, message: NewMessage) -> dict[str, Any]:
         """原子分配 seq、写入消息并推进会话 next_seq。"""
@@ -275,6 +287,258 @@ class SessionStore:
         """读取会话元数据；不存在时返回 None。"""
 
         return self._get_session_meta_sync(session_key)
+
+    def create_workspace(self, path: str, title: str = "") -> dict[str, Any]:
+        """注册已存在目录；同一真实路径重复提交时返回原记录。"""
+
+        resolved = Path(path).expanduser().resolve(strict=True)
+        if not resolved.is_dir():
+            raise ValueError(f"路径不是目录：{resolved}")
+        canonical_path = str(resolved)
+        canonical_key = os.path.normcase(canonical_path)
+        clean_title = str(title or "").strip() or resolved.name or canonical_path
+        if len(clean_title) > 80:
+            raise ValueError("工作区名称不能超过 80 个字符")
+        now = _now_iso()
+        with self._lock:
+            self._ensure_open()
+            existing = self._conn.execute(
+                "SELECT * FROM workspaces WHERE canonical_key = ?",
+                (canonical_key,),
+            ).fetchone()
+            if existing is not None:
+                return self._row_to_workspace(existing)
+            workspace_id = uuid4().hex
+            self._conn.execute(
+                """
+                INSERT INTO workspaces (
+                    id, canonical_path, canonical_key, title, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (workspace_id, canonical_path, canonical_key, clean_title, now, now),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("工作区创建后无法读取")
+        return self._row_to_workspace(row)
+
+    def list_workspaces(self) -> list[dict[str, Any]]:
+        """列出目录注册关系，并动态标记本地路径是否仍然有效。"""
+
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                "SELECT * FROM workspaces ORDER BY updated_at DESC, id DESC"
+            ).fetchall()
+        return [self._row_to_workspace(row) for row in rows]
+
+    def get_workspace(self, workspace_id: str) -> dict[str, Any] | None:
+        clean_id = str(workspace_id or "").strip()
+        if not clean_id:
+            return None
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT * FROM workspaces WHERE id = ?", (clean_id,)
+            ).fetchone()
+        return self._row_to_workspace(row) if row is not None else None
+
+    def delete_workspace(self, workspace_id: str) -> bool:
+        """删除注册关系并解除会话绑定，绝不操作用户目录。"""
+
+        clean_id = str(workspace_id or "").strip()
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    UPDATE sessions
+                    SET workspace_id = NULL, cwd_snapshot = NULL,
+                        sandbox_mode = CASE
+                            WHEN sandbox_mode = 'workspace-write' THEN 'read-only'
+                            ELSE sandbox_mode
+                        END,
+                        updated_at = ?
+                    WHERE workspace_id = ?
+                    """,
+                    (_now_iso(), clean_id),
+                )
+                cursor = self._conn.execute(
+                    "DELETE FROM workspaces WHERE id = ?", (clean_id,)
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return cursor.rowcount > 0
+
+    def set_session_workspace(
+        self,
+        session_key: str,
+        workspace_id: str | None,
+    ) -> dict[str, Any]:
+        """仅允许空会话原子绑定或解除工作区。"""
+
+        key = self._validate_session_key(session_key)
+        clean_workspace_id = str(workspace_id or "").strip() or None
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT sandbox_mode FROM sessions WHERE key = ?", (key,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError("会话不存在")
+                used = self._conn.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(1) FROM messages WHERE session_key = ?) +
+                        (SELECT COUNT(1) FROM surface_events WHERE session_key = ?) +
+                        (SELECT COUNT(1) FROM session_events WHERE session_key = ?)
+                        AS count
+                    """,
+                    (key, key, key),
+                ).fetchone()
+                if int(used["count"] or 0) > 0:
+                    raise ValueError("会话已经开始，不能切换工作目录")
+                workspace = None
+                if clean_workspace_id is not None:
+                    workspace = self._conn.execute(
+                        "SELECT canonical_path FROM workspaces WHERE id = ?",
+                        (clean_workspace_id,),
+                    ).fetchone()
+                    if workspace is None:
+                        raise KeyError("工作区不存在")
+                next_mode = str(row["sandbox_mode"] or "read-only")
+                if clean_workspace_id is None and next_mode == "workspace-write":
+                    next_mode = "read-only"
+                self._conn.execute(
+                    """
+                    UPDATE sessions
+                    SET workspace_id = ?, cwd_snapshot = ?, sandbox_mode = ?, updated_at = ?
+                    WHERE key = ?
+                    """,
+                    (
+                        clean_workspace_id,
+                        str(workspace["canonical_path"]) if workspace else None,
+                        next_mode,
+                        _now_iso(),
+                        key,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        result = self.get_session_sandbox(key)
+        if result is None:
+            raise RuntimeError("工作区绑定后无法读取会话")
+        return result
+
+    def update_session_sandbox_mode(
+        self,
+        session_key: str,
+        sandbox_mode: str,
+    ) -> dict[str, Any]:
+        key = self._validate_session_key(session_key)
+        mode = self._validate_sandbox_mode(sandbox_mode)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT workspace_id FROM sessions WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                raise KeyError("会话不存在")
+            if mode == "workspace-write" and row["workspace_id"] is None:
+                raise ValueError("没有工作目录时不能使用工作区可写权限")
+            self._conn.execute(
+                "UPDATE sessions SET sandbox_mode = ?, updated_at = ? WHERE key = ?",
+                (mode, _now_iso(), key),
+            )
+            self._conn.commit()
+        result = self.get_session_sandbox(key)
+        if result is None:
+            raise RuntimeError("权限更新后无法读取会话")
+        return result
+
+    def get_session_sandbox(self, session_key: str) -> dict[str, Any] | None:
+        key = self._validate_session_key(session_key)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                """
+                SELECT s.key AS session_id, s.workspace_id, s.cwd_snapshot,
+                       s.sandbox_mode, w.title AS workspace_title,
+                       w.canonical_path AS workspace_path
+                FROM sessions s
+                LEFT JOIN workspaces w ON w.id = s.workspace_id
+                WHERE s.key = ?
+                """,
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["workspace_valid"] = bool(
+            item.get("workspace_path") and Path(str(item["workspace_path"])).is_dir()
+        )
+        item["backend"] = "windows-acl"
+        item["capability"] = "partial"
+        return item
+
+    def create_sandbox_approval(self, request: dict[str, object]) -> None:
+        """写入一条不进入聊天正文的审批审计事实。"""
+
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute(
+                """
+                INSERT INTO sandbox_approvals (
+                    id, session_key, turn_id, call_id, tool_name, operation,
+                    arguments, reason, requested_mode, fingerprint, state,
+                    created_at, decided_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    str(request["id"]),
+                    str(request["session_id"]),
+                    str(request["turn_id"]),
+                    str(request["call_id"]),
+                    str(request["tool_name"]),
+                    str(request["operation"]),
+                    json.dumps(request.get("arguments", {}), ensure_ascii=False, default=str),
+                    str(request["reason"]),
+                    str(request["requested_mode"]),
+                    str(request["fingerprint"]),
+                    str(request["state"]),
+                    str(request["created_at"]),
+                ),
+            )
+            self._conn.commit()
+
+    def resolve_sandbox_approval(
+        self,
+        request_id: str,
+        state: str,
+        decided_at: str,
+    ) -> bool:
+        with self._lock:
+            self._ensure_open()
+            cursor = self._conn.execute(
+                """
+                UPDATE sandbox_approvals
+                SET state = ?, decided_at = ?
+                WHERE id = ? AND state = 'pending'
+                """,
+                (str(state), str(decided_at), str(request_id)),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
 
     def fetch_session_messages(
         self,
@@ -461,6 +725,11 @@ class SessionStore:
                        ), s.created_at) AS created_at,
                        s.updated_at,
                        s.metadata,
+                       s.workspace_id,
+                       s.cwd_snapshot,
+                       s.sandbox_mode,
+                       w.title AS workspace_title,
+                       w.canonical_path AS workspace_path,
                        COUNT(m.id) AS message_count,
                        COALESCE((
                            SELECT first.content
@@ -472,8 +741,11 @@ class SessionStore:
                        ), '') AS first_message_content
                 FROM sessions s
                 LEFT JOIN messages m ON m.session_key = s.key
+                LEFT JOIN workspaces w ON w.id = s.workspace_id
                 WHERE s.key LIKE ?
-                 GROUP BY s.key, s.created_at, s.updated_at, s.metadata
+                 GROUP BY s.key, s.created_at, s.updated_at, s.metadata,
+                          s.workspace_id, s.cwd_snapshot, s.sandbox_mode,
+                          w.title, w.canonical_path
                 ORDER BY created_at DESC, s.key DESC
                 """,
                 (prefix,),
@@ -483,6 +755,10 @@ class SessionStore:
             item = dict(row)
             metadata = _load_json_object(item.pop("metadata", "{}"))
             item["title"] = str(metadata.get("title") or "")
+            item["workspace_valid"] = bool(
+                item.get("workspace_path")
+                and Path(str(item["workspace_path"])).is_dir()
+            )
             if int(item.get("message_count") or 0) <= 0 and not item["title"].strip():
                 continue
             items.append(item)
@@ -526,6 +802,9 @@ class SessionStore:
             summary = self._conn.execute(
                 """
                 SELECT s.key, s.created_at, s.updated_at, s.metadata,
+                       s.workspace_id, s.cwd_snapshot, s.sandbox_mode,
+                       w.title AS workspace_title,
+                       w.canonical_path AS workspace_path,
                        COUNT(m.id) AS message_count,
                        COALESCE((
                            SELECT first.content
@@ -537,8 +816,11 @@ class SessionStore:
                        ), '') AS first_message_content
                 FROM sessions s
                 LEFT JOIN messages m ON m.session_key = s.key
+                LEFT JOIN workspaces w ON w.id = s.workspace_id
                 WHERE s.key = ?
-                GROUP BY s.key, s.created_at, s.updated_at, s.metadata
+                GROUP BY s.key, s.created_at, s.updated_at, s.metadata,
+                         s.workspace_id, s.cwd_snapshot, s.sandbox_mode,
+                         w.title, w.canonical_path
                 """,
                 (key,),
             ).fetchone()
@@ -547,6 +829,10 @@ class SessionStore:
         item = dict(summary)
         metadata = _load_json_object(item.pop("metadata", "{}"))
         item["title"] = str(metadata.get("title") or "")
+        item["workspace_valid"] = bool(
+            item.get("workspace_path")
+            and Path(str(item["workspace_path"])).is_dir()
+        )
         return item
 
     def update_chat_session_title(self, session_key: str, title: str) -> dict[str, Any] | None:
@@ -882,13 +1168,27 @@ class SessionStore:
         with self._lock:
             self._conn.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS workspaces (
+                    id             TEXT PRIMARY KEY,
+                    canonical_path TEXT NOT NULL,
+                    canonical_key  TEXT NOT NULL UNIQUE,
+                    title          TEXT NOT NULL,
+                    created_at     TEXT NOT NULL,
+                    updated_at     TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS sessions (
                     key               TEXT PRIMARY KEY,
                     created_at        TEXT NOT NULL,
                     updated_at        TEXT NOT NULL,
                     last_consolidated INTEGER NOT NULL DEFAULT 0,
                     next_seq          INTEGER NOT NULL DEFAULT 0,
-                    metadata          TEXT NOT NULL DEFAULT '{}'
+                    metadata          TEXT NOT NULL DEFAULT '{}',
+                    workspace_id      TEXT,
+                    cwd_snapshot      TEXT,
+                    sandbox_mode      TEXT NOT NULL DEFAULT 'read-only',
+                    FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
+                        ON DELETE SET NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS messages (
@@ -1044,7 +1344,48 @@ class SessionStore:
 
                 CREATE INDEX IF NOT EXISTS idx_session_usage_session
                     ON session_usage(session_key);
+
+                CREATE TABLE IF NOT EXISTS sandbox_approvals (
+                    id             TEXT PRIMARY KEY,
+                    session_key    TEXT NOT NULL,
+                    turn_id        TEXT NOT NULL,
+                    call_id        TEXT NOT NULL,
+                    tool_name      TEXT NOT NULL,
+                    operation      TEXT NOT NULL,
+                    arguments      TEXT NOT NULL,
+                    reason         TEXT NOT NULL,
+                    requested_mode TEXT NOT NULL,
+                    fingerprint    TEXT NOT NULL,
+                    state          TEXT NOT NULL,
+                    created_at     TEXT NOT NULL,
+                    decided_at     TEXT,
+                    UNIQUE (session_key, turn_id, call_id),
+                    FOREIGN KEY (session_key) REFERENCES sessions(key)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sandbox_approvals_session_state
+                    ON sandbox_approvals(session_key, state, created_at);
                 """
+            )
+            session_columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(sessions)")
+            }
+            if "workspace_id" not in session_columns:
+                self._conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN workspace_id TEXT REFERENCES workspaces(id) ON DELETE SET NULL"
+                )
+            if "cwd_snapshot" not in session_columns:
+                self._conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN cwd_snapshot TEXT"
+                )
+            if "sandbox_mode" not in session_columns:
+                self._conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN sandbox_mode TEXT NOT NULL DEFAULT 'read-only'"
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id, updated_at)"
             )
             surface_columns = {
                 str(row["name"])
@@ -1126,24 +1467,44 @@ class SessionStore:
                 (json.dumps(metadata, ensure_ascii=False), str(row["key"])),
             )
 
-    def _create_session_sync(self, session_key: str) -> dict[str, Any]:
+    def _create_session_sync(
+        self,
+        session_key: str,
+        *,
+        workspace_id: str | None = None,
+        sandbox_mode: str = "read-only",
+    ) -> dict[str, Any]:
         key = self._validate_session_key(session_key)
+        clean_workspace_id = str(workspace_id or "").strip() or None
+        mode = self._validate_sandbox_mode(sandbox_mode)
         now = _now_iso()
         with self._lock:
             self._ensure_open()
+            workspace_path: str | None = None
+            if clean_workspace_id is not None:
+                workspace = self._conn.execute(
+                    "SELECT canonical_path FROM workspaces WHERE id = ?",
+                    (clean_workspace_id,),
+                ).fetchone()
+                if workspace is None:
+                    raise KeyError("工作区不存在")
+                workspace_path = str(workspace["canonical_path"])
+            if mode == "workspace-write" and clean_workspace_id is None:
+                raise ValueError("没有工作目录时不能使用工作区可写权限")
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO sessions (
-                    key, created_at, updated_at, last_consolidated, next_seq, metadata
-                ) VALUES (?, ?, ?, 0, 0, '{}')
+                    key, created_at, updated_at, last_consolidated, next_seq,
+                    metadata, workspace_id, cwd_snapshot, sandbox_mode
+                ) VALUES (?, ?, ?, 0, 0, '{}', ?, ?, ?)
                 """,
-                (key, now, now),
+                (key, now, now, clean_workspace_id, workspace_path, mode),
             )
             self._conn.commit()
             row = self._conn.execute(
                 """
                 SELECT key, created_at, updated_at, last_consolidated,
-                       next_seq, metadata
+                       next_seq, metadata, workspace_id, cwd_snapshot, sandbox_mode
                 FROM sessions WHERE key = ?
                 """,
                 (key,),
@@ -1854,7 +2215,7 @@ class SessionStore:
             row = self._conn.execute(
                 """
                 SELECT key, created_at, updated_at, last_consolidated,
-                       next_seq, metadata
+                       next_seq, metadata, workspace_id, cwd_snapshot, sandbox_mode
                 FROM sessions WHERE key = ?
                 """,
                 (key,),
@@ -2663,13 +3024,37 @@ class SessionStore:
 
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> dict[str, Any]:
-        return {
+        item = {
             "key": str(row["key"]),
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
             "last_consolidated": int(row["last_consolidated"] or 0),
             "next_seq": int(row["next_seq"] or 0),
             "metadata": _load_json_object(row["metadata"]),
+        }
+        columns = set(row.keys())
+        if "workspace_id" in columns:
+            item["workspace_id"] = (
+                str(row["workspace_id"]) if row["workspace_id"] is not None else None
+            )
+        if "cwd_snapshot" in columns:
+            item["cwd_snapshot"] = (
+                str(row["cwd_snapshot"]) if row["cwd_snapshot"] is not None else None
+            )
+        if "sandbox_mode" in columns:
+            item["sandbox_mode"] = str(row["sandbox_mode"] or "read-only")
+        return item
+
+    @staticmethod
+    def _row_to_workspace(row: sqlite3.Row) -> dict[str, Any]:
+        path = str(row["canonical_path"])
+        return {
+            "id": str(row["id"]),
+            "canonical_path": path,
+            "title": str(row["title"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+            "valid": Path(path).is_dir(),
         }
 
     @staticmethod
@@ -2848,6 +3233,13 @@ class SessionStore:
         if not key:
             raise ValueError("session_key 不能为空")
         return key
+
+    @staticmethod
+    def _validate_sandbox_mode(mode: str) -> str:
+        value = str(mode or "").strip()
+        if value not in {"read-only", "workspace-write", "danger-full-access"}:
+            raise ValueError(f"不支持的沙箱权限：{value or 'empty'}")
+        return value
 
     def _ensure_open(self) -> None:
         if self._closed:

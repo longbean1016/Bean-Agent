@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -1058,3 +1059,103 @@ def test_session_usage_is_idempotent_and_aggregated(store: SessionStore) -> None
     assert second["total_input_tokens"] == 1_060
     assert second["total_output_tokens"] == 50
     assert second["cache_hit_rate"] == pytest.approx(880 / 1060)
+
+
+def test_workspace_binding_and_permission_are_persisted(
+    store: SessionStore,
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    workspace = store.create_workspace(str(project), "示例项目")
+    duplicate = store.create_workspace(str(project / "."), "不会覆盖")
+
+    session = store.create_session(
+        "web:sandbox",
+        workspace_id=workspace["id"],
+        sandbox_mode="workspace-write",
+    )
+    sandbox = store.get_session_sandbox("web:sandbox")
+
+    assert duplicate["id"] == workspace["id"]
+    assert session["workspace_id"] == workspace["id"]
+    assert sandbox is not None
+    assert sandbox["workspace_path"] == str(project.resolve())
+    assert sandbox["sandbox_mode"] == "workspace-write"
+    assert sandbox["workspace_valid"] is True
+
+
+def test_workspace_write_requires_workspace_and_started_session_cannot_rebind(
+    store: SessionStore,
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = store.create_workspace(str(first_dir))
+    second = store.create_workspace(str(second_dir))
+    store.create_session("web:fixed", workspace_id=first["id"])
+
+    with pytest.raises(ValueError, match="没有工作目录"):
+        store.create_session("web:no-workspace", sandbox_mode="workspace-write")
+
+    store.add_message(NewMessage(session_key="web:fixed", role="user", content="开始"))
+    with pytest.raises(ValueError, match="不能切换工作目录"):
+        store.set_session_workspace("web:fixed", second["id"])
+
+
+def test_deleting_workspace_detaches_sessions_without_deleting_directory(
+    store: SessionStore,
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "kept-project"
+    project.mkdir()
+    marker = project / "kept.txt"
+    marker.write_text("保留", encoding="utf-8")
+    workspace = store.create_workspace(str(project))
+    store.create_session(
+        "web:detach",
+        workspace_id=workspace["id"],
+        sandbox_mode="workspace-write",
+    )
+
+    assert store.delete_workspace(workspace["id"]) is True
+    sandbox = store.get_session_sandbox("web:detach")
+
+    assert marker.read_text(encoding="utf-8") == "保留"
+    assert sandbox is not None
+    assert sandbox["workspace_id"] is None
+    assert sandbox["sandbox_mode"] == "read-only"
+
+
+def test_existing_sessions_database_is_migrated_to_read_only(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        """
+        CREATE TABLE sessions (
+            key TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_consolidated INTEGER NOT NULL DEFAULT 0,
+            next_seq INTEGER NOT NULL DEFAULT 0,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO sessions VALUES ('web:legacy', 'now', 'now', 0, 0, '{}')"
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SessionStore(db_path)
+    try:
+        sandbox = migrated.get_session_sandbox("web:legacy")
+    finally:
+        migrated.close()
+
+    assert sandbox is not None
+    assert sandbox["workspace_id"] is None
+    assert sandbox["sandbox_mode"] == "read-only"

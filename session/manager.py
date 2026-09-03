@@ -302,7 +302,13 @@ class SessionManager:
         self._close_lock = asyncio.Lock()
         self._closed = False
 
-    async def get_or_create(self, session_key: str) -> Session:
+    async def get_or_create(
+        self,
+        session_key: str,
+        *,
+        workspace_id: str | None = None,
+        sandbox_mode: str = "read-only",
+    ) -> Session:
         """优先返回完整缓存；未命中时从 SQLite 重建 Session。"""
 
         self._ensure_open()
@@ -321,7 +327,11 @@ class SessionManager:
             messages = self._store.fetch_session_messages(key)
             if meta is None and not messages:
                 # 新会话先落元数据，确保随后第一条消息可以满足外键约束。
-                meta = self._store.create_session(key)
+                meta = self._store.create_session(
+                    key,
+                    workspace_id=workspace_id,
+                    sandbox_mode=sandbox_mode,
+                )
             now = _now_local()
             session = Session(
                 session_key=key,
@@ -525,6 +535,36 @@ class SessionManager:
             if cached is not None:
                 cached.metadata["title"] = str(title).strip()
             return updated
+
+    async def set_workspace(
+        self,
+        session_key: str,
+        workspace_id: str | None,
+    ) -> dict[str, Any]:
+        """在会话锁内更新可选工作区，缓存消息对象不拥有这项执行策略。"""
+
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(
+                self._store.set_session_workspace,
+                key,
+                workspace_id,
+            )
+
+    async def set_sandbox_mode(
+        self,
+        session_key: str,
+        sandbox_mode: str,
+    ) -> dict[str, Any]:
+        """在会话锁内持久化权限，避免与同会话创建流程交错。"""
+
+        key = self._validate_session_key(session_key)
+        async with self._lock_for(key):
+            return await asyncio.to_thread(
+                self._store.update_session_sandbox_mode,
+                key,
+                sandbox_mode,
+            )
 
     async def ensure_default_title(
         self,
