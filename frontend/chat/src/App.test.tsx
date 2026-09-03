@@ -108,6 +108,40 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it("按连接选择同名模型并把路由加入发送帧", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "/api/settings") return { ok: true, json: async () => ({
+      routing_required: true,
+      default_route: { connection_id: "first", model_id: "same" },
+      catalog: {},
+      connections: [
+        { id: "first", name: "连接一", provider: "", base_url: "https://one.example/v1", has_api_key: true, enabled: true, default_adapter: "generic_openai", revision: 1, created_at: "", updated_at: "", models: [
+          { connection_id: "first", model_id: "same", display_name: "同名模型", context_window: 32000, max_output_tokens: 4000, supports_tools: true, supports_vision: false, supports_reasoning: false, reasoning_options: [], adapter: "generic_openai", metadata_source: "unknown", metadata_updated_at: null, user_overrides: {}, available: true, revision: 1, discovered_at: "" },
+        ] },
+        { id: "second", name: "连接二", provider: "", base_url: "https://two.example/v1", has_api_key: true, enabled: true, default_adapter: "generic_openai", revision: 1, created_at: "", updated_at: "", models: [
+          { connection_id: "second", model_id: "same", display_name: "同名模型", context_window: 128000, max_output_tokens: 8000, supports_tools: true, supports_vision: false, supports_reasoning: false, reasoning_options: [], adapter: "generic_openai", metadata_source: "unknown", metadata_updated_at: null, user_overrides: {}, available: true, revision: 1, discovered_at: "" },
+        ] },
+      ],
+    }) } as Response;
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+  render(<App />);
+
+  await screen.findByRole("button", { name: "上下文容量 32K" });
+  const modelSelect = screen.getByRole("combobox", { name: "模型" });
+  fireEvent.change(modelSelect, { target: { value: JSON.stringify(["second", "same"]) } });
+  expect(await screen.findByRole("button", { name: "上下文容量 128K" })).toBeVisible();
+  fireEvent.change(screen.getByPlaceholderText("输入消息，或附加文本与图片"), { target: { value: "route test" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+  await waitFor(() => {
+    const frame = FakeWebSocket.instances[0].sent.find((item) => item.type === "message.send");
+    expect(frame?.model_route).toEqual({ connection_id: "second", model_id: "same", reasoning_effort: null });
+  });
+  expect(screen.getByRole("button", { name: "设置" })).toBeVisible();
+});
+
 it("首条消息发送后创建 Session 并保留用户消息", async () => {
   render(<App />);
 

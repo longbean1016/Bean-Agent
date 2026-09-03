@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { ContextUsageIndicator } from "./App";
 import type { ContextUsage } from "./types";
+import type { ModelProfile } from "./types";
 
 const usage: ContextUsage = {
   turnId: "turn-1",
@@ -42,5 +43,21 @@ describe("ContextUsageIndicator", () => {
     const result = render(<ContextUsageIndicator compacting usage={{ ...usage, contextWindow: 0 }} />);
 
     expect(result.container).toBeEmptyDOMElement();
+  });
+
+  it("尚无 usage 时显示所选模型容量，未知容量显示空状态", () => {
+    const profile = {
+      connection_id: "connection-1", model_id: "model-1", display_name: "Model 1",
+      context_window: 128000, max_output_tokens: 8192, supports_tools: true,
+      supports_vision: false, supports_reasoning: false, reasoning_options: [],
+      adapter: "generic_openai", metadata_source: "models.dev:test",
+      metadata_updated_at: null, user_overrides: {}, available: true, revision: 1,
+      discovered_at: "2026-09-03T00:00:00Z",
+    } satisfies ModelProfile;
+    const { rerender } = render(<ContextUsageIndicator compacting={false} profile={profile} />);
+    expect(screen.getByRole("button", { name: "上下文容量 128K" })).toHaveTextContent("128K");
+
+    rerender(<ContextUsageIndicator compacting={false} profile={{ ...profile, context_window: null }} />);
+    expect(screen.getByRole("button", { name: "上下文容量未知" })).toHaveTextContent("--");
   });
 });

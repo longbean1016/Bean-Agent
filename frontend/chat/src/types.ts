@@ -228,6 +228,54 @@ export interface ProactiveNotificationRow {
   recurring: boolean;
 }
 
+export type ModelAdapterId = "generic_openai" | "deepseek" | "qwen_dashscope" | "openai_reasoning";
+
+export interface ModelProfile {
+  connection_id: string;
+  model_id: string;
+  display_name: string;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  supports_tools: boolean | null;
+  supports_vision: boolean | null;
+  supports_reasoning: boolean | null;
+  reasoning_options: string[];
+  adapter: ModelAdapterId;
+  metadata_source: string;
+  metadata_updated_at: string | null;
+  user_overrides: Record<string, unknown>;
+  available: boolean;
+  revision: number;
+  discovered_at: string;
+}
+
+export interface ModelConnection {
+  id: string;
+  name: string;
+  provider: string;
+  base_url: string;
+  has_api_key: boolean;
+  enabled: boolean;
+  default_adapter: ModelAdapterId;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  models: ModelProfile[];
+}
+
+export interface ModelRoute {
+  connection_id: string;
+  model_id: string;
+  reasoning_effort?: string | null;
+}
+
+export interface ModelSettingsPayload {
+  connections: ModelConnection[];
+  default_route: ModelRoute | null;
+  catalog: { updated_at?: string | null };
+  routing_required: boolean;
+}
+
 export type ChatFrame =
   | { type: "session.created"; request_id: string; session_id: string }
   | { type: "session.updated"; session: SessionSummary }
