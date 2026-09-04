@@ -7,7 +7,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
-from model_settings.catalog import ModelCatalogService
+from model_settings.catalog import CatalogUpdateError, ModelCatalogService
 from model_settings.discovery import OpenAIModelDiscovery
 from model_settings.models import ADAPTER_IDS, REASONING_EFFORTS, ModelConnection, ModelProfile, ModelRoute
 from model_settings.secrets import SecretStore, SecretStoreError
@@ -39,14 +39,25 @@ class ModelSettingsService:
         result = []
         for connection in self.store.list_connections():
             try:
-                has_key = bool(self._secrets.get(connection.secret_ref))
+                api_key = self._secrets.get(connection.secret_ref)
             except SecretStoreError:
-                has_key = False
+                api_key = None
+            has_key = bool(api_key)
             result.append({
-                **connection.public_dict(has_api_key=has_key),
+                **connection.public_dict(
+                    has_api_key=has_key,
+                    api_key_preview=_api_key_preview(api_key),
+                ),
                 "models": [item.public_dict() for item in self.store.list_models(connection.id)],
             })
         return result
+
+    def get_connection_api_key(self, connection_id: str) -> str:
+        connection = self._connection(connection_id)
+        api_key = self._secrets.get(connection.secret_ref)
+        if not api_key:
+            raise ModelSettingsValidationError("连接尚未配置 API Key")
+        return api_key
 
     def create_connection(self, values: dict[str, Any]) -> dict[str, Any]:
         api_key = _required_text(values.get("api_key"), "API Key", 4096)
@@ -67,7 +78,9 @@ class ModelSettingsService:
         except Exception:
             self._secrets.delete(secret_ref)
             raise
-        return saved.public_dict(has_api_key=True)
+        return saved.public_dict(
+            has_api_key=True, api_key_preview=_api_key_preview(api_key)
+        )
 
     def update_connection(self, connection_id: str, values: dict[str, Any]) -> dict[str, Any]:
         current = self._connection(connection_id)
@@ -92,7 +105,10 @@ class ModelSettingsService:
                 else:
                     self._secrets.delete(current.secret_ref)
             raise
-        return saved.public_dict(has_api_key=bool(self._secrets.get(saved.secret_ref)))
+        saved_key = self._secrets.get(saved.secret_ref)
+        return saved.public_dict(
+            has_api_key=bool(saved_key), api_key_preview=_api_key_preview(saved_key)
+        )
 
     def delete_connection(self, connection_id: str) -> None:
         current = self._connection(connection_id)
@@ -124,9 +140,30 @@ class ModelSettingsService:
         ]
         return [item.public_dict() for item in self.store.replace_discovered_models(connection.id, profiles)]
 
-    async def test_connection(self, connection_id: str) -> dict[str, Any]:
-        models = await self.discover_models(connection_id)
-        return {"ok": True, "model_count": sum(1 for item in models if item["available"])}
+    async def refresh_models(self, connection_id: str) -> dict[str, Any]:
+        catalog_warning = ""
+        if not self._catalog.has_data():
+            try:
+                state = await self._catalog.update()
+                self.store.set_catalog_state(updated_at=str(state["updated_at"]))
+            except CatalogUpdateError as error:
+                # 公共目录不可用不应阻断私有网关发现，未知容量仍可手工覆盖。
+                catalog_warning = str(error)
+        return {
+            "items": await self.discover_models(connection_id),
+            "catalog_warning": catalog_warning or None,
+        }
+
+    async def test_model_list(self, connection_id: str) -> dict[str, Any]:
+        connection = self._connection(connection_id)
+        api_key = self._api_key(connection)
+        models = await self._discovery.list_models(connection, api_key)
+        return {
+            "ok": True,
+            "connection_id": connection.id,
+            "connection_name": connection.name,
+            "model_count": len(models),
+        }
 
     def save_manual_model(self, connection_id: str, values: dict[str, Any]) -> dict[str, Any]:
         connection = self._connection(connection_id)
@@ -162,8 +199,10 @@ class ModelSettingsService:
     def set_route(self, route: ModelRoute, session_key: str | None = None) -> ModelRoute:
         connection = self._connection(route.connection_id)
         profile = self.store.get_model(route.connection_id, route.model_id)
-        if not connection.enabled or profile is None or not profile.available:
-            raise ModelSettingsValidationError("所选连接或模型当前不可用")
+        if not connection.enabled:
+            raise ModelSettingsValidationError("连接已停用，请先启用并保存连接")
+        if profile is None or not profile.available:
+            raise ModelSettingsValidationError("所选模型当前不可用，请重新获取或选择模型")
         if route.reasoning_effort:
             if not profile.supports_reasoning:
                 raise ModelSettingsValidationError("该模型不支持推理等级")
@@ -192,6 +231,12 @@ class ModelSettingsService:
         if connection is None:
             raise ModelSettingsNotFound("连接不存在")
         return connection
+
+    def _api_key(self, connection: ModelConnection) -> str:
+        api_key = self._secrets.get(connection.secret_ref) or ""
+        if not api_key:
+            raise ModelSettingsValidationError("连接尚未配置 API Key")
+        return api_key
 
 
 def normalize_base_url(value: Any) -> str:
@@ -247,6 +292,15 @@ def _required_text(value: Any, label: str, maximum: int) -> str:
     if len(text) > maximum:
         raise ModelSettingsValidationError(f"{label}过长")
     return text
+
+
+def _api_key_preview(value: str | None) -> str | None:
+    if not value:
+        return None
+    if len(value) <= 8:
+        visible = max(1, len(value) // 4)
+        return f"{value[:visible]}...{value[-visible:]}"
+    return f"{value[:4]}...{value[-4:]}"
 
 
 def _optional_text(value: Any, maximum: int) -> str:

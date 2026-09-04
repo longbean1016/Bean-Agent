@@ -30,6 +30,17 @@ def client(tmp_path: Path):
     return TestClient(create_fastapi_app(runtime)), runtime
 
 
+def test_model_settings_route_returns_spa_index_or_build_hint(tmp_path: Path) -> None:
+    test_client, _runtime = client(tmp_path)
+    with test_client:
+        response = test_client.get("/settings/models")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].split(";", 1)[0] in {
+        "text/html", "application/json"
+    }
+
+
 def test_settings_api_manages_connection_manual_model_and_default_route(tmp_path: Path) -> None:
     test_client, runtime = client(tmp_path)
     with test_client:
@@ -40,7 +51,14 @@ def test_settings_api_manages_connection_manual_model_and_default_route(tmp_path
         assert created.status_code == 201
         connection = created.json()
         assert connection["has_api_key"] is True
+        assert connection["api_key_preview"] == "supe...cret"
         assert "api_key" not in connection
+
+        revealed = test_client.get(
+            f"/api/settings/connections/{connection['id']}/api-key"
+        )
+        assert revealed.status_code == 200
+        assert revealed.json() == {"api_key": "super-secret"}
 
         model = test_client.post(
             f"/api/settings/connections/{connection['id']}/models",

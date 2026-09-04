@@ -53,7 +53,7 @@ from model_settings.discovery import (
     OpenAIModelDiscovery,
 )
 from model_settings.models import ModelRoute
-from model_settings.provider_manager import ProviderManager
+from model_settings.provider_manager import ModelInvocationTestError, ProviderManager
 from model_settings.secrets import SecretStore, SecretStoreError, SqliteSecretStore
 from model_settings.service import ModelSettingsNotFound, ModelSettingsService, ModelSettingsValidationError
 from model_settings.store import ModelSettingsConflict, ModelSettingsStore
@@ -624,6 +624,10 @@ def create_fastapi_app(
         lambda _request, error: settings_error(502, error.code, error),
     )
     app.add_exception_handler(
+        ModelInvocationTestError,
+        lambda _request, error: settings_error(error.status_code, error.code, error),
+    )
+    app.add_exception_handler(
         CatalogUpdateError,
         lambda _request, error: settings_error(502, "catalog_update_failed", error),
     )
@@ -651,6 +655,10 @@ def create_fastapi_app(
     ) -> dict[str, Any]:
         return settings.update_connection(connection_id, payload)
 
+    @app.get("/api/settings/connections/{connection_id}/api-key")
+    async def get_model_connection_api_key(connection_id: str) -> dict[str, str]:
+        return {"api_key": settings.get_connection_api_key(connection_id)}
+
     @app.delete("/api/settings/connections/{connection_id}", status_code=204)
     async def delete_model_connection(connection_id: str) -> Response:
         settings.delete_connection(connection_id)
@@ -658,11 +666,17 @@ def create_fastapi_app(
 
     @app.post("/api/settings/connections/{connection_id}/test")
     async def test_model_connection(connection_id: str) -> dict[str, Any]:
-        return await settings.test_connection(connection_id)
+        return await settings.test_model_list(connection_id)
 
     @app.post("/api/settings/connections/{connection_id}/models/refresh")
     async def refresh_connection_models(connection_id: str) -> dict[str, Any]:
-        return {"items": await settings.discover_models(connection_id)}
+        return await settings.refresh_models(connection_id)
+
+    @app.post("/api/settings/connections/{connection_id}/models/{model_id:path}/test")
+    async def test_connection_model(connection_id: str, model_id: str) -> dict[str, Any]:
+        return await application.core.provider_manager.test_model(
+            settings, ModelRoute(connection_id, model_id)
+        )
 
     @app.post("/api/settings/connections/{connection_id}/models", status_code=201)
     async def create_manual_model(
@@ -721,6 +735,14 @@ def create_fastapi_app(
     @app.get("/chat/{session_id}", response_model=None)
     def chat_session_index(session_id: str) -> FileResponse | dict[str, str]:
         """会话详情使用前端路由，直接访问或刷新时仍返回同一 SPA 入口。"""
+
+        if index_file.is_file():
+            return FileResponse(index_file)
+        return {"status": "ok", "message": "聊天前端尚未构建，请运行 npm run build"}
+
+    @app.get("/settings/models", response_model=None)
+    def model_settings_index() -> FileResponse | dict[str, str]:
+        """模型设置是独立前端路由，直接访问或刷新时返回 SPA 入口。"""
 
         if index_file.is_file():
             return FileResponse(index_file)

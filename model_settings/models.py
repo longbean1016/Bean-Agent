@@ -36,13 +36,16 @@ class ModelConnection:
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 
-    def public_dict(self, *, has_api_key: bool) -> dict[str, Any]:
+    def public_dict(
+        self, *, has_api_key: bool, api_key_preview: str | None = None
+    ) -> dict[str, Any]:
         return {
             "id": self.id,
             "name": self.name,
             "provider": self.provider,
             "base_url": self.base_url,
             "has_api_key": has_api_key,
+            "api_key_preview": api_key_preview,
             "enabled": self.enabled,
             "default_adapter": self.default_adapter,
             "revision": self.revision,
