@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { ContextUsageIndicator } from "./App";
@@ -33,6 +33,7 @@ describe("ContextUsageIndicator", () => {
 
     fireEvent.click(button);
     expect(screen.getByRole("dialog", { name: "上下文占用详情" })).toHaveTextContent("~65.5K / 1M");
+    expect(screen.getByRole("dialog")).toHaveTextContent("上下文占用");
     expect(screen.getByRole("dialog")).toHaveTextContent("系统提示词");
 
     fireEvent.keyDown(document, { key: "Escape" });
@@ -56,8 +57,27 @@ describe("ContextUsageIndicator", () => {
     } satisfies ModelProfile;
     const { rerender } = render(<ContextUsageIndicator compacting={false} profile={profile} />);
     expect(screen.getByRole("button", { name: "上下文容量 128K" })).toHaveTextContent("128K");
+    fireEvent.click(screen.getByRole("button", { name: "上下文容量 128K" }));
+    expect(screen.getByRole("dialog", { name: "上下文占用详情" })).toHaveTextContent("models.dev");
 
     rerender(<ContextUsageIndicator compacting={false} profile={{ ...profile, context_window: null }} />);
     expect(screen.getByRole("button", { name: "上下文容量未知" })).toHaveTextContent("--");
+  });
+
+  it("把手动上下文来源显示为用户可读文案", () => {
+    const profile = {
+      connection_id: "connection-1", model_id: "model-1", display_name: "Model 1",
+      context_window: 1_000_000, max_output_tokens: 8192, supports_tools: true,
+      supports_vision: false, supports_reasoning: false, reasoning_options: [],
+      adapter: "generic_openai", metadata_source: "unknown",
+      metadata_updated_at: null, user_overrides: { context_window: 1_000_000 }, available: true, revision: 1,
+      discovered_at: "2026-09-03T00:00:00Z",
+    } satisfies ModelProfile;
+    const result = render(<ContextUsageIndicator compacting={false} profile={profile} />);
+    const view = within(result.container);
+
+    fireEvent.click(view.getByRole("button", { name: "上下文容量 1M" }));
+    expect(view.getByRole("dialog", { name: "上下文占用详情" })).toHaveTextContent("等待本轮估算 · 手动设置");
+    expect(view.getByRole("dialog", { name: "上下文占用详情" })).not.toHaveTextContent("user_override");
   });
 });

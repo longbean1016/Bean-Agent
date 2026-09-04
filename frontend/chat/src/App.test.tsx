@@ -120,7 +120,7 @@ it("按连接选择同名模型并把路由加入发送帧", async () => {
           { connection_id: "first", model_id: "same", display_name: "同名模型", context_window: 32000, max_output_tokens: 4000, supports_tools: true, supports_vision: false, supports_reasoning: false, reasoning_options: [], adapter: "generic_openai", metadata_source: "unknown", metadata_updated_at: null, user_overrides: {}, available: true, revision: 1, discovered_at: "" },
         ] },
         { id: "second", name: "连接二", provider: "", base_url: "https://two.example/v1", has_api_key: true, enabled: true, default_adapter: "generic_openai", revision: 1, created_at: "", updated_at: "", models: [
-          { connection_id: "second", model_id: "same", display_name: "同名模型", context_window: 128000, max_output_tokens: 8000, supports_tools: true, supports_vision: false, supports_reasoning: false, reasoning_options: [], adapter: "generic_openai", metadata_source: "unknown", metadata_updated_at: null, user_overrides: {}, available: true, revision: 1, discovered_at: "" },
+          { connection_id: "second", model_id: "same", display_name: "同名模型", context_window: 128000, max_output_tokens: 8000, supports_tools: true, supports_vision: false, supports_reasoning: true, reasoning_options: ["none", "low", "high", "max"], adapter: "deepseek", metadata_source: "models.dev:deepseek", metadata_updated_at: null, user_overrides: {}, available: true, revision: 1, discovered_at: "" },
         ] },
       ],
     }) } as Response;
@@ -129,17 +129,142 @@ it("按连接选择同名模型并把路由加入发送帧", async () => {
   render(<App />);
 
   await screen.findByRole("button", { name: "上下文容量 32K" });
-  const modelSelect = screen.getByRole("combobox", { name: "模型" });
-  fireEvent.change(modelSelect, { target: { value: JSON.stringify(["second", "same"]) } });
+  fireEvent.click(screen.getByRole("button", { name: "模型与推理：同名模型" }));
+  expect(screen.queryByRole("menuitem", { name: /选择推理等级/ })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("menuitem", { name: "选择模型，当前 同名模型" }));
+  fireEvent.change(screen.getByPlaceholderText("搜索模型"), { target: { value: "连接二" } });
+  expect(screen.queryByRole("button", { name: "连接一 / 同名模型 · 32K" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "连接二 / 同名模型 · 128K" }));
   expect(await screen.findByRole("button", { name: "上下文容量 128K" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "模型与推理：同名模型" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "选择推理等级，当前 未选择" }));
+  expect(screen.getByRole("button", { name: "max" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: "默认" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "high" }));
+  expect(screen.getByRole("button", { name: "模型与推理：同名模型 high" })).toBeVisible();
   fireEvent.change(screen.getByPlaceholderText("输入消息，或附加文本与图片"), { target: { value: "route test" } });
   fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
   await waitFor(() => {
     const frame = FakeWebSocket.instances[0].sent.find((item) => item.type === "message.send");
-    expect(frame?.model_route).toEqual({ connection_id: "second", model_id: "same", reasoning_effort: null });
+    expect(frame?.model_route).toEqual({ connection_id: "second", model_id: "same", reasoning_effort: "high" });
   });
   expect(screen.getByRole("button", { name: "设置" })).toBeVisible();
+});
+
+it("从设置页设为默认时同步切换当前会话模型", async () => {
+  window.history.replaceState({}, "", "/chat/current-model");
+  const routeA = { connection_id: "company", model_id: "model-a" };
+  const routeB = { connection_id: "company", model_id: "model-b" };
+  const modelSettings = {
+    routing_required: true,
+    default_route: routeA,
+    catalog: {},
+    connections: [{
+      id: "company", name: "公司 API", provider: "", base_url: "https://example.com/v1",
+      has_api_key: true, enabled: true, default_adapter: "generic_openai", revision: 1,
+      created_at: "", updated_at: "", models: [
+        { connection_id: "company", model_id: "model-a", display_name: "Model A", context_window: 32000, max_output_tokens: 4000, supports_tools: true, supports_vision: false, supports_reasoning: false, reasoning_options: [], adapter: "generic_openai", metadata_source: "unknown", metadata_updated_at: null, user_overrides: {}, available: true, revision: 1, discovered_at: "" },
+        { connection_id: "company", model_id: "model-b", display_name: "Model B", context_window: 128000, max_output_tokens: 8000, supports_tools: true, supports_vision: false, supports_reasoning: false, reasoning_options: [], adapter: "generic_openai", metadata_source: "unknown", metadata_updated_at: null, user_overrides: {}, available: true, revision: 1, discovered_at: "" },
+      ],
+    }],
+  };
+  const sessionRouteWrites: Array<Record<string, unknown>> = [];
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "/api/settings") return { ok: true, json: async () => modelSettings } as Response;
+    if (url === "/api/settings/routes/default" && init?.method === "PUT") {
+      return { ok: true, json: async () => ({ route: JSON.parse(String(init.body)) }) } as Response;
+    }
+    if (url.includes("/api/settings/routes/session/")) {
+      if (init?.method === "PUT") {
+        const route = JSON.parse(String(init.body)) as Record<string, unknown>;
+        sessionRouteWrites.push(route);
+        return { ok: true, json: async () => ({ route }) } as Response;
+      }
+      return { ok: true, json: async () => ({ route: routeA }) } as Response;
+    }
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+  render(<App />);
+
+  expect(await screen.findByRole("button", { name: "上下文容量 32K" })).toBeVisible();
+  fireEvent.change(screen.getByPlaceholderText("输入消息，或附加文本与图片"), { target: { value: "保留的会话草稿" } });
+  fireEvent.click(screen.getByRole("button", { name: "设置" }));
+  expect(window.location.pathname).toBe("/settings/models");
+  expect(screen.queryByRole("button", { name: "设置" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "新建会话" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("navigation", { name: "会话列表" })).not.toBeInTheDocument();
+  fireEvent.click(await screen.findByRole("button", { name: /Model Bmodel-b/ }));
+  fireEvent.click(screen.getByRole("button", { name: "设为默认" }));
+
+  await waitFor(() => expect(sessionRouteWrites).toContainEqual(routeB));
+  fireEvent.click(screen.getByRole("button", { name: "返回会话" }));
+  expect(window.location.pathname).toBe("/chat/current-model");
+  expect(screen.getByRole("button", { name: "模型与推理：Model B" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "上下文容量 128K" })).toBeVisible();
+  expect(screen.getByPlaceholderText("输入消息，或附加文本与图片")).toHaveValue("保留的会话草稿");
+});
+
+it("直接打开设置路由时保留已存会话且不会改写 URL", async () => {
+  localStorage.setItem("beanagent.session_id", "web:remembered");
+  window.history.replaceState({}, "", "/settings/models");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "/api/settings") return { ok: true, json: async () => ({
+      routing_required: true,
+      default_route: null,
+      catalog: {},
+      connections: [],
+    }) } as Response;
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+
+  render(<App />);
+
+  expect(await screen.findByRole("heading", { name: "模型连接" })).toBeVisible();
+  expect(window.location.pathname).toBe("/settings/models");
+  expect(document.querySelector(".settings-app-shell")).toBeInTheDocument();
+  expect(document.querySelector(".app-shell")).not.toBeInTheDocument();
+  expect(document.querySelector(".chat-workspace")).not.toBeInTheDocument();
+  expect(document.querySelector(".composer")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "设置" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "打开会话列表" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "返回会话" }));
+  expect(window.location.pathname).toBe("/chat/remembered");
+  expect(await screen.findByRole("log")).toBeVisible();
+});
+
+it("响应浏览器历史事件在会话和独立设置页之间切换", async () => {
+  window.history.replaceState({}, "", "/chat/history-route");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "/api/settings") return { ok: true, json: async () => ({
+      routing_required: true,
+      default_route: null,
+      catalog: {},
+      connections: [],
+    }) } as Response;
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+  render(<App />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "设置" }));
+  expect(await screen.findByRole("heading", { name: "模型连接" })).toBeVisible();
+
+  act(() => {
+    window.history.replaceState({}, "", "/chat/history-route");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  });
+  expect(await screen.findByRole("log")).toBeVisible();
+
+  act(() => {
+    window.history.replaceState({}, "", "/settings/models");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  });
+  expect(await screen.findByRole("heading", { name: "模型连接" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: "设置" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("navigation", { name: "会话列表" })).not.toBeInTheDocument();
 });
 
 it("首条消息发送后创建 Session 并保留用户消息", async () => {

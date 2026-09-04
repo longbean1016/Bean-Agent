@@ -748,6 +748,30 @@ describe("reduceChatFrame", () => {
     expect(message.tools).toEqual([]);
   });
 
+  it("错误历史消息保留实际连接与模型路由", () => {
+    const [message] = rowsToMessages([{
+      id: "error-1",
+      role: "assistant",
+      content: "出错：模型调用失败",
+      status: "error",
+      metadata: { model_route: {
+        connection_id: "company",
+        connection_name: "公司 API",
+        model_id: "model-a",
+        model_display_name: "Model A",
+        adapter: "generic_openai",
+      } },
+    }]);
+
+    expect(message.modelRoute).toEqual({
+      connection_id: "company",
+      connection_name: "公司 API",
+      model_id: "model-a",
+      model_display_name: "Model A",
+      adapter: "generic_openai",
+    });
+  });
+
   it("merges a fresh running snapshot when returning to an active session", () => {
     let state = reduceChatFrame({ ...initialChatState, sessionId: "web:one" }, {
       type: "ui.user.append",

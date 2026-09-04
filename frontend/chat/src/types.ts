@@ -66,6 +66,15 @@ export interface ChatMessage {
   proactive?: boolean;
   source?: "scheduled_reminder" | "scheduled_soft" | "proactive_conversation";
   scheduledAt?: string;
+  modelRoute?: ModelRouteMetadata;
+}
+
+export interface ModelRouteMetadata {
+  connection_id: string;
+  model_id: string;
+  connection_name?: string;
+  model_display_name?: string;
+  adapter?: ModelAdapterId;
 }
 
 export interface ChatState {
@@ -255,6 +264,7 @@ export interface ModelConnection {
   provider: string;
   base_url: string;
   has_api_key: boolean;
+  api_key_preview?: string | null;
   enabled: boolean;
   default_adapter: ModelAdapterId;
   revision: number;

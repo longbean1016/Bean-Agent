@@ -242,18 +242,36 @@ export async function updateModelConnection(id: string, values: Record<string, u
   });
 }
 
+export async function fetchModelConnectionApiKey(id: string): Promise<string> {
+  const payload = await settingsRequest<{ api_key: string }>(
+    `/api/settings/connections/${encodeURIComponent(id)}/api-key`,
+  );
+  return payload.api_key;
+}
+
 export async function deleteModelConnection(id: string): Promise<void> {
   const response = await fetch(`/api/settings/connections/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (!response.ok) throw new Error("无法删除连接");
 }
 
-export async function testModelConnection(id: string): Promise<{ ok: boolean; model_count: number }> {
+export async function testModelConnection(id: string): Promise<{ ok: boolean; connection_id: string; connection_name: string; model_count: number }> {
   return settingsRequest(`/api/settings/connections/${encodeURIComponent(id)}/test`, { method: "POST" });
 }
 
-export async function refreshConnectionModels(id: string): Promise<ModelProfile[]> {
-  const payload = await settingsRequest<{ items: ModelProfile[] }>(`/api/settings/connections/${encodeURIComponent(id)}/models/refresh`, { method: "POST" });
-  return payload.items;
+export async function refreshConnectionModels(id: string): Promise<{ items: ModelProfile[]; catalog_warning?: string | null }> {
+  return settingsRequest(`/api/settings/connections/${encodeURIComponent(id)}/models/refresh`, { method: "POST" });
+}
+
+export async function testConnectionModel(connectionId: string, modelId: string): Promise<{
+  ok: boolean;
+  connection_id: string;
+  connection_name: string;
+  model_id: string;
+  model_display_name: string;
+  adapter: string;
+  duration_ms: number;
+}> {
+  return settingsRequest(`/api/settings/connections/${encodeURIComponent(connectionId)}/models/${encodeURIComponent(modelId)}/test`, { method: "POST" });
 }
 
 export async function createManualModel(id: string, values: Record<string, unknown>): Promise<ModelProfile> {

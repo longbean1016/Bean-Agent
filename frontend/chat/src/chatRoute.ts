@@ -1,4 +1,9 @@
 const NEW_CHAT_PATH = "/";
+export const MODEL_SETTINGS_PATH = "/settings/models";
+
+export function isModelSettingsPath(pathname: string): boolean {
+  return /^\/settings\/models\/?$/.test(pathname);
+}
 
 export function sessionFromPath(pathname: string): string {
   const match = pathname.match(/^\/chat\/([^/]+)\/?$/);
