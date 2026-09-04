@@ -42,8 +42,7 @@ class ModelCatalogService:
         provider: str,
         default_adapter: str,
     ) -> ModelProfile:
-        catalog = _provider_catalog(self._load_cache())
-        match = _find_model(catalog, provider.strip().lower(), profile.model_id)
+        match = _find_model(self._load_cache(), provider.strip().lower(), profile.model_id)
         if match is None:
             return replace(profile, adapter=default_adapter, metadata_source="unknown")
         catalog_provider, model = match
@@ -66,6 +65,12 @@ class ModelCatalogService:
             metadata_source=f"models.dev:{catalog_provider}",
             metadata_updated_at=str(model.get("last_updated") or utc_now()),
         )
+
+    def has_data(self) -> bool:
+        """返回本地缓存是否已经包含可用于匹配的模型资料。"""
+
+        payload = self._load_cache()
+        return bool(_provider_catalog(payload) or _canonical_models(payload))
 
     async def update(self) -> dict[str, Any]:
         client = self._client or httpx.AsyncClient()
@@ -118,13 +123,32 @@ class ModelCatalogService:
 
 
 def _find_model(
-    catalog: dict[str, Any], provider: str, model_id: str
+    payload: dict[str, Any], provider: str, model_id: str
 ) -> tuple[str, dict[str, Any]] | None:
+    catalog = _provider_catalog(payload)
     if provider:
         item = catalog.get(provider)
         models = item.get("models") if isinstance(item, dict) else None
         if isinstance(models, dict) and isinstance(models.get(model_id), dict):
             return provider, models[model_id]
+
+    canonical = _find_canonical_model(_canonical_models(payload), model_id)
+    if canonical is not None:
+        canonical_provider, canonical_model = canonical
+        # 统一索引适合匹配中转站别名，但可能省略推理档位等 provider 侧字段。
+        # 命中后用同一厂商的原始模型记录补齐，仍保留统一索引中的基础能力。
+        item = catalog.get(canonical_provider)
+        provider_models = item.get("models") if isinstance(item, dict) else None
+        canonical_id = str(canonical_model.get("id") or "")
+        native_id = canonical_id.split("/", 1)[-1]
+        provider_model = (
+            provider_models.get(native_id)
+            if isinstance(provider_models, dict)
+            else None
+        )
+        if isinstance(provider_model, dict):
+            return canonical_provider, {**canonical_model, **provider_model}
+        return canonical
 
     exact: list[tuple[str, dict[str, Any]]] = []
     for provider_id, item in catalog.items():
@@ -138,20 +162,52 @@ def _find_model(
     return exact[0] if len(exact) == 1 else None
 
 
+def _find_canonical_model(
+    models: dict[str, Any], model_id: str
+) -> tuple[str, dict[str, Any]] | None:
+    """按统一模型 ID 或完整 base model ID 匹配，不裁剪版本后缀。"""
+
+    requested = model_id.casefold()
+    exact = [
+        (str(key), value)
+        for key, value in models.items()
+        if isinstance(value, dict)
+        and (str(key).casefold() == requested or str(value.get("id") or "").casefold() == requested)
+    ]
+    if len(exact) == 1:
+        key, model = exact[0]
+        return key.split("/", 1)[0], model
+
+    base_model_id = requested.rsplit("/", 1)[-1]
+    base_matches = [
+        (str(key), value)
+        for key, value in models.items()
+        if isinstance(value, dict) and str(key).casefold().rsplit("/", 1)[-1] == base_model_id
+    ]
+    if len(base_matches) != 1:
+        return None
+    key, model = base_matches[0]
+    return key.split("/", 1)[0], model
+
+
 def _reasoning_values(value: Any) -> tuple[str, ...]:
-    if not isinstance(value, list):
+    options = value if isinstance(value, list) else [value]
+    if not all(isinstance(option, dict) for option in options):
         return ()
     values: set[str] = set()
-    for option in value:
-        if not isinstance(option, dict):
-            continue
-        if option.get("type") == "toggle":
-            values.update(("none", "high"))
+    has_toggle = False
+    for option in options:
+        has_toggle = has_toggle or option.get("type") == "toggle"
         raw_values = option.get("values")
         if isinstance(raw_values, list):
             values.update(
                 str(item) for item in raw_values if str(item) in REASONING_EFFORTS
             )
+    if has_toggle:
+        # 有明确 effort 时开启由各档位表达；只有 toggle 时才提供独立“开启”。
+        values.add("none")
+        if not values.difference({"none"}):
+            values.add("enabled")
     return tuple(item for item in REASONING_EFFORT_ORDER if item in values)
 
 
@@ -185,6 +241,11 @@ def _provider_catalog(payload: dict[str, Any]) -> dict[str, Any]:
 
     providers = payload.get("providers")
     return providers if isinstance(providers, dict) else payload
+
+
+def _canonical_models(payload: dict[str, Any]) -> dict[str, Any]:
+    models = payload.get("models")
+    return models if isinstance(models, dict) else {}
 
 
 def _validate_catalog(payload: Any) -> None:

@@ -13,7 +13,9 @@ ADAPTER_IDS = frozenset({
     "qwen_dashscope",
     "openai_reasoning",
 })
-REASONING_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+REASONING_EFFORT_ORDER = (
+    "none", "enabled", "minimal", "low", "medium", "high", "xhigh", "max",
+)
 REASONING_EFFORTS = frozenset(REASONING_EFFORT_ORDER)
 
 

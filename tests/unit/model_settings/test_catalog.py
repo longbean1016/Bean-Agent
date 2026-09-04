@@ -74,3 +74,54 @@ def test_catalog_accepts_wrapped_models_dev_catalog(tmp_path: Path) -> None:
     assert result.reasoning_options == ("none", "low", "high", "max")
     assert result.adapter == "deepseek"
     assert result.metadata_source == "models.dev:deepseek"
+
+
+def test_catalog_maps_toggle_only_reasoning_to_off_and_on(tmp_path: Path) -> None:
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps({
+        "providers": {"deepseek": {"models": {"toggle-model": {
+            "reasoning": True,
+            "reasoning_options": {"type": "toggle"},
+        }}}},
+    }), encoding="utf-8")
+
+    result = ModelCatalogService(path).enrich(
+        ModelProfile("c", "toggle-model", "Toggle Model"),
+        provider="deepseek",
+        default_adapter="generic_openai",
+    )
+
+    assert result.reasoning_options == ("none", "enabled")
+
+
+def test_catalog_matches_unique_canonical_base_model_for_gateway_id(tmp_path: Path) -> None:
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps({
+        "models": {
+            "deepseek/deepseek-v4-pro": {
+                "id": "deepseek/deepseek-v4-pro",
+                "name": "DeepSeek V4 Pro",
+                "reasoning": True,
+                "tool_call": True,
+                "limit": {"context": 1_000_000, "output": 384_000},
+            },
+        },
+        "providers": {"deepseek": {"models": {"deepseek-v4-pro": {
+            "reasoning_options": [
+                {"type": "toggle"},
+                {"type": "effort", "values": ["high", "max"]},
+            ],
+        }}}},
+    }), encoding="utf-8")
+
+    result = ModelCatalogService(path).enrich(
+        ModelProfile("c", "deepseek-ai/DeepSeek-V4-Pro", "remote name"),
+        provider="",
+        default_adapter="generic_openai",
+    )
+
+    assert result.context_window == 1_000_000
+    assert result.max_output_tokens == 384_000
+    assert result.reasoning_options == ("none", "high", "max")
+    assert result.adapter == "deepseek"
+    assert result.metadata_source == "models.dev:deepseek"
