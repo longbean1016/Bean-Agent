@@ -54,7 +54,7 @@ from model_settings.discovery import (
 )
 from model_settings.models import ModelRoute
 from model_settings.provider_manager import ProviderManager
-from model_settings.secrets import SecretStore, SecretStoreError, create_system_secret_store
+from model_settings.secrets import SecretStore, SecretStoreError, SqliteSecretStore
 from model_settings.service import ModelSettingsNotFound, ModelSettingsService, ModelSettingsValidationError
 from model_settings.store import ModelSettingsConflict, ModelSettingsStore
 from proactive.agent_tools import ProactiveToolFactory
@@ -343,8 +343,9 @@ def build_core_runtime(
     sandbox_guard = SandboxGuard(sandbox_policy, sandbox_approvals)
     sandbox_runtime = SandboxProcessRuntime(sandbox_policy)
     mutation_broker = FilesystemMutationBroker(sandbox_policy, sandbox_runtime)
-    model_store = ModelSettingsStore(root / "model-settings.db")
-    secrets = model_secret_store or create_system_secret_store()
+    model_database = root / "model-settings.db"
+    secrets = model_secret_store or SqliteSecretStore(model_database)
+    model_store = ModelSettingsStore(model_database)
     model_settings = ModelSettingsService(
         model_store,
         secrets,

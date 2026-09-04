@@ -1,4 +1,6 @@
-from model_settings.secrets import MemorySecretStore, SecretStoreError, UnavailableSecretStore
+from pathlib import Path
+
+from model_settings.secrets import MemorySecretStore, SqliteSecretStore
 
 
 def test_memory_secret_store_contract() -> None:
@@ -9,11 +11,11 @@ def test_memory_secret_store_contract() -> None:
     assert store.get("connection:one") is None
 
 
-def test_unavailable_store_never_falls_back_to_plaintext() -> None:
-    store = UnavailableSecretStore()
-    try:
-        store.set("connection:one", "secret")
-    except SecretStoreError as error:
-        assert "不可用" in str(error)
-    else:
-        raise AssertionError("凭据组件不可用时必须拒绝保存")
+def test_sqlite_secret_store_persists_and_deletes_value(tmp_path: Path) -> None:
+    path = tmp_path / "model-settings.db"
+    store = SqliteSecretStore(path)
+    store.set("connection:one", "secret")
+
+    assert SqliteSecretStore(path).get("connection:one") == "secret"
+    store.delete("connection:one")
+    assert store.get("connection:one") is None

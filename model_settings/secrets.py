@@ -1,12 +1,16 @@
-"""API Key 的系统凭据存储边界。"""
+"""模型连接 API Key 的独立持久化边界。"""
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
 from typing import Protocol
+
+from model_settings.models import utc_now
 
 
 class SecretStoreError(RuntimeError):
-    """系统凭据存储不可用或操作失败。"""
+    """连接密钥持久化不可用或操作失败。"""
 
 
 class SecretStore(Protocol):
@@ -15,54 +19,55 @@ class SecretStore(Protocol):
     def delete(self, secret_ref: str) -> None: ...
 
 
-class KeyringSecretStore:
-    """通过 keyring 使用 Windows Credential Manager 等系统凭据后端。"""
+class SqliteSecretStore:
+    """将连接密钥保存在模型设置数据库的独立表中。"""
 
-    def __init__(self, service_name: str = "BeanAgent.ModelConnections") -> None:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path).expanduser().resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            import keyring
-        except ImportError as error:
-            raise SecretStoreError("系统凭据组件未安装") from error
-        self._keyring = keyring
-        self._service_name = service_name
+            with sqlite3.connect(self.path) as database:
+                database.execute(_SCHEMA)
+        except sqlite3.Error as error:
+            raise SecretStoreError("初始化连接密钥表失败") from error
 
     def get(self, secret_ref: str) -> str | None:
         try:
-            return self._keyring.get_password(self._service_name, secret_ref)
-        except Exception as error:
-            raise SecretStoreError("读取系统凭据失败") from error
+            with sqlite3.connect(self.path) as database:
+                row = database.execute(
+                    "SELECT api_key FROM model_connection_secrets WHERE secret_ref = ?",
+                    (secret_ref,),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise SecretStoreError("读取连接密钥失败") from error
+        return str(row[0]) if row else None
 
     def set(self, secret_ref: str, value: str) -> None:
         if not value:
             raise SecretStoreError("API Key 不能为空")
         try:
-            self._keyring.set_password(self._service_name, secret_ref, value)
-        except Exception as error:
-            raise SecretStoreError("保存系统凭据失败") from error
+            with sqlite3.connect(self.path) as database:
+                database.execute(
+                    """
+                    INSERT INTO model_connection_secrets (secret_ref, api_key, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(secret_ref) DO UPDATE SET
+                        api_key=excluded.api_key, updated_at=excluded.updated_at
+                    """,
+                    (secret_ref, value, utc_now()),
+                )
+        except sqlite3.Error as error:
+            raise SecretStoreError("保存连接密钥失败") from error
 
     def delete(self, secret_ref: str) -> None:
         try:
-            self._keyring.delete_password(self._service_name, secret_ref)
-        except self._keyring.errors.PasswordDeleteError:
-            return
-        except Exception as error:
-            raise SecretStoreError("删除系统凭据失败") from error
-
-
-class UnavailableSecretStore:
-    """系统凭据组件不可用时保持服务可启动，但绝不降级明文。"""
-
-    def _raise(self) -> None:
-        raise SecretStoreError("系统凭据存储不可用，请安装并配置 keyring 后端")
-
-    def get(self, secret_ref: str) -> str | None:
-        self._raise()
-
-    def set(self, secret_ref: str, value: str) -> None:
-        self._raise()
-
-    def delete(self, secret_ref: str) -> None:
-        self._raise()
+            with sqlite3.connect(self.path) as database:
+                database.execute(
+                    "DELETE FROM model_connection_secrets WHERE secret_ref = ?",
+                    (secret_ref,),
+                )
+        except sqlite3.Error as error:
+            raise SecretStoreError("删除连接密钥失败") from error
 
 
 class MemorySecretStore:
@@ -81,18 +86,18 @@ class MemorySecretStore:
         self._values.pop(secret_ref, None)
 
 
-def create_system_secret_store() -> SecretStore:
-    try:
-        return KeyringSecretStore()
-    except SecretStoreError:
-        return UnavailableSecretStore()
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS model_connection_secrets (
+    secret_ref TEXT PRIMARY KEY,
+    api_key TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
 
 
 __all__ = [
-    "KeyringSecretStore",
     "MemorySecretStore",
     "SecretStore",
     "SecretStoreError",
-    "UnavailableSecretStore",
-    "create_system_secret_store",
+    "SqliteSecretStore",
 ]
