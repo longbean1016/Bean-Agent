@@ -225,8 +225,12 @@ class DeepSeekStrategy(ProviderStrategy):
         # extra_body.thinking.type；pop 可避免把非协议字段继续发送给服务端。
         thinking_enabled = extra_body.pop("enable_thinking", None)
         reasoning_effort = extra_body.pop("reasoning_effort", None)
-        if str(reasoning_effort or "").strip().lower() == "none":
+        normalized_effort = str(reasoning_effort or "").strip().lower()
+        if normalized_effort == "none":
             extra_body["thinking"] = {"type": "disabled"}
+            reasoning_effort = None
+        elif normalized_effort == "enabled":
+            extra_body["thinking"] = {"type": "enabled"}
             reasoning_effort = None
         thinking_requested = bool(thinking_enabled) or bool(reasoning_effort)
         if _deepseek_thinking_enabled(extra_body):
@@ -316,10 +320,15 @@ class DashScopeStrategy(ProviderStrategy):
         if disable_thinking or effort == "none":
             _drop_thinking_keys(extra_body)
             extra_body["enable_thinking"] = False
-        elif effort:
-            # 页面统一强度在 DashScope Chat Completions 中退化为思考开关。
+        elif effort == "enabled":
             extra_body.pop("thinking", None)
             extra_body["enable_thinking"] = True
+        elif effort:
+            # 新版 DashScope reasoning 模型接受明确等级；enable_thinking 仍负责
+            # 打开 hybrid 模型的思考模式，两者表达不同维度，不能降级丢失等级。
+            extra_body.pop("thinking", None)
+            extra_body["enable_thinking"] = True
+            request["reasoning_effort"] = effort
         if extra_body:
             request["extra_body"] = extra_body
 
@@ -338,6 +347,9 @@ class OpenAIReasoningStrategy(ProviderStrategy):
         _drop_thinking_keys(extra_body)
         if disable_thinking:
             effort = "none"
+        elif effort == "enabled":
+            # 开启但不指定等级等价于使用 OpenAI 模型自身的默认强度。
+            effort = None
         if effort:
             request["reasoning_effort"] = str(effort)
         # 新 reasoning 模型使用 max_completion_tokens；保留这一差异在适配器内。

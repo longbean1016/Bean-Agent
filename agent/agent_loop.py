@@ -221,6 +221,7 @@ class AgentLoop:
             logger.exception("Agent 推理异常: session_key=%s", message.session_key)
             snapshotter = getattr(self._pipeline, "snapshot_interrupt_state", None)
             snapshot = snapshotter(turn_id) if callable(snapshotter) else {}
+            route_metadata = _public_model_route(message.metadata.get("model_route"))
             terminal_timing = await self._persist_terminal_turn(
                 message,
                 turn_id,
@@ -234,6 +235,7 @@ class AgentLoop:
                     "turn_id": turn_id,
                     "request_id": request_id,
                     "status": "error",
+                    **({"model_route": route_metadata} if route_metadata else {}),
                     **({"duration_ms": terminal_timing.get("duration_ms")} if terminal_timing.get("duration_ms") is not None else {}),
                     **({"generated_at": terminal_timing.get("ended_at")} if terminal_timing.get("ended_at") else {}),
                 },
@@ -401,8 +403,14 @@ class AgentLoop:
             "tools_used": tools_used,
             "tool_chain": tool_chain,
         }
+        assistant_metadata: dict[str, Any] = {}
+        route_metadata = _public_model_route(message.metadata.get("model_route"))
+        if route_metadata:
+            assistant_metadata["model_route"] = route_metadata
         if duration_ms is not None:
-            assistant_fields["metadata"] = {"duration_ms": duration_ms}
+            assistant_metadata["duration_ms"] = duration_ms
+        if assistant_metadata:
+            assistant_fields["metadata"] = assistant_metadata
         if ended_at:
             assistant_fields["timestamp"] = ended_at
         assistant = session.add_message("assistant", assistant_content, **assistant_fields)
@@ -1087,7 +1095,8 @@ def _public_model_route(value: object) -> dict[str, Any]:
         return {}
     allowed = {
         "connection_id", "connection_revision", "model_id", "model_revision",
-        "adapter", "reasoning_effort", "model_runtime_id",
+        "adapter", "reasoning_effort", "model_runtime_id", "connection_name",
+        "model_display_name",
     }
     return {key: value[key] for key in allowed if key in value}
 

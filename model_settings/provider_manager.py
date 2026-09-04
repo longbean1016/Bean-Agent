@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
+from time import perf_counter
 from typing import Any
 
 from agent.config_models import LLMConfig
@@ -25,11 +26,13 @@ class FrozenModelRoute:
     reasoning_effort: str | None
     runtime_id: str
     cache_key: str
+    connection_name: str = ""
+    model_display_name: str = ""
 
     def metadata(self) -> dict[str, Any]:
         """只返回可进入消息 metadata 的公开路由事实。"""
 
-        return {
+        metadata = {
             "connection_id": self.connection_id,
             "connection_revision": self.connection_revision,
             "model_id": self.model_id,
@@ -39,12 +42,24 @@ class FrozenModelRoute:
             "model_runtime_id": self.runtime_id,
             "lease_key": self.cache_key,
         }
+        if self.connection_name:
+            metadata["connection_name"] = self.connection_name
+        if self.model_display_name:
+            metadata["model_display_name"] = self.model_display_name
+        return metadata
 
 
 @dataclass(frozen=True, slots=True)
 class ProviderLease:
     provider: Any
     route: FrozenModelRoute
+
+
+class ModelInvocationTestError(RuntimeError):
+    def __init__(self, message: str, *, code: str, status_code: int) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
 
 
 class ProviderManager:
@@ -85,8 +100,16 @@ class ProviderManager:
         ))
         runtime_id = f"{connection.id}:{connection.revision}:{profile.model_id}:{profile.revision}"
         frozen = FrozenModelRoute(
-            connection.id, connection.revision, profile.model_id, profile.revision,
-            profile.adapter, route.reasoning_effort, runtime_id, key,
+            connection_id=connection.id,
+            connection_revision=connection.revision,
+            model_id=profile.model_id,
+            model_revision=profile.revision,
+            adapter=profile.adapter,
+            reasoning_effort=route.reasoning_effort,
+            runtime_id=runtime_id,
+            cache_key=key,
+            connection_name=connection.name,
+            model_display_name=profile.display_name,
         )
         if key not in self._providers:
             self._providers[key] = self._create_provider(connection, profile, route, runtime_id)
@@ -113,6 +136,35 @@ class ProviderManager:
                 self._active.pop(key, None)
             else:
                 self._active[key] = count - 1
+
+    async def test_model(
+        self, settings: ModelSettingsService, route: ModelRoute
+    ) -> dict[str, Any]:
+        """使用实际 adapter 发起无工具的最小生成，验证模型级权限与协议。"""
+
+        frozen = self.freeze(settings, session_key="settings:model-test", requested=route)
+        lease = await self.acquire(frozen.metadata())
+        started = perf_counter()
+        try:
+            await lease.provider.chat(
+                [{"role": "user", "content": "Reply OK."}],
+                tools=None,
+                max_tokens=8,
+                disable_thinking=True,
+            )
+        except Exception as error:
+            raise _model_test_error(error, frozen) from error
+        finally:
+            await self.release(lease)
+        return {
+            "ok": True,
+            "connection_id": frozen.connection_id,
+            "connection_name": frozen.connection_name,
+            "model_id": frozen.model_id,
+            "model_display_name": frozen.model_display_name,
+            "adapter": frozen.adapter,
+            "duration_ms": max(0, round((perf_counter() - started) * 1000)),
+        }
 
     async def close(self) -> None:
         async with self._lock:
@@ -148,6 +200,10 @@ class ProviderManager:
         if not api_key:
             raise ModelSettingsValidationError("连接尚未配置 API Key")
         extra_body = dict(self._legacy_config.extra_body)
+        # 页面路由是主模型推理设置的唯一事实源，不能让旧 TOML 中的推理字段
+        # 在用户选择“默认”时继续生效；其他兼容扩展参数仍可沿用。
+        for key in ("enable_thinking", "thinking", "reasoning_effort"):
+            extra_body.pop(key, None)
         if route.reasoning_effort:
             extra_body["reasoning_effort"] = route.reasoning_effort
         config = replace(
@@ -169,4 +225,20 @@ class ProviderManager:
         )
 
 
-__all__ = ["FrozenModelRoute", "ProviderLease", "ProviderManager"]
+def _model_test_error(error: Exception, route: FrozenModelRoute) -> ModelInvocationTestError:
+    status = getattr(error, "status_code", None)
+    label = f"连接“{route.connection_name}” / 模型“{route.model_display_name or route.model_id}”"
+    if status == 401:
+        return ModelInvocationTestError(f"{label}认证失败（HTTP 401），请检查 API Key", code="model_authentication_failed", status_code=401)
+    if status == 403:
+        return ModelInvocationTestError(f"{label}调用被拒绝（HTTP 403），请检查中转站分组、模型权限或渠道", code="model_forbidden", status_code=403)
+    if status == 404:
+        return ModelInvocationTestError(f"{label}不存在或调用路径未开放（HTTP 404）", code="model_not_found", status_code=404)
+    if status in {400, 422}:
+        return ModelInvocationTestError(f"{label}请求协议或参数不兼容（HTTP {status}）", code="model_request_invalid", status_code=422)
+    if isinstance(status, int):
+        return ModelInvocationTestError(f"{label}调用失败（HTTP {status}）", code="model_invocation_failed", status_code=502)
+    return ModelInvocationTestError(f"{label}无法连接模型服务", code="model_connection_failed", status_code=502)
+
+
+__all__ = ["FrozenModelRoute", "ModelInvocationTestError", "ProviderLease", "ProviderManager"]
