@@ -10,6 +10,7 @@ import {
   Pencil,
   Pin,
   PinOff,
+  Settings,
   Trash2,
   Unlink,
   X,
@@ -44,6 +45,7 @@ export function SessionSidebar(props: {
   onSetSessionPinned: (id: string, pinned: boolean) => Promise<void>;
   onUpdateWorkspace: (id: string, patch: { title?: string; pinned?: boolean }) => Promise<void>;
   onSelect: (id: string) => void;
+  onSettings: () => void;
 }) {
   const [menuSessionId, setMenuSessionId] = useState("");
   const [menuWorkspaceId, setMenuWorkspaceId] = useState("");
@@ -322,6 +324,7 @@ export function SessionSidebar(props: {
         </div>
         <div className="recent-sessions" data-workspace-id="none">{renderSessions(unassignedSessions)}</div>
       </nav>
+      <button className="sidebar-settings-button" onClick={props.onSettings} title="模型与连接设置"><Settings size={17} />设置</button>
       <Dialog.Root open={deleteTarget !== null} onOpenChange={(open) => { if (!open && !deleting) setDeleteTarget(null); }}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" onClick={() => { if (!deleting) setDeleteTarget(null); }} />

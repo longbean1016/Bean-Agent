@@ -54,6 +54,15 @@ class ProviderApi(Protocol):
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, **kwargs: Any) -> LLMResponse: ...
 
 
+class ProviderLeaseApi(Protocol):
+    provider: ProviderApi
+
+
+class ProviderManagerApi(Protocol):
+    async def acquire(self, metadata: dict[str, Any]) -> ProviderLeaseApi: ...
+    async def release(self, lease: ProviderLeaseApi) -> None: ...
+
+
 HistoryLoader = Callable[[str, int | None], Awaitable[list[dict[str, Any]]]]
 SurfaceLoader = Callable[[str], Awaitable[list[dict[str, Any]]]]
 SurfaceAppender = Callable[[NewSurfaceEvent], Awaitable[dict[str, Any]]]
@@ -104,6 +113,7 @@ class Pipeline:
         multimodal: bool = True,
         vl_available: bool = False,
         sandbox_guard: SandboxGuard | None = None,
+        provider_manager: ProviderManagerApi | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -129,6 +139,7 @@ class Pipeline:
         self._multimodal = bool(multimodal)
         self._vl_available = bool(vl_available)
         self._sandbox_guard = sandbox_guard
+        self._provider_manager = provider_manager
         # 中断快照只服务于当前进程内的停止/续跑语义，不进入 Session 或长期记忆。
         self._interrupt_snapshots: dict[str, dict[str, Any]] = {}
         # 只保存每个会话最近一次供应商 usage 锚点；完整快照由 SessionStore
@@ -136,6 +147,22 @@ class Pipeline:
         self._context_measurements: dict[str, dict[str, Any]] = {}
 
     async def process(self, message: InboundMessage, *, turn_id: str) -> PipelineResult:
+        route = message.metadata.get("model_route")
+        if self._provider_manager is None or not isinstance(route, dict):
+            return await self._process_with_provider(message, turn_id=turn_id, provider=self._provider)
+        lease = await self._provider_manager.acquire(route)
+        try:
+            return await self._process_with_provider(message, turn_id=turn_id, provider=lease.provider)
+        finally:
+            await self._provider_manager.release(lease)
+
+    async def _process_with_provider(
+        self,
+        message: InboundMessage,
+        *,
+        turn_id: str,
+        provider: ProviderApi,
+    ) -> PipelineResult:
         turn_started_at = datetime.now(_LOCAL_TZ).isoformat()
         turn_started_monotonic = time.perf_counter()
         self._interrupt_snapshots[turn_id] = {
@@ -518,7 +545,7 @@ class Pipeline:
                 ):
                     surface_epoch_id = canonical_header_hash(
                         _request_header_identity(
-                            self._provider,
+                            provider,
                             assembled.messages,
                             tool_schemas,
                             tool_choice="auto",
@@ -553,16 +580,16 @@ class Pipeline:
                 model_messages = [*assembled.messages, *react_messages]
                 last_base_messages = assembled.messages
                 estimate = (
-                    self._provider.estimate_context_tokens(model_messages, tool_schemas)
-                    if callable(getattr(self._provider, "estimate_context_tokens", None))
+                    provider.estimate_context_tokens(model_messages, tool_schemas)
+                    if callable(getattr(provider, "estimate_context_tokens", None))
                     else estimate_payload_tokens(model_messages, tool_schemas)
                 )
-                provider_window = int(getattr(self._provider, "context_window", 0) or 0)
-                provider_output = int(getattr(self._provider, "max_tokens", 0) or 0)
-                provider_model = str(getattr(self._provider, "model", "") or "")
+                provider_window = int(getattr(provider, "context_window", 0) or 0)
+                provider_output = int(getattr(provider, "max_tokens", 0) or 0)
+                provider_model = str(getattr(provider, "model", "") or "")
                 provider_runtime_id = str(
-                    getattr(self._provider, "runtime_id", "")
-                    or f"{getattr(self._provider, 'provider_name', '')}:{provider_model}:{provider_window}"
+                    getattr(provider, "runtime_id", "")
+                    or f"{getattr(provider, 'provider_name', '')}:{provider_model}:{provider_window}"
                 )
                 soft_limit = soft_limit_tokens(provider_window) if provider_window > 0 else 0
                 hard_limit = (
@@ -617,7 +644,7 @@ class Pipeline:
                     "model": provider_model,
                     "context_window": provider_window,
                     "context_window_source": str(
-                        getattr(self._provider, "context_window_source", "unknown") or "unknown"
+                        getattr(provider, "context_window_source", "unknown") or "unknown"
                     ),
                     "soft_limit_tokens": soft_limit,
                     "hard_input_tokens": hard_limit,
@@ -632,7 +659,7 @@ class Pipeline:
                     soft_limit_tokens=soft_limit,
                     hard_input_tokens=hard_limit,
                     context_window_source=str(
-                        getattr(self._provider, "context_window_source", "unknown") or "unknown"
+                        getattr(provider, "context_window_source", "unknown") or "unknown"
                     ),
                     estimate_source="provider_projected" if projected_tokens is not None else "heuristic",
                     breakdown=breakdown,
@@ -696,7 +723,7 @@ class Pipeline:
                             sent_messages,
                             sent_tools,
                             header=_request_header_identity(
-                                self._provider,
+                                provider,
                                 sent_messages,
                                 sent_tools,
                                 tool_choice="auto",
@@ -716,7 +743,7 @@ class Pipeline:
                             usage,
                         )
 
-                    response = await self._provider.chat(
+                    response = await provider.chat(
                         model_messages,
                         tool_schemas,
                         tool_choice="auto",
@@ -732,7 +759,7 @@ class Pipeline:
                             model_messages,
                             tool_schemas,
                             header=_request_header_identity(
-                                self._provider,
+                                provider,
                                 model_messages,
                                 tool_schemas,
                                 tool_choice="auto",
@@ -760,7 +787,7 @@ class Pipeline:
                             soft_limit_tokens=soft_limit,
                             hard_input_tokens=hard_limit,
                             context_window_source=str(
-                                getattr(self._provider, "context_window_source", "unknown") or "unknown"
+                                getattr(provider, "context_window_source", "unknown") or "unknown"
                             ),
                             estimate_source="provider_usage",
                             breakdown=breakdown,
@@ -894,7 +921,7 @@ class Pipeline:
                             sent_messages,
                             sent_tools,
                             header=_request_header_identity(
-                                self._provider,
+                                provider,
                                 sent_messages,
                                 sent_tools,
                                 tool_choice="none",
@@ -905,7 +932,7 @@ class Pipeline:
                         llm_epoch_id = retry_diagnostic.epoch_id
                         sync_surface_snapshot()
 
-                    retry = await self._provider.chat(
+                    retry = await provider.chat(
                         [*last_base_messages, *react_messages],
                         tools=[],
                         tool_choice="none",
@@ -919,7 +946,7 @@ class Pipeline:
                             [*last_base_messages, *react_messages],
                             [],
                             header=_request_header_identity(
-                                self._provider,
+                                provider,
                                 [*last_base_messages, *react_messages],
                                 [],
                                 tool_choice="none",
@@ -1130,6 +1157,7 @@ class Pipeline:
         )
         summary = await self._summarize_incomplete_progress(
             last_base_messages, react_messages,
+            provider=provider,
             reason="max_iterations",
             iteration=self._max_iterations,
             tools_used=tools_used,
@@ -1311,6 +1339,7 @@ class Pipeline:
         reason: str,
         iteration: int,
         tools_used: list[str],
+        provider: ProviderApi | None = None,
     ) -> str:
         """ReAct 达到上限时调 LLM 生成用户可读的阶段性进度总结。"""
 
@@ -1321,7 +1350,7 @@ class Pipeline:
             + _INCOMPLETE_SUMMARY_PROMPT
         )
         try:
-            response = await self._provider.chat(
+            response = await (provider or self._provider).chat(
                 [*base_messages, *react_messages,
                  {"role": "user", "content": summary_prompt}],
                 tools=[],

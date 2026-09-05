@@ -198,8 +198,7 @@ class DeepSeekStrategy(ProviderStrategy):
     """处理 DeepSeek 的请求与响应协议差异。
 
     Strategy 只处理 DeepSeek 特有差异；重试、流式消费和 Cache 指标仍由
-    ``LLMProvider`` 统一负责。当前 BeanAgent 仅支持 DeepSeek，因此暂不
-    引入其他供应商策略，也不增加无意义的策略选择分支。
+    ``LLMProvider`` 统一负责。
     """
 
     def normalize_messages(
@@ -226,6 +225,13 @@ class DeepSeekStrategy(ProviderStrategy):
         # extra_body.thinking.type；pop 可避免把非协议字段继续发送给服务端。
         thinking_enabled = extra_body.pop("enable_thinking", None)
         reasoning_effort = extra_body.pop("reasoning_effort", None)
+        normalized_effort = str(reasoning_effort or "").strip().lower()
+        if normalized_effort == "none":
+            extra_body["thinking"] = {"type": "disabled"}
+            reasoning_effort = None
+        elif normalized_effort == "enabled":
+            extra_body["thinking"] = {"type": "enabled"}
+            reasoning_effort = None
         thinking_requested = bool(thinking_enabled) or bool(reasoning_effort)
         if _deepseek_thinking_enabled(extra_body):
             thinking_requested = True
@@ -310,9 +316,46 @@ class DashScopeStrategy(ProviderStrategy):
     ) -> None:
         """单次禁用时清理其他推理字段，并发送 DashScope 专属开关。"""
 
-        if disable_thinking:
+        effort = str(extra_body.pop("reasoning_effort", "") or "").strip().lower()
+        if disable_thinking or effort == "none":
             _drop_thinking_keys(extra_body)
             extra_body["enable_thinking"] = False
+        elif effort == "enabled":
+            extra_body.pop("thinking", None)
+            extra_body["enable_thinking"] = True
+        elif effort:
+            # 新版 DashScope reasoning 模型接受明确等级；enable_thinking 仍负责
+            # 打开 hybrid 模型的思考模式，两者表达不同维度，不能降级丢失等级。
+            extra_body.pop("thinking", None)
+            extra_body["enable_thinking"] = True
+            request["reasoning_effort"] = effort
+        if extra_body:
+            request["extra_body"] = extra_body
+
+
+class OpenAIReasoningStrategy(ProviderStrategy):
+    """适配 OpenAI reasoning Chat Completions 的顶层参数。"""
+
+    def prepare_request(
+        self,
+        request: dict[str, Any],
+        extra_body: dict[str, Any],
+        *,
+        disable_thinking: bool,
+    ) -> None:
+        effort = extra_body.pop("reasoning_effort", None)
+        _drop_thinking_keys(extra_body)
+        if disable_thinking:
+            effort = "none"
+        elif effort == "enabled":
+            # 开启但不指定等级等价于使用 OpenAI 模型自身的默认强度。
+            effort = None
+        if effort:
+            request["reasoning_effort"] = str(effort)
+        # 新 reasoning 模型使用 max_completion_tokens；保留这一差异在适配器内。
+        max_tokens = request.pop("max_tokens", None)
+        if max_tokens is not None:
+            request["max_completion_tokens"] = max_tokens
         if extra_body:
             request["extra_body"] = extra_body
 
@@ -328,6 +371,8 @@ class LLMProvider:
         self,
         config: LLMConfig,
         *,
+        strategy: ProviderStrategy | None = None,
+        runtime_id: str | None = None,
         stream_idle_timeout_s: float | None = None,
         max_retries: int = 1,
         force_disable_thinking: bool = False,
@@ -354,6 +399,8 @@ class LLMProvider:
         self._context_window_source = context_resolution.source
         self._system_prompt = config.system_prompt
         self._extra_body = dict(config.extra_body)
+        self._strategy = strategy
+        self._runtime_id_override = str(runtime_id or "")
 
         # request_timeout 限制“创建请求/获取响应”的等待时间；stream idle
         # timeout 限制流建立后相邻两个 chunk 之间的等待时间，两者含义不同。
@@ -390,7 +437,7 @@ class LLMProvider:
     def runtime_id(self) -> str:
         """返回模型、服务商和容量组成的稳定计量身份。"""
 
-        return f"{self._provider_name}:{self._model}:{self._context_window}"
+        return self._runtime_id_override or f"{self._provider_name}:{self._model}:{self._context_window}"
 
     @property
     def max_tokens(self) -> int:
@@ -447,7 +494,9 @@ class LLMProvider:
 
         # 只复制外层列表；策略会逐条复制消息，避免污染 Session 历史。
         selected_model = model or self._model
-        strategy = _select_provider_strategy(
+        # 页面设置生成的 Provider 固定使用显式适配器；仅 legacy TOML 继续
+        # 使用文本特征推断，避免第三方网关因 URL 不含厂商名而选错协议。
+        strategy = self._strategy or _select_provider_strategy(
             provider_name=self._provider_name,
             base_url=self._base_url,
             model=selected_model,
@@ -1174,6 +1223,7 @@ __all__ = [
     "DashScopeStrategy",
     "DeepSeekStrategy",
     "LLMProvider",
+    "OpenAIReasoningStrategy",
     "LLMResponse",
     "ProviderStrategy",
     "ToolCall",

@@ -94,6 +94,36 @@ async def test_message_send_does_not_publish_session_title_before_turn_runs() ->
 
 
 @pytest.mark.asyncio
+async def test_message_send_freezes_only_whitelisted_model_route_fields() -> None:
+    bus = MessageBus()
+    captured = {}
+
+    def resolve(session_key: str, route: dict | None) -> dict:
+        captured.update({"session_key": session_key, "route": route})
+        return {"lease_key": "frozen", "connection_id": route["connection_id"], "model_id": route["model_id"]}
+
+    channel = WebChannel(bus, EventBus(), Interrupt(), route_resolver=resolve)
+    socket = Socket()
+    await channel.handle_frame(socket, {
+        "type": "message.send", "request_id": "r-route", "session_id": "web:chat",
+        "text": "hello", "media": [],
+        "model_route": {
+            "connection_id": "connection-1", "model_id": "model-1", "reasoning_effort": "high",
+            "base_url": "https://evil.example/v1", "api_key": "must-not-pass", "adapter": "deepseek",
+        },
+    })
+
+    message = await bus.consume_inbound()
+    assert captured == {"session_key": "web:chat", "route": {
+        "connection_id": "connection-1", "model_id": "model-1", "reasoning_effort": "high",
+    }}
+    assert message.metadata["model_route"]["lease_key"] == "frozen"
+    assert "must-not-pass" not in str(message.metadata)
+    assert "evil.example" not in str(message.metadata)
+    await channel.close()
+
+
+@pytest.mark.asyncio
 async def test_message_send_without_session_creates_session_after_validation() -> None:
     bus = MessageBus()
     created: list[str] = []

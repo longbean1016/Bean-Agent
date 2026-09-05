@@ -1,4 +1,4 @@
-import type { MessagePage, MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile, Workspace } from "./types";
+import type { MessagePage, MessageRow, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile, Workspace } from "./types";
 
 // 仅控制聊天页面的滚动分页，不参与模型上下文 token gate 或 checkpoint 边界。
 const MESSAGE_WINDOW_LIMIT = 60;
@@ -199,4 +199,100 @@ export async function fetchReminders(sessionId: string): Promise<ScheduledRemind
 export async function deleteReminder(sessionId: string, reminderId: string): Promise<void> {
   const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/reminders/${encodeURIComponent(reminderId)}`, { method: "DELETE" });
   if (!response.ok) throw new Error("无法删除提醒");
+}
+
+async function settingsRequest<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init);
+  const payload = await response.json().catch(() => ({})) as T & { detail?: string };
+  if (!response.ok) throw new Error(payload.detail || `模型设置请求失败 (${response.status})`);
+  return payload;
+}
+
+export async function fetchModelSettings(): Promise<ModelSettingsPayload> {
+  const payload = await settingsRequest<Partial<ModelSettingsPayload>>("/api/settings");
+  return {
+    connections: payload.connections ?? [],
+    default_route: payload.default_route ?? null,
+    catalog: payload.catalog ?? {},
+    routing_required: payload.routing_required ?? false,
+  };
+}
+
+export async function fetchSessionModelRoute(sessionId: string): Promise<ModelRoute | null> {
+  const payload = await settingsRequest<{ route: ModelRoute | null }>(`/api/settings/routes/session/${encodeURIComponent(sessionId)}`);
+  return payload.route;
+}
+
+export async function saveSessionModelRoute(sessionId: string, route: ModelRoute): Promise<ModelRoute> {
+  const payload = await settingsRequest<{ route: ModelRoute }>(`/api/settings/routes/session/${encodeURIComponent(sessionId)}`, {
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(route),
+  });
+  return payload.route;
+}
+
+export async function createModelConnection(values: Record<string, unknown>): Promise<ModelConnection> {
+  return settingsRequest("/api/settings/connections", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(values),
+  });
+}
+
+export async function updateModelConnection(id: string, values: Record<string, unknown>): Promise<ModelConnection> {
+  return settingsRequest(`/api/settings/connections/${encodeURIComponent(id)}`, {
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(values),
+  });
+}
+
+export async function fetchModelConnectionApiKey(id: string): Promise<string> {
+  const payload = await settingsRequest<{ api_key: string }>(
+    `/api/settings/connections/${encodeURIComponent(id)}/api-key`,
+  );
+  return payload.api_key;
+}
+
+export async function deleteModelConnection(id: string): Promise<void> {
+  const response = await fetch(`/api/settings/connections/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!response.ok) throw new Error("无法删除连接");
+}
+
+export async function testModelConnection(id: string): Promise<{ ok: boolean; connection_id: string; connection_name: string; model_count: number }> {
+  return settingsRequest(`/api/settings/connections/${encodeURIComponent(id)}/test`, { method: "POST" });
+}
+
+export async function refreshConnectionModels(id: string): Promise<{ items: ModelProfile[]; catalog_warning?: string | null }> {
+  return settingsRequest(`/api/settings/connections/${encodeURIComponent(id)}/models/refresh`, { method: "POST" });
+}
+
+export async function testConnectionModel(connectionId: string, modelId: string): Promise<{
+  ok: boolean;
+  connection_id: string;
+  connection_name: string;
+  model_id: string;
+  model_display_name: string;
+  adapter: string;
+  duration_ms: number;
+}> {
+  return settingsRequest(`/api/settings/connections/${encodeURIComponent(connectionId)}/models/${encodeURIComponent(modelId)}/test`, { method: "POST" });
+}
+
+export async function createManualModel(id: string, values: Record<string, unknown>): Promise<ModelProfile> {
+  return settingsRequest(`/api/settings/connections/${encodeURIComponent(id)}/models`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(values),
+  });
+}
+
+export async function updateModelProfile(connectionId: string, modelId: string, values: Record<string, unknown>): Promise<ModelProfile> {
+  return settingsRequest(`/api/settings/connections/${encodeURIComponent(connectionId)}/models/${encodeURIComponent(modelId)}`, {
+    method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(values),
+  });
+}
+
+export async function saveDefaultModelRoute(route: ModelRoute): Promise<ModelRoute> {
+  const payload = await settingsRequest<{ route: ModelRoute }>("/api/settings/routes/default", {
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(route),
+  });
+  return payload.route;
+}
+
+export async function updateModelCatalog(): Promise<{ updated_at: string; providers: number; models: number }> {
+  return settingsRequest("/api/settings/catalog/update", { method: "POST" });
 }

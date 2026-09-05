@@ -1,4 +1,4 @@
-import type { ChatAction, ChatMessage, ChatState, ContextUsage, MessageRow, ProactiveNotificationRow, SessionUsage, ToolActivity, TurnRuntimeState } from "./types";
+import type { ChatAction, ChatMessage, ChatState, ContextUsage, MessageRow, ModelAdapterId, ProactiveNotificationRow, SessionUsage, ToolActivity, TurnRuntimeState } from "./types";
 import { reconcileMessages } from "./timeline";
 
 export const idleTurnState: TurnRuntimeState = {
@@ -468,6 +468,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
         streaming: false,
         timestamp,
         status: String(action.metadata?.status || "") || message.status,
+        modelRoute: modelRouteFromMetadata(action.metadata) ?? message.modelRoute,
         ...(durationMs === undefined ? {} : { durationMs }),
       };
     });
@@ -589,8 +590,26 @@ export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {
       source: row.proactive
         ? (String(row.metadata?.source || "proactive_conversation") as ChatMessage["source"])
         : undefined,
+      modelRoute: modelRouteFromMetadata(row.metadata),
     };
   });
+}
+
+function modelRouteFromMetadata(metadata: Record<string, unknown> | undefined): ChatMessage["modelRoute"] {
+  const route = metadata?.model_route;
+  if (!route || typeof route !== "object" || Array.isArray(route)) return undefined;
+  const value = route as Record<string, unknown>;
+  const connectionId = String(value.connection_id || "");
+  const modelId = String(value.model_id || "");
+  const adapter = String(value.adapter || "");
+  if (!connectionId || !modelId) return undefined;
+  return {
+    connection_id: connectionId,
+    model_id: modelId,
+    connection_name: String(value.connection_name || "") || undefined,
+    model_display_name: String(value.model_display_name || "") || undefined,
+    ...(adapter ? { adapter: adapter as ModelAdapterId } : {}),
+  };
 }
 
 function durationFromRow(row: MessageRow): number | undefined {

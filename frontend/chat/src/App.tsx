@@ -9,6 +9,8 @@ import {
   Bell,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   CircleStop,
   Copy,
   FileText,
@@ -21,7 +23,9 @@ import {
   Paperclip,
   PlugZap,
   RefreshCw,
+  Search,
   SendHorizontal,
+  Settings,
   Sun,
   Wrench,
   X,
@@ -33,7 +37,7 @@ import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import type { StickToBottomContext } from "use-stick-to-bottom";
 
-import { deleteSession, deleteWorkspace, fetchMessagePage, fetchMessagesAroundPage, fetchNotifications, fetchOlderMessages, fetchSessions, fetchTurns, fetchWorkspaces, mediaUrl, openWorkspaceDirectory, registerWorkspace, renameSession, setSessionPinned, updateWorkspace, uploadAttachment } from "./api";
+import { deleteSession, deleteWorkspace, fetchMessagePage, fetchMessagesAroundPage, fetchModelSettings, fetchNotifications, fetchOlderMessages, fetchSessionModelRoute, fetchSessions, fetchTurns, fetchWorkspaces, mediaUrl, openWorkspaceDirectory, registerWorkspace, renameSession, saveSessionModelRoute, setSessionPinned, updateWorkspace, uploadAttachment } from "./api";
 import { idleTurnState, initialChatState, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
 import { composeTimeline, reconcileMessages } from "./timeline";
 import { parseMemoryCitations } from "./citations";
@@ -41,8 +45,9 @@ import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
 import { ApprovalPanel, PermissionSelector, WorkspaceSelector } from "./SandboxControls";
 import { SessionSidebar } from "./SessionSidebar";
-import { pathForSession, routeKey, sessionFromPath } from "./chatRoute";
-import type { ApprovalRequest, ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, SandboxMode, SandboxSnapshot, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry, Workspace } from "./types";
+import type { ApprovalRequest, ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, SandboxMode, SandboxSnapshot, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry, Workspace } from "./types";
+import { ModelSettingsPage } from "./ModelSettingsPage";
+import { isModelSettingsPath, MODEL_SETTINGS_PATH, pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupMessagesIntoNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
 
@@ -68,6 +73,7 @@ const ATTACHMENT_ACCEPT = [
   ...TEXT_SUFFIXES,
 ].join(",");
 type ThemePreference = "light" | "system" | "dark";
+const EMPTY_MODEL_SETTINGS: ModelSettingsPayload = { connections: [], default_route: null, catalog: {}, routing_required: false };
 type MessageWindowState = {
   hasMoreBefore: boolean;
   nextBeforeSeq: number | null;
@@ -171,12 +177,14 @@ function containsClosedMermaidFence(markdown: string): boolean {
 }
 
 export function App() {
+  const initialPage = isModelSettingsPath(window.location.pathname) ? "model-settings" : "chat";
   const initialRouteSession = sessionFromPath(window.location.pathname);
   const initialSession = initialRouteSession || readStoredSession();
   const [chat, dispatch] = useReducer(reduceChatFrame, {
     ...initialChatState,
     sessionId: initialSession,
   });
+  const [activePage, setActivePage] = useState<"chat" | "model-settings">(initialPage);
   const [routeSession, setRouteSession] = useState(initialSession);
   const [connection, setConnection] = useState<ConnectionStatus>("connecting");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -198,6 +206,8 @@ export function App() {
   const [fileDrafts, setFileDrafts] = useState<Record<string, File[]>>({});
   const [sending, setSending] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [modelSettings, setModelSettings] = useState<ModelSettingsPayload>(EMPTY_MODEL_SETTINGS);
+  const [selectedModelRoute, setSelectedModelRoute] = useState<ModelRoute | null>(null);
   const [theme, setTheme] = useState<ThemePreference>(() => readThemePreference());
   const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -210,6 +220,7 @@ export function App() {
   const loadingMessageWindowRef = useRef("");
   const compactionStartedAtRef = useRef<Record<string, number>>({});
   const compactionNoticeTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const activePageRef = useRef(activePage);
   const routeSessionRef = useRef(routeSession);
   const workspacesRef = useRef(workspaces);
   const pendingApprovalsRef = useRef(pendingApprovals);
@@ -223,6 +234,7 @@ export function App() {
   const reloadSessionRef = useRef<(sessionId: string) => void>(() => undefined);
   chatRef.current = chat;
   messageWindowsRef.current = messageWindows;
+  activePageRef.current = activePage;
   routeSessionRef.current = routeSession;
   workspacesRef.current = workspaces;
   pendingApprovalsRef.current = pendingApprovals;
@@ -263,9 +275,45 @@ export function App() {
     mergeNavigationTurns(turnsBySession[chat.sessionId] ?? [], messageTurns)
   ), [chat.sessionId, messageTurns, turnsBySession]);
   const conversationTurnGroups = useMemo(() => groupMessagesIntoNavigationTurns(displayMessages), [displayMessages]);
+  const selectedModel = useMemo(() => {
+    if (!selectedModelRoute) return undefined;
+    return modelSettings.connections.find((item) => item.id === selectedModelRoute.connection_id)
+      ?.models.find((item) => item.model_id === selectedModelRoute.model_id);
+  }, [modelSettings.connections, selectedModelRoute]);
+  const selectedContextUsage = currentContextUsage && selectedModel
+    && ((currentContextUsage.model && currentContextUsage.model !== selectedModel.model_id)
+      || (currentContextUsage.modelRuntimeId && selectedModelRoute
+        && !currentContextUsage.modelRuntimeId.startsWith(`${selectedModelRoute.connection_id}:`)))
+    ? undefined : currentContextUsage;
+
+  const refreshModelSettings = useCallback(async () => {
+    const loaded = await fetchModelSettings();
+    setModelSettings(loaded);
+    setSelectedModelRoute((current) => current ?? loaded.default_route);
+    return loaded;
+  }, []);
 
   useEffect(() => {
-    if (!initialRouteSession && initialSession) {
+    void refreshModelSettings().catch((error) => dispatch(errorFrame(error)));
+  }, [refreshModelSettings]);
+
+  useEffect(() => {
+    if (!chat.sessionId || !modelSettings.routing_required) return;
+    void fetchSessionModelRoute(chat.sessionId)
+      .then((route) => setSelectedModelRoute(route ?? modelSettings.default_route))
+      .catch((error) => dispatch(errorFrame(error)));
+  }, [chat.sessionId, modelSettings.default_route, modelSettings.routing_required]);
+
+  const selectModelRoute = useCallback((route: ModelRoute) => {
+    setSelectedModelRoute(route);
+    if (chat.sessionId) dispatch({ type: "context.usage.reset", session_id: chat.sessionId });
+    if (chat.sessionId && modelSettings.routing_required) {
+      void saveSessionModelRoute(chat.sessionId, route).catch((error) => dispatch(errorFrame(error)));
+    }
+  }, [chat.sessionId, modelSettings.routing_required]);
+
+  useEffect(() => {
+    if (initialPage === "chat" && !initialRouteSession && initialSession) {
       window.history.replaceState({}, "", pathForSession(initialSession));
     }
     // 初始路径归一化只在首屏执行，后续切换会话由 selectSession/createSession 接管。
@@ -441,8 +489,11 @@ export function App() {
       localStorage.setItem(SESSION_STORAGE_KEY, frame.session_id);
       const createdAt = new Date().toISOString();
       if (!routeSessionRef.current) {
-        window.history.pushState({}, "", pathForSession(frame.session_id));
+        routeSessionRef.current = frame.session_id;
         setRouteSession(frame.session_id);
+        if (activePageRef.current === "chat") {
+          window.history.pushState({}, "", pathForSession(frame.session_id));
+        }
       }
       setSessions((current) => current.some((session) => session.key === frame.session_id)
         ? current
@@ -594,6 +645,8 @@ export function App() {
     setLoadingSessionId("");
     localStorage.removeItem(SESSION_STORAGE_KEY);
     window.history.pushState({}, "", "/");
+    activePageRef.current = "chat";
+    setActivePage("chat");
     routeSessionRef.current = "";
     setRouteSession("");
     dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
@@ -610,6 +663,8 @@ export function App() {
   const selectSession = (sessionId: string) => {
     if (chat.sessionId && chat.sessionId !== sessionId) rejectPendingApprovals(chat.sessionId);
     window.history.pushState({}, "", pathForSession(sessionId));
+    activePageRef.current = "chat";
+    setActivePage("chat");
     routeSessionRef.current = sessionId;
     setRouteSession(sessionId);
     setInput(textDrafts[routeKey(sessionId)] ?? "");
@@ -933,6 +988,14 @@ export function App() {
 
   useEffect(() => {
     const handlePopState = () => {
+      if (isModelSettingsPath(window.location.pathname)) {
+        activePageRef.current = "model-settings";
+        setActivePage("model-settings");
+        setSidebarOpen(false);
+        return;
+      }
+      activePageRef.current = "chat";
+      setActivePage("chat");
       const sessionId = sessionFromPath(window.location.pathname);
       const previousSessionId = chatRef.current.sessionId;
       if (previousSessionId && previousSessionId !== sessionId) {
@@ -999,6 +1062,7 @@ export function App() {
         } : {}),
         text: cleanText,
         media: uploaded.map((item) => item.upload_path),
+        ...(selectedModelRoute ? { model_route: selectedModelRoute } : {}),
       });
       if (!sent) {
         dispatch({
@@ -1058,6 +1122,43 @@ export function App() {
     }
   };
 
+  const openModelSettings = () => {
+    if (activePageRef.current !== "model-settings") {
+      window.history.pushState({}, "", MODEL_SETTINGS_PATH);
+    }
+    activePageRef.current = "model-settings";
+    setActivePage("model-settings");
+    setSidebarOpen(false);
+  };
+
+  const closeModelSettings = () => {
+    window.history.replaceState({}, "", pathForSession(routeSessionRef.current));
+    activePageRef.current = "chat";
+    setActivePage("chat");
+  };
+
+  if (activePage === "model-settings") {
+    return (
+      <div className="settings-app-shell">
+        <main className="settings-workspace">
+          <header className="topbar">
+            <div className="topbar-page-title"><Settings size={17} /><div><strong>设置</strong><span>模型与连接</span></div></div>
+            <div className="topbar-actions">
+              <ConnectionControl status={connection} onReconnect={() => clientRef.current?.reconnectNow()} />
+              <ThemeControl value={theme} onChange={setTheme} />
+            </div>
+          </header>
+          <ModelSettingsPage
+            settings={modelSettings}
+            onBack={closeModelSettings}
+            onRefresh={refreshModelSettings}
+            onDefaultRoute={selectModelRoute}
+          />
+        </main>
+      </div>
+    );
+  }
+
   const sidebar = (
     <SessionSidebar
       activeSessionId={chat.sessionId}
@@ -1072,6 +1173,7 @@ export function App() {
       onSetSessionPinned={handleSetSessionPinned}
       onUpdateWorkspace={handleUpdateWorkspace}
       onSelect={selectSession}
+      onSettings={openModelSettings}
     />
   );
 
@@ -1193,8 +1295,12 @@ export function App() {
             connected={connection === "connected"}
             files={files}
             input={input}
-            sessionId={chat.sessionId}
-            contextUsage={currentContextUsage}
+             sessionId={chat.sessionId}
+             contextUsage={selectedContextUsage}
+             connections={modelSettings.connections}
+             selectedRoute={selectedModelRoute}
+             selectedModel={selectedModel}
+             routingRequired={modelSettings.routing_required}
             sessionUsage={currentSessionUsage}
             workspaces={workspaces}
             workspaceId={currentWorkspaceId}
@@ -1216,7 +1322,8 @@ export function App() {
               setTextDrafts((current) => ({ ...current, [routeKey(routeSession)]: value }));
             }}
             onSend={() => void submit()}
-            onStop={stopTurn}
+             onStop={stopTurn}
+             onRouteChange={selectModelRoute}
             onWorkspaceChange={handleWorkspaceChange}
             onSandboxModeChange={handleSandboxModeChange}
           />
@@ -1383,6 +1490,12 @@ function MessageView({ message, navigationTurnId, turnDurationMs }: {
       {!isUser ? <div className="message-label">BeanAgent</div> : null}
       <div className="message-body">
         {isUser ? <div className="message-label user-message-label">你</div> : null}
+        {!isUser && message.status === "error" && message.modelRoute ? (
+          <div className="message-model-route" title={`适配器：${message.modelRoute.adapter || "unknown"}`}>
+            <PlugZap size={13} aria-hidden="true" />
+            <span>{message.modelRoute.connection_name || message.modelRoute.connection_id} / {message.modelRoute.model_display_name || message.modelRoute.model_id}</span>
+          </div>
+        ) : null}
         {!isUser && message.source ? <MessageSourceBadge message={message} /> : null}
         {message.media.length ? <AttachmentGallery paths={message.media} /> : null}
         {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} status={message.thinkingStatus} /> : null}
@@ -1581,7 +1694,8 @@ function AttachmentGallery({ paths }: { paths: string[] }) {
 function Composer(props: {
   input: string; files: File[]; active: boolean; turnStatus: "idle" | "submitting" | "queued" | "running" | "compacting"; compacting: boolean; queuePosition: number | null; connected: boolean; sending: boolean; sessionId: string; contextUsage?: ContextUsage; sessionUsage?: SessionUsage;
   workspaces: Workspace[]; workspaceId: string | null; workspaceValid: boolean; sandboxMode: SandboxMode; sandboxUpdating: boolean; workspaceLocked: boolean;
-  onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void; onWorkspaceChange: (workspaceId: string | null) => void; onSandboxModeChange: (mode: SandboxMode, riskConfirmed?: boolean) => void;
+  connections: ModelConnection[]; selectedRoute: ModelRoute | null; selectedModel?: ModelProfile; routingRequired: boolean;
+  onInput: (value: string) => void; onFiles: (files: File[]) => void; onSend: () => void; onStop: () => void; onRouteChange: (route: ModelRoute) => void; onWorkspaceChange: (workspaceId: string | null) => void; onSandboxModeChange: (mode: SandboxMode, riskConfirmed?: boolean) => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -1850,8 +1964,8 @@ function Composer(props: {
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey && !props.active) { event.preventDefault(); handleSend(); }
           }}
-          placeholder={props.connected ? "输入消息，或附加文本与图片" : "等待连接恢复"}
-          disabled={!props.connected}
+          placeholder={!props.connected ? "等待连接恢复" : props.routingRequired && !props.selectedRoute ? "请先在设置中配置模型" : "输入消息，或附加文本与图片"}
+          disabled={!props.connected || (props.routingRequired && !props.selectedRoute)}
           rows={2}
         />
         {props.compacting ? (
@@ -1861,7 +1975,7 @@ function Composer(props: {
           </div>
         ) : null}
         <div className="composer-actions">
-          <ContextUsageIndicator usage={props.contextUsage} compacting={props.compacting} />
+          <ContextUsageIndicator usage={props.contextUsage} compacting={props.compacting} profile={props.selectedModel} />
           <WorkspaceSelector
             workspaces={props.workspaces}
             value={props.workspaceId}
@@ -1899,10 +2013,17 @@ function Composer(props: {
               {props.queuePosition === 1 ? "排队中 · 即将开始" : `排队中 · 前面还有 ${(props.queuePosition ?? 1) - 1} 个会话`}
             </span>
           ) : null}
+          <ModelRouteControl
+            connections={props.connections}
+            route={props.selectedRoute}
+            profile={props.selectedModel}
+            disabled={props.active}
+            onChange={props.onRouteChange}
+          />
           {props.active ? (
             <button className="send-button stop" aria-label="停止" onClick={handleStop}><CircleStop size={18} /><span>停止</span></button>
           ) : (
-            <button className="send-button" aria-label="发送" onClick={handleSend} disabled={props.sending || (!props.input.trim() && props.files.length === 0)}><SendHorizontal size={18} /><span>发送</span></button>
+            <button className="send-button" aria-label="发送" onClick={handleSend} disabled={props.sending || (props.routingRequired && !props.selectedRoute) || (!props.input.trim() && props.files.length === 0)}><SendHorizontal size={18} /><span>发送</span></button>
           )}
         </div>
       </div>
@@ -1927,7 +2048,151 @@ function SessionUsageStats({ usage }: { usage?: SessionUsage }) {
   );
 }
 
-export function ContextUsageIndicator({ usage, compacting }: { usage?: ContextUsage; compacting: boolean }) {
+function ModelRouteControl(props: {
+  connections: ModelConnection[];
+  route: ModelRoute | null;
+  profile?: ModelProfile;
+  disabled: boolean;
+  onChange: (route: ModelRoute) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [view, setView] = useState<"overview" | "models" | "reasoning">("overview");
+  const [query, setQuery] = useState("");
+  const rootRef = useRef<HTMLDivElement>(null);
+  const enabled = useMemo(
+    () => props.connections.filter((connection) => connection.enabled),
+    [props.connections],
+  );
+  const available = useMemo(() => enabled.map((connection) => ({
+    connection,
+    models: connection.models.filter((model) => model.available),
+  })).filter((group) => group.models.length), [enabled]);
+  const currentProfile = props.profile ?? available
+    .find((group) => group.connection.id === props.route?.connection_id)
+    ?.models.find((model) => model.model_id === props.route?.model_id);
+  const efforts = currentProfile?.supports_reasoning ? currentProfile.reasoning_options : [];
+  const selectedEffort = efforts.includes(props.route?.reasoning_effort ?? "")
+    ? props.route?.reasoning_effort ?? ""
+    : "";
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filtered = available.map((group) => ({
+    ...group,
+    models: normalizedQuery ? group.models.filter((model) => (
+      model.display_name.toLocaleLowerCase().includes(normalizedQuery)
+      || model.model_id.toLocaleLowerCase().includes(normalizedQuery)
+      || group.connection.name.toLocaleLowerCase().includes(normalizedQuery)
+    )) : group.models,
+  })).filter((group) => group.models.length);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointerDown = (event: PointerEvent) => {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (view !== "overview") setView("overview");
+        else setOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open, view]);
+
+  useEffect(() => {
+    if (!props.disabled) return;
+    setOpen(false);
+    setView("overview");
+  }, [props.disabled]);
+
+  if (!available.length) return null;
+  const modelLabel = currentProfile?.display_name ?? props.route?.model_id ?? "选择模型";
+  const close = () => {
+    setOpen(false);
+    setView("overview");
+    setQuery("");
+  };
+  const openView = (next: "models" | "reasoning") => {
+    setQuery("");
+    setView(next);
+  };
+
+  return <div className={`model-route-control${open ? " open" : ""}`} ref={rootRef}>
+    <button
+      type="button"
+      className="model-route-trigger"
+      aria-label={`模型与推理：${modelLabel}${selectedEffort ? ` ${selectedEffort}` : ""}`}
+      aria-expanded={open}
+      disabled={props.disabled}
+      onClick={() => {
+        setOpen((current) => !current);
+        setView("overview");
+        setQuery("");
+      }}
+    >
+      <strong>{modelLabel}</strong>
+      {selectedEffort ? <span>{selectedEffort}</span> : null}
+      <ChevronDown size={17} aria-hidden="true" />
+    </button>
+    {open ? <div className="model-route-popover" role="menu" aria-label="模型与推理设置">
+      {view === "overview" ? <div className="model-route-overview">
+        <button type="button" role="menuitem" aria-label={`选择模型，当前 ${modelLabel}`} onClick={() => openView("models")}>
+          <strong>模型</strong><span>{modelLabel}</span><ChevronRight size={18} aria-hidden="true" />
+        </button>
+        {efforts.length ? <button type="button" role="menuitem" aria-label={`选择推理等级，当前 ${selectedEffort || "未选择"}`} onClick={() => openView("reasoning")}>
+          <strong>推理等级</strong><span>{selectedEffort || "未选择"}</span><ChevronRight size={18} aria-hidden="true" />
+        </button> : null}
+      </div> : null}
+      {view === "models" ? <div className="model-route-subview">
+        <header><button type="button" className="icon-button" aria-label="返回模型与推理设置" onClick={() => setView("overview")}><ChevronLeft size={18} /></button><strong>选择模型</strong></header>
+        <label className="model-route-search"><Search size={15} aria-hidden="true" /><span className="sr-only">搜索模型</span><input autoFocus type="search" placeholder="搜索模型" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+        <div className="model-route-options">
+          {filtered.map(({ connection, models }) => <section key={connection.id}>
+            <h3>{connection.name}</h3>
+            {models.map((model) => {
+              const selected = props.route?.connection_id === connection.id && props.route.model_id === model.model_id;
+              return <button
+                type="button"
+                className={selected ? "selected" : ""}
+                aria-label={`${connection.name} / ${model.display_name} · ${model.context_window ? formatTokenCount(model.context_window) : "--"}`}
+                aria-pressed={selected}
+                key={model.model_id}
+                onClick={() => {
+                  const keepEffort = model.reasoning_options.includes(props.route?.reasoning_effort ?? "")
+                    ? props.route?.reasoning_effort : null;
+                  props.onChange({ connection_id: connection.id, model_id: model.model_id, reasoning_effort: keepEffort });
+                  close();
+                }}
+              ><span><strong>{model.display_name}</strong><small>{model.model_id}</small></span><small>{model.context_window ? formatTokenCount(model.context_window) : "--"}</small>{selected ? <Check size={15} aria-hidden="true" /> : null}</button>;
+            })}
+          </section>)}
+          {!filtered.length ? <p>没有匹配的模型</p> : null}
+        </div>
+      </div> : null}
+      {view === "reasoning" ? <div className="model-route-subview">
+        <header><button type="button" className="icon-button" aria-label="返回模型与推理设置" onClick={() => setView("overview")}><ChevronLeft size={18} /></button><strong>选择推理等级</strong></header>
+        <div className="model-route-options reasoning-options">
+          {efforts.map((effort) => <button
+            type="button"
+            className={selectedEffort === effort ? "selected" : ""}
+            aria-pressed={selectedEffort === effort}
+            key={effort}
+            onClick={() => {
+              if (props.route) props.onChange({ ...props.route, reasoning_effort: effort });
+              close();
+            }}
+          ><span><strong>{effort}</strong></span>{selectedEffort === effort ? <Check size={15} aria-hidden="true" /> : null}</button>)}
+        </div>
+      </div> : null}
+    </div> : null}
+  </div>;
+}
+
+export function ContextUsageIndicator({ usage, compacting, profile }: { usage?: ContextUsage; compacting: boolean; profile?: ModelProfile }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -1946,19 +2211,24 @@ export function ContextUsageIndicator({ usage, compacting }: { usage?: ContextUs
     };
   }, [open]);
 
-  const contextWindow = usage?.contextWindow ?? 0;
+  const contextWindow = profile?.context_window ?? usage?.contextWindow ?? 0;
   const usedTokens = usage?.usedTokens ?? 0;
-  const known = Boolean(usage && contextWindow > 0 && usage.pressureTokens !== undefined);
-  // DSH 只在真实 pressure 与模型容量同时存在时显示圆圈，避免估算值伪装成供应商用量。
-  if (!known) return null;
-  const percent = Math.min(100, Math.max(0, Math.round((usedTokens / contextWindow) * 100)));
+  const hasUsage = Boolean(usage && contextWindow > 0 && usage.pressureTokens !== undefined);
+  // 尚无供应商 usage 时只展示容量；不能把本地估算伪装成已使用比例。
+  if (!profile && !hasUsage) return null;
+  const percent = hasUsage ? Math.min(100, Math.max(0, Math.round((usedTokens / contextWindow) * 100))) : 0;
   const level = percent >= 90 ? "danger" : percent >= 74 ? "warning" : "normal";
-  const label = `上下文已用 ${percent}%`;
+  const label = contextWindow > 0
+    ? (hasUsage ? `上下文已用 ${percent}%` : `上下文容量 ${formatTokenCount(contextWindow)}`)
+    : "上下文容量未知";
   const style = { "--usage-progress": `${percent}%` } as CSSProperties;
   const breakdown = usage?.breakdown;
+  const contextSource = profile && Object.prototype.hasOwnProperty.call(profile.user_overrides, "context_window")
+    ? "user_override"
+    : profile?.metadata_source || usage?.contextWindowSource || "unknown";
 
   return (
-    <div ref={rootRef} className={`context-usage-indicator ${level}${compacting ? " compacting" : ""}${open ? " open" : ""}`}>
+    <div ref={rootRef} className={`context-usage-indicator ${contextWindow > 0 ? level : "unknown"}${compacting ? " compacting" : ""}${open ? " open" : ""}`}>
       <button
         type="button"
         className="context-usage-button"
@@ -1968,29 +2238,27 @@ export function ContextUsageIndicator({ usage, compacting }: { usage?: ContextUs
         aria-haspopup="dialog"
         onClick={() => setOpen((current) => !current)}
       >
-        <span className="context-usage-ring" aria-hidden="true"><span /></span>
+        <span className="context-usage-ring" aria-hidden="true"><span>{contextWindow > 0 ? formatTokenCount(contextWindow) : "--"}</span></span>
       </button>
       <span className="context-usage-tooltip" role="tooltip">{label}</span>
       {open ? (
         <div className="context-usage-popover" role="dialog" aria-label="上下文占用详情">
           <div className="context-usage-popover-header">
             <strong>上下文占用</strong>
-            <span>~{formatTokenCount(usedTokens)} / {formatTokenCount(contextWindow)}</span>
+            <span>{hasUsage ? `~${formatTokenCount(usedTokens)}` : "--"} / {contextWindow > 0 ? formatTokenCount(contextWindow) : "--"}</span>
           </div>
           <div className="context-usage-meter" aria-label={label}>
             <span style={{ width: `${percent}%` }} />
           </div>
           {compacting ? <p className="context-usage-state">正在压缩上下文，当前数值保持不变</p> : null}
-          {breakdown ? (
-            <dl className="context-usage-breakdown">
-              <div><dt>系统提示词</dt><dd>{formatTokenCount(breakdown.system_prompt_tokens)}</dd></div>
-              <div><dt>工具</dt><dd>{formatTokenCount(breakdown.tools_tokens)}</dd></div>
-              <div><dt>对话消息</dt><dd>{formatTokenCount(breakdown.conversation_tokens)}</dd></div>
-            </dl>
-          ) : <p className="context-usage-empty">等待本轮上下文估算</p>}
+          <dl className="context-usage-breakdown">
+            <div><dt>系统提示词</dt><dd>{breakdown ? formatTokenCount(breakdown.system_prompt_tokens) : "--"}</dd></div>
+            <div><dt>工具</dt><dd>{breakdown ? formatTokenCount(breakdown.tools_tokens) : "--"}</dd></div>
+            <div><dt>对话消息</dt><dd>{breakdown ? formatTokenCount(breakdown.conversation_tokens) : "--"}</dd></div>
+          </dl>
           <small className="context-usage-source">
-            {usage?.estimateSource === "provider_usage" ? "Provider usage" : usage?.estimateSource === "provider_projected" ? "投影值" : "估算值"}
-            {" · "}{usage?.contextWindowSource || "unknown"}
+            {usage?.estimateSource === "provider_usage" ? "Provider usage" : usage?.estimateSource === "provider_projected" ? "投影值" : usage ? "估算值" : "等待本轮估算"}
+            {" · "}{formatContextWindowSource(contextSource)}
           </small>
         </div>
       ) : null}
@@ -2003,6 +2271,14 @@ function formatTokenCount(value: number): string {
   if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(count >= 10_000_000 ? 0 : 1).replace(/\.0$/, "")}M`;
   if (count >= 1_000) return `${(count / 1_000).toFixed(count >= 100_000 ? 0 : 1).replace(/\.0$/, "")}K`;
   return String(count);
+}
+
+function formatContextWindowSource(source: string): string {
+  if (source === "user_override") return "手动设置";
+  if (source === "provider_catalog") return "模型资料库";
+  if (source.startsWith("models.dev")) return "models.dev";
+  if (source === "unknown") return "来源未知";
+  return source;
 }
 
 function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositioned }: {

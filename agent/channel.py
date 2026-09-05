@@ -28,6 +28,7 @@ from agent.event_bus import (
 from agent.message_bus import MessageBus, OutboundMessage
 from agent.web_commands import (
     InterruptController,
+    RouteResolver,
     WebCommandError,
     WebCommandService,
     normalize_web_session_id,
@@ -81,6 +82,7 @@ class WebChannel:
         sandbox_mode_writer: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None,
         workspace_writer: Callable[[str, str | None], Awaitable[dict[str, Any]]] | None = None,
         approvals: Any | None = None,
+        route_resolver: RouteResolver | None = None,
     ) -> None:
         self._bus = bus
         self._events = event_bus
@@ -93,12 +95,14 @@ class WebChannel:
             sandbox_mode_writer=sandbox_mode_writer,
             workspace_writer=workspace_writer,
             approvals=approvals,
+            route_resolver=route_resolver,
         )
         self._mapper = WebEventMapper()
         self._proactive_store = proactive_store
         self._context_usage_loader = context_usage_loader
         self._session_usage_loader = session_usage_loader
         self._context_runtime_id = str(context_runtime_id or "")
+        self._route_resolver = route_resolver
         self._connections: dict[str, set[WebSocketApi]] = {}
         self._socket_send_locks: weakref.WeakKeyDictionary[WebSocketApi, asyncio.Lock] = (
             weakref.WeakKeyDictionary()
@@ -171,11 +175,11 @@ class WebChannel:
                     workspace_id=str(frame.get("workspace_id") or "") or None,
                     sandbox_mode=str(frame.get("sandbox_mode") or "read-only"),
                     risk_confirmed=frame.get("risk_confirmed") is True,
+                    model_route=frame.get("model_route"),
                 )
             except WebCommandError as error:
                 await self._error(websocket, request_id, error.code, error.message)
                 return
-
             # 发布可能同步触发 Turn 事件，因此连接注册和新会话确认必须先完成。
             await self._register(prepared.session_key, websocket)
             if prepared.created_session:

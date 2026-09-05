@@ -254,15 +254,30 @@ async def test_pipeline_failure_persists_error_turn_without_committed(tmp_path: 
     committed = []
     events.on(TurnCommitted, lambda event: committed.append(event))
     loop = AgentLoop(bus, events, FailingPipeline(), sessions)
-    await bus.publish_inbound(InboundMessage(channel="web", sender="u", chat_id="c", content="问题"))
+    await bus.publish_inbound(InboundMessage(
+        channel="web",
+        sender="u",
+        chat_id="c",
+        content="问题",
+        metadata={"model_route": {
+            "connection_id": "company",
+            "connection_name": "公司 API",
+            "model_id": "model-a",
+            "model_display_name": "Model A",
+            "adapter": "generic_openai",
+        }},
+    ))
 
     await loop.run_once()
 
     rows = sessions.store.fetch_session_messages("web:c")
     outbound = await bus.consume_outbound()
     assert rows[1]["status"] == "error"
+    assert rows[1]["metadata"]["model_route"]["connection_name"] == "公司 API"
+    assert rows[1]["metadata"]["model_route"]["model_id"] == "model-a"
     assert committed == []
     assert "模型失败" in outbound.content
+    assert outbound.metadata["model_route"]["model_display_name"] == "Model A"
     await sessions.close()
 
 
