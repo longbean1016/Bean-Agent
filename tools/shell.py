@@ -15,6 +15,10 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import urlparse
 
+from sandbox.errors import SandboxError
+from sandbox.guard import SandboxGuard
+from sandbox.runtime import SandboxProcessRuntime
+from sandbox.shell import SandboxShellBroker
 from tools.base import Tool
 
 _DEFAULT_TIMEOUT = 60
@@ -244,10 +248,19 @@ class ShellTool(Tool):
         allow_network: bool = True,
         working_dir: Path | None = None,
         restricted_dir: Path | None = None,
+        sandbox_guard: SandboxGuard | None = None,
+        sandbox_runtime: SandboxProcessRuntime | None = None,
     ) -> None:
         self._allow_network = allow_network
         self._working_dir = working_dir
         self._restricted_dir = restricted_dir.resolve() if restricted_dir else None
+        self._sandbox_guard = sandbox_guard
+        self._sandbox_runtime = sandbox_runtime
+        self._sandbox_shell = (
+            SandboxShellBroker(sandbox_runtime)
+            if sandbox_runtime is not None
+            else None
+        )
 
     @property
     def description(self) -> str:
@@ -284,9 +297,20 @@ class ShellTool(Tool):
         timeout = min(int(kwargs.get("timeout", _DEFAULT_TIMEOUT)), _MAX_TIMEOUT)
         if not command:
             return _err("命令不能为空")
-        cwd = self._working_dir
+        session_key = str(kwargs.get("session_key") or "")
+        turn_id = str(kwargs.get("turn_id") or "")
+        call_id = str(kwargs.get("call_id") or "")
+        if self._sandbox_guard is not None and not session_key:
+            return _err("缺少会话身份，已拒绝 Shell 执行")
+        policy = (
+            self._sandbox_guard.policy(session_key)
+            if self._sandbox_guard is not None and session_key
+            else None
+        )
+        cwd = policy.cwd if policy is not None else self._working_dir
         if kwargs.get("cwd") not in (None, ""):
-            cwd = Path(str(kwargs["cwd"])).expanduser()
+            candidate = Path(str(kwargs["cwd"])).expanduser()
+            cwd = ((policy.cwd / candidate) if policy is not None and not candidate.is_absolute() else candidate).resolve()
         if self._restricted_dir is not None and cwd is None:
             cwd = self._restricted_dir
 
@@ -300,36 +324,81 @@ class ShellTool(Tool):
         validation_error = _validate_command(
             command,
             allow_network=self._allow_network,
-            restricted_dir=self._restricted_dir,
+            # Windows ACL 是生产执行边界；旧的字符串过滤只为未注入 Runtime 的
+            # 独立工具调用保留，避免两套策略互相产生假授权。
+            restricted_dir=(None if policy is not None else self._restricted_dir),
             cwd=cwd,
         )
         if validation_error:
             return _err(validation_error)
 
         start = time.monotonic()
-        process = await asyncio.create_subprocess_shell(
-            command,
-            **_subprocess_options(cwd, os.environ.copy()),
-        )
-        interrupted = False
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            interrupted = True
-            try:
-                _kill_process_tree(process)
-            except (ProcessLookupError, PermissionError):
-                pass
-            stdout, stderr = await process.communicate()
-        except asyncio.CancelledError:
-            try:
-                _kill_process_tree(process)
-            except (ProcessLookupError, PermissionError):
-                pass
-            raise
+            if policy is not None and self._sandbox_shell is not None:
+                if cwd is None:
+                    return _err("沙箱 Shell 缺少工作目录")
+                run = await self._sandbox_shell.execute(
+                    policy,
+                    command,
+                    cwd=cwd,
+                    timeout=timeout,
+                )
+                stdout, stderr = run.stdout, run.stderr
+                interrupted = run.interrupted
+                exit_code = run.exit_code
+                if (
+                    exit_code != 0
+                    and policy.mode != "danger-full-access"
+                    and _looks_access_denied(stdout, stderr)
+                    and self._sandbox_guard is not None
+                ):
+                    authorized = await self._sandbox_guard.authorize_shell_retry(
+                        policy=policy,
+                        turn_id=turn_id,
+                        call_id=call_id,
+                        arguments={
+                            "command": command,
+                            "description": description,
+                            "timeout": timeout,
+                            **({"cwd": str(cwd)} if cwd is not None else {}),
+                        },
+                    )
+                    run = await self._sandbox_shell.execute(
+                        policy,
+                        command,
+                        cwd=cwd,
+                        timeout=timeout,
+                        execution_mode=authorized.mode,
+                    )
+                    stdout, stderr = run.stdout, run.stderr
+                    interrupted = run.interrupted
+                    exit_code = run.exit_code
+            else:
+                process = await asyncio.create_subprocess_shell(
+                    command,
+                    **_subprocess_options(cwd, os.environ.copy()),
+                )
+                interrupted = False
+                try:
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    interrupted = True
+                    try:
+                        _kill_process_tree(process)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    stdout, stderr = await process.communicate()
+                except asyncio.CancelledError:
+                    try:
+                        _kill_process_tree(process)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    raise
+                exit_code = -1 if interrupted else (process.returncode or 0)
+        except SandboxError as error:
+            return _err(str(error))
 
-        output = stdout.decode(errors="replace") + stderr.decode(errors="replace")
-        exit_code = -1 if interrupted else (process.returncode or 0)
+        output = _decode_process_output(stdout) + _decode_process_output(stderr)
         if not output:
             output = "（无输出）"
         elif exit_code != 0 and not interrupted:
@@ -359,6 +428,30 @@ class ShellTool(Tool):
             },
             ensure_ascii=False,
         )
+
+
+def _looks_access_denied(stdout: bytes, stderr: bytes) -> bool:
+    text = (_decode_process_output(stdout) + "\n" + _decode_process_output(stderr)).casefold()
+    return any(
+        marker in text
+        for marker in (
+            "access is denied",
+            "access denied",
+            "permission denied",
+            "拒绝访问",
+        )
+    )
+
+
+def _decode_process_output(content: bytes) -> str:
+    """兼容 UTF-8 工具与跟随 Windows 当前代码页的 cmd.exe 输出。"""
+
+    for encoding in (("utf-8", "mbcs") if _IS_WINDOWS else ("utf-8",)):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="replace")
 
 
 __all__ = ["ShellTool"]

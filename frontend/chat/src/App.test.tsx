@@ -128,6 +128,249 @@ it("首条消息发送后创建 Session 并保留用户消息", async () => {
   expect(screen.getByRole("button", { name: "新对话" })).toBeVisible();
 });
 
+it("新会话首条消息携带工作目录和工作区可写权限", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/chat/workspaces")) {
+      return { ok: true, json: async () => ({ items: [{
+        id: "workspace-1", canonical_path: "D:/code/bean", title: "Bean 项目",
+        created_at: "2026-09-03T10:00:00+08:00", updated_at: "2026-09-03T10:00:00+08:00", valid: true,
+      }] }) } as Response;
+    }
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+  render(<App />);
+  await screen.findByText("已连接");
+
+  fireEvent.click(screen.getByRole("button", { name: "工作目录：无工作目录" }));
+  fireEvent.click(screen.getByRole("menuitemradio", { name: /Bean 项目/ }));
+  fireEvent.click(screen.getByRole("button", { name: "权限：只读" }));
+  fireEvent.click(screen.getByRole("menuitemradio", { name: /工作区可写/ }));
+  fireEvent.change(screen.getByPlaceholderText("输入消息，或附加文本与图片"), { target: { value: "检查工作区" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+  const socket = FakeWebSocket.instances[0];
+  await waitFor(() => expect(socket.sent.some((frame) => frame.type === "message.send")).toBe(true));
+  const frame = socket.sent.find((item) => item.type === "message.send");
+  expect(frame).toMatchObject({
+    workspace_id: "workspace-1",
+    sandbox_mode: "workspace-write",
+    text: "检查工作区",
+  });
+  expect(frame).not.toHaveProperty("risk_confirmed");
+});
+
+it("完全访问必须完成独立风险确认", async () => {
+  render(<App />);
+  await screen.findByText("已连接");
+
+  fireEvent.click(screen.getByRole("button", { name: "权限：只读" }));
+  fireEvent.click(screen.getByRole("menuitemradio", { name: /完全访问/ }));
+  const dialog = screen.getByRole("dialog", { name: "启用完全访问？" });
+  const confirm = within(dialog).getByRole("button", { name: "启用完全访问" });
+  expect(confirm).toBeDisabled();
+  fireEvent.click(within(dialog).getByRole("checkbox"));
+  expect(confirm).toBeEnabled();
+  fireEvent.click(confirm);
+
+  expect(screen.queryByRole("dialog", { name: "启用完全访问？" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "权限：完全访问" })).toBeVisible();
+});
+
+it("已有会话等待服务端快照后再更新权限", async () => {
+  window.history.replaceState({}, "", "/chat/sandbox");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/chat/workspaces")) {
+      return { ok: true, json: async () => ({ items: [{
+        id: "workspace-1", canonical_path: "D:/code/bean", title: "Bean 项目",
+        created_at: "2026-09-03T10:00:00+08:00", updated_at: "2026-09-03T10:00:00+08:00", valid: true,
+      }] }) } as Response;
+    }
+    if (url.includes("/api/chat/sessions?page=")) {
+      return { ok: true, json: async () => ({ items: [{
+        key: "web:sandbox", title: "沙箱会话", first_message_content: "", message_count: 0,
+        created_at: "2026-09-03T10:00:00+08:00", updated_at: "2026-09-03T10:00:00+08:00",
+        workspace_id: "workspace-1", workspace_title: "Bean 项目", workspace_path: "D:/code/bean",
+        workspace_valid: true, sandbox_mode: "read-only",
+      }] }) } as Response;
+    }
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+  render(<App />);
+  await screen.findByRole("button", { name: "权限：只读" });
+  const socket = FakeWebSocket.instances[0];
+
+  fireEvent.click(screen.getByRole("button", { name: "权限：只读" }));
+  fireEvent.click(screen.getByRole("menuitemradio", { name: /工作区可写/ }));
+  const request = socket.sent.find((frame) => frame.type === "sandbox.mode.set");
+  expect(request).toMatchObject({ session_id: "web:sandbox", sandbox_mode: "workspace-write" });
+  expect(screen.getByRole("button", { name: "权限：只读" })).toBeDisabled();
+
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "sandbox.updated",
+    request_id: request?.request_id,
+    sandbox: {
+      session_id: "web:sandbox", workspace_id: "workspace-1", cwd_snapshot: "D:/code/bean",
+      workspace_title: "Bean 项目", workspace_path: "D:/code/bean", workspace_valid: true,
+      sandbox_mode: "workspace-write", backend: "windows-acl", capability: "partial",
+    },
+  }) } as MessageEvent));
+  expect(screen.getByRole("button", { name: "权限：工作区可写" })).toBeEnabled();
+});
+
+it("审批面板锁定单次决定并等待服务端终态", async () => {
+  window.history.replaceState({}, "", "/chat/approval");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  const approval = {
+    id: "approval-1", session_id: "web:approval", turn_id: "turn-1", call_id: "call-1",
+    tool_name: "shell", operation: "执行完整 Shell 命令",
+    arguments: { command: "Set-Content D:\\outside.txt 'value'", cwd: "D:/code/bean" },
+    reason: "命令需要写入工作目录之外的位置", requested_mode: "danger-full-access",
+    fingerprint: "fingerprint", state: "pending", created_at: "2026-09-03T10:00:00+08:00",
+  };
+  act(() => {
+    socket.onmessage?.({ data: JSON.stringify({ type: "session.subscribed", request_id: "sub", session_id: "web:approval" }) } as MessageEvent);
+    socket.onmessage?.({ data: JSON.stringify({ type: "approval.requested", session_id: "web:approval", approval }) } as MessageEvent);
+  });
+
+  expect(screen.getByLabelText("待处理权限审批")).toBeVisible();
+  expect(screen.getByText("Set-Content D:\\outside.txt 'value'")).toBeVisible();
+  expect(screen.queryByPlaceholderText("输入消息，或附加文本与图片")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "仅允许本次" }));
+  expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
+  const decision = socket.sent.find((frame) => frame.type === "approval.decide");
+  expect(decision).toMatchObject({ approval_id: "approval-1", decision: "allowed-once" });
+
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.resolved", request_id: decision?.request_id, session_id: "web:approval",
+    approval_id: "approval-1", decision: "allowed-once",
+  }) } as MessageEvent));
+  expect(screen.getByPlaceholderText("输入消息，或附加文本与图片")).toBeVisible();
+});
+
+it("Turn 最终消息会清理未单独回执的审批", async () => {
+  window.history.replaceState({}, "", "/chat/approval-final");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  act(() => {
+    socket.onmessage?.({ data: JSON.stringify({
+      type: "approval.requested",
+      session_id: "web:approval-final",
+      approval: {
+        id: "approval-final", session_id: "web:approval-final", turn_id: "turn-final", call_id: "call-final",
+        tool_name: "shell", operation: "执行完整 Shell 命令", arguments: { command: "echo done" },
+        reason: "命令需要临时授权", requested_mode: "danger-full-access",
+        fingerprint: "fingerprint-final", state: "pending", created_at: "2026-09-03T10:00:00+08:00",
+      },
+    }) } as MessageEvent);
+  });
+  expect(screen.getByLabelText("待处理权限审批")).toBeVisible();
+
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "message.final", session_id: "web:approval-final", turn_id: "turn-final", content: "已结束",
+  }) } as MessageEvent));
+
+  expect(screen.queryByLabelText("待处理权限审批")).not.toBeInTheDocument();
+  expect(screen.getByPlaceholderText("输入消息，或附加文本与图片")).toBeVisible();
+});
+
+it("浏览器历史切换会话时拒绝旧会话待审批", async () => {
+  window.history.replaceState({}, "", "/chat/history-approval");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  act(() => {
+    socket.onmessage?.({ data: JSON.stringify({
+      type: "approval.requested",
+      session_id: "web:history-approval",
+      approval: {
+        id: "approval-history", session_id: "web:history-approval", turn_id: "turn-history", call_id: "call-history",
+        tool_name: "filesystem", operation: "删除文件", arguments: { path: "D:\\outside.txt" },
+        reason: "删除操作需要临时授权", requested_mode: "danger-full-access",
+        fingerprint: "fingerprint-history", state: "pending", created_at: "2026-09-03T10:00:00+08:00",
+      },
+    }) } as MessageEvent);
+  });
+  expect(screen.getByLabelText("待处理权限审批")).toBeVisible();
+
+  window.history.pushState({}, "", "/chat/history-target");
+  act(() => window.dispatchEvent(new PopStateEvent("popstate")));
+
+  await waitFor(() => expect(socket.sent.some((frame) => (
+    frame.type === "approval.decide"
+    && frame.session_id === "web:history-approval"
+    && frame.approval_id === "approval-history"
+    && frame.decision === "rejected"
+  ))).toBe(true));
+});
+
+it("工作区列表加载不到关联目录时仍显示原有会话", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/api/chat/sessions?page=")) {
+      return { ok: true, json: async () => ({ items: [{
+        key: "web:orphaned-workspace", title: "保留的会话", first_message_content: "", message_count: 1,
+        created_at: "2026-09-03T10:00:00+08:00", updated_at: "2026-09-03T10:00:00+08:00",
+        workspace_id: "missing-workspace", workspace_title: "已丢失工程", workspace_path: "D:/missing/project",
+        workspace_valid: false, sandbox_mode: "read-only",
+      }], total: 1 }) } as Response;
+    }
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+
+  render(<App />);
+
+  expect(await screen.findByText("已丢失工程")).toBeVisible();
+  expect(screen.getByRole("button", { name: "保留的会话" })).toBeVisible();
+});
+
+it("工作目录通过原生选择器注册且移除时明确保留磁盘文件", async () => {
+  let finishPicking: ((response: Response) => void) | undefined;
+  const picking = new Promise<Response>((resolve) => { finishPicking = resolve; });
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/api/chat/workspaces/pick") && init?.method === "POST") {
+      return picking;
+    }
+    if (url.endsWith("/api/chat/workspaces") && init?.method === "POST") {
+      const body = JSON.parse(String(init.body)) as { path: string; title: string };
+      return { ok: true, json: async () => ({
+        id: "workspace-added", canonical_path: body.path, title: body.title,
+        created_at: "2026-09-03T10:00:00+08:00", updated_at: "2026-09-03T10:00:00+08:00", valid: true,
+      }) } as Response;
+    }
+    if (url.includes("/api/chat/workspaces/workspace-added") && init?.method === "DELETE") {
+      return { ok: true } as Response;
+    }
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+  render(<App />);
+  await screen.findByText("已连接");
+
+  fireEvent.click(screen.getByRole("button", { name: "添加工作目录" }));
+  fireEvent.click(screen.getByRole("button", { name: /选择 Bean 可读取和编辑的文件夹/ }));
+  expect(screen.getByRole("button", { name: /选择 Bean 可读取和编辑的文件夹/ })).toBeDisabled();
+  expect(screen.queryByText(/正在打开文件夹选择器/)).not.toBeInTheDocument();
+  await act(async () => {
+    finishPicking?.({ ok: true, json: async () => ({ path: "D:\\code\\bean" }) } as Response);
+    await picking;
+  });
+  await screen.findByText("D:\\code\\bean");
+  fireEvent.change(screen.getByLabelText(/显示名称/), { target: { value: "Bean 工程" } });
+  fireEvent.click(screen.getByRole("button", { name: "添加" }));
+  expect(await screen.findByText("Bean 工程")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "打开工作目录“Bean 工程”的菜单" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "移除工作目录" }));
+  expect(screen.getByText(/磁盘上的目录和文件不会被删除/)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "确认移除" }));
+  await waitFor(() => expect(screen.queryByText("Bean 工程")).not.toBeInTheDocument());
+});
+
 it("中断消息只显示状态标签，不渲染持久化占位正文", async () => {
   window.history.replaceState({}, "", "/chat/interrupted");
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
@@ -820,31 +1063,30 @@ it("切回后台运行会话时恢复用户问题流式内容和工具状态", a
   expect(screen.queryByText("排队中 · 即将开始")).not.toBeInTheDocument();
 });
 
-it("会话列表使用最近更新时间分组", async () => {
+it("最近会话按对话活动时间倒序且不再创建时间小组", async () => {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const payload = String(input).includes("/messages")
       ? { items: [], total: 0 }
       : {
-          items: [{
-            key: "web:first-time",
-            first_message_content: "固定创建时间",
-            created_at: "2026-01-02T10:00:00+08:00",
-            updated_at: "2026-06-10T10:00:00+08:00",
-          }],
-          total: 1,
+          items: [
+            { key: "web:older", first_message_content: "较早活动", created_at: "2026-06-01T10:00:00+08:00", updated_at: "2026-07-01T10:00:00+08:00", last_activity_at: "2026-06-10T10:00:00+08:00" },
+            { key: "web:newer", first_message_content: "较晚活动", created_at: "2026-01-02T10:00:00+08:00", updated_at: "2026-01-02T10:00:00+08:00", last_activity_at: "2026-07-10T10:00:00+08:00" },
+          ],
+          total: 2,
         };
     return { ok: true, json: async () => payload } as Response;
   }));
 
   const { container } = render(<App />);
 
-  await screen.findByText("固定创建时间");
-  expect(screen.getByText("2026-06", { selector: ".session-group-title" })).toBeVisible();
-  expect(screen.queryByText("2026-01", { selector: ".session-group-title" })).not.toBeInTheDocument();
+  const newer = await screen.findByRole("button", { name: "较晚活动" });
+  const older = screen.getByRole("button", { name: "较早活动" });
+  expect(newer.compareDocumentPosition(older) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(container.querySelector(".session-group-title")).toBeNull();
   expect(container.querySelector(".session-row time")).toBeNull();
 });
 
-it("会话列表显示时间分组标题", async () => {
+it("最近分区保持在项目之后且会话按活动时间倒序", async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-07-19T18:00:00+08:00"));
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
@@ -860,9 +1102,81 @@ it("会话列表显示时间分组标题", async () => {
 
   render(<App />);
 
-  expect(await screen.findByText("今天", { selector: ".session-group-title" })).toBeVisible();
-  expect(screen.getByText("昨天", { selector: ".session-group-title" })).toBeVisible();
+  const today = await screen.findByRole("button", { name: "今天会话" });
+  const yesterday = screen.getByRole("button", { name: "昨天会话" });
+  expect(today.compareDocumentPosition(yesterday) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "最近" })).toBeVisible();
   vi.useRealTimers();
+});
+
+it("侧栏按置顶项目、普通项目和最近的固定规则排序", async () => {
+  const session = (
+    key: string,
+    title: string,
+    workspaceId: string | null,
+    activity: string,
+    pinnedAt: string | null = null,
+  ) => ({
+    key,
+    title,
+    created_at: activity,
+    updated_at: activity,
+    last_activity_at: activity,
+    pinned_at: pinnedAt,
+    message_count: 1,
+    first_message_content: title,
+    workspace_id: workspaceId,
+  });
+  const workspace = (
+    id: string,
+    title: string,
+    createdAt: string,
+    pinnedAt: string | null = null,
+  ) => ({
+    id,
+    title,
+    canonical_path: `D:/projects/${id}`,
+    created_at: createdAt,
+    updated_at: createdAt,
+    pinned_at: pinnedAt,
+    valid: true,
+  });
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/chat/workspaces")) {
+      return { ok: true, json: async () => ({ items: [
+        workspace("project-old", "旧项目", "2026-01-01T10:00:00+08:00"),
+        workspace("pinned-later", "后置顶", "2026-04-01T10:00:00+08:00", "2026-07-02T10:00:00+08:00"),
+        workspace("project-new", "新项目", "2026-06-01T10:00:00+08:00"),
+        workspace("pinned-first", "先置顶", "2026-03-01T10:00:00+08:00", "2026-07-01T10:00:00+08:00"),
+      ] }) } as Response;
+    }
+    if (url.includes("/api/chat/sessions")) {
+      return { ok: true, json: async () => ({ items: [
+        session("web:normal-old", "普通较早", "pinned-first", "2026-05-01T10:00:00+08:00"),
+        session("web:pinned-later", "后置顶会话", "pinned-first", "2026-08-01T10:00:00+08:00", "2026-07-04T10:00:00+08:00"),
+        session("web:recent", "最近会话", null, "2026-08-03T10:00:00+08:00"),
+        session("web:normal-new", "普通较新", "pinned-first", "2026-06-01T10:00:00+08:00"),
+        session("web:pinned-first", "先置顶会话", "pinned-first", "2026-04-01T10:00:00+08:00", "2026-07-03T10:00:00+08:00"),
+      ], total: 5 }) } as Response;
+    }
+    return { ok: true, json: async () => ({ items: [] }) } as Response;
+  }));
+
+  const { container } = render(<App />);
+  await screen.findByText("最近会话");
+
+  expect([...container.querySelectorAll(".sidebar-section-label")].map((node) => node.textContent)).toEqual([
+    "置顶", "项目", "最近",
+  ]);
+  expect([...container.querySelectorAll("[data-workspace-id]")].map((node) => node.getAttribute("data-workspace-id"))).toEqual([
+    "pinned-first", "pinned-later", "project-new", "project-old", "none",
+  ]);
+  const pinnedProject = container.querySelector('[data-workspace-id="pinned-first"]');
+  expect(pinnedProject).not.toBeNull();
+  expect([...pinnedProject!.querySelectorAll(".session-row-select")].map((node) => node.textContent)).toEqual([
+    "先置顶会话", "后置顶会话", "普通较新", "普通较早",
+  ]);
 });
 
 it("通过会话菜单重命名且不触发会话切换", async () => {

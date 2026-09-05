@@ -141,6 +141,14 @@ class ToolCallCompleted:
 
 
 @dataclass(frozen=True, slots=True)
+class SandboxApprovalRequested:
+    """工具越权后等待当前会话的 Web 用户给出一次性决定。"""
+
+    session_key: str
+    request: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class TurnCommitted:
     """user 与 assistant 两条消息均持久化成功后的提交事件。"""
 
@@ -211,6 +219,7 @@ __all__ = [
     "EventBus",
     "EventHandler",
     "SessionUpdated",
+    "SandboxApprovalRequested",
     "StreamDeltaReady",
     "ToolCallCompleted",
     "ToolCallStarted",

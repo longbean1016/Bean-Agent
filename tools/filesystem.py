@@ -12,6 +12,9 @@ import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
+from sandbox.errors import SandboxError
+from sandbox.filesystem import FilesystemMutationBroker
+from sandbox.guard import SandboxGuard, resolve_tool_target
 from tools.base import Tool, ToolResult
 
 _READ_MAX_LINES = 400
@@ -272,10 +275,12 @@ class ReadFileTool(Tool):
         allowed_dir: Path | None = None,
         multimodal: bool = True,
         vl_available: bool = False,
+        sandbox_guard: SandboxGuard | None = None,
     ) -> None:
         self._allowed_dir = allowed_dir
         self._multimodal = multimodal
         self._vl_available = vl_available
+        self._sandbox_guard = sandbox_guard
 
     @property
     def name(self) -> str:
@@ -322,7 +327,14 @@ class ReadFileTool(Tool):
         raw_limit = kwargs.get("limit")
         limit = int(raw_limit) if raw_limit is not None else None
         try:
-            file_path = _resolve_path(path, self._allowed_dir)
+            session_key = str(kwargs.get("session_key") or "")
+            if self._sandbox_guard is not None and not session_key:
+                raise SandboxError("缺少会话身份，已拒绝文件读取")
+            file_path = (
+                resolve_tool_target(path, self._sandbox_guard.policy(session_key))
+                if self._sandbox_guard is not None and session_key
+                else _resolve_path(path, self._allowed_dir)
+            )
             if not file_path.exists():
                 return f"错误：文件不存在：{path}"
             if not file_path.is_file():
@@ -392,8 +404,16 @@ class ReadFileTool(Tool):
 class WriteFileTool(Tool):
     """完整覆盖写入文本文件，并自动创建父目录。"""
 
-    def __init__(self, allowed_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        allowed_dir: Path | None = None,
+        *,
+        sandbox_guard: SandboxGuard | None = None,
+        mutation_broker: FilesystemMutationBroker | None = None,
+    ) -> None:
         self._allowed_dir = allowed_dir
+        self._sandbox_guard = sandbox_guard
+        self._mutation_broker = mutation_broker
 
     @property
     def name(self) -> str:
@@ -423,6 +443,27 @@ class WriteFileTool(Tool):
 
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
+            session_key = str(kwargs.get("session_key") or "")
+            if self._sandbox_guard is not None and not session_key:
+                raise SandboxError("缺少会话身份，已拒绝文件写入")
+            if self._sandbox_guard is not None and self._mutation_broker is not None and session_key:
+                policy = self._sandbox_guard.policy(session_key)
+                target = resolve_tool_target(path, policy)
+                authorized = await self._sandbox_guard.authorize_file_mutation(
+                    session_key=session_key,
+                    turn_id=str(kwargs.get("turn_id") or ""),
+                    call_id=str(kwargs.get("call_id") or ""),
+                    tool_name=self.name,
+                    arguments={"path": path, "content": content},
+                    target=target,
+                    operation="完整写入文件",
+                )
+                return await self._mutation_broker.execute(
+                    session_key=session_key,
+                    operation=self.name,
+                    arguments={"path": path, "content": content},
+                    execution_mode=authorized.mode,
+                )
             file_path = _resolve_path(path, self._allowed_dir)
 
             async def write() -> str:
@@ -433,7 +474,7 @@ class WriteFileTool(Tool):
                 return f"已写入 {len(content)} 字节到 {path}"
 
             return await _run_with_file_mutation_lock(file_path, write)
-        except PermissionError as error:
+        except (PermissionError, SandboxError) as error:
             return f"错误：{error}"
         except Exception as error:
             return f"写入文件失败：{error}"
@@ -442,8 +483,16 @@ class WriteFileTool(Tool):
 class EditFileTool(Tool):
     """精确替换文件文本，并返回可审查的 unified diff。"""
 
-    def __init__(self, allowed_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        allowed_dir: Path | None = None,
+        *,
+        sandbox_guard: SandboxGuard | None = None,
+        mutation_broker: FilesystemMutationBroker | None = None,
+    ) -> None:
         self._allowed_dir = allowed_dir
+        self._sandbox_guard = sandbox_guard
+        self._mutation_broker = mutation_broker
 
     @property
     def name(self) -> str:
@@ -491,6 +540,33 @@ class EditFileTool(Tool):
     ) -> str:
         replace_all = bool(kwargs.get("replace_all", False))
         try:
+            session_key = str(kwargs.get("session_key") or "")
+            if self._sandbox_guard is not None and not session_key:
+                raise SandboxError("缺少会话身份，已拒绝文件编辑")
+            if self._sandbox_guard is not None and self._mutation_broker is not None and session_key:
+                policy = self._sandbox_guard.policy(session_key)
+                target = resolve_tool_target(path, policy)
+                arguments = {
+                    "path": path,
+                    "old_text": old_text,
+                    "new_text": new_text,
+                    "replace_all": replace_all,
+                }
+                authorized = await self._sandbox_guard.authorize_file_mutation(
+                    session_key=session_key,
+                    turn_id=str(kwargs.get("turn_id") or ""),
+                    call_id=str(kwargs.get("call_id") or ""),
+                    tool_name=self.name,
+                    arguments=arguments,
+                    target=target,
+                    operation="精确编辑文件",
+                )
+                return await self._mutation_broker.execute(
+                    session_key=session_key,
+                    operation=self.name,
+                    arguments=arguments,
+                    execution_mode=authorized.mode,
+                )
             file_path = _resolve_path(path, self._allowed_dir)
 
             async def edit() -> str:
@@ -531,7 +607,7 @@ class EditFileTool(Tool):
                 return f"已成功编辑 {path}（替换 {replaced_count} 处）"
 
             return await _run_with_file_mutation_lock(file_path, edit)
-        except PermissionError as error:
+        except (PermissionError, SandboxError) as error:
             return f"错误：{error}"
         except Exception as error:
             return f"编辑文件失败：{error}"
@@ -540,8 +616,14 @@ class EditFileTool(Tool):
 class ListDirTool(Tool):
     """按名称排序列出指定目录的直接子项。"""
 
-    def __init__(self, allowed_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        allowed_dir: Path | None = None,
+        *,
+        sandbox_guard: SandboxGuard | None = None,
+    ) -> None:
         self._allowed_dir = allowed_dir
+        self._sandbox_guard = sandbox_guard
 
     @property
     def name(self) -> str:
@@ -563,7 +645,14 @@ class ListDirTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            directory = _resolve_path(path, self._allowed_dir)
+            session_key = str(kwargs.get("session_key") or "")
+            if self._sandbox_guard is not None and not session_key:
+                raise SandboxError("缺少会话身份，已拒绝目录读取")
+            directory = (
+                resolve_tool_target(path, self._sandbox_guard.policy(session_key))
+                if self._sandbox_guard is not None and session_key
+                else _resolve_path(path, self._allowed_dir)
+            )
             if not directory.exists():
                 return f"错误：目录不存在：{path}"
             if not directory.is_dir():

@@ -1,6 +1,44 @@
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "offline";
 export type ToolStatus = "running" | "completed" | "error" | "interrupted";
 export type ThinkingStatus = "running" | "completed" | "interrupted";
+export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+
+export interface Workspace {
+  id: string;
+  canonical_path: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  pinned_at?: string | null;
+  valid: boolean;
+}
+
+export interface SandboxSnapshot {
+  session_id: string;
+  workspace_id: string | null;
+  cwd_snapshot?: string | null;
+  workspace_title?: string | null;
+  workspace_path?: string | null;
+  workspace_valid: boolean;
+  sandbox_mode: SandboxMode;
+  backend: string;
+  capability: "partial" | string;
+}
+
+export interface ApprovalRequest {
+  id: string;
+  session_id: string;
+  turn_id: string;
+  call_id: string;
+  tool_name: string;
+  operation: string;
+  arguments: Record<string, unknown>;
+  reason: string;
+  requested_mode: SandboxMode;
+  fingerprint: string;
+  state: "pending";
+  created_at: string;
+}
 
 export interface ToolActivity {
   callId: string;
@@ -93,8 +131,16 @@ export interface SessionSummary {
   title?: string;
   created_at: string;
   updated_at: string;
+  last_activity_at?: string;
+  pinned_at?: string | null;
   message_count: number;
   first_message_content: string;
+  workspace_id?: string | null;
+  cwd_snapshot?: string | null;
+  workspace_title?: string | null;
+  workspace_path?: string | null;
+  workspace_valid?: boolean;
+  sandbox_mode?: SandboxMode;
 }
 
 export interface MessageRow {
@@ -186,6 +232,9 @@ export type ChatFrame =
   | { type: "session.created"; request_id: string; session_id: string }
   | { type: "session.updated"; session: SessionSummary }
   | { type: "session.subscribed"; request_id: string; session_id: string }
+  | { type: "sandbox.updated"; request_id: string; sandbox: SandboxSnapshot }
+  | { type: "approval.requested"; session_id: string; approval: ApprovalRequest }
+  | { type: "approval.resolved"; request_id: string; session_id: string; approval_id: string; decision: "allowed-once" | "rejected" }
   | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message: string; user_media: string[]; content: string; thinking: string; tools: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments: unknown; result_preview: string }>; started_at?: string; status: "running" }
   | { type: "turn.queued"; request_id: string; session_id: string; position: number }
   | { type: "turn.started"; request_id?: string; session_id: string; turn_id: string }

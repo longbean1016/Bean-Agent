@@ -75,6 +75,11 @@ def test_websocket_mcp_turn_commits_and_next_turn_loads_history(tmp_path: Path) 
         {"BEANAGENT_MCP_TEST_LOG": str(tmp_path / "mcp.jsonl")},
     )
     core = build_core_runtime(config, workspace, provider=provider)
+    # MCP stdio 子进程不经过 Windows ACL 边界，只允许已确认的完全访问会话调用。
+    core.sessions.store.create_session(
+        "web:mcp",
+        sandbox_mode="danger-full-access",
+    )
     committed: list[TurnCommitted] = []
     core.event_bus.on(TurnCommitted, committed.append)
     app = create_fastapi_app(core)

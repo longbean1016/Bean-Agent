@@ -1,4 +1,4 @@
-import type { MessagePage, MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile } from "./types";
+import type { MessagePage, MessageRow, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile, Workspace } from "./types";
 
 // 仅控制聊天页面的滚动分页，不参与模型上下文 token gate 或 checkpoint 边界。
 const MESSAGE_WINDOW_LIMIT = 60;
@@ -8,6 +8,67 @@ export async function fetchSessions(): Promise<SessionSummary[]> {
   if (!response.ok) throw new Error("无法加载会话列表");
   const payload = await response.json() as { items?: SessionSummary[] };
   return payload.items ?? [];
+}
+
+export async function fetchWorkspaces(): Promise<Workspace[]> {
+  const response = await fetch("/api/chat/workspaces");
+  if (!response.ok) throw new Error("无法加载工作目录");
+  const payload = await response.json() as { items?: Workspace[] };
+  return (payload.items ?? []).filter((item) => (
+    typeof item?.id === "string" && typeof item.canonical_path === "string"
+  ));
+}
+
+export async function registerWorkspace(path: string, title: string): Promise<Workspace> {
+  const response = await fetch("/api/chat/workspaces", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, title }),
+  });
+  const payload = await response.json().catch(() => ({})) as Partial<Workspace> & { detail?: string };
+  if (!response.ok || !payload.id) throw new Error(payload.detail || "无法添加工作目录");
+  return payload as Workspace;
+}
+
+export async function pickWorkspaceDirectory(): Promise<string | null> {
+  const response = await fetch("/api/chat/workspaces/pick", { method: "POST" });
+  const payload = await response.json().catch(() => ({})) as { path?: string | null; detail?: string };
+  if (!response.ok) throw new Error(payload.detail || "无法打开系统文件夹选择器");
+  return typeof payload.path === "string" ? payload.path : null;
+}
+
+export async function updateWorkspace(
+  workspaceId: string,
+  patch: { title?: string; pinned?: boolean },
+): Promise<Workspace> {
+  const response = await fetch(`/api/chat/workspaces/${encodeURIComponent(workspaceId)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  const payload = await response.json().catch(() => ({})) as Partial<Workspace> & { detail?: string };
+  if (!response.ok || !payload.id) throw new Error(payload.detail || "无法更新工作目录");
+  return payload as Workspace;
+}
+
+export async function openWorkspaceDirectory(workspaceId: string): Promise<void> {
+  const response = await fetch(`/api/chat/workspaces/${encodeURIComponent(workspaceId)}/open`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { detail?: string };
+    throw new Error(payload.detail || "无法在资源管理器中打开工作目录");
+  }
+}
+
+export async function deleteWorkspace(workspaceId: string): Promise<void> {
+  const response = await fetch(`/api/chat/workspaces/${encodeURIComponent(workspaceId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { detail?: string };
+    throw new Error(payload.detail || "无法移除工作目录");
+  }
 }
 
 export async function fetchMessages(sessionId: string): Promise<MessageRow[]> {
@@ -71,6 +132,18 @@ export async function renameSession(sessionId: string, title: string): Promise<S
     throw new Error(payload.detail || "无法重命名会话");
   }
   return response.json() as Promise<SessionSummary>;
+}
+
+export async function setSessionPinned(sessionId: string, pinned: boolean): Promise<void> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pinned }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { detail?: string };
+    throw new Error(payload.detail || "无法更新会话置顶状态");
+  }
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {

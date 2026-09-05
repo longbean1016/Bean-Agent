@@ -15,6 +15,7 @@ from agent.event_bus import (
     ContextCompactionStarted,
     ContextUsageUpdated,
     EventBus,
+    SandboxApprovalRequested,
     SessionUsageUpdated,
     SessionUpdated,
     StreamDeltaReady,
@@ -57,6 +58,7 @@ _WEB_EVENT_TYPES = (
     StreamDeltaReady,
     ToolCallStarted,
     ToolCallCompleted,
+    SandboxApprovalRequested,
 )
 
 
@@ -71,10 +73,14 @@ class WebChannel:
         *,
         media_root: Path | None = None,
         proactive_store: ProactiveStore | None = None,
-        ensure_session: Callable[[str], Awaitable[object]] | None = None,
+        ensure_session: Callable[..., Awaitable[object]] | None = None,
         context_usage_loader: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
         session_usage_loader: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
         context_runtime_id: str = "",
+        sandbox_loader: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
+        sandbox_mode_writer: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None,
+        workspace_writer: Callable[[str, str | None], Awaitable[dict[str, Any]]] | None = None,
+        approvals: Any | None = None,
     ) -> None:
         self._bus = bus
         self._events = event_bus
@@ -83,6 +89,10 @@ class WebChannel:
             interrupt_controller,
             media_root=media_root,
             ensure_session=ensure_session,
+            sandbox_loader=sandbox_loader,
+            sandbox_mode_writer=sandbox_mode_writer,
+            workspace_writer=workspace_writer,
+            approvals=approvals,
         )
         self._mapper = WebEventMapper()
         self._proactive_store = proactive_store
@@ -117,13 +127,22 @@ class WebChannel:
             await self._send_json(websocket, {"type": "pong", "request_id": request_id})
             return
         if frame_type == "session.create":
-            session_key = await self._commands.create_session()
+            try:
+                session_key = await self._commands.create_session(
+                    workspace_id=str(frame.get("workspace_id") or "") or None,
+                    sandbox_mode=str(frame.get("sandbox_mode") or "read-only"),
+                    risk_confirmed=frame.get("risk_confirmed") is True,
+                )
+            except WebCommandError as error:
+                await self._error(websocket, request_id, error.code, error.message)
+                return
             await self._register(session_key, websocket)
             await self._send_json(websocket, {
                 "type": "session.created",
                 "request_id": request_id,
                 "session_id": session_key,
             })
+            await self._send_sandbox_snapshot(session_key, websocket)
             return
 
         session_key = normalize_web_session_id(frame.get("session_id"))
@@ -136,6 +155,8 @@ class WebChannel:
             })
             await self._send_context_usage_snapshot(session_key, websocket)
             await self._send_session_usage_snapshot(session_key, websocket)
+            await self._send_sandbox_snapshot(session_key, websocket)
+            await self._send_pending_approvals(session_key, websocket)
             # 订阅确认后只给当前连接补发运行中快照，用于刷新/重连恢复流式草稿。
             await self._send_active_turn_snapshot(session_key, websocket)
             await self._replay_pending_notifications(session_key, websocket)
@@ -147,6 +168,9 @@ class WebChannel:
                     session_id=frame.get("session_id"),
                     text=frame.get("text"),
                     media=frame.get("media", []),
+                    workspace_id=str(frame.get("workspace_id") or "") or None,
+                    sandbox_mode=str(frame.get("sandbox_mode") or "read-only"),
+                    risk_confirmed=frame.get("risk_confirmed") is True,
                 )
             except WebCommandError as error:
                 await self._error(websocket, request_id, error.code, error.message)
@@ -160,6 +184,7 @@ class WebChannel:
                     "request_id": request_id,
                     "session_id": prepared.session_key,
                 })
+                await self._send_sandbox_snapshot(prepared.session_key, websocket)
             await self._commands.submit_message(prepared)
             return
         if frame_type == "turn.stop" and session_key is not None:
@@ -168,6 +193,53 @@ class WebChannel:
                 websocket,
                 self._mapper.map_interrupted(session_key, request_id, result),
             )
+            return
+        if frame_type == "sandbox.mode.set" and session_key is not None:
+            try:
+                snapshot = await self._commands.set_sandbox_mode(
+                    session_key,
+                    str(frame.get("sandbox_mode") or ""),
+                    risk_confirmed=frame.get("risk_confirmed") is True,
+                )
+            except WebCommandError as error:
+                await self._error(websocket, request_id, error.code, error.message)
+                return
+            await self._broadcast(session_key, {
+                "type": "sandbox.updated",
+                "request_id": request_id,
+                "sandbox": snapshot,
+            })
+            return
+        if frame_type == "workspace.bind" and session_key is not None:
+            try:
+                snapshot = await self._commands.bind_workspace(
+                    session_key,
+                    str(frame.get("workspace_id") or "").strip() or None,
+                )
+            except WebCommandError as error:
+                await self._error(websocket, request_id, error.code, error.message)
+                return
+            await self._broadcast(session_key, {
+                "type": "sandbox.updated",
+                "request_id": request_id,
+                "sandbox": snapshot,
+            })
+            return
+        if frame_type == "approval.decide" and session_key is not None:
+            approval_id = str(frame.get("approval_id") or "")
+            decision = str(frame.get("decision") or "")
+            try:
+                await self._commands.decide_approval(approval_id, session_key, decision)
+            except WebCommandError as error:
+                await self._error(websocket, request_id, error.code, error.message)
+                return
+            await self._broadcast(session_key, {
+                "type": "approval.resolved",
+                "request_id": request_id,
+                "session_id": session_key,
+                "approval_id": approval_id,
+                "decision": decision,
+            })
             return
         await self._error(
             websocket,
@@ -302,19 +374,49 @@ class WebChannel:
                 self._mapper.map_session_usage_snapshot(session_key, usage),
             )
 
+    async def _send_sandbox_snapshot(
+        self,
+        session_key: str,
+        websocket: WebSocketApi,
+    ) -> None:
+        snapshot = await self._commands.sandbox_snapshot(session_key)
+        if snapshot is not None:
+            await self._send_json(websocket, {
+                "type": "sandbox.updated",
+                "request_id": "",
+                "sandbox": snapshot,
+            })
+
+    async def _send_pending_approvals(
+        self,
+        session_key: str,
+        websocket: WebSocketApi,
+    ) -> None:
+        for request in await self._commands.pending_approvals(session_key):
+            await self._send_json(websocket, {
+                "type": "approval.requested",
+                "session_id": session_key,
+                "approval": request.to_wire(),
+            })
+
     async def _register(self, session_key: str, websocket: WebSocketApi) -> None:
         async with self._lock:
             self._connections.setdefault(session_key, set()).add(websocket)
             self._socket_send_locks.setdefault(websocket, asyncio.Lock())
+        await self._commands.set_session_available(session_key, True)
 
     async def _unregister(self, websocket: WebSocketApi) -> None:
+        unavailable: list[str] = []
         async with self._lock:
             for key in list(self._connections):
                 self._connections[key].discard(websocket)
                 if not self._connections[key]:
                     self._connections.pop(key, None)
+                    unavailable.append(key)
             # 发送锁使用弱引用保存；连接对象仍存活时始终复用同一把锁，断开且无引用后
             # 自动回收，避免清理与并发发送之间出现双锁竞态。
+        for session_key in unavailable:
+            await self._commands.set_session_available(session_key, False)
 
     async def _broadcast_mapped(self, mapped: MappedWebEvent) -> int:
         sent = 0

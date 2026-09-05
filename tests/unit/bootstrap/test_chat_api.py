@@ -11,6 +11,11 @@ from PIL import Image
 
 from agent.config_models import Config
 from bootstrap.app import build_core_runtime, create_fastapi_app
+from bootstrap.native_folder_picker import (
+    NativeHostError,
+    NativeHostUnavailable,
+    NativePickerBusy,
+)
 from session.store import NewMessage, NewSessionEvent
 
 
@@ -25,6 +30,23 @@ class Provider:
         return None
 
 
+class FakeDirectoryPicker:
+    def __init__(self, result: Path | None = None) -> None:
+        self.result = result
+        self.error: Exception | None = None
+        self.opened: list[Path] = []
+
+    def pick_directory(self) -> Path | None:
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+    def open_directory(self, path: Path) -> None:
+        if self.error is not None:
+            raise self.error
+        self.opened.append(path)
+
+
 def _client(tmp_path: Path) -> tuple[TestClient, object]:
     config = Config()
     config.memory.enabled = False
@@ -35,6 +57,98 @@ def _client(tmp_path: Path) -> tuple[TestClient, object]:
         provider=Provider(),
     )
     return TestClient(create_fastapi_app(runtime)), runtime
+
+
+def _native_client(
+    tmp_path: Path,
+    picker: FakeDirectoryPicker,
+    *,
+    client_host: str = "127.0.0.1",
+) -> tuple[TestClient, object]:
+    config = Config()
+    config.memory.enabled = False
+    config.agent.workdir = str(tmp_path / "workdir")
+    runtime = build_core_runtime(
+        config,
+        tmp_path / "workspace",
+        provider=Provider(),
+    )
+    app = create_fastapi_app(runtime, directory_picker=picker)
+    return TestClient(app, client=(client_host, 50000)), runtime
+
+
+def test_native_workspace_picker_is_local_non_persisting_and_maps_host_errors(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "picked-project"
+    project.mkdir()
+    picker = FakeDirectoryPicker(project)
+    client, runtime = _native_client(tmp_path, picker)
+
+    with client:
+        selected = client.post("/api/chat/workspaces/pick")
+        assert selected.status_code == 200
+        assert selected.json() == {"path": str(project.resolve())}
+        assert runtime.sessions.store.list_workspaces() == []
+
+        picker.result = None
+        assert client.post("/api/chat/workspaces/pick").json() == {"path": None}
+
+        for error, status in (
+            (NativePickerBusy("busy"), 409),
+            (NativeHostUnavailable("unavailable"), 501),
+            (NativeHostError("failed"), 503),
+        ):
+            picker.error = error
+            response = client.post("/api/chat/workspaces/pick")
+            assert response.status_code == status
+            assert response.json()["detail"] == str(error)
+
+
+def test_native_workspace_picker_rejects_remote_client(tmp_path: Path) -> None:
+    picker = FakeDirectoryPicker()
+    client, _runtime = _native_client(
+        tmp_path,
+        picker,
+        client_host="192.0.2.10",
+    )
+
+    with client:
+        response = client.post("/api/chat/workspaces/pick")
+
+    assert response.status_code == 403
+    assert "回环地址" in response.json()["detail"]
+
+
+def test_workspace_and_session_management_endpoints(tmp_path: Path) -> None:
+    project = tmp_path / "managed-project"
+    project.mkdir()
+    picker = FakeDirectoryPicker()
+    client, runtime = _native_client(tmp_path, picker)
+    workspace = runtime.sessions.store.create_workspace(str(project), "旧名称")
+    runtime.sessions.store.create_session(
+        "web:managed",
+        workspace_id=workspace["id"],
+    )
+
+    with client:
+        updated = client.patch(
+            f"/api/chat/workspaces/{workspace['id']}",
+            json={"title": "新名称", "pinned": True},
+        )
+        pinned = client.patch(
+            "/api/chat/sessions/web:managed",
+            json={"pinned": True},
+        )
+        opened = client.post(f"/api/chat/workspaces/{workspace['id']}/open")
+
+    assert updated.status_code == 200
+    assert updated.json()["title"] == "新名称"
+    assert updated.json()["pinned_at"] is not None
+    assert pinned.status_code == 200
+    assert pinned.json()["pinned_at"] is not None
+    assert opened.status_code == 204
+    assert picker.opened == [project.resolve()]
 
 
 def test_chat_api_lists_sessions_and_messages(tmp_path: Path) -> None:
@@ -63,6 +177,91 @@ def test_chat_api_lists_sessions_and_messages(tmp_path: Path) -> None:
     assert sessions["items"][0]["key"] == "web:chat-1"
     assert [item["content"] for item in messages["items"]] == ["第一问", "第一答"]
     assert not any(key.startswith("llm_") for key in messages["items"][0])
+
+
+def test_workspace_api_and_session_sandbox_closed_loop(tmp_path: Path) -> None:
+    client, runtime = _client(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+
+    with client:
+        registered = client.post(
+            "/api/chat/workspaces",
+            json={"path": str(project), "title": "Bean 项目"},
+        )
+        assert registered.status_code == 201
+        workspace = registered.json()
+        assert workspace["canonical_path"] == str(project.resolve())
+        assert workspace["valid"] is True
+        assert client.get("/api/chat/workspaces").json()["items"] == [workspace]
+
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json({
+                "type": "session.create",
+                "request_id": "create-sandbox",
+                "workspace_id": workspace["id"],
+                "sandbox_mode": "workspace-write",
+            })
+            created = websocket.receive_json()
+            snapshot_frame = websocket.receive_json()
+
+        assert created["type"] == "session.created"
+        assert snapshot_frame["type"] == "sandbox.updated"
+        assert snapshot_frame["sandbox"]["workspace_id"] == workspace["id"]
+        assert snapshot_frame["sandbox"]["sandbox_mode"] == "workspace-write"
+        session_id = created["session_id"]
+        assert client.get(
+            f"/api/chat/sessions/{session_id}/sandbox"
+        ).json()["workspace_path"] == str(project.resolve())
+
+        removed = client.delete(f"/api/chat/workspaces/{workspace['id']}")
+        assert removed.status_code == 204
+        detached = client.get(
+            f"/api/chat/sessions/{session_id}/sandbox"
+        ).json()
+        assert detached["workspace_id"] is None
+        assert detached["sandbox_mode"] == "read-only"
+
+        overlap = client.post(
+            "/api/chat/workspaces",
+            json={"path": str(runtime.workspace)},
+        )
+        assert overlap.status_code == 422
+        assert "数据目录重叠" in overlap.json()["detail"]
+
+    assert project.exists()
+
+
+def test_workspace_api_refuses_to_detach_busy_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, runtime = _client(tmp_path)
+    project = tmp_path / "busy-project"
+    project.mkdir()
+    workspace = runtime.sessions.store.create_workspace(str(project))
+    session_id = "web:busy-workspace"
+    runtime.sessions.store.create_session(
+        session_id,
+        workspace_id=workspace["id"],
+        sandbox_mode="workspace-write",
+    )
+    monkeypatch.setattr(
+        runtime.agent_loop,
+        "is_session_busy",
+        lambda key: key == session_id,
+    )
+
+    with client:
+        removed = client.delete(f"/api/chat/workspaces/{workspace['id']}")
+        assert runtime.sessions.store.get_workspace(workspace["id"]) is not None
+        assert (
+            runtime.sessions.store.get_session_meta(session_id)["workspace_id"]
+            == workspace["id"]
+        )
+
+    assert removed.status_code == 409
+    assert "正在运行或排队" in removed.json()["detail"]
 
 
 def test_chat_api_lists_titled_running_session_without_messages(tmp_path: Path) -> None:

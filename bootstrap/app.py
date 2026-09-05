@@ -22,7 +22,7 @@ from PIL import Image, UnidentifiedImageError
 from agent.agent_loop import AgentLoop
 from agent.channel import WebChannel
 from agent.config_models import Config
-from agent.event_bus import EventBus
+from agent.event_bus import EventBus, SandboxApprovalRequested
 from agent.message_bus import MessageBus
 from agent.mcp.manage_tools import McpAddTool, McpListTool, McpRemoveTool
 from agent.mcp.registry import McpServerRegistry
@@ -32,6 +32,14 @@ from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt
 from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import LLMProvider, create_vision_provider
 from agent.skills import SkillsLoader
+from bootstrap.native_folder_picker import (
+    DirectoryPicker,
+    NativeHostError,
+    NativeHostUnavailable,
+    NativePickerBusy,
+    WindowsDirectoryPicker,
+    is_loopback_client,
+)
 from memory.embedder import Embedder
 from memory.engine import MemoryEngine
 from proactive.agent_tools import ProactiveToolFactory
@@ -43,6 +51,11 @@ from proactive.soft_executor import SoftTaskExecutor
 from proactive.store import ProactiveStore
 from proactive.turn_service import ProactiveTurnService
 from session.manager import SessionManager
+from sandbox.approval import ApprovalCoordinator
+from sandbox.filesystem import FilesystemMutationBroker
+from sandbox.guard import SandboxGuard
+from sandbox.policy import SandboxPolicyResolver
+from sandbox.runtime import SandboxProcessRuntime, create_runtime_temp_root
 from tools import ToolRegistry, register_all
 from tools.schedule import (
     CancelScheduleTool,
@@ -165,6 +178,12 @@ class AppRuntime:
                 core.sessions.store.get_session_usage, session_key
             ),
             context_runtime_id=str(getattr(core.provider, "runtime_id", "") or ""),
+            sandbox_loader=lambda session_key: asyncio.to_thread(
+                core.sessions.store.get_session_sandbox, session_key
+            ),
+            sandbox_mode_writer=core.sessions.set_sandbox_mode,
+            workspace_writer=core.sessions.set_workspace,
+            approvals=core.sandbox_approvals,
         )
         self.maintenance = (
             MemoryMaintenanceLoop(
@@ -206,6 +225,7 @@ class AppRuntime:
             # 顺序与参考 AppRuntime 一致：先阻止新工作进入，再等待/取消执行任务，
             # 最后按所有权从上层服务向底层 HTTP/SQLite 资源释放。
             await _cleanup_step("web_channel.close", self.channel.close)
+            await _cleanup_step("sandbox_approvals.close", self.core.sandbox_approvals.close)
             await _cleanup_step("proactive_chat.close", self.core.proactive_chat.close)
             await _cleanup_step("proactive_scheduler.close", self.core.scheduler.close)
             await _cleanup_step("agent_loop.close", self.core.agent_loop.close)
@@ -213,6 +233,7 @@ class AppRuntime:
                 self.agent_task.cancel()
                 await asyncio.gather(self.agent_task, return_exceptions=True)
             await _cleanup_step("mcp_registry.shutdown", self.core.mcp_registry.shutdown)
+            await _cleanup_step("sandbox_runtime.close", self.core.sandbox_runtime.close)
             if self.maintenance is not None:
                 await _cleanup_step("memory_maintenance.close", self.maintenance.close)
             if self.core.memory is not None:
@@ -254,6 +275,10 @@ class CoreRuntime:
     scheduler: SchedulerService
     proactive_chat: ProactiveChatLoop
     proactive_tools: ProactiveToolFactory
+    sandbox_policy: SandboxPolicyResolver
+    sandbox_approvals: ApprovalCoordinator
+    sandbox_guard: SandboxGuard
+    sandbox_runtime: SandboxProcessRuntime
     vision_provider: Any | None = None
 
 
@@ -268,9 +293,6 @@ def build_core_runtime(
 
     root = Path(workspace).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    workdir = Path(config.agent.workdir).expanduser().resolve()
-    workdir.mkdir(parents=True, exist_ok=True)
-
     # 主 Provider 是应用级共享资源，由 Runtime 最终关闭；MemoryEngine 只借用它执行
     # QueryRewriter/Consolidation，不拥有其生命周期。
     main_provider = provider or LLMProvider(config.llm)
@@ -278,6 +300,22 @@ def build_core_runtime(
     events = EventBus()
     messages = MessageBus()
     proactive_store = ProactiveStore(root / "proactive.db")
+    sandbox_policy = SandboxPolicyResolver(
+        sessions.store,
+        data_root=root,
+        runtime_temp_root=create_runtime_temp_root(),
+    )
+    sandbox_approvals = ApprovalCoordinator(sessions.store)
+
+    async def publish_approval(request: Any) -> None:
+        await events.emit(
+            SandboxApprovalRequested(request.session_id, request.to_wire())
+        )
+
+    sandbox_approvals.set_publisher(publish_approval)
+    sandbox_guard = SandboxGuard(sandbox_policy, sandbox_approvals)
+    sandbox_runtime = SandboxProcessRuntime(sandbox_policy)
+    mutation_broker = FilesystemMutationBroker(sandbox_policy, sandbox_runtime)
 
     memory: MemoryEngine | None = None
     actual_embedder = embedder
@@ -300,13 +338,16 @@ def build_core_runtime(
     tools = ToolRegistry()
     register_all(
         tools,
-        allowed_dir=workdir,
+        allowed_dir=None,
         multimodal=config.llm.multimodal,
         vl_provider=vision_provider,
         vl_model=config.llm.vl.model if config.llm.vl else "",
         session_store=sessions.store,
         memory_engine=memory,
         skills=skills,
+        sandbox_guard=sandbox_guard,
+        sandbox_runtime=sandbox_runtime,
+        mutation_broker=mutation_broker,
     )
     # 提醒工具从当前 Turn 的系统执行上下文取得 session_key，模型不需要也不能
     # 选择其他 Web 会话作为目标。
@@ -356,6 +397,7 @@ def build_core_runtime(
         # 后者只通过 read_image_vision 工具读取本地上传路径。
         multimodal=config.llm.multimodal,
         vl_available=vision_provider is not None,
+        sandbox_guard=sandbox_guard,
     )
     agent_loop = AgentLoop(
         messages,
@@ -402,14 +444,23 @@ def build_core_runtime(
         scheduler=scheduler,
         proactive_chat=proactive_chat,
         proactive_tools=proactive_tools,
+        sandbox_policy=sandbox_policy,
+        sandbox_approvals=sandbox_approvals,
+        sandbox_guard=sandbox_guard,
+        sandbox_runtime=sandbox_runtime,
         vision_provider=vision_provider,
     )
 
 
-def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
+def create_fastapi_app(
+    runtime: CoreRuntime | AppRuntime,
+    *,
+    directory_picker: DirectoryPicker | None = None,
+) -> FastAPI:
     """为已组装 Runtime 暴露 WebSocket 路由，不复制或隐式替换依赖。"""
 
     application = runtime if isinstance(runtime, AppRuntime) else AppRuntime(runtime)
+    host_directories = directory_picker or WindowsDirectoryPicker()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -462,6 +513,110 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
             offset=(page - 1) * page_size,
         )
         return {"items": items, "total": total}
+
+    @app.get("/api/chat/workspaces")
+    def list_workspaces() -> dict[str, Any]:
+        return {"items": application.core.sessions.store.list_workspaces()}
+
+    def require_local_host(request: Request) -> None:
+        client_host = request.client.host if request.client is not None else None
+        if not is_loopback_client(client_host):
+            raise HTTPException(
+                status_code=403,
+                detail="本机目录能力只允许从回环地址调用",
+            )
+
+    @app.post("/api/chat/workspaces/pick")
+    def pick_workspace_directory(request: Request) -> dict[str, str | None]:
+        """打开系统选择器；选择阶段不创建工作目录或会话记录。"""
+
+        require_local_host(request)
+        try:
+            selected = host_directories.pick_directory()
+            if selected is None:
+                return {"path": None}
+            resolved = application.core.sandbox_policy.validate_workspace(selected)
+            return {"path": str(resolved)}
+        except NativePickerBusy as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except NativeHostUnavailable as error:
+            raise HTTPException(status_code=501, detail=str(error)) from error
+        except NativeHostError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except (OSError, ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/api/chat/workspaces", status_code=201)
+    def register_workspace(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        path = str(payload.get("path") or "").strip()
+        if not path:
+            raise HTTPException(status_code=400, detail="工作目录路径不能为空")
+        try:
+            resolved = application.core.sandbox_policy.validate_workspace(path)
+            return application.core.sessions.store.create_workspace(
+                str(resolved),
+                str(payload.get("title") or ""),
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.patch("/api/chat/workspaces/{workspace_id}")
+    def update_workspace(
+        workspace_id: str,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        allowed = {"title", "pinned"}
+        if not payload or any(key not in allowed for key in payload):
+            raise HTTPException(status_code=400, detail="工作区更新字段无效")
+        title = payload.get("title") if "title" in payload else None
+        pinned = payload.get("pinned") if "pinned" in payload else None
+        if pinned is not None and not isinstance(pinned, bool):
+            raise HTTPException(status_code=400, detail="pinned 必须是布尔值")
+        try:
+            updated = application.core.sessions.store.update_workspace(
+                workspace_id,
+                title=title,
+                pinned=pinned,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        if updated is None:
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        return updated
+
+    @app.post("/api/chat/workspaces/{workspace_id}/open", status_code=204)
+    def open_workspace(workspace_id: str, request: Request) -> Response:
+        require_local_host(request)
+        workspace = application.core.sessions.store.get_workspace(workspace_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        if not workspace["valid"]:
+            raise HTTPException(status_code=409, detail="工作区目录当前不可用")
+        try:
+            host_directories.open_directory(Path(str(workspace["canonical_path"])))
+        except NativeHostUnavailable as error:
+            raise HTTPException(status_code=501, detail=str(error)) from error
+        except NativeHostError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        return Response(status_code=204)
+
+    @app.delete("/api/chat/workspaces/{workspace_id}", status_code=204)
+    async def unregister_workspace(workspace_id: str) -> Response:
+        session_keys = application.core.sessions.store.list_workspace_session_keys(
+            workspace_id
+        )
+        if any(
+            application.core.agent_loop.is_session_busy(session_key)
+            for session_key in session_keys
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="工作区仍有关联会话正在运行或排队，请结束后再移除",
+            )
+        if not application.core.sessions.store.delete_workspace(workspace_id):
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        # 删除关系可能让多个缓存策略失效；Policy 每次回源，不需要全局缓存失效。
+        return Response(status_code=204)
 
     @app.get("/api/chat/sessions/{session_key:path}/messages")
     def list_messages(
@@ -519,6 +674,14 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
     @app.get("/api/chat/sessions/{session_key:path}/turns")
     def list_turns(session_key: str) -> dict[str, Any]:
         return {"items": application.core.sessions.store.list_chat_turns(session_key)}
+
+    @app.get("/api/chat/sessions/{session_key:path}/sandbox")
+    def get_session_sandbox(session_key: str) -> dict[str, Any]:
+        require_web_session(session_key)
+        snapshot = application.core.sessions.store.get_session_sandbox(session_key)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return snapshot
 
     def require_web_session(session_key: str) -> None:
         """主动设置只属于当前 Web channel，禁止借 path 参数访问其他渠道。"""
@@ -591,26 +754,48 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
         return Response(status_code=204)
 
     @app.patch("/api/chat/sessions/{session_key:path}")
-    async def rename_session(
+    async def update_session(
         session_key: str,
-        title: str = Body(embed=True),
-    ) -> dict[str, str]:
-        """修改会话展示标题；原始消息和长期记忆均不参与该操作。"""
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        """修改会话标题或目录内置顶状态，不改变对话活动时间。"""
 
-        clean_title = str(title).strip()
-        if not clean_title or len(clean_title) > 60:
-            raise HTTPException(status_code=400, detail="会话标题长度必须为 1-60 个字符")
+        allowed = {"title", "pinned"}
+        if len(payload) != 1 or any(key not in allowed for key in payload):
+            raise HTTPException(status_code=400, detail="会话更新字段无效")
         channel = application.core.config.channels.chat.channel_name
         if not session_key.startswith(f"{channel}:"):
             raise HTTPException(status_code=404, detail="会话不存在")
-        updated = await application.core.sessions.update_title(session_key, clean_title)
-        if updated is None:
+        if "title" in payload:
+            clean_title = str(payload.get("title") or "").strip()
+            if not clean_title or len(clean_title) > 60:
+                raise HTTPException(status_code=400, detail="会话标题长度必须为 1-60 个字符")
+            updated = await application.core.sessions.update_title(session_key, clean_title)
+            if updated is None:
+                raise HTTPException(status_code=404, detail="会话不存在")
+        if "pinned" in payload:
+            pinned = payload.get("pinned")
+            if not isinstance(pinned, bool):
+                raise HTTPException(status_code=400, detail="pinned 必须是布尔值")
+            try:
+                updated = await asyncio.to_thread(
+                    application.core.sessions.store.set_chat_session_pinned,
+                    session_key,
+                    pinned,
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            if updated is None:
+                raise HTTPException(status_code=404, detail="会话不存在")
+        meta = application.core.sessions.store.get_session_meta(session_key)
+        if meta is None:
             raise HTTPException(status_code=404, detail="会话不存在")
-        # 前端按最近活动时间分组，重命名也属于一次活动，必须把持久化后的时间一并返回。
         return {
             "key": session_key,
-            "title": clean_title,
-            "updated_at": str(updated["updated_at"]),
+            "title": str(meta.get("metadata", {}).get("title") or ""),
+            "updated_at": str(meta["updated_at"]),
+            "last_activity_at": str(meta.get("last_activity_at") or meta["created_at"]),
+            "pinned_at": meta.get("pinned_at"),
         }
 
     @app.delete("/api/chat/sessions/{session_key:path}", status_code=204)
@@ -620,8 +805,10 @@ def create_fastapi_app(runtime: CoreRuntime | AppRuntime) -> FastAPI:
         channel = application.core.config.channels.chat.channel_name
         if not session_key.startswith(f"{channel}:"):
             raise HTTPException(status_code=404, detail="会话不存在")
+        await application.core.sandbox_approvals.cancel_session(session_key)
         if not await application.core.sessions.delete(session_key):
             raise HTTPException(status_code=404, detail="会话不存在")
+        await application.core.sandbox_runtime.close_session(session_key)
         return Response(status_code=204)
 
     @app.post("/api/chat/uploads")

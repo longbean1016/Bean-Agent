@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -793,7 +794,7 @@ async def test_cursor_defaults_to_zero_and_can_advance(store: SessionStore) -> N
     assert store.get_cursor("web:chat-1") == 0
 
 
-def test_list_chat_sessions_uses_first_user_time_for_display_and_order(
+def test_list_chat_sessions_uses_first_user_time_and_latest_activity_order(
     store: SessionStore,
 ) -> None:
     store.create_session("web:empty")
@@ -825,11 +826,12 @@ def test_list_chat_sessions_uses_first_user_time_for_display_and_order(
     items, total = store.list_chat_sessions(channel="web", limit=20, offset=0)
 
     assert total == 2
-    assert [item["key"] for item in items] == ["web:newer", "web:older"]
-    assert items[0]["created_at"] == "2026-07-18T11:00:00+08:00"
-    assert items[1]["created_at"] == "2026-07-18T10:00:00+08:00"
-    assert items[1]["message_count"] == 2
-    assert items[0]["first_message_content"] == "较晚创建的问题"
+    assert [item["key"] for item in items] == ["web:older", "web:newer"]
+    assert items[0]["created_at"] == "2026-07-18T10:00:00+08:00"
+    assert items[0]["last_activity_at"] == "2026-07-18T12:00:00+08:00"
+    assert items[0]["message_count"] == 2
+    assert items[1]["created_at"] == "2026-07-18T11:00:00+08:00"
+    assert items[1]["first_message_content"] == "较晚创建的问题"
 
 
 def test_update_chat_session_title_persists_metadata_and_list_value(store: SessionStore) -> None:
@@ -1058,3 +1060,192 @@ def test_session_usage_is_idempotent_and_aggregated(store: SessionStore) -> None
     assert second["total_input_tokens"] == 1_060
     assert second["total_output_tokens"] == 50
     assert second["cache_hit_rate"] == pytest.approx(880 / 1060)
+
+
+def test_workspace_binding_and_permission_are_persisted(
+    store: SessionStore,
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    workspace = store.create_workspace(str(project), "示例项目")
+    duplicate = store.create_workspace(str(project / "."), "不会覆盖")
+
+    session = store.create_session(
+        "web:sandbox",
+        workspace_id=workspace["id"],
+        sandbox_mode="workspace-write",
+    )
+    sandbox = store.get_session_sandbox("web:sandbox")
+
+    assert duplicate["id"] == workspace["id"]
+    assert session["workspace_id"] == workspace["id"]
+    assert sandbox is not None
+    assert sandbox["workspace_path"] == str(project.resolve())
+    assert sandbox["sandbox_mode"] == "workspace-write"
+    assert sandbox["workspace_valid"] is True
+
+
+def test_workspace_pin_order_is_stable_and_unpin_restores_created_order(
+    store: SessionStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"value": "2026-09-03T10:00:00+08:00"}
+    monkeypatch.setattr("session.store._now_iso", lambda: clock["value"])
+    first_dir = tmp_path / "first-project"
+    second_dir = tmp_path / "second-project"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = store.create_workspace(str(first_dir), "先创建")
+    clock["value"] = "2026-09-03T11:00:00+08:00"
+    second = store.create_workspace(str(second_dir), "后创建")
+
+    assert [item["id"] for item in store.list_workspaces()] == [second["id"], first["id"]]
+
+    clock["value"] = "2026-09-03T12:00:00+08:00"
+    pinned_second = store.update_workspace(second["id"], pinned=True)
+    clock["value"] = "2026-09-03T13:00:00+08:00"
+    store.update_workspace(first["id"], pinned=True)
+    clock["value"] = "2026-09-03T14:00:00+08:00"
+    repeated = store.update_workspace(second["id"], pinned=True)
+
+    assert pinned_second is not None and repeated is not None
+    assert repeated["pinned_at"] == pinned_second["pinned_at"]
+    assert [item["id"] for item in store.list_workspaces()] == [second["id"], first["id"]]
+
+    store.update_workspace(second["id"], pinned=False)
+    ordered = store.list_workspaces()
+    assert [item["id"] for item in ordered] == [first["id"], second["id"]]
+    assert ordered[1]["created_at"] == "2026-09-03T11:00:00+08:00"
+
+
+def test_session_pin_and_non_conversation_updates_preserve_activity_time(
+    store: SessionStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"value": "2026-09-03T10:00:00+08:00"}
+    monkeypatch.setattr("session.store._now_iso", lambda: clock["value"])
+    project = tmp_path / "activity-project"
+    project.mkdir()
+    workspace = store.create_workspace(str(project))
+    store.create_session("web:first", workspace_id=workspace["id"])
+    store.create_session("web:second", workspace_id=workspace["id"])
+    store.add_message(NewMessage(
+        session_key="web:first",
+        role="user",
+        content="first",
+        timestamp="2026-09-03T11:00:00+08:00",
+    ))
+    store.add_message(NewMessage(
+        session_key="web:second",
+        role="user",
+        content="second",
+        timestamp="2026-09-03T12:00:00+08:00",
+    ))
+
+    activity = store.get_session_meta("web:first")["last_activity_at"]
+    clock["value"] = "2026-09-03T13:00:00+08:00"
+    store.update_chat_session_title("web:first", "重命名")
+    store.update_session_sandbox_mode("web:first", "workspace-write")
+    pinned = store.set_chat_session_pinned("web:first", True)
+    clock["value"] = "2026-09-03T14:00:00+08:00"
+    repeated = store.set_chat_session_pinned("web:first", True)
+
+    assert pinned is not None and repeated is not None
+    assert repeated["pinned_at"] == pinned["pinned_at"]
+    assert repeated["last_activity_at"] == activity
+    assert [item["key"] for item in store.list_chat_sessions()[0]] == [
+        "web:first",
+        "web:second",
+    ]
+
+    store.set_chat_session_pinned("web:first", False)
+    assert [item["key"] for item in store.list_chat_sessions()[0]] == [
+        "web:second",
+        "web:first",
+    ]
+
+
+def test_recent_session_cannot_be_pinned(store: SessionStore) -> None:
+    store.create_session("web:recent")
+
+    with pytest.raises(ValueError, match="最近会话不能置顶"):
+        store.set_chat_session_pinned("web:recent", True)
+
+
+def test_workspace_write_requires_workspace_and_started_session_cannot_rebind(
+    store: SessionStore,
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = store.create_workspace(str(first_dir))
+    second = store.create_workspace(str(second_dir))
+    store.create_session("web:fixed", workspace_id=first["id"])
+
+    with pytest.raises(ValueError, match="没有工作目录"):
+        store.create_session("web:no-workspace", sandbox_mode="workspace-write")
+
+    store.add_message(NewMessage(session_key="web:fixed", role="user", content="开始"))
+    with pytest.raises(ValueError, match="不能切换工作目录"):
+        store.set_session_workspace("web:fixed", second["id"])
+
+
+def test_deleting_workspace_detaches_sessions_without_deleting_directory(
+    store: SessionStore,
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "kept-project"
+    project.mkdir()
+    marker = project / "kept.txt"
+    marker.write_text("保留", encoding="utf-8")
+    workspace = store.create_workspace(str(project))
+    store.create_session(
+        "web:detach",
+        workspace_id=workspace["id"],
+        sandbox_mode="workspace-write",
+    )
+
+    assert store.delete_workspace(workspace["id"]) is True
+    sandbox = store.get_session_sandbox("web:detach")
+
+    assert marker.read_text(encoding="utf-8") == "保留"
+    assert sandbox is not None
+    assert sandbox["workspace_id"] is None
+    assert sandbox["sandbox_mode"] == "read-only"
+
+
+def test_existing_sessions_database_is_migrated_to_read_only(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        """
+        CREATE TABLE sessions (
+            key TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_consolidated INTEGER NOT NULL DEFAULT 0,
+            next_seq INTEGER NOT NULL DEFAULT 0,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO sessions VALUES ('web:legacy', 'now', 'now', 0, 0, '{}')"
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SessionStore(db_path)
+    try:
+        sandbox = migrated.get_session_sandbox("web:legacy")
+    finally:
+        migrated.close()
+
+    assert sandbox is not None
+    assert sandbox["workspace_id"] is None
+    assert sandbox["sandbox_mode"] == "read-only"

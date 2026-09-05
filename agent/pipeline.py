@@ -43,6 +43,7 @@ from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import ContextLengthError, LLMResponse, ProviderUsage
 from agent.skills import SkillsLoader, collect_skill_mentions
 from agent.tool_runtime import ToolRuntimeView
+from sandbox.guard import SandboxGuard
 from session.store import NewSessionEvent, NewSurfaceEvent
 from tools.base import normalize_tool_result
 from tools.registry import ToolRegistry
@@ -102,6 +103,7 @@ class Pipeline:
         max_iterations: int = 10,
         multimodal: bool = True,
         vl_available: bool = False,
+        sandbox_guard: SandboxGuard | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -126,6 +128,7 @@ class Pipeline:
         # 接收 image_url；独立 VL 可用时则由现有 ReAct 工具链负责真正读图。
         self._multimodal = bool(multimodal)
         self._vl_available = bool(vl_available)
+        self._sandbox_guard = sandbox_guard
         # 中断快照只服务于当前进程内的停止/续跑语义，不进入 Session 或长期记忆。
         self._interrupt_snapshots: dict[str, dict[str, Any]] = {}
         # 只保存每个会话最近一次供应商 usage 锚点；完整快照由 SessionStore
@@ -1036,6 +1039,8 @@ class Pipeline:
                 execution_context: dict[str, Any] = tool_view.context
                 execution_context.update({
                     "session_key": message.session_key,
+                    "turn_id": turn_id,
+                    "call_id": call.id,
                     "channel": message.channel,
                     "chat_id": message.chat_id,
                     "request_time": str(message.metadata.get("request_time") or message.metadata.get("received_at") or ""),
@@ -1044,11 +1049,27 @@ class Pipeline:
                     # 搜索工具需要知道哪些 Schema 已在当前 Turn 可见，但不能
                     # 持有 View 本身，否则状态会重新泄漏到全局工具实例。
                     execution_context["excluded_names"] = set(tool_view.visible_names)
-                raw_result = await self._tools.execute(
-                    call.name,
-                    call.arguments,
-                    context=execution_context,
+                tool_meta = self._tools.get_metadata(call.name)
+                mcp_restricted = (
+                    self._sandbox_guard is not None
+                    and (
+                        (tool_meta is not None and tool_meta.source_type == "mcp")
+                        or call.name == "mcp_add"
+                    )
+                    and self._sandbox_guard.policy(message.session_key).mode
+                    != "danger-full-access"
                 )
+                if mcp_restricted:
+                    raw_result = (
+                        "错误：MCP 子进程属于受信任扩展，当前仅在经过风险确认的"
+                        "完全访问会话中可用"
+                    )
+                else:
+                    raw_result = await self._tools.execute(
+                        call.name,
+                        call.arguments,
+                        context=execution_context,
+                    )
                 result = normalize_tool_result(raw_result)
                 if call.name == "tool_search":
                     try:
