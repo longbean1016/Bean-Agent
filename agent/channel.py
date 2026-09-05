@@ -142,6 +142,7 @@ class WebChannel:
                 "request_id": request_id,
                 "session_id": session_key,
             })
+            await self._send_sandbox_snapshot(session_key, websocket)
             return
 
         session_key = normalize_web_session_id(frame.get("session_id"))
@@ -183,6 +184,7 @@ class WebChannel:
                     "request_id": request_id,
                     "session_id": prepared.session_key,
                 })
+                await self._send_sandbox_snapshot(prepared.session_key, websocket)
             await self._commands.submit_message(prepared)
             return
         if frame_type == "turn.stop" and session_key is not None:
