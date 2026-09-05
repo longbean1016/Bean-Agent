@@ -292,3 +292,7 @@ export async function saveDefaultModelRoute(route: ModelRoute): Promise<ModelRou
   });
   return payload.route;
 }
+
+export async function updateModelCatalog(): Promise<{ updated_at: string; providers: number; models: number }> {
+  return settingsRequest("/api/settings/catalog/update", { method: "POST" });
+}
