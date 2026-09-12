@@ -92,3 +92,20 @@ def test_registry_exposes_only_supported_explicit_adapters() -> None:
     assert AdapterRegistry().ids() == (
         "generic_openai", "deepseek", "qwen_dashscope", "openai_reasoning"
     )
+
+
+def test_dashscope_non_stream_response_preserves_reasoning_content() -> None:
+    strategy = AdapterRegistry().create("qwen_dashscope")
+    content, thinking, fields = strategy.extract_response(
+        SimpleNamespace(content="answer", reasoning_content="internal steps"),
+        "answer",
+    )
+    assert content == "answer"
+    assert thinking == "internal steps"
+    assert fields == {"reasoning_content": "internal steps"}
+
+
+def test_adapter_normalizes_unified_effort_before_protocol_mapping() -> None:
+    deepseek = AdapterRegistry().create("deepseek")
+    assert deepseek.normalize_effort("deepseek-v4-flash", "medium") == "high"
+    assert deepseek.normalize_effort("deepseek-v4-flash", "xhigh") == "max"

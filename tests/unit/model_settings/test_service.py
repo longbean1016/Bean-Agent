@@ -33,6 +33,7 @@ async def test_connection_discovery_and_route_round_trip_without_key_exposure(tm
         "api_key": "top-secret", "default_adapter": "generic_openai",
     })
     models = await settings.discover_models(connection["id"])
+    assert settings.discovery_runs(connection["id"])[0]["status"] == "success"
     route = settings.set_route(ModelRoute(connection["id"], models[0]["model_id"]))
 
     payload = settings.list_connections()[0]

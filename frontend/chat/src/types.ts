@@ -256,6 +256,18 @@ export interface ModelProfile {
   available: boolean;
   revision: number;
   discovered_at: string;
+  protocol?: "chat_completions" | "responses" | string;
+  capability_source?: "catalog" | "probe" | "manual" | "unknown" | string;
+  capability_confidence?: "high" | "medium" | "low" | string;
+  capabilities_json?: {
+    reasoning?: {
+      mode?: "toggle" | "effort" | string;
+      native?: string[];
+      aliases?: Record<string, string>;
+      response_field?: string;
+    };
+    [key: string]: unknown;
+  };
 }
 
 export interface ModelConnection {

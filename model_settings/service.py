@@ -9,7 +9,14 @@ from uuid import uuid4
 
 from model_settings.catalog import CatalogUpdateError, ModelCatalogService
 from model_settings.discovery import OpenAIModelDiscovery
-from model_settings.models import ADAPTER_IDS, REASONING_EFFORTS, ModelConnection, ModelProfile, ModelRoute
+from model_settings.models import (
+    ADAPTER_IDS,
+    REASONING_EFFORTS,
+    DiscoveryRun,
+    ModelConnection,
+    ModelProfile,
+    ModelRoute,
+)
 from model_settings.secrets import SecretStore, SecretStoreError
 from model_settings.store import ModelSettingsConflict, ModelSettingsStore
 
@@ -129,7 +136,17 @@ class ModelSettingsService:
         api_key = self._secrets.get(connection.secret_ref) or ""
         if not api_key:
             raise ModelSettingsValidationError("连接尚未配置 API Key")
-        discovered = await self._discovery.list_models(connection, api_key)
+        requested_url = f"{connection.base_url.rstrip('/')}/models"
+        try:
+            discovered = await self._discovery.list_models(connection, api_key)
+        except Exception as error:
+            self.store.record_discovery_run(DiscoveryRun(
+                connection_id=connection.id,
+                requested_url=requested_url,
+                status="failed",
+                error_message=str(error)[:500],
+            ))
+            raise
         profiles = [
             self._catalog.enrich(
                 ModelProfile(connection.id, item.id, item.name),
@@ -138,7 +155,15 @@ class ModelSettingsService:
             )
             for item in discovered
         ]
-        return [item.public_dict() for item in self.store.replace_discovered_models(connection.id, profiles)]
+        saved = self.store.replace_discovered_models(connection.id, profiles)
+        self.store.record_discovery_run(DiscoveryRun(
+            connection_id=connection.id,
+            requested_url=requested_url,
+            status="success",
+            model_count=len(discovered),
+            response_hash=getattr(self._discovery, "last_response_hash", None),
+        ))
+        return [item.public_dict() for item in saved]
 
     async def refresh_models(self, connection_id: str) -> dict[str, Any]:
         catalog_warning = ""
@@ -157,13 +182,43 @@ class ModelSettingsService:
     async def test_model_list(self, connection_id: str) -> dict[str, Any]:
         connection = self._connection(connection_id)
         api_key = self._api_key(connection)
-        models = await self._discovery.list_models(connection, api_key)
+        requested_url = f"{connection.base_url.rstrip('/')}/models"
+        try:
+            models = await self._discovery.list_models(connection, api_key)
+        except Exception as error:
+            self.store.record_discovery_run(DiscoveryRun(
+                connection_id=connection.id,
+                requested_url=requested_url,
+                status="failed",
+                error_message=str(error)[:500],
+            ))
+            raise
+        self.store.record_discovery_run(DiscoveryRun(
+            connection_id=connection.id,
+            requested_url=requested_url,
+            status="tested",
+            model_count=len(models),
+            response_hash=getattr(self._discovery, "last_response_hash", None),
+        ))
         return {
             "ok": True,
             "connection_id": connection.id,
             "connection_name": connection.name,
             "model_count": len(models),
         }
+
+    def discovery_runs(self, connection_id: str) -> list[dict[str, Any]]:
+        self._connection(connection_id)
+        return [item.public_dict() for item in self.store.list_discovery_runs(connection_id)]
+
+    def capability_probes(
+        self, connection_id: str, model_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        self._connection(connection_id)
+        return [
+            item.public_dict()
+            for item in self.store.list_capability_probes(connection_id, model_id)
+        ]
 
     def save_manual_model(self, connection_id: str, values: dict[str, Any]) -> dict[str, Any]:
         connection = self._connection(connection_id)

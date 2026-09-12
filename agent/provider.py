@@ -162,6 +162,32 @@ class ProviderStrategy:
         if extra_body:
             request["extra_body"] = extra_body
 
+    def normalize_effort(self, model_id: str, requested_effort: str | None) -> str | None:
+        """将内部统一推理档位转换为该协议可发送的档位。"""
+
+        value = str(requested_effort or "").strip().lower()
+        return value or None
+
+    def build_request(
+        self,
+        request: dict[str, Any],
+        extra_body: dict[str, Any] | None = None,
+        *,
+        model_id: str = "",
+        disable_thinking: bool = False,
+    ) -> dict[str, Any]:
+        """构造最终供应商请求，供探测器和运行时复用。"""
+
+        built = dict(request)
+        existing_body = built.pop("extra_body", {}) or {}
+        body = dict(existing_body)
+        body.update(extra_body or {})
+        effort = self.normalize_effort(model_id, body.get("reasoning_effort"))
+        if effort is not None:
+            body["reasoning_effort"] = effort
+        self.prepare_request(built, body, disable_thinking=disable_thinking)
+        return built
+
     def extract_message(
         self,
         message: Any,
@@ -176,6 +202,25 @@ class ProviderStrategy:
                 thinking = match.group(1).strip()
                 content = _THINK_RE.sub("", content).strip() or None
         return content, thinking, {}
+
+    def extract_response(
+        self,
+        message: Any,
+        content: str | None,
+    ) -> tuple[str | None, str | None, dict[str, Any]]:
+        """统一响应提取入口，保留旧 extract_message 兼容性。"""
+
+        return self.extract_message(message, content)
+
+    def probe(self, model_id: str, requested_effort: str | None = None) -> dict[str, Any]:
+        """返回协议静态能力，真实支持情况由 capability probe 覆盖。"""
+
+        return {
+            "model_id": model_id,
+            "protocol": "chat_completions",
+            "requested_effort": requested_effort,
+            "status": "unverified",
+        }
 
     def provider_fields_for_tool_call(
         self,
@@ -211,6 +256,28 @@ class DeepSeekStrategy(ProviderStrategy):
             messages, fill_tool_call_content=False
         )
         return _strip_image_url_blocks(normalized)
+
+    def normalize_effort(self, model_id: str, requested_effort: str | None) -> str | None:
+        value = super().normalize_effort(model_id, requested_effort)
+        if value == "medium":
+            return "high"
+        if value == "xhigh":
+            return "max"
+        return value
+
+    def probe(self, model_id: str, requested_effort: str | None = None) -> dict[str, Any]:
+        return {
+            "model_id": model_id,
+            "protocol": "chat_completions",
+            "requested_effort": requested_effort,
+            "status": "unverified",
+            "reasoning": {
+                "mode": "effort",
+                "native": ["none", "low", "high", "max"],
+                "aliases": {"medium": "high", "xhigh": "max"},
+                "response_field": "reasoning_content",
+            },
+        }
 
     def prepare_request(
         self,
@@ -250,8 +317,8 @@ class DeepSeekStrategy(ProviderStrategy):
         # 将通用等级 xhigh 映射为 DeepSeek 接受的 max；thinking 被
         # 明确关闭时不能继续发送 reasoning_effort，否则请求语义互相冲突。
         if reasoning_effort and not _deepseek_thinking_disabled(extra_body):
-            request["reasoning_effort"] = _normalize_deepseek_effort(
-                str(reasoning_effort)
+            request["reasoning_effort"] = self.normalize_effort(
+                request.get("model", ""), str(reasoning_effort)
             )
 
         # Thinking 多轮协议要求 assistant 历史含 reasoning_content。只在
@@ -332,6 +399,30 @@ class DashScopeStrategy(ProviderStrategy):
         if extra_body:
             request["extra_body"] = extra_body
 
+    def extract_message(
+        self,
+        message: Any,
+        content: str | None,
+    ) -> tuple[str | None, str | None, dict[str, Any]]:
+        reasoning = _get_field(message, "reasoning_content")
+        if reasoning is None:
+            return super().extract_message(message, content)
+        text = str(reasoning)
+        return content, text, {"reasoning_content": text}
+
+    def probe(self, model_id: str, requested_effort: str | None = None) -> dict[str, Any]:
+        return {
+            "model_id": model_id,
+            "protocol": "chat_completions",
+            "requested_effort": requested_effort,
+            "status": "unverified",
+            "reasoning": {
+                "mode": "effort",
+                "native": ["none", "enabled", "low", "medium", "high", "max"],
+                "response_field": "reasoning_content",
+            },
+        }
+
 
 class OpenAIReasoningStrategy(ProviderStrategy):
     """适配 OpenAI reasoning Chat Completions 的顶层参数。"""
@@ -358,6 +449,18 @@ class OpenAIReasoningStrategy(ProviderStrategy):
             request["max_completion_tokens"] = max_tokens
         if extra_body:
             request["extra_body"] = extra_body
+
+    def extract_message(
+        self,
+        message: Any,
+        content: str | None,
+    ) -> tuple[str | None, str | None, dict[str, Any]]:
+        for field in ("reasoning_content", "reasoning", "thinking_content"):
+            reasoning = _get_field(message, field)
+            if reasoning is not None:
+                text = str(reasoning)
+                return content, text, {field: text}
+        return super().extract_message(message, content)
 
 
 class LLMProvider:
@@ -530,9 +633,10 @@ class LLMProvider:
         merged_extra_body = dict(self._extra_body)
         if extra_body:
             merged_extra_body.update(extra_body)
-        strategy.prepare_request(
+        request = strategy.build_request(
             request,
             merged_extra_body,
+            model_id=selected_model,
             disable_thinking=self._force_disable_thinking or disable_thinking,
         )
         if on_request is not None:
