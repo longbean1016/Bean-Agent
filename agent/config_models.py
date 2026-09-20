@@ -95,7 +95,7 @@ class DedupConfig:
 class MemoryConfig:
     """记忆模块总配置。"""
 
-    enabled: bool = False  # 是否启用长期记忆闭环
+    enabled: bool = True  # 默认启用长期记忆闭环；显式配置 false 仍可关闭
     engine_name: str = "default"  # 记忆引擎名称，当前最小版本仅支持 default
     # 旧配置字段仅为反序列化兼容保留；历史范围和压缩触发均由 Session
     # checkpoint 边界及 LLM token gate 决定，不能再从这里派生消息数窗口。
