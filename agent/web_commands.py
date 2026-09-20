@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -209,15 +210,51 @@ class WebCommandService:
         approval_id: str,
         session_key: str,
         decision: str,
-    ) -> None:
+        *,
+        request_id: str = "",
+    ) -> str:
         if self._approvals is None:
             raise WebCommandError("approval_unavailable", "审批服务不可用")
         if decision not in {"allowed-once", "rejected"}:
             raise WebCommandError("invalid_approval", "审批结果无效")
         try:
-            await self._approvals.decide(approval_id, session_key, decision)
+            decider = self._approvals.decide
+            # ApprovalCoordinator 新协议接收 client_request_id；保留对旧
+            # 测试替身/插件三参数 decide 的兼容，避免用 TypeError 重试造成
+            # 一次用户点击触发两次副作用。
+            supports_request_id = False
+            try:
+                signature = inspect.signature(decider)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is not None:
+                supports_request_id = (
+                    "client_request_id" in signature.parameters
+                    or any(
+                        parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
+                )
+            if supports_request_id:
+                outcome = await decider(
+                    approval_id,
+                    session_key,
+                    decision,
+                    client_request_id=request_id or None,
+                )
+            else:
+                outcome = await decider(approval_id, session_key, decision)
         except (KeyError, PermissionError, ValueError) as error:
             raise WebCommandError("invalid_approval", str(error)) from error
+        # 新 coordinator 返回真实收敛状态；旧替身没有返回值时沿用请求值，
+        # 仅用于兼容没有终态回执发布器的测试/插件实现。
+        return str(outcome or decision)
+
+    def approval_resolution_managed(self) -> bool:
+        """是否已有 coordinator 统一广播终态回执，避免 WebChannel 重复发送。"""
+
+        value = getattr(self._approvals, "has_resolution_publisher", False)
+        return bool(value() if callable(value) else value)
 
     def get_active_turn_snapshot(self, session_key: str) -> dict[str, Any] | None:
         snapshotter = getattr(self._interrupt, "get_active_turn_snapshot", None)

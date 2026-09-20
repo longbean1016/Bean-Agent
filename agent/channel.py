@@ -16,6 +16,7 @@ from agent.event_bus import (
     ContextUsageUpdated,
     EventBus,
     SandboxApprovalRequested,
+    SandboxApprovalResolved,
     SessionUsageUpdated,
     SessionUpdated,
     StreamDeltaReady,
@@ -60,6 +61,7 @@ _WEB_EVENT_TYPES = (
     ToolCallStarted,
     ToolCallCompleted,
     SandboxApprovalRequested,
+    SandboxApprovalResolved,
 )
 
 
@@ -107,6 +109,9 @@ class WebChannel:
         self._socket_send_locks: weakref.WeakKeyDictionary[WebSocketApi, asyncio.Lock] = (
             weakref.WeakKeyDictionary()
         )
+        # 同一会话的连接注册/注销必须串行更新审批可用性；否则旧 socket 的
+        # unregister 可能在新 socket register 之后迟到，把会话错误标记为断开。
+        self._availability_locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
         bus.subscribe_outbound(self.name, self._on_response)
         for event_type in _WEB_EVENT_TYPES:
@@ -233,17 +238,26 @@ class WebChannel:
             approval_id = str(frame.get("approval_id") or "")
             decision = str(frame.get("decision") or "")
             try:
-                await self._commands.decide_approval(approval_id, session_key, decision)
+                outcome = await self._commands.decide_approval(
+                    approval_id,
+                    session_key,
+                    decision,
+                    request_id=request_id,
+                )
             except WebCommandError as error:
                 await self._error(websocket, request_id, error.code, error.message)
                 return
-            await self._broadcast(session_key, {
-                "type": "approval.resolved",
-                "request_id": request_id,
-                "session_id": session_key,
-                "approval_id": approval_id,
-                "decision": decision,
-            })
+            # 生产 coordinator 通过 EventBus 发送一次终态回执；测试替身或旧
+            # 实现没有该出口时保留这里的兼容回执，避免重复发送同一审批卡。
+            if not self._commands.approval_resolution_managed():
+                await self._broadcast(session_key, {
+                    "type": "approval.resolved",
+                    "request_id": request_id,
+                    "session_id": session_key,
+                    "approval_id": approval_id,
+                    "decision": outcome if outcome in {"allowed-once", "rejected"} else None,
+                    "state": outcome,
+                })
             return
         await self._error(
             websocket,
@@ -397,30 +411,54 @@ class WebChannel:
         websocket: WebSocketApi,
     ) -> None:
         for request in await self._commands.pending_approvals(session_key):
-            await self._send_json(websocket, {
-                "type": "approval.requested",
-                "session_id": session_key,
-                "approval": request.to_wire(),
-            })
+            # 重连 replay 也必须经过同一安全投影，不能绕过
+            # WebEventMapper 直接把 fingerprint/原始参数送到浏览器。
+            await self._send_mapped(
+                websocket,
+                self._mapper.map_event(
+                    SandboxApprovalRequested(session_key, request.to_wire())
+                ),
+            )
 
     async def _register(self, session_key: str, websocket: WebSocketApi) -> None:
         async with self._lock:
             self._connections.setdefault(session_key, set()).add(websocket)
             self._socket_send_locks.setdefault(websocket, asyncio.Lock())
-        await self._commands.set_session_available(session_key, True)
+        await self._sync_session_availability(session_key)
 
     async def _unregister(self, websocket: WebSocketApi) -> None:
-        unavailable: list[str] = []
+        maybe_unavailable: list[str] = []
         async with self._lock:
             for key in list(self._connections):
-                self._connections[key].discard(websocket)
-                if not self._connections[key]:
+                connections = self._connections[key]
+                if websocket not in connections:
+                    continue
+                connections.discard(websocket)
+                if not connections:
                     self._connections.pop(key, None)
-                    unavailable.append(key)
+                    maybe_unavailable.append(key)
             # 发送锁使用弱引用保存；连接对象仍存活时始终复用同一把锁，断开且无引用后
             # 自动回收，避免清理与并发发送之间出现双锁竞态。
-        for session_key in unavailable:
-            await self._commands.set_session_available(session_key, False)
+        for session_key in maybe_unavailable:
+            await self._sync_session_availability(session_key)
+
+    async def _sync_session_availability(self, session_key: str) -> None:
+        """按当前连接集合同步审批可用性，并串行化同会话的状态变更。
+
+        连接集合与审批 coordinator 使用不同的锁，不能在持有 `_lock` 时直接
+        await coordinator，否则终态回执重新进入 WebChannel 时会形成死锁。先在
+        会话级锁内重新读取连接快照，再调用 coordinator；所有 register、
+        unregister、close 路径都经过这里，迟到的旧注销因此不会覆盖新连接。
+        """
+
+        availability_lock = self._availability_locks.setdefault(
+            session_key,
+            asyncio.Lock(),
+        )
+        async with availability_lock:
+            async with self._lock:
+                available = bool(self._connections.get(session_key))
+            await self._commands.set_session_available(session_key, available)
 
     async def _broadcast_mapped(self, mapped: MappedWebEvent) -> int:
         sent = 0
@@ -482,8 +520,14 @@ class WebChannel:
         for event_type in _WEB_EVENT_TYPES:
             self._events.off(event_type, self._on_event)
         async with self._lock:
+            session_keys = list(self._connections)
             self._connections.clear()
             self._socket_send_locks.clear()
+        # 关闭 Web 通道也视为所有会话审批界面不可用；不能只清空连接映射
+        # 而留下等待中的工具协程。Runtime 级 close 仍可再次调用，coordinator
+        # 的终态收敛保证该操作幂等。
+        for session_key in session_keys:
+            await self._sync_session_availability(session_key)
 
 
 __all__ = ["WebChannel", "normalize_web_session_id"]

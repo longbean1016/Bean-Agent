@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import sandbox.approval as approval_module
 from sandbox.approval import ApprovalCoordinator, ApprovalRequest
 from sandbox.errors import ApprovalUnavailable
 
@@ -27,6 +28,21 @@ class AuditStore:
     ) -> bool:
         self.resolved.append((request_id, state, decided_at))
         return True
+
+
+class CreateFailStore(AuditStore):
+    def create_sandbox_approval(self, request: dict[str, object]) -> None:
+        raise RuntimeError("database unavailable")
+
+
+class ResolveFailStore(AuditStore):
+    def resolve_sandbox_approval(
+        self,
+        request_id: str,
+        state: str,
+        decided_at: str,
+    ) -> bool:
+        raise RuntimeError("database unavailable")
 
 
 async def _wait_for_request(items: list[ApprovalRequest]) -> ApprovalRequest:
@@ -150,3 +166,370 @@ async def test_publisher_failure_fails_closed() -> None:
         )
 
     assert store.resolved[0][1] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_audit_create_failure_does_not_leave_pending_approval() -> None:
+    store = CreateFailStore()
+    published: list[ApprovalRequest] = []
+
+    async def publish(request: ApprovalRequest) -> None:
+        published.append(request)
+
+    coordinator = ApprovalCoordinator(store, publisher=publish)
+    await coordinator.set_session_available("web:a", True)
+
+    with pytest.raises(ApprovalUnavailable, match="审批审计不可用"):
+        await coordinator.request(
+            session_id="web:a",
+            turn_id="turn-create-fail",
+            call_id="call-create-fail",
+            tool_name="shell",
+            operation="执行命令",
+            arguments={"command": "echo blocked"},
+            reason="需要授权",
+        )
+
+    assert published == []
+    assert await coordinator.pending_for_session("web:a") == []
+
+
+@pytest.mark.asyncio
+async def test_allowed_once_audit_failure_is_fail_closed() -> None:
+    store = ResolveFailStore()
+    published: list[ApprovalRequest] = []
+
+    async def publish(request: ApprovalRequest) -> None:
+        published.append(request)
+
+    coordinator = ApprovalCoordinator(store, publisher=publish)
+    await coordinator.set_session_available("web:a", True)
+    waiting = asyncio.create_task(coordinator.request(
+        session_id="web:a",
+        turn_id="turn-resolve-fail",
+        call_id="call-resolve-fail",
+        tool_name="shell",
+        operation="执行命令",
+        arguments={"command": "echo blocked"},
+        reason="需要授权",
+    ))
+    request = await _wait_for_request(published)
+
+    assert await coordinator.decide(request.id, "web:a", "allowed-once") == "unavailable"
+    assert await waiting == "unavailable"
+    assert await coordinator.pending_for_session("web:a") == []
+
+
+@pytest.mark.asyncio
+async def test_approval_wait_uses_monotonic_duration_when_wall_clock_moves_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_datetime = approval_module.datetime
+    wall_clock_values = iter(
+        (
+            real_datetime(2026, 9, 20, 12, 0, 1, tzinfo=approval_module._LOCAL_TZ),
+            real_datetime(2026, 9, 20, 11, 59, 1, tzinfo=approval_module._LOCAL_TZ),
+        )
+    )
+
+    class BackwardClock(real_datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> "BackwardClock":
+            value = next(wall_clock_values)
+            if tz is not None:
+                value = value.astimezone(tz)
+            return cls.fromtimestamp(value.timestamp(), tz=value.tzinfo)
+
+    monkeypatch.setattr(approval_module, "datetime", BackwardClock)
+    store = AuditStore()
+    published: list[ApprovalRequest] = []
+
+    async def publish(request: ApprovalRequest) -> None:
+        published.append(request)
+
+    coordinator = ApprovalCoordinator(store, publisher=publish)
+    await coordinator.set_session_available("web:a", True)
+    waiting = asyncio.create_task(coordinator.request(
+        session_id="web:a",
+        turn_id="turn-monotonic",
+        call_id="call-monotonic",
+        tool_name="shell",
+        operation="执行命令",
+        arguments={"command": "echo ok"},
+        reason="需要授权",
+    ))
+    request = await _wait_for_request(published)
+    assert await coordinator.decide(request.id, "web:a", "rejected") == "rejected"
+    assert await waiting == "rejected"
+
+    timing = await coordinator.timing_for_call(
+        "web:a",
+        "turn-monotonic",
+        "call-monotonic",
+    )
+    assert timing["approval_wait_ms"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_resolution_publisher_includes_call_identity_and_is_idempotent() -> None:
+    store = AuditStore()
+    published: list[ApprovalRequest] = []
+    resolutions: list[tuple[str, str, str, str, str | None]] = []
+
+    async def publish(request: ApprovalRequest) -> None:
+        published.append(request)
+
+    async def publish_resolution(
+        request: ApprovalRequest,
+        state: str,
+        decided_at: str,
+        error_code: str | None,
+    ) -> None:
+        resolutions.append((request.id, request.turn_id, request.call_id, state, error_code))
+
+    coordinator = ApprovalCoordinator(
+        store,
+        publisher=publish,
+        resolution_publisher=publish_resolution,
+    )
+    await coordinator.set_session_available("web:a", True)
+    waiting = asyncio.create_task(coordinator.request(
+        session_id="web:a",
+        turn_id="turn-resolution",
+        call_id="call-resolution",
+        tool_name="shell",
+        operation="执行命令",
+        arguments={"command": "echo ok"},
+        reason="需要授权",
+    ))
+    request = await _wait_for_request(published)
+
+    assert await coordinator.decide(request.id, "web:a", "rejected") == "rejected"
+    assert await waiting == "rejected"
+    # 迟到的重复 decision 只返回原结果，不重复发送 resolved 回执。
+    assert await coordinator.decide(request.id, "web:a", "allowed-once") == "rejected"
+    assert resolutions == [(request.id, "turn-resolution", "call-resolution", "rejected", "user_rejected")]
+
+
+@pytest.mark.asyncio
+async def test_disconnect_resolution_publisher_marks_unavailable() -> None:
+    store = AuditStore()
+    published: list[ApprovalRequest] = []
+    resolutions: list[tuple[str, str | None]] = []
+
+    async def publish(request: ApprovalRequest) -> None:
+        published.append(request)
+
+    async def publish_resolution(
+        _request: ApprovalRequest,
+        state: str,
+        _decided_at: str,
+        error_code: str | None,
+    ) -> None:
+        resolutions.append((state, error_code))
+
+    coordinator = ApprovalCoordinator(
+        store,
+        publisher=publish,
+        resolution_publisher=publish_resolution,
+    )
+    await coordinator.set_session_available("web:a", True)
+    waiting = asyncio.create_task(coordinator.request(
+        session_id="web:a",
+        turn_id="turn-disconnect",
+        call_id="call-disconnect",
+        tool_name="write_file",
+        operation="写入文件",
+        arguments={"path": "a.txt", "content": "x"},
+        reason="只读会话",
+    ))
+    await _wait_for_request(published)
+    await coordinator.set_session_available("web:a", False)
+
+    assert await waiting == "unavailable"
+    assert resolutions == [("unavailable", "unavailable")]
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_explicitly_expired_and_late_decision_is_idempotent() -> None:
+    store = AuditStore()
+    published: list[ApprovalRequest] = []
+    resolutions: list[tuple[str, str | None, str | None]] = []
+
+    async def publish(request: ApprovalRequest) -> None:
+        published.append(request)
+
+    async def publish_resolution(
+        request: ApprovalRequest,
+        state: str,
+        _decided_at: str,
+        error_code: str | None,
+        client_request_id: str | None,
+    ) -> None:
+        resolutions.append((state, error_code, client_request_id))
+        assert request.expires_at
+
+    coordinator = ApprovalCoordinator(
+        store,
+        publisher=publish,
+        resolution_publisher=publish_resolution,
+        timeout_seconds=1.0,
+    )
+    await coordinator.set_session_available("web:a", True)
+    waiting = asyncio.create_task(coordinator.request(
+        session_id="web:a",
+        turn_id="turn-expire",
+        call_id="call-expire",
+        tool_name="shell",
+        operation="执行命令",
+        arguments={"command": "echo wait"},
+        reason="需要授权",
+    ))
+    request = await _wait_for_request(published)
+
+    assert await waiting == "expired"
+    # 超时后的迟到点击只返回已收敛状态，不能重新触发回执或放行。
+    assert await coordinator.decide(
+        request.id,
+        "web:a",
+        "allowed-once",
+        client_request_id="late-decision",
+    ) == "expired"
+    assert resolutions == [("expired", "timeout", None)]
+    assert store.resolved[0][1] == "expired"
+
+
+@pytest.mark.asyncio
+async def test_five_argument_resolution_callback_receives_client_request_id() -> None:
+    store = AuditStore()
+    published: list[ApprovalRequest] = []
+    client_ids: list[str | None] = []
+
+    async def publish(request: ApprovalRequest) -> None:
+        published.append(request)
+
+    async def publish_resolution(
+        _request: ApprovalRequest,
+        _state: str,
+        _decided_at: str,
+        _error_code: str | None,
+        client_request_id: str | None,
+    ) -> None:
+        client_ids.append(client_request_id)
+
+    coordinator = ApprovalCoordinator(
+        store,
+        publisher=publish,
+        resolution_publisher=publish_resolution,
+    )
+    await coordinator.set_session_available("web:a", True)
+    waiting = asyncio.create_task(coordinator.request(
+        session_id="web:a",
+        turn_id="turn-client-id",
+        call_id="call-client-id",
+        tool_name="shell",
+        operation="执行命令",
+        arguments={"command": "echo ok"},
+        reason="需要授权",
+    ))
+    request = await _wait_for_request(published)
+    assert await coordinator.decide(
+        request.id,
+        "web:a",
+        "allowed-once",
+        client_request_id="decision-42",
+    ) == "allowed-once"
+    assert await waiting == "allowed-once"
+    assert client_ids == ["decision-42"]
+
+
+@pytest.mark.asyncio
+async def test_keyword_only_resolution_callback_receives_client_request_id() -> None:
+    store = AuditStore()
+    published: list[ApprovalRequest] = []
+    client_ids: list[str | None] = []
+
+    async def publish(request: ApprovalRequest) -> None:
+        published.append(request)
+
+    async def publish_resolution(
+        _request: ApprovalRequest,
+        _state: str,
+        _decided_at: str,
+        _error_code: str | None,
+        *,
+        client_request_id: str | None,
+    ) -> None:
+        client_ids.append(client_request_id)
+
+    coordinator = ApprovalCoordinator(
+        store,
+        publisher=publish,
+        resolution_publisher=publish_resolution,
+    )
+    await coordinator.set_session_available("web:a", True)
+    waiting = asyncio.create_task(coordinator.request(
+        session_id="web:a",
+        turn_id="turn-keyword-client-id",
+        call_id="call-keyword-client-id",
+        tool_name="shell",
+        operation="执行命令",
+        arguments={"command": "echo ok"},
+        reason="需要授权",
+    ))
+    request = await _wait_for_request(published)
+    assert await coordinator.decide(
+        request.id,
+        "web:a",
+        "rejected",
+        client_request_id="decision-keyword",
+    ) == "rejected"
+    assert await waiting == "rejected"
+    assert client_ids == ["decision-keyword"]
+
+
+@pytest.mark.asyncio
+async def test_blocked_resolution_publisher_cannot_block_decision() -> None:
+    store = AuditStore()
+    published: list[ApprovalRequest] = []
+    blocker = asyncio.Event()
+
+    async def publish(request: ApprovalRequest) -> None:
+        published.append(request)
+
+    async def blocked_resolution(
+        _request: ApprovalRequest,
+        _state: str,
+        _decided_at: str,
+        _error_code: str | None,
+        _client_request_id: str | None,
+    ) -> None:
+        await blocker.wait()
+
+    coordinator = ApprovalCoordinator(
+        store,
+        publisher=publish,
+        resolution_publisher=blocked_resolution,
+        resolution_timeout_seconds=0.05,
+    )
+    await coordinator.set_session_available("web:a", True)
+    waiting = asyncio.create_task(coordinator.request(
+        session_id="web:a",
+        turn_id="turn-blocked-publisher",
+        call_id="call-blocked-publisher",
+        tool_name="shell",
+        operation="执行命令",
+        arguments={"command": "echo ok"},
+        reason="需要授权",
+    ))
+    request = await _wait_for_request(published)
+
+    # 即使 UI 事件处理器永久等待，决定也必须在超时窗口内返回，且工具
+    # Future 已收到明确终态。
+    assert await coordinator.decide(
+        request.id,
+        "web:a",
+        "allowed-once",
+        client_request_id="decision-blocked",
+    ) == "allowed-once"
+    assert await waiting == "allowed-once"

@@ -22,7 +22,7 @@ from PIL import Image, UnidentifiedImageError
 from agent.agent_loop import AgentLoop
 from agent.channel import WebChannel
 from agent.config_models import Config
-from agent.event_bus import EventBus, SandboxApprovalRequested
+from agent.event_bus import EventBus, SandboxApprovalRequested, SandboxApprovalResolved
 from agent.message_bus import MessageBus
 from agent.mcp.manage_tools import McpAddTool, McpListTool, McpRemoveTool
 from agent.mcp.registry import McpServerRegistry
@@ -32,6 +32,7 @@ from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt
 from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import LLMProvider, create_vision_provider
 from agent.skills import SkillsLoader
+from agent.tool_projection import project_tool_call, project_tool_chain
 from bootstrap.native_folder_picker import (
     DirectoryPicker,
     NativeHostError,
@@ -104,13 +105,16 @@ _MODEL_ONLY_MESSAGE_FIELDS = frozenset({
 
 
 def _public_chat_message(message: dict[str, Any]) -> dict[str, Any]:
-    """聊天接口只返回语义消息，隐藏模型侧 Prompt 投影。"""
+    """聊天接口只返回语义消息和安全的工具展示投影。"""
 
-    return {
+    public = {
         key: value
         for key, value in message.items()
         if key not in _MODEL_ONLY_MESSAGE_FIELDS
     }
+    if "tool_chain" in public:
+        public["tool_chain"] = project_tool_chain(public.get("tool_chain"))
+    return public
 
 
 class MemoryMaintenanceLoop:
@@ -339,7 +343,29 @@ def build_core_runtime(
             SandboxApprovalRequested(request.session_id, request.to_wire())
         )
 
+    async def publish_approval_resolution(
+        request: Any,
+        state: str,
+        decided_at: str,
+        error_code: str | None,
+        client_request_id: str | None = None,
+    ) -> None:
+        # 终态回执由 coordinator 统一发出；迟到的重复 decide 不会再次进入
+        # _finish，因此不会产生重复审批卡或把已结束工具回退为 pending。
+        await events.emit(SandboxApprovalResolved(
+            session_key=request.session_id,
+            request_id=request.id,
+            turn_id=request.turn_id,
+            call_id=request.call_id,
+            state=state,
+            decision=state if state in {"allowed-once", "rejected"} else None,
+            decided_at=decided_at,
+            error_code=error_code,
+            client_request_id=client_request_id,
+        ))
+
     sandbox_approvals.set_publisher(publish_approval)
+    sandbox_approvals.set_resolution_publisher(publish_approval_resolution)
     sandbox_guard = SandboxGuard(sandbox_policy, sandbox_approvals)
     sandbox_runtime = SandboxProcessRuntime(sandbox_policy)
     mutation_broker = FilesystemMutationBroker(sandbox_policy, sandbox_runtime)
@@ -1193,13 +1219,35 @@ def _append_running_snapshot(
     for tool in snapshot.get("tools") or []:
         if not isinstance(tool, dict):
             continue
-        tools.append({
-            "call_id": str(tool.get("call_id") or ""),
-            "name": str(tool.get("name") or "tool"),
-            "arguments": tool.get("arguments") if isinstance(tool.get("arguments"), dict) else {},
-            "result": str(tool.get("result_preview") or ""),
-            "status": str(tool.get("status") or "running"),
-        })
+        tool_item = project_tool_call(tool)
+        # running snapshot 只允许有限状态，未知值必须保守显示。
+        status = str(tool.get("status") or "running").strip().lower()
+        tool_item["status"] = (
+            "completed" if status == "ok" else status
+            if status in {"running", "completed", "error", "interrupted", "cancelled", "expired", "unavailable", "rejected", "unknown"}
+            else "unknown"
+        )
+        # 运行快照只投影已知的可选计时字段；旧快照缺失时保持旧 JSON 形状。
+        for key in (
+            "started_at",
+            "ended_at",
+            "approval_requested_at",
+            "approval_resolved_at",
+        ):
+            value = str(tool.get(key) or "").strip()
+            if value:
+                tool_item[key] = value
+        for key in ("duration_ms", "approval_wait_ms", "execution_ms", "group_duration_ms"):
+            value = tool.get(key)
+            if value is None:
+                continue
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if number >= 0:
+                tool_item[key] = number
+        tools.append(tool_item)
     return [
         *items,
         {
