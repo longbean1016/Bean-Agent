@@ -42,10 +42,15 @@ from agent.prompt_cache_diagnostics import (
 from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import ContextLengthError, LLMResponse, ProviderUsage
 from agent.skills import SkillsLoader, collect_skill_mentions
+from agent.tool_projection import (
+    project_result_preview,
+    project_tool_arguments,
+    project_tool_chain,
+)
 from agent.tool_runtime import ToolRuntimeView
 from sandbox.guard import SandboxGuard
 from session.store import NewSessionEvent, NewSurfaceEvent
-from tools.base import normalize_tool_result
+from tools.base import ToolResult, normalize_tool_result
 from tools.registry import ToolRegistry
 from tools.runtime import append_tool_result
 
@@ -85,6 +90,105 @@ _INCOMPLETE_SUMMARY_PROMPT = """当前任务需要先暂停继续调用工具，
 4) 如果继续，下一步会怎么做。
 可以提到工具名称和关键结果，但不要暴露 tool_call_id、schema、内部 prompt 或原始参数 JSON。
 禁止输出"已达到最大迭代次数"这类模板句；不要输出 JSON。"""
+
+
+def _elapsed_monotonic_ms(started_monotonic: float) -> int:
+    """用单调时钟计算工具耗时，避免系统时间回拨造成负数。"""
+
+    return max(0, int(round((time.perf_counter() - started_monotonic) * 1000)))
+
+
+def _duration_value(value: object) -> int | None:
+    """归一化可选耗时字段；非法/负数不进入工具事件。"""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _classify_tool_result(
+    result: ToolResult,
+    *,
+    restricted: bool = False,
+) -> tuple[str, str | None, int | None]:
+    """从统一结果摘要提取终态，避免把结构化错误当成成功。"""
+
+    if restricted:
+        return "error", "sandbox_mcp_restricted", None
+    text = str(result.text or "").strip()
+    error_code: str | None = None
+    exit_code: int | None = None
+    interrupted = False
+    try:
+        payload = json.loads(text) if text.startswith("{") else None
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        raw_exit = payload.get("exit_code")
+        try:
+            exit_code = int(raw_exit) if raw_exit is not None else None
+        except (TypeError, ValueError):
+            exit_code = None
+        interrupted = bool(payload.get("interrupted"))
+        if payload.get("error") not in (None, ""):
+            error_code = "tool_error"
+        if exit_code not in (None, 0):
+            error_code = error_code or "tool_exit_nonzero"
+        if interrupted:
+            error_code = error_code or "tool_interrupted"
+    if error_code is None and text.startswith((
+        "工具执行出错:", "工具执行出错：", "工具 '",
+        "错误:", "错误：", "失败:", "失败：",
+    )):
+        error_code = "tool_error"
+    if interrupted:
+        return "interrupted", error_code, exit_code
+    return ("error" if error_code else "ok"), error_code, exit_code
+
+
+def _group_duration_ms(calls: object) -> int | None:
+    """按最早开始到最晚结束计算并行工具组墙钟耗时。"""
+
+    if not isinstance(calls, list):
+        return None
+    starts: list[datetime] = []
+    ends: list[datetime] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        started = _parse_iso_datetime(call.get("started_at"))
+        ended = _parse_iso_datetime(call.get("ended_at"))
+        if started is not None:
+            starts.append(started)
+        if ended is not None:
+            ends.append(ended)
+    if not starts or not ends:
+        return None
+    # 旧历史可能没有时区，而新事件统一使用带时区的 ISO 时间。先归一化到
+    # 同一时区再计算，避免 aware/naive 相减直接抛 TypeError 让 UI 组摘要失败。
+    normalized_starts = [_as_local_datetime(value) for value in starts]
+    normalized_ends = [_as_local_datetime(value) for value in ends]
+    return max(0, int(round((max(normalized_ends) - min(normalized_starts)).total_seconds() * 1000)))
+
+
+def _parse_iso_datetime(value: object) -> datetime | None:
+    try:
+        text = str(value or "").strip()
+        return datetime.fromisoformat(text) if text else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_local_datetime(value: datetime) -> datetime:
+    """把历史中的 naive 时间按本地时区解释，避免混合时区计算异常。"""
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=_LOCAL_TZ)
+    return value.astimezone(_LOCAL_TZ)
 
 
 class Pipeline:
@@ -142,6 +246,9 @@ class Pipeline:
         self._provider_manager = provider_manager
         # 中断快照只服务于当前进程内的停止/续跑语义，不进入 Session 或长期记忆。
         self._interrupt_snapshots: dict[str, dict[str, Any]] = {}
+        # 工具起点的单调时钟只保存在进程内，用于取消/异常时补算终态耗时；
+        # 不把不可序列化的时钟值泄漏到运行快照或历史消息。
+        self._tool_monotonic_starts: dict[str, dict[str, float]] = {}
         # 只保存每个会话最近一次供应商 usage 锚点；完整快照由 SessionStore
         # 持久化，进程重启或 WebSocket 重连都不会依赖这份内存缓存。
         self._context_measurements: dict[str, dict[str, Any]] = {}
@@ -179,6 +286,7 @@ class Pipeline:
             "llm_surface_persisted": False,
             "turn_started_at": turn_started_at,
         }
+        self._tool_monotonic_starts[turn_id] = {}
         if self._event_appender is not None:
             await self._event_appender(NewSessionEvent(
                 session_key=message.session_key,
@@ -353,6 +461,7 @@ class Pipeline:
             source_kind: str,
             operation_suffix: str,
             status: str = "committed",
+            tool_timing: dict[str, Any] | None = None,
         ) -> None:
             """按 Provider 发送顺序写入 durable surface；无写入器时保留旧测试路径。"""
 
@@ -386,10 +495,34 @@ class Pipeline:
                 "tool_result": "tool/result",
             }.get(source_kind)
             if event_type:
+                event_data: dict[str, Any] = {"message": deepcopy(model_message)}
+                # tool/result 事件与 surface 共用同一条持久化链；把计时放在
+                # 事件数据而不是模型消息中，避免把 UI 元数据发送给 Provider。
+                if event_type == "tool/result" and tool_timing:
+                    event_data.update({
+                        key: value
+                        for key, value in tool_timing.items()
+                        if key in {
+                            "call_id",
+                            "started_at",
+                            "ended_at",
+                            "duration_ms",
+                            "approval_requested_at",
+                            "approval_resolved_at",
+                            "approval_wait_ms",
+                            "execution_ms",
+                            "group_duration_ms",
+                            "result_kind",
+                            "is_truncated",
+                            "exit_code",
+                            "error_code",
+                        }
+                        and value is not None
+                    })
                 await append_session_event(
                     event_type,
                     iteration=iteration,
-                    data={"message": deepcopy(model_message)},
+                    data=event_data,
                     operation_suffix=f"{iteration}:{operation_suffix}:message",
                     source_event_seqs=(
                         list(chunk_event_seqs.get(iteration, []))
@@ -1025,8 +1158,51 @@ class Pipeline:
             sync_surface_snapshot()
             group: dict[str, Any] = {"iteration": iteration, "text": response.content or "", "calls": [], "provider_fields": dict(response.provider_fields)}
             for call in response.tool_calls:
+                # 起点必须在任何执行或授权等待之前记录；后续审批不会重置计时。
+                tool_started_at = datetime.now(_LOCAL_TZ).isoformat()
+                tool_started_monotonic = time.perf_counter()
                 if call.name not in tool_view.visible_names:
+                    # 即使工具不在当前可见集合，也要发出完整生命周期；否则
+                    # 前端只会看到模型返回后突然出现的错误结果，无法解释耗时。
+                    await append_session_event(
+                        "tool/call",
+                        iteration=iteration,
+                        data={
+                            "call_id": call.id,
+                            "name": call.name,
+                            "arguments": project_tool_arguments(call.name, call.arguments),
+                            "started_at": tool_started_at,
+                        },
+                        operation_suffix=f"{iteration}:tool-call:{call.id}",
+                    )
+                    self._upsert_interrupt_tool(
+                        turn_id,
+                        call_id=call.id,
+                        name=call.name,
+                        arguments=dict(call.arguments),
+                        status="running",
+                        result_preview="",
+                        started_at=tool_started_at,
+                    )
+                    self._tool_monotonic_starts.setdefault(turn_id, {})[call.id] = (
+                        tool_started_monotonic
+                    )
+                    if not suppress_stream:
+                        await self._events.emit(ToolCallStarted(
+                            message.session_key,
+                            turn_id,
+                            call.id,
+                            call.name,
+                            project_tool_arguments(call.name, call.arguments),
+                            tool_started_at,
+                        ))
                     result = normalize_tool_result(f"工具 '{call.name}' 未被当前执行上下文授权")
+                    tool_ended_at = datetime.now(_LOCAL_TZ).isoformat()
+                    tool_duration_ms = _elapsed_monotonic_ms(tool_started_monotonic)
+                    raw_preview = result.preview()
+                    preview = raw_preview[:500]
+                    result_kind = "multimodal" if result.content_blocks else ("text" if result.text else "empty")
+                    is_truncated = len(raw_preview) > len(preview)
                     before_tool_messages = len(react_messages)
                     append_tool_result(react_messages, tool_call_id=call.id, content=result, tool_name=call.name)
                     llm_surface_messages.extend(
@@ -1038,9 +1214,64 @@ class Pipeline:
                             iteration=iteration,
                             source_kind="tool_result",
                             operation_suffix=f"tool-result-{call.id}-{offset}",
+                            tool_timing={
+                                "call_id": call.id,
+                                "started_at": tool_started_at,
+                                "ended_at": tool_ended_at,
+                                "duration_ms": tool_duration_ms,
+                                "result_kind": result_kind,
+                                "is_truncated": is_truncated,
+                                "error_code": "tool_not_visible",
+                            },
                         )
                     sync_surface_snapshot()
-                    group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "content_blocks": deepcopy(result.content_blocks), "status": "error"})
+                    self._upsert_interrupt_tool(
+                        turn_id,
+                        call_id=call.id,
+                        name=call.name,
+                        arguments=dict(call.arguments),
+                        status="error",
+                        result_preview=preview,
+                        started_at=tool_started_at,
+                        ended_at=tool_ended_at,
+                        duration_ms=tool_duration_ms,
+                        timing={
+                            "result_kind": result_kind,
+                            "is_truncated": is_truncated,
+                            "error_code": "tool_not_visible",
+                        },
+                    )
+                    self._tool_monotonic_starts.get(turn_id, {}).pop(call.id, None)
+                    if not suppress_stream:
+                        await self._events.emit(ToolCallCompleted(
+                            message.session_key,
+                            turn_id,
+                            call.id,
+                            call.name,
+                            "error",
+                            project_result_preview(preview),
+                            tool_started_at,
+                            tool_ended_at,
+                            tool_duration_ms,
+                            result_kind=result_kind,
+                            is_truncated=is_truncated,
+                            error_code="tool_not_visible",
+                        ))
+                    group["calls"].append({
+                        "call_id": call.id,
+                        "name": call.name,
+                        "arguments": dict(call.arguments),
+                        "result": result.text,
+                        "content_blocks": deepcopy(result.content_blocks),
+                        "status": "error",
+                        "started_at": tool_started_at,
+                        "ended_at": tool_ended_at,
+                        "duration_ms": tool_duration_ms,
+                        "result_kind": result_kind,
+                        "is_truncated": is_truncated,
+                        "error_code": "tool_not_visible",
+                    })
+                    tools_used.append(call.name)
                     continue
                 await append_session_event(
                     "tool/call",
@@ -1048,21 +1279,36 @@ class Pipeline:
                     data={
                         "call_id": call.id,
                         "name": call.name,
-                        "arguments": deepcopy(call.arguments),
+                        # session event 是展示/审计投影；模型侧 assistant surface
+                        # 仍单独保留完整参数供下一轮推理，不从这里读取。
+                        "arguments": project_tool_arguments(call.name, call.arguments),
+                        "started_at": tool_started_at,
                     },
                     operation_suffix=f"{iteration}:tool-call:{call.id}",
                 )
+                # 先写入运行中快照，再发实时事件；刷新重连正好发生在事件前后时，
+                # 订阅端都能恢复工具图标。即使 suppress_stream，也要保留历史快照。
+                self._upsert_interrupt_tool(
+                    turn_id,
+                    call_id=call.id,
+                    name=call.name,
+                    arguments=dict(call.arguments),
+                    status="running",
+                    result_preview="",
+                    started_at=tool_started_at,
+                )
+                self._tool_monotonic_starts.setdefault(turn_id, {})[call.id] = (
+                    tool_started_monotonic
+                )
                 if not suppress_stream:
-                    # 先写入运行中快照，再发实时事件；刷新重连正好发生在事件前后时，订阅端都能恢复工具图标。
-                    self._upsert_interrupt_tool(
+                    await self._events.emit(ToolCallStarted(
+                        message.session_key,
                         turn_id,
-                        call_id=call.id,
-                        name=call.name,
-                        arguments=dict(call.arguments),
-                        status="running",
-                        result_preview="",
-                    )
-                    await self._events.emit(ToolCallStarted(message.session_key, turn_id, call.id, call.name, dict(call.arguments)))
+                        call.id,
+                        call.name,
+                        project_tool_arguments(call.name, call.arguments),
+                        tool_started_at,
+                    ))
                 execution_context: dict[str, Any] = tool_view.context
                 execution_context.update({
                     "session_key": message.session_key,
@@ -1109,7 +1355,27 @@ class Pipeline:
                     except (json.JSONDecodeError, AttributeError):
                         # 搜索结果异常只表示本次没有解锁，原工具结果仍完整交给模型。
                         logger.warning("tool_search 返回了无法解析的结果")
-                status = "error" if result.text.startswith("工具执行出错:") or result.text.startswith("工具 '") else "ok"
+                status, error_code, exit_code = _classify_tool_result(
+                    result,
+                    restricted=mcp_restricted,
+                )
+                tool_ended_at = datetime.now(_LOCAL_TZ).isoformat()
+                tool_duration_ms = _elapsed_monotonic_ms(tool_started_monotonic)
+                approval_timing = await self._approval_timing(
+                    message.session_key,
+                    turn_id,
+                    call.id,
+                )
+                approval_wait_ms = _duration_value(approval_timing.get("approval_wait_ms"))
+                execution_ms = (
+                    max(0, tool_duration_ms - approval_wait_ms)
+                    if approval_wait_ms is not None
+                    else None
+                )
+                raw_preview = result.preview()
+                preview = raw_preview[:500]
+                result_kind = "multimodal" if result.content_blocks else ("text" if result.text else "empty")
+                is_truncated = len(raw_preview) > len(preview)
                 before_tool_messages = len(react_messages)
                 append_tool_result(react_messages, tool_call_id=call.id, content=result, tool_name=call.name)
                 llm_surface_messages.extend(
@@ -1121,26 +1387,107 @@ class Pipeline:
                         iteration=iteration,
                         source_kind="tool_result",
                         operation_suffix=f"tool-result-{call.id}-{offset}",
+                        tool_timing={
+                            "call_id": call.id,
+                            "started_at": tool_started_at,
+                            "ended_at": tool_ended_at,
+                            "duration_ms": tool_duration_ms,
+                            **approval_timing,
+                            **({"execution_ms": execution_ms} if execution_ms is not None else {}),
+                            "result_kind": result_kind,
+                            "is_truncated": is_truncated,
+                            "exit_code": exit_code,
+                            **({"error_code": error_code} if error_code else {}),
+                        },
                     )
                 sync_surface_snapshot()
+                # 完成态同样先落快照再发事件，避免刷新窗口里看到旧的 running 状态。
+                self._upsert_interrupt_tool(
+                    turn_id,
+                    call_id=call.id,
+                    name=call.name,
+                    arguments=dict(call.arguments),
+                    status="error" if status == "error" else "interrupted" if status == "interrupted" else "completed",
+                    result_preview=preview,
+                    started_at=tool_started_at,
+                    ended_at=tool_ended_at,
+                    duration_ms=tool_duration_ms,
+                    timing={
+                        **approval_timing,
+                        **({"execution_ms": execution_ms} if execution_ms is not None else {}),
+                        "result_kind": result_kind,
+                        "is_truncated": is_truncated,
+                        "exit_code": exit_code,
+                        **({"error_code": error_code} if error_code else {}),
+                    },
+                )
+                self._tool_monotonic_starts.get(turn_id, {}).pop(call.id, None)
                 if not suppress_stream:
-                    preview = result.preview()[:500]
-                    # 完成态同样先落快照再发事件，避免刷新窗口里看到旧的 running 状态。
-                    self._upsert_interrupt_tool(
+                    await self._events.emit(ToolCallCompleted(
+                        message.session_key,
                         turn_id,
-                        call_id=call.id,
-                        name=call.name,
-                        arguments=dict(call.arguments),
-                        status="error" if status == "error" else "completed",
-                        result_preview=preview,
-                    )
-                    await self._events.emit(ToolCallCompleted(message.session_key, turn_id, call.id, call.name, status, preview))
-                group["calls"].append({"call_id": call.id, "name": call.name, "arguments": dict(call.arguments), "result": result.text, "content_blocks": deepcopy(result.content_blocks), "status": status})
+                        call.id,
+                        call.name,
+                        status,
+                        project_result_preview(preview),
+                        tool_started_at,
+                        tool_ended_at,
+                        tool_duration_ms,
+                        approval_requested_at=approval_timing.get("approval_requested_at"),
+                        approval_resolved_at=approval_timing.get("approval_resolved_at"),
+                        approval_wait_ms=approval_wait_ms,
+                        execution_ms=execution_ms,
+                        result_kind=result_kind,
+                        is_truncated=is_truncated,
+                        exit_code=exit_code,
+                        error_code=error_code,
+                    ))
+                group["calls"].append({
+                    "call_id": call.id,
+                    "name": call.name,
+                    "arguments": dict(call.arguments),
+                    "result": result.text,
+                    "content_blocks": deepcopy(result.content_blocks),
+                    "status": status,
+                    "started_at": tool_started_at,
+                    "ended_at": tool_ended_at,
+                    "duration_ms": tool_duration_ms,
+                    **approval_timing,
+                    **({"execution_ms": execution_ms} if execution_ms is not None else {}),
+                    "result_kind": result_kind,
+                    "is_truncated": is_truncated,
+                    "exit_code": exit_code,
+                    **({"error_code": error_code} if error_code else {}),
+                })
                 tools_used.append(call.name)
                 # 一组内后续工具也可能阻塞或被取消；每完成一个调用就刷新快照，避免丢失已完成结果。
                 snapshot = self._interrupt_snapshots[turn_id]
                 snapshot["tools_used"] = list(dict.fromkeys(tools_used))
-                snapshot["tool_chain_partial"] = deepcopy([*tool_chain, group])
+                # 中断/重连快照对外只保存安全投影；原始链仅留在当前模型请求内存。
+                snapshot["tool_chain_partial"] = project_tool_chain([*tool_chain, group])
+            group_duration_ms = _group_duration_ms(group.get("calls"))
+            if group_duration_ms is not None:
+                group["group_duration_ms"] = group_duration_ms
+                for call_item in group.get("calls", []):
+                    if isinstance(call_item, dict):
+                        call_item["group_duration_ms"] = group_duration_ms
+                # 已完成调用的重连快照也带上并行组墙钟耗时；不把并行调用
+                # 简单相加，避免 UI 误读为串行总时长。
+                snapshot_tools = self._interrupt_snapshots.get(turn_id, {}).get("tools", [])
+                for snapshot_tool in snapshot_tools:
+                    if not isinstance(snapshot_tool, dict):
+                        continue
+                    if any(
+                        str(item.get("call_id") or "") == str(snapshot_tool.get("call_id") or "")
+                        for item in group.get("calls", [])
+                        if isinstance(item, dict)
+                    ):
+                        snapshot_tool["group_duration_ms"] = group_duration_ms
+                # group_duration 在当前 group 完成后才可计算；重新投影链，
+                # 让重连收到的 tool_chain_partial 与 tools 快照保持同一口径。
+                snapshot = self._interrupt_snapshots.get(turn_id)
+                if snapshot is not None:
+                    snapshot["tool_chain_partial"] = project_tool_chain([*tool_chain, group])
             tool_chain.append(group)
             await append_session_event(
                 "step/end",
@@ -1218,6 +1565,10 @@ class Pipeline:
         arguments: dict[str, Any],
         status: str,
         result_preview: str,
+        started_at: str | None = None,
+        ended_at: str | None = None,
+        duration_ms: int | None = None,
+        timing: dict[str, Any] | None = None,
     ) -> None:
         """维护当前进程内 running turn 的工具快照，供刷新/重连后补发 UI 状态。"""
 
@@ -1228,10 +1579,47 @@ class Pipeline:
         item = {
             "call_id": call_id,
             "name": name,
-            "arguments": deepcopy(arguments),
+            "arguments": project_tool_arguments(name, arguments),
             "status": status,
-            "result_preview": result_preview,
+            "result_preview": project_result_preview(result_preview),
         }
+        # 仅在已有值时写入可选字段，旧快照和测试夹具仍保持原有 JSON 形状。
+        for key, value in (("started_at", started_at), ("ended_at", ended_at)):
+            if value:
+                item[key] = str(value)
+        normalized_duration = _duration_value(duration_ms)
+        if normalized_duration is not None:
+            item["duration_ms"] = normalized_duration
+        if isinstance(timing, dict):
+            for key in (
+                "approval_requested_at",
+                "approval_resolved_at",
+                "approval_wait_ms",
+                "execution_ms",
+                "group_duration_ms",
+            ):
+                value = timing.get(key)
+                if key.endswith("_ms"):
+                    number = _duration_value(value)
+                    if number is not None:
+                        item[key] = number
+                elif value:
+                    item[key] = str(value)
+            # 结果诊断字段只接受有限标量，避免把完整结果、content blocks
+            # 或供应商扩展对象意外带入重连快照。
+            for key in ("result_kind", "error_code"):
+                value = timing.get(key)
+                if value is not None and str(value).strip():
+                    item[key] = str(value).strip()[:80]
+            if timing.get("is_truncated") is not None:
+                item["is_truncated"] = bool(timing.get("is_truncated"))
+            if timing.get("exit_code") is not None:
+                try:
+                    exit_code = int(timing.get("exit_code"))
+                except (TypeError, ValueError):
+                    exit_code = -1
+                if exit_code != -1 or timing.get("exit_code") in (-1, "-1"):
+                    item["exit_code"] = exit_code
         for index, existing in enumerate(tools):
             if existing.get("call_id") == call_id:
                 tools[index] = item
@@ -1242,6 +1630,35 @@ class Pipeline:
         """Turn 结束后幂等释放纯内存快照。"""
 
         self._interrupt_snapshots.pop(turn_id, None)
+        self._tool_monotonic_starts.pop(turn_id, None)
+
+    def interrupt_tool_durations(self, turn_id: str) -> dict[str, int]:
+        """返回当前未结束工具截至此刻的单调耗时，供取消路径固定终态。"""
+
+        now = time.perf_counter()
+        return {
+            call_id: max(0, int(round((now - started) * 1000)))
+            for call_id, started in self._tool_monotonic_starts.get(turn_id, {}).items()
+        }
+
+    async def _approval_timing(
+        self,
+        session_key: str,
+        turn_id: str,
+        call_id: str,
+    ) -> dict[str, Any]:
+        """读取审批协调器的已记录时间；没有审批时保持空投影。"""
+
+        guard = self._sandbox_guard
+        reader = getattr(guard, "approval_timing", None) if guard is not None else None
+        if not callable(reader):
+            return {}
+        try:
+            value = await reader(session_key, turn_id, call_id)
+        except Exception:
+            logger.debug("读取工具审批计时失败", exc_info=True)
+            return {}
+        return dict(value) if isinstance(value, dict) else {}
 
     async def _record_session_usage(
         self,

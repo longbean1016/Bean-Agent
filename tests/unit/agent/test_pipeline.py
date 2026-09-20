@@ -127,10 +127,13 @@ async def test_restricted_session_does_not_execute_mcp_tool(tmp_path: Path) -> N
     registry = ToolRegistry()
     registry.register(tool, source_type="mcp", source_name="demo")
     provider = McpProvider()
+    events = EventBus()
+    completed: list[ToolCallCompleted] = []
+    events.on(ToolCallCompleted, completed.append)
     pipeline = Pipeline(
         provider,
         registry,
-        EventBus(),
+        events,
         _assembler(tmp_path),
         workspace=str(tmp_path),
         sandbox_guard=SimpleNamespace(
@@ -138,13 +141,16 @@ async def test_restricted_session_does_not_execute_mcp_tool(tmp_path: Path) -> N
         ),
     )
 
-    await pipeline.process(
+    result = await pipeline.process(
         InboundMessage("web", "u", "restricted", "调用扩展"),
         turn_id="turn-mcp",
     )
 
     assert tool.calls == 0
     assert "完全访问会话" in str(provider.messages[1])
+    assert completed[-1].status == "error"
+    assert completed[-1].error_code == "sandbox_mcp_restricted"
+    assert result.tool_chain[0]["calls"][0]["status"] == "error"
 
 
 @pytest.mark.asyncio
@@ -543,8 +549,17 @@ async def test_pipeline_runs_tool_loop_and_emits_lifecycle_events() -> None:
     assert result.final_reasoning == "推理"
     assert result.tools_used == ["echo"]
     assert result.tool_chain[0]["calls"][0]["result"] == "echo:hi:web:c"
+    tool_call = result.tool_chain[0]["calls"][0]
+    assert isinstance(tool_call["started_at"], str)
+    assert isinstance(tool_call["ended_at"], str)
+    assert isinstance(tool_call["duration_ms"], int)
+    assert tool_call["duration_ms"] >= 0
     assert any(isinstance(event, ToolCallStarted) for event in seen)
     assert any(isinstance(event, ToolCallCompleted) for event in seen)
+    completed_event = next(event for event in seen if isinstance(event, ToolCallCompleted))
+    assert completed_event.started_at == tool_call["started_at"]
+    assert completed_event.ended_at == tool_call["ended_at"]
+    assert completed_event.duration_ms == tool_call["duration_ms"]
     assert any(isinstance(event, StreamDeltaReady) for event in seen)
     assert provider.messages[1][-1]["role"] == "tool"
 
@@ -581,20 +596,25 @@ async def test_pipeline_snapshot_tracks_running_and_completed_tool_state() -> No
     )
 
     assert result.content == "done"
-    assert started_snapshot == [{
-        "call_id": "call-1",
-        "name": "blocking_echo",
-        "arguments": {"text": "hi"},
-        "status": "running",
-        "result_preview": "",
-    }]
-    assert completed_snapshot == [{
-        "call_id": "call-1",
-        "name": "blocking_echo",
-        "arguments": {"text": "hi"},
-        "status": "completed",
-        "result_preview": "blocked:hi:web:c",
-    }]
+    assert len(started_snapshot) == 1
+    assert started_snapshot[0]["call_id"] == "call-1"
+    assert started_snapshot[0]["name"] == "blocking_echo"
+    assert started_snapshot[0]["arguments"] == {"text": "hi"}
+    assert started_snapshot[0]["status"] == "running"
+    assert started_snapshot[0]["result_preview"] == ""
+    assert isinstance(started_snapshot[0].get("started_at"), str)
+    assert len(completed_snapshot) == 1
+    assert completed_snapshot[0]["call_id"] == "call-1"
+    assert completed_snapshot[0]["name"] == "blocking_echo"
+    assert completed_snapshot[0]["arguments"] == {"text": "hi"}
+    assert completed_snapshot[0]["status"] == "completed"
+    assert completed_snapshot[0]["result_preview"] == "blocked:hi:web:c"
+    assert isinstance(completed_snapshot[0].get("started_at"), str)
+    assert isinstance(completed_snapshot[0].get("ended_at"), str)
+    assert isinstance(completed_snapshot[0].get("duration_ms"), int)
+    assert completed_snapshot[0]["duration_ms"] >= 0
+    assert completed_snapshot[0]["result_kind"] == "text"
+    assert completed_snapshot[0]["is_truncated"] is False
 
 
 @pytest.mark.asyncio

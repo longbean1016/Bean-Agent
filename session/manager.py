@@ -192,13 +192,16 @@ class Session:
                         call for call in calls
                         if isinstance(call, dict)
                         and str(call.get("status") or "")
-                        in {"ok", "completed", "error", "running", "interrupted"}
+                        in {
+                            "ok", "completed", "error", "running", "interrupted",
+                            "cancelled", "expired", "unavailable", "rejected", "unknown",
+                        }
                     ]
                 if not calls:
                     continue
                 assistant_message: dict[str, Any] = {
                     "role": "assistant",
-                    "content": group.get("text"),
+                    "content": group.get("_model_text", group.get("text")),
                     "tool_calls": [
                         {
                             "id": call["call_id"],
@@ -206,7 +209,8 @@ class Session:
                             "function": {
                                 "name": call["name"],
                                 "arguments": json.dumps(
-                                    call.get("arguments", {}), ensure_ascii=False
+                                    call.get("_model_arguments", call.get("arguments", {})),
+                                    ensure_ascii=False,
                                 ),
                             },
                         }
@@ -223,18 +227,22 @@ class Session:
                     assistant_message["reasoning_content"] = reasoning
                 history.append(assistant_message)
                 for call in calls:
-                    interrupted_call = interrupted and str(call.get("status") or "") in {
-                        "running", "interrupted"
+                    # 工具链可能在 Turn 的异常终态中才被补写；此时 assistant
+                    # 状态是 ``error`` 而不是 ``interrupted``，未完成调用仍必须
+                    # 用确定性的占位结果闭合模型消息，不能伪装成空成功结果。
+                    interrupted_call = str(call.get("status") or "") in {
+                        "running", "interrupted", "unknown"
                     }
-                    content_blocks = call.get("content_blocks")
+                    content_blocks = call.get("_model_content_blocks", call.get("content_blocks"))
+                    model_result = call.get("_model_result", call.get("result", ""))
                     tool_content: str | ToolResult = (
                         INTERRUPTED_TOOL_RESULT_CONTENT
                         if interrupted_call
-                        else str(call.get("result", ""))
+                        else str(model_result)
                     )
                     if not interrupted_call and isinstance(content_blocks, list) and content_blocks:
                         tool_content = ToolResult(
-                            text=str(call.get("result", "")),
+                            text=str(model_result),
                             content_blocks=[
                                 dict(block)
                                 for block in content_blocks
