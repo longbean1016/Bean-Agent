@@ -262,16 +262,25 @@ export async function refreshConnectionModels(id: string): Promise<{ items: Mode
   return settingsRequest(`/api/settings/connections/${encodeURIComponent(id)}/models/refresh`, { method: "POST" });
 }
 
-export async function testConnectionModel(connectionId: string, modelId: string): Promise<{
+export async function testConnectionModel(connectionId: string, modelId: string, reasoning_effort?: string | null, probe_type?: "basic" | "reasoning" | "tool_call"): Promise<{
   ok: boolean;
   connection_id: string;
   connection_name: string;
   model_id: string;
   model_display_name: string;
   adapter: string;
+  requested_effort?: string | null;
+  effective_effort?: string | null;
+  thinking_received?: boolean;
+  probe_type?: "basic" | "reasoning" | "tool_call";
+  tool_call_received?: boolean;
   duration_ms: number;
 }> {
-  return settingsRequest(`/api/settings/connections/${encodeURIComponent(connectionId)}/models/${encodeURIComponent(modelId)}/test`, { method: "POST" });
+  return settingsRequest(`/api/settings/connections/${encodeURIComponent(connectionId)}/models/${encodeURIComponent(modelId)}/test`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ reasoning_effort: reasoning_effort || null, probe_type: probe_type || null }),
+  });
 }
 
 export async function createManualModel(id: string, values: Record<string, unknown>): Promise<ModelProfile> {

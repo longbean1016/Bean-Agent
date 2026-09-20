@@ -15,7 +15,7 @@ import {
   updateModelProfile,
 } from "./api";
 import type { ModelAdapterId, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload } from "./types";
-import { REASONING_CHOICES, updateReasoningOptions } from "./reasoning";
+import { REASONING_CHOICES, reasoningStatusForModel, updateReasoningOptions } from "./reasoning";
 
 const ADAPTERS: Array<{ id: ModelAdapterId; label: string }> = [
   { id: "generic_openai", label: "通用 OpenAI" },
@@ -77,6 +77,9 @@ export function ModelSettingsPage(props: {
   const testModel = availableModels.find((model) => model.model_id === testModelId)
     ?? availableModels.find((model) => props.settings.default_route?.connection_id === selected?.id && props.settings.default_route?.model_id === model.model_id)
     ?? availableModels[0];
+  const testEffort = testModel?.supports_reasoning
+    ? (testModel.capabilities_json?.reasoning?.native?.at(-1) ?? testModel.reasoning_options.at(-1) ?? null)
+    : null;
 
   const selectConnection = (connection: ModelConnection | null) => {
     setCreating(connection === null);
@@ -200,8 +203,8 @@ export function ModelSettingsPage(props: {
                   })}><ListChecks size={15} />{busy === "test-list" ? "测试中" : "测试模型列表"}</button>
                   <button disabled={Boolean(busy) || !testModel} onClick={() => run("test-model", async () => {
                     if (!testModel) return;
-                    const result = await testConnectionModel(selected.id, testModel.model_id);
-                    setNotice(`“${result.connection_name} / ${result.model_display_name}”调用成功，耗时 ${result.duration_ms} ms`);
+                    const result = await testConnectionModel(selected.id, testModel.model_id, testEffort);
+                    setNotice(`“${result.connection_name} / ${result.model_display_name}”调用成功${result.thinking_received ? `，思考模式 ${result.effective_effort || testEffort || "已验证"}` : ""}，耗时 ${result.duration_ms} ms`);
                   })}><Play size={15} />{busy === "test-model" ? "调用中" : "测试所选模型"}</button>
                 </div>
                 {error ? <p className="model-test-message error" role="alert">{error}</p> : null}
@@ -219,9 +222,9 @@ export function ModelSettingsPage(props: {
                         <strong>{model.display_name}</strong><small>{model.model_id}</small>
                       </button>
                       <span className="model-capacity">上下文 {formatCapacity(model.context_window)}</span>
-                      <span className="model-source">{model.supports_reasoning && model.reasoning_options.length
-                        ? `推理 ${model.reasoning_options.join("/")}`
-                        : Object.prototype.hasOwnProperty.call(model.user_overrides, "context_window") ? "手动设置" : model.metadata_source === "unknown" ? "未匹配" : model.metadata_source}</span>
+                      <span className="model-source">{model.supports_reasoning
+                        ? reasoningStatusForModel(model)
+                        : Object.prototype.hasOwnProperty.call(model.user_overrides, "context_window") ? "手动设置" : "思考关闭"}</span>
                       <button className={isDefault ? "default-model active" : "default-model"} disabled={Boolean(busy) || !selected.enabled} title={!selected.enabled ? "连接已停用，请先启用并保存" : ""} onClick={() => run("default", async () => {
                         const route = await saveDefaultModelRoute({ connection_id: selected.id, model_id: model.model_id }); setTestModelId(model.model_id); props.onDefaultRoute(route); await props.onRefresh(); setNotice("已设为默认并切换当前会话");
                       })}>{isDefault ? "默认" : "设为默认"}</button>

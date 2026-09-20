@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from model_settings.models import ModelConnection, ModelProfile, ModelRoute
+from model_settings.models import (
+    CapabilityProbe,
+    DiscoveryRun,
+    ModelConnection,
+    ModelProfile,
+    ModelRoute,
+)
 from model_settings.store import ModelSettingsConflict, ModelSettingsStore
 
 
@@ -58,3 +64,60 @@ def test_connection_delete_rejects_active_route(tmp_path: Path) -> None:
 
     store.delete_route("global")
     assert store.delete_connection("one") is True
+
+
+def test_model_capabilities_and_protocol_round_trip(tmp_path: Path) -> None:
+    store = ModelSettingsStore(tmp_path / "settings.db")
+    store.save_connection(connection("one"))
+    profile = ModelProfile(
+        "one",
+        "deepseek-v4-flash",
+        "DeepSeek V4 Flash",
+        protocol="chat_completions",
+        capability_source="probe",
+        capability_confidence="high",
+        capabilities_json={
+            "reasoning": {
+                "mode": "effort",
+                "native": ["none", "low", "high", "max"],
+                "aliases": {"medium": "high", "xhigh": "max"},
+                "response_field": "reasoning_content",
+            }
+        },
+    )
+    store.save_model(profile)
+    actual = store.get_model("one", "deepseek-v4-flash")
+    assert actual is not None
+    assert actual.protocol == "chat_completions"
+    assert actual.capability_source == "probe"
+    assert actual.capability_confidence == "high"
+    assert actual.capabilities_json["reasoning"]["native"] == ["none", "low", "high", "max"]
+
+
+def test_discovery_runs_and_capability_probes_are_persisted(tmp_path: Path) -> None:
+    store = ModelSettingsStore(tmp_path / "settings.db")
+    store.save_connection(connection("one"))
+    store.save_model(ModelProfile("one", "deepseek-v4-flash", "DeepSeek V4 Flash"))
+    run = store.record_discovery_run(
+        DiscoveryRun(
+            connection_id="one",
+            requested_url="https://example.test/v1/models",
+            status="success",
+            model_count=2,
+            response_hash="abc123",
+        )
+    )
+    probe = store.record_capability_probe(
+        CapabilityProbe(
+            connection_id="one",
+            model_id="deepseek-v4-flash",
+            probe_type="reasoning",
+            requested_effort="medium",
+            effective_effort="high",
+            protocol="chat_completions",
+            response_reasoning_field="reasoning_content",
+            status="verified",
+        )
+    )
+    assert store.list_discovery_runs("one")[0] == run
+    assert store.list_capability_probes("one", "deepseek-v4-flash")[0] == probe

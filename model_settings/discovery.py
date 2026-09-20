@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any
 
 import httpx
@@ -45,6 +46,7 @@ class OpenAIModelDiscovery:
         self._client = client
         self._timeout = max(1.0, timeout_seconds)
         self._max_response_bytes = max_response_bytes
+        self.last_response_hash: str | None = None
 
     async def list_models(
         self, connection: ModelConnection, api_key: str
@@ -73,6 +75,7 @@ class OpenAIModelDiscovery:
             raise ModelDiscoveryError(f"模型服务返回 HTTP {response.status_code}")
         if len(response.content) > self._max_response_bytes:
             raise ModelDiscoveryError("模型列表响应过大")
+        self.last_response_hash = sha256(response.content).hexdigest()
         try:
             payload = response.json()
         except ValueError as error:

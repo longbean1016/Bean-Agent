@@ -1095,7 +1095,8 @@ def _public_model_route(value: object) -> dict[str, Any]:
         return {}
     allowed = {
         "connection_id", "connection_revision", "model_id", "model_revision",
-        "adapter", "reasoning_effort", "model_runtime_id", "connection_name",
+        "adapter", "reasoning_effort", "effective_reasoning_effort",
+        "model_runtime_id", "connection_name",
         "model_display_name",
     }
     return {key: value[key] for key in allowed if key in value}

@@ -9,7 +9,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
-from model_settings.models import ModelConnection, ModelProfile, ModelRoute, utc_now
+from model_settings.models import (
+    CapabilityProbe,
+    DiscoveryRun,
+    ModelConnection,
+    ModelProfile,
+    ModelRoute,
+    utc_now,
+)
 
 
 class ModelSettingsConflict(RuntimeError):
@@ -29,6 +36,7 @@ class ModelSettingsStore:
         with self._lock:
             self._db.execute("PRAGMA foreign_keys = ON")
             self._db.executescript(_SCHEMA)
+            _migrate_schema(self._db)
             self._db.commit()
 
     def close(self) -> None:
@@ -140,8 +148,9 @@ class ModelSettingsStore:
                     max_output_tokens, supports_tools, supports_vision,
                     supports_reasoning, reasoning_options, adapter,
                     metadata_source, metadata_updated_at, user_overrides,
-                    available, revision, discovered_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    available, revision, discovered_at, protocol,
+                    capability_source, capability_confidence, capabilities_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(connection_id, model_id) DO UPDATE SET
                     display_name=excluded.display_name,
                     context_window=excluded.context_window,
@@ -155,7 +164,11 @@ class ModelSettingsStore:
                     metadata_updated_at=excluded.metadata_updated_at,
                     user_overrides=excluded.user_overrides,
                     available=excluded.available, revision=excluded.revision,
-                    discovered_at=excluded.discovered_at
+                    discovered_at=excluded.discovered_at,
+                    protocol=excluded.protocol,
+                    capability_source=excluded.capability_source,
+                    capability_confidence=excluded.capability_confidence,
+                    capabilities_json=excluded.capabilities_json
                 """,
                 _profile_values(saved),
             )
@@ -178,6 +191,63 @@ class ModelSettingsStore:
                 if existing.model_id not in incoming and existing.available:
                     self.save_model(replace(existing, available=False))
         return self.list_models(connection_id)
+
+    def record_discovery_run(self, run: DiscoveryRun) -> DiscoveryRun:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO model_discovery_runs (
+                    id, connection_id, requested_url, status, model_count,
+                    response_hash, error_message, discovered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run.id, run.connection_id, run.requested_url, run.status,
+                 run.model_count, run.response_hash, run.error_message,
+                 run.discovered_at),
+            )
+            self._db.commit()
+        return run
+
+    def list_discovery_runs(self, connection_id: str, *, limit: int = 20) -> list[DiscoveryRun]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM model_discovery_runs WHERE connection_id = ? "
+                "ORDER BY discovered_at DESC, id DESC LIMIT ?",
+                (connection_id, max(1, min(limit, 100))),
+            ).fetchall()
+        return [_discovery_run(row) for row in rows]
+
+    def record_capability_probe(self, probe: CapabilityProbe) -> CapabilityProbe:
+        with self._lock:
+            self._db.execute(
+                """
+                INSERT INTO model_capability_probes (
+                    id, connection_id, model_id, probe_type, requested_effort,
+                    effective_effort, protocol, response_reasoning_field,
+                    status, error_message, checked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (probe.id, probe.connection_id, probe.model_id, probe.probe_type,
+                 probe.requested_effort, probe.effective_effort, probe.protocol,
+                 probe.response_reasoning_field, probe.status, probe.error_message,
+                 probe.checked_at),
+            )
+            self._db.commit()
+        return probe
+
+    def list_capability_probes(
+        self, connection_id: str, model_id: str | None = None, *, limit: int = 50
+    ) -> list[CapabilityProbe]:
+        query = "SELECT * FROM model_capability_probes WHERE connection_id = ?"
+        params: list[Any] = [connection_id]
+        if model_id is not None:
+            query += " AND model_id = ?"
+            params.append(model_id)
+        query += " ORDER BY checked_at DESC, id DESC LIMIT ?"
+        params.append(max(1, min(limit, 200)))
+        with self._lock:
+            rows = self._db.execute(query, params).fetchall()
+        return [_capability_probe(row) for row in rows]
 
     def set_route(self, scope: str, route: ModelRoute) -> None:
         with self._lock:
@@ -251,6 +321,10 @@ def _profile(row: sqlite3.Row) -> ModelProfile:
         user_overrides=json.loads(row["user_overrides"] or "{}"),
         available=bool(row["available"]), revision=int(row["revision"]),
         discovered_at=row["discovered_at"],
+        protocol=row["protocol"],
+        capability_source=row["capability_source"],
+        capability_confidence=row["capability_confidence"],
+        capabilities_json=json.loads(row["capabilities_json"] or "{}"),
     )
 
 
@@ -265,7 +339,43 @@ def _profile_values(profile: ModelProfile) -> tuple[Any, ...]:
         profile.adapter, profile.metadata_source, profile.metadata_updated_at,
         json.dumps(profile.user_overrides, ensure_ascii=False, sort_keys=True),
         int(profile.available), profile.revision, profile.discovered_at,
+        profile.protocol, profile.capability_source, profile.capability_confidence,
+        json.dumps(profile.capabilities_json, ensure_ascii=False, sort_keys=True),
     )
+
+
+def _discovery_run(row: sqlite3.Row) -> DiscoveryRun:
+    return DiscoveryRun(
+        id=row["id"], connection_id=row["connection_id"],
+        requested_url=row["requested_url"], status=row["status"],
+        model_count=int(row["model_count"] or 0), response_hash=row["response_hash"],
+        error_message=row["error_message"], discovered_at=row["discovered_at"],
+    )
+
+
+def _capability_probe(row: sqlite3.Row) -> CapabilityProbe:
+    return CapabilityProbe(
+        id=row["id"], connection_id=row["connection_id"], model_id=row["model_id"],
+        probe_type=row["probe_type"], requested_effort=row["requested_effort"],
+        effective_effort=row["effective_effort"], protocol=row["protocol"],
+        response_reasoning_field=row["response_reasoning_field"], status=row["status"],
+        error_message=row["error_message"], checked_at=row["checked_at"],
+    )
+
+
+def _migrate_schema(db: sqlite3.Connection) -> None:
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(connection_models)").fetchall()
+    }
+    additions = {
+        "protocol": "TEXT NOT NULL DEFAULT 'chat_completions'",
+        "capability_source": "TEXT NOT NULL DEFAULT 'unknown'",
+        "capability_confidence": "TEXT NOT NULL DEFAULT 'low'",
+        "capabilities_json": "TEXT NOT NULL DEFAULT '{}'",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            db.execute(f"ALTER TABLE connection_models ADD COLUMN {name} {definition}")
 
 
 _SCHEMA = """
@@ -299,6 +409,10 @@ CREATE TABLE IF NOT EXISTS connection_models (
     available INTEGER NOT NULL DEFAULT 1,
     revision INTEGER NOT NULL DEFAULT 1,
     discovered_at TEXT NOT NULL,
+    protocol TEXT NOT NULL DEFAULT 'chat_completions',
+    capability_source TEXT NOT NULL DEFAULT 'unknown',
+    capability_confidence TEXT NOT NULL DEFAULT 'low',
+    capabilities_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (connection_id, model_id),
     FOREIGN KEY (connection_id) REFERENCES model_connections(id) ON DELETE CASCADE
 );
@@ -316,6 +430,34 @@ CREATE TABLE IF NOT EXISTS model_routes (
 CREATE TABLE IF NOT EXISTS model_settings_meta (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS model_discovery_runs (
+    id TEXT PRIMARY KEY,
+    connection_id TEXT NOT NULL,
+    requested_url TEXT NOT NULL,
+    status TEXT NOT NULL,
+    model_count INTEGER NOT NULL DEFAULT 0,
+    response_hash TEXT,
+    error_message TEXT,
+    discovered_at TEXT NOT NULL,
+    FOREIGN KEY (connection_id) REFERENCES model_connections(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS model_capability_probes (
+    id TEXT PRIMARY KEY,
+    connection_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    probe_type TEXT NOT NULL,
+    requested_effort TEXT,
+    effective_effort TEXT,
+    protocol TEXT,
+    response_reasoning_field TEXT,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    checked_at TEXT NOT NULL,
+    FOREIGN KEY (connection_id, model_id)
+        REFERENCES connection_models(connection_id, model_id) ON DELETE CASCADE
 );
 """
 

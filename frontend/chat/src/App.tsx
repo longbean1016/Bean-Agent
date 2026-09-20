@@ -50,6 +50,7 @@ import { ModelSettingsPage } from "./ModelSettingsPage";
 import { isModelSettingsPath, MODEL_SETTINGS_PATH, pathForSession, routeKey, sessionFromPath } from "./chatRoute";
 import { groupMessagesIntoNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
+import { reasoningOptionsForModel, reasoningStatusForModel } from "./reasoning";
 
 const SESSION_STORAGE_KEY = "beanagent.session_id";
 const THEME_STORAGE_KEY = "beanagent.theme";
@@ -2070,7 +2071,7 @@ function ModelRouteControl(props: {
   const currentProfile = props.profile ?? available
     .find((group) => group.connection.id === props.route?.connection_id)
     ?.models.find((model) => model.model_id === props.route?.model_id);
-  const efforts = currentProfile?.supports_reasoning ? currentProfile.reasoning_options : [];
+  const efforts = currentProfile?.supports_reasoning ? reasoningOptionsForModel(currentProfile) : [];
   const selectedEffort = efforts.includes(props.route?.reasoning_effort ?? "")
     ? props.route?.reasoning_effort ?? ""
     : "";
@@ -2135,7 +2136,7 @@ function ModelRouteControl(props: {
       }}
     >
       <strong>{modelLabel}</strong>
-      {selectedEffort ? <span>{selectedEffort}</span> : null}
+      {currentProfile?.supports_reasoning ? <span>{selectedEffort || reasoningStatusForModel(currentProfile)}</span> : null}
       <ChevronDown size={17} aria-hidden="true" />
     </button>
     {open ? <div className="model-route-popover" role="menu" aria-label="模型与推理设置">
@@ -2162,7 +2163,7 @@ function ModelRouteControl(props: {
                 aria-pressed={selected}
                 key={model.model_id}
                 onClick={() => {
-                  const keepEffort = model.reasoning_options.includes(props.route?.reasoning_effort ?? "")
+                  const keepEffort = reasoningOptionsForModel(model).includes(props.route?.reasoning_effort ?? "")
                     ? props.route?.reasoning_effort : null;
                   props.onChange({ connection_id: connection.id, model_id: model.model_id, reasoning_effort: keepEffort });
                   close();

@@ -10,7 +10,7 @@ from typing import Any
 from agent.config_models import LLMConfig
 from agent.provider import LLMProvider
 from model_settings.adapters import AdapterRegistry
-from model_settings.models import ModelConnection, ModelProfile, ModelRoute
+from model_settings.models import CapabilityProbe, ModelConnection, ModelProfile, ModelRoute
 from model_settings.secrets import SecretStore
 from model_settings.service import ModelSettingsService, ModelSettingsValidationError
 from model_settings.store import ModelSettingsStore
@@ -24,6 +24,7 @@ class FrozenModelRoute:
     model_revision: int
     adapter: str
     reasoning_effort: str | None
+    effective_reasoning_effort: str | None
     runtime_id: str
     cache_key: str
     connection_name: str = ""
@@ -39,6 +40,7 @@ class FrozenModelRoute:
             "model_revision": self.model_revision,
             "adapter": self.adapter,
             "reasoning_effort": self.reasoning_effort,
+            "effective_reasoning_effort": self.effective_reasoning_effort,
             "model_runtime_id": self.runtime_id,
             "lease_key": self.cache_key,
         }
@@ -94,6 +96,8 @@ class ProviderManager:
             raise ModelSettingsValidationError("尚未配置默认模型")
         # 冻结前统一走 Service 校验，但消息发送不改变已保存的默认路由。
         connection, profile = self._validated(route)
+        adapter = self._adapters.create(profile.adapter)
+        effective_effort = adapter.normalize_effort(profile.model_id, route.reasoning_effort)
         key = ":".join((
             connection.id, str(connection.revision), profile.model_id,
             str(profile.revision), route.reasoning_effort or "",
@@ -106,6 +110,7 @@ class ProviderManager:
             model_revision=profile.revision,
             adapter=profile.adapter,
             reasoning_effort=route.reasoning_effort,
+            effective_reasoning_effort=effective_effort,
             runtime_id=runtime_id,
             cache_key=key,
             connection_name=connection.name,
@@ -138,21 +143,92 @@ class ProviderManager:
                 self._active[key] = count - 1
 
     async def test_model(
-        self, settings: ModelSettingsService, route: ModelRoute
+        self,
+        settings: ModelSettingsService,
+        route: ModelRoute,
+        *,
+        probe_type: str | None = None,
     ) -> dict[str, Any]:
         """使用实际 adapter 发起无工具的最小生成，验证模型级权限与协议。"""
 
+        kind = probe_type or ("reasoning" if route.reasoning_effort else "basic")
+        if kind not in {"basic", "reasoning", "tool_call"}:
+            raise ModelSettingsValidationError("探测类型无效")
         frozen = self.freeze(settings, session_key="settings:model-test", requested=route)
         lease = await self.acquire(frozen.metadata())
         started = perf_counter()
+        profile = self._store.get_model(frozen.connection_id, frozen.model_id)
         try:
-            await lease.provider.chat(
+            response = await lease.provider.chat(
                 [{"role": "user", "content": "Reply OK."}],
-                tools=None,
+                tools=([{
+                    "type": "function",
+                    "function": {
+                        "name": "probe_echo",
+                        "description": "Return the supplied probe text",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                        },
+                    },
+                }] if kind == "tool_call" else None),
                 max_tokens=8,
-                disable_thinking=True,
+                disable_thinking=kind != "reasoning" or not bool(frozen.reasoning_effort),
             )
+            thinking = getattr(response, "thinking", None)
+            tool_calls = getattr(response, "tool_calls", None)
+            effective = frozen.effective_reasoning_effort
+            reasoning_field = "reasoning_content" if thinking is not None else None
+            self._store.record_capability_probe(CapabilityProbe(
+                connection_id=frozen.connection_id,
+                model_id=frozen.model_id,
+                probe_type=kind,
+                requested_effort=frozen.reasoning_effort,
+                effective_effort=effective,
+                protocol=profile.protocol if profile else None,
+                response_reasoning_field=reasoning_field,
+                status=(
+                    "verified"
+                    if ((kind == "reasoning" and thinking is not None)
+                        or (kind == "tool_call" and tool_calls)
+                        or kind == "basic")
+                    else "accepted_no_reasoning"
+                ),
+            ))
+            if profile and kind == "reasoning" and frozen.reasoning_effort and thinking is not None:
+                native = list(
+                    (profile.capabilities_json.get("reasoning") or {}).get("native") or []
+                )
+                if effective and effective not in {"none", "enabled"} and effective not in native:
+                    native.append(effective)
+                capabilities = dict(profile.capabilities_json)
+                capabilities["reasoning"] = {
+                    **dict(capabilities.get("reasoning") or {}),
+                    "mode": "effort",
+                    "native": native,
+                    "response_field": "reasoning_content",
+                }
+                self._store.save_model(replace(
+                    profile,
+                    supports_reasoning=True,
+                    reasoning_options=tuple(dict.fromkeys(
+                        (*profile.reasoning_options, *([effective] if effective else []))
+                    )),
+                    capability_source="probe",
+                    capability_confidence="high",
+                    capabilities_json=capabilities,
+                ))
         except Exception as error:
+            self._store.record_capability_probe(CapabilityProbe(
+                connection_id=frozen.connection_id,
+                model_id=frozen.model_id,
+                probe_type=kind,
+                requested_effort=frozen.reasoning_effort,
+                protocol=profile.protocol if profile else None,
+                status="failed",
+                error_message=str(error)[:500],
+            ))
             raise _model_test_error(error, frozen) from error
         finally:
             await self.release(lease)
@@ -163,6 +239,11 @@ class ProviderManager:
             "model_id": frozen.model_id,
             "model_display_name": frozen.model_display_name,
             "adapter": frozen.adapter,
+            "requested_effort": frozen.reasoning_effort,
+            "effective_effort": effective,
+            "thinking_received": bool(thinking),
+            "probe_type": kind,
+            "tool_call_received": bool(tool_calls),
             "duration_ms": max(0, round((perf_counter() - started) * 1000)),
         }
 

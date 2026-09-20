@@ -134,6 +134,35 @@ async def test_model_test_uses_selected_route_and_returns_public_identity(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_reasoning_model_test_uses_requested_effort_instead_of_forcing_disabled(
+    tmp_path: Path,
+) -> None:
+    store, settings, manager, _connection, _profile = setup(tmp_path)
+    frozen = manager.freeze(
+        settings, session_key="web:s", requested=ModelRoute("one", "reasoner", "high")
+    )
+    calls = []
+
+    class Provider:
+        async def chat(self, messages, tools=None, **kwargs):
+            calls.append(kwargs)
+            return type("Response", (), {"thinking": "verified reasoning"})()
+
+        async def close(self):
+            return None
+
+    manager._providers[frozen.cache_key] = Provider()
+    result = await manager.test_model(settings, ModelRoute("one", "reasoner", "high"))
+
+    assert calls[0]["disable_thinking"] is False
+    assert result["thinking_received"] is True
+    updated = store.get_model("one", "reasoner")
+    assert updated.capability_source == "probe"
+    assert updated.capability_confidence == "high"
+    await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_model_test_classifies_forbidden_without_upstream_body(tmp_path: Path) -> None:
     _store, settings, manager, _connection, _profile = setup(tmp_path)
     frozen = manager.freeze(settings, session_key="web:s", requested=ModelRoute("one", "reasoner"))

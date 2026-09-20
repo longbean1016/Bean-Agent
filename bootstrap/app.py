@@ -672,10 +672,26 @@ def create_fastapi_app(
     async def refresh_connection_models(connection_id: str) -> dict[str, Any]:
         return await settings.refresh_models(connection_id)
 
+    @app.get("/api/settings/connections/{connection_id}/discovery-runs")
+    async def list_connection_discovery_runs(connection_id: str) -> dict[str, Any]:
+        return {"items": settings.discovery_runs(connection_id)}
+
+    @app.get("/api/settings/connections/{connection_id}/models/{model_id:path}/capability-probes")
+    async def list_model_capability_probes(connection_id: str, model_id: str) -> dict[str, Any]:
+        return {"items": settings.capability_probes(connection_id, model_id)}
+
     @app.post("/api/settings/connections/{connection_id}/models/{model_id:path}/test")
-    async def test_connection_model(connection_id: str, model_id: str) -> dict[str, Any]:
+    async def test_connection_model(
+        connection_id: str, model_id: str, payload: dict[str, Any] | None = Body(default=None)
+    ) -> dict[str, Any]:
         return await application.core.provider_manager.test_model(
-            settings, ModelRoute(connection_id, model_id)
+            settings,
+            ModelRoute(
+                connection_id,
+                model_id,
+                str((payload or {}).get("reasoning_effort") or "") or None,
+            ),
+            probe_type=str((payload or {}).get("probe_type") or "") or None,
         )
 
     @app.post("/api/settings/connections/{connection_id}/models", status_code=201)

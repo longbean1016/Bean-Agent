@@ -44,7 +44,16 @@ class ModelCatalogService:
     ) -> ModelProfile:
         match = _find_model(self._load_cache(), provider.strip().lower(), profile.model_id)
         if match is None:
-            return replace(profile, adapter=default_adapter, metadata_source="unknown")
+            if profile.capability_source == "probe":
+                return replace(profile, adapter=default_adapter, metadata_source="unknown")
+            return replace(
+                profile,
+                adapter=default_adapter,
+                metadata_source="unknown",
+                capability_source="unknown",
+                capability_confidence="low",
+                capabilities_json={},
+            )
         catalog_provider, model = match
         limit = model.get("limit") if isinstance(model.get("limit"), dict) else {}
         modalities = model.get("modalities") if isinstance(model.get("modalities"), dict) else {}
@@ -52,6 +61,12 @@ class ModelCatalogService:
         reasoning_options = _reasoning_values(model.get("reasoning_options"))
         supports_reasoning = bool(model.get("reasoning"))
         adapter = _suggest_adapter(catalog_provider, profile.model_id, supports_reasoning, default_adapter)
+        catalog_capabilities = {
+            "reasoning": {
+                "mode": "effort" if reasoning_options else "toggle",
+                "native": list(reasoning_options),
+            }
+        } if supports_reasoning else {}
         return replace(
             profile,
             display_name=str(model.get("name") or profile.display_name),
@@ -64,6 +79,9 @@ class ModelCatalogService:
             adapter=adapter,
             metadata_source=f"models.dev:{catalog_provider}",
             metadata_updated_at=str(model.get("last_updated") or utc_now()),
+            capability_source=("probe" if profile.capability_source == "probe" else "catalog"),
+            capability_confidence=(profile.capability_confidence if profile.capability_source == "probe" else "low"),
+            capabilities_json=(profile.capabilities_json if profile.capability_source == "probe" else catalog_capabilities),
         )
 
     def has_data(self) -> bool:
