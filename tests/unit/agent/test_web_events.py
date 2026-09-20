@@ -12,6 +12,8 @@ from agent.event_bus import (
     ContextUsageUpdated,
     SessionUsageUpdated,
     SessionUpdated,
+    SandboxApprovalRequested,
+    SandboxApprovalResolved,
     StreamDeltaReady,
     ToolCallCompleted,
     ToolCallStarted,
@@ -146,10 +148,10 @@ def test_outbound_message_maps_complete_final_payload() -> None:
                 "type": "react.tool.completed",
                 "session_id": "web:chat",
                 "turn_id": "turn-1",
-                "call_id": "call-1",
-                "tool_name": "read_file",
-                "status": "ok",
-                "result_preview": "done",
+                    "call_id": "call-1",
+                    "tool_name": "read_file",
+                    "status": "completed",
+                    "result_preview": "done",
             },
         ),
     ],
@@ -170,6 +172,65 @@ def test_lifecycle_event_payloads_are_preserved(event: object, expected: dict) -
 
     assert mapped.session_key == "web:chat"
     assert mapped.payloads == (expected,)
+
+
+def test_tool_timing_fields_are_forwarded_only_when_present() -> None:
+    mapper = WebEventMapper()
+    started = mapper.map_event(
+        ToolCallStarted(
+            "web:chat",
+            "turn-1",
+            "call-1",
+            "read_file",
+            {"path": "a"},
+            "2026-09-20T16:00:00+08:00",
+        )
+    ).payloads[0]
+    completed = mapper.map_event(
+        ToolCallCompleted(
+            "web:chat",
+            "turn-1",
+            "call-1",
+            "read_file",
+            "ok",
+            "done",
+            "2026-09-20T16:00:00+08:00",
+            "2026-09-20T16:00:01+08:00",
+            1000,
+        )
+    ).payloads[0]
+
+    assert started["started_at"] == "2026-09-20T16:00:00+08:00"
+    assert completed["started_at"] == "2026-09-20T16:00:00+08:00"
+    assert completed["ended_at"] == "2026-09-20T16:00:01+08:00"
+    assert completed["duration_ms"] == 1000
+    # 旧生产者不提供时间字段时，不能给 Web 帧伪造当前时间。
+    legacy = mapper.map_event(
+        ToolCallCompleted("web:chat", "turn-1", "call-1", "read_file", "ok", "done")
+    ).payloads[0]
+    assert "started_at" not in legacy
+    assert "ended_at" not in legacy
+    assert "duration_ms" not in legacy
+
+
+@pytest.mark.parametrize(
+    ("wire_status", "expected"),
+    [("ok", "completed"), ("completed", "completed"), ("mystery", "unknown")],
+)
+def test_tool_completed_status_is_normalized_fail_safe(
+    wire_status: str,
+    expected: str,
+) -> None:
+    mapped = WebEventMapper().map_event(ToolCallCompleted(
+        "web:chat",
+        "turn-1",
+        "call-1",
+        "read_file",
+        wire_status,
+        "done",
+    ))
+
+    assert mapped.payloads[0]["status"] == expected
 
 
 @pytest.mark.parametrize(
@@ -299,6 +360,44 @@ def test_snapshot_and_direct_response_helpers_keep_protocol_shapes() -> None:
     },)
 
 
+def test_active_snapshot_allowlist_does_not_forward_model_surface_fields() -> None:
+    mapped = WebEventMapper().map_active_turn_snapshot("web:chat", {
+        "session_id": "web:chat",
+        "turn_id": "turn-1",
+        "request_id": "request-1",
+        "content": "partial",
+        "thinking": "thinking",
+        "llm_surface_messages": [{
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call-1",
+                "function": {
+                    "name": "write_file",
+                    "arguments": '{"content":"DO_NOT_SEND"}',
+                },
+            }],
+        }],
+        "provider_fields": {"reasoning_content": "internal"},
+        "tools": [{
+            "call_id": "call-1",
+            "name": "write_file",
+            "arguments": {"path": "a.txt", "content": "DO_NOT_SEND"},
+            "result": "TOKEN=secret",
+            "status": "completed",
+        }],
+    })
+
+    payload = mapped.payloads[0]
+    assert set(payload) <= {
+        "type", "session_id", "turn_id", "request_id", "content", "thinking",
+        "user_media", "started_at", "status", "tools", "tool_chain_partial",
+    }
+    assert "llm_surface_messages" not in payload
+    assert "provider_fields" not in payload
+    assert "DO_NOT_SEND" not in str(payload)
+    assert "secret" not in str(payload)
+
+
 def test_pending_notification_maps_as_final_message() -> None:
     mapped = WebEventMapper().map_pending_notification(
         "web:chat",
@@ -318,3 +417,103 @@ def test_pending_notification_maps_as_final_message() -> None:
         "message_id": "notification-1",
         "metadata": {"notification_id": "notification-1"},
     },)
+
+
+def test_approval_resolution_maps_terminal_metadata() -> None:
+    mapped = WebEventMapper().map_event(SandboxApprovalResolved(
+        session_key="web:chat",
+        request_id="approval-1",
+        turn_id="turn-1",
+        call_id="call-1",
+        state="cancelled",
+        decision=None,
+        decided_at="2026-09-20T10:00:00+08:00",
+        error_code="timeout",
+    ))
+
+    assert mapped.payloads == ({
+        "type": "approval.resolved",
+        "request_id": "",
+        "session_id": "web:chat",
+        "approval_id": "approval-1",
+        "decision": None,
+        "turn_id": "turn-1",
+        "call_id": "call-1",
+        "state": "cancelled",
+        "decided_at": "2026-09-20T10:00:00+08:00",
+        "error_code": "timeout",
+    },)
+
+
+def test_approval_resolution_uses_client_request_id_without_losing_approval_id() -> None:
+    mapped = WebEventMapper().map_event(SandboxApprovalResolved(
+        session_key="web:chat",
+        request_id="approval-1",
+        turn_id="turn-1",
+        call_id="call-1",
+        state="allowed-once",
+        decision="allowed-once",
+        decided_at="2026-09-20T10:00:00+08:00",
+        client_request_id="decision-1",
+    ))
+
+    assert mapped.payloads[0]["request_id"] == "decision-1"
+    assert mapped.payloads[0]["approval_id"] == "approval-1"
+
+
+def test_approval_request_projection_omits_fingerprint_and_unknown_fields() -> None:
+    mapped = WebEventMapper().map_event(SandboxApprovalRequested(
+        session_key="web:chat",
+        request={
+            "id": "approval-1",
+            "session_id": "web:chat",
+            "turn_id": "turn-1",
+            "call_id": "call-1",
+            "tool_name": "shell",
+            "operation": "执行命令",
+            "arguments": {
+                "command": "curl --token=secret https://example.test",
+                "cwd": "D:/internal",
+            },
+            "reason": "需要临时授权",
+            "requested_mode": "danger-full-access",
+            "state": "pending",
+            "created_at": "2026-09-20T10:00:00+08:00",
+            "expires_at": "2026-09-20T10:05:00+08:00",
+            "fingerprint": "internal-fingerprint",
+            "schema": {"secret": "must-not-leak"},
+        },
+    ))
+
+    approval = mapped.payloads[0]["approval"]
+    assert "fingerprint" not in approval
+    assert "schema" not in approval
+    assert approval["arguments"] == {
+        "command": "curl --token=[已脱敏] https://example.test",
+        "cwd": "[已隐藏]",
+    }
+
+
+def test_tool_event_mapper_redacts_sensitive_arguments_and_result() -> None:
+    mapper = WebEventMapper()
+    started = mapper.map_event(ToolCallStarted(
+        "web:chat",
+        "turn-1",
+        "call-1",
+        "shell",
+        {"command": "curl --token=secret https://example.test", "cwd": "D:/internal"},
+    ))
+    completed = mapper.map_event(ToolCallCompleted(
+        "web:chat",
+        "turn-1",
+        "call-1",
+        "shell",
+        "ok",
+        "TOKEN=secret output",
+    ))
+
+    assert started.payloads[0]["arguments"] == {
+        "command": "curl --token=[已脱敏] https://example.test",
+        "cwd": "[已隐藏]",
+    }
+    assert completed.payloads[0]["result_preview"] == "TOKEN=[已脱敏] output"

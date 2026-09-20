@@ -13,6 +13,7 @@ from agent.event_bus import (
     ContextCompactionStarted,
     ContextUsageUpdated,
     SandboxApprovalRequested,
+    SandboxApprovalResolved,
     SessionUsageUpdated,
     SessionUpdated,
     StreamDeltaReady,
@@ -23,6 +24,11 @@ from agent.event_bus import (
     TurnStarted,
 )
 from agent.message_bus import OutboundMessage
+from agent.tool_projection import (
+    project_result_preview,
+    project_tool_arguments,
+    project_tool_call,
+)
 
 JsonPayload: TypeAlias = dict[str, Any]
 WebLifecycleEvent: TypeAlias = (
@@ -39,6 +45,7 @@ WebLifecycleEvent: TypeAlias = (
     | ToolCallStarted
     | ToolCallCompleted
     | SandboxApprovalRequested
+    | SandboxApprovalResolved
 )
 
 
@@ -183,30 +190,75 @@ class WebEventMapper:
                 })
             return MappedWebEvent(event.session_key, tuple(payloads))
         if isinstance(event, ToolCallStarted):
-            return _mapped(event.session_key, {
+            payload: JsonPayload = {
                 "type": "react.tool.started",
                 "session_id": event.session_key,
                 "turn_id": event.turn_id,
                 "call_id": event.call_id,
                 "tool_name": event.tool_name,
-                "arguments": dict(event.arguments),
-            })
+                "arguments": project_tool_arguments(event.tool_name, event.arguments),
+            }
+            _add_tool_timing(
+                payload,
+                started_at=event.started_at,
+                approval_requested_at=event.approval_requested_at,
+            )
+            return _mapped(event.session_key, payload)
         if isinstance(event, ToolCallCompleted):
-            return _mapped(event.session_key, {
+            payload = {
                 "type": "react.tool.completed",
                 "session_id": event.session_key,
                 "turn_id": event.turn_id,
                 "call_id": event.call_id,
                 "tool_name": event.tool_name,
-                "status": event.status,
-                "result_preview": event.result_preview,
-            })
+                # 兼容旧 Pipeline 的 ``ok``，并对未知值 fail-safe；不能把
+                # 任意新/拼写错误状态伪装成 completed。
+                "status": _normalize_tool_status(event.status),
+                "result_preview": project_result_preview(event.result_preview),
+            }
+            _add_tool_timing(
+                payload,
+                started_at=event.started_at,
+                ended_at=event.ended_at,
+                duration_ms=event.duration_ms,
+                approval_requested_at=event.approval_requested_at,
+                approval_resolved_at=event.approval_resolved_at,
+                approval_wait_ms=event.approval_wait_ms,
+                execution_ms=event.execution_ms,
+                group_duration_ms=event.group_duration_ms,
+                result_kind=event.result_kind,
+                is_truncated=event.is_truncated,
+                exit_code=event.exit_code,
+                error_code=event.error_code,
+            )
+            return _mapped(event.session_key, payload)
         if isinstance(event, SandboxApprovalRequested):
             return _mapped(event.session_key, {
                 "type": "approval.requested",
                 "session_id": event.session_key,
-                "approval": dict(event.request),
+                # approval.requested 只向浏览器投影执行边界；尤其不把
+                # fingerprint/内部 schema/未知字段原样广播。身份字段仍保留
+                # 供 reducer 将卡片绑定到对应 turn/call。
+                "approval": _project_approval_request(event.request),
             })
+        if isinstance(event, SandboxApprovalResolved):
+            payload: JsonPayload = {
+                "type": "approval.resolved",
+                # request_id 是客户端决定命令的关联 ID；超时/断线没有命令
+                # ID 时保持空字符串。approval_id 始终使用审批实体 ID，避免
+                # 把两个不同的幂等键混为一谈。
+                "request_id": event.client_request_id or "",
+                "session_id": event.session_key,
+                "approval_id": event.request_id,
+                "decision": event.decision,
+                "turn_id": event.turn_id,
+                "call_id": event.call_id,
+                "state": event.state,
+                "decided_at": event.decided_at,
+            }
+            if event.error_code:
+                payload["error_code"] = event.error_code
+            return _mapped(event.session_key, payload)
         raise TypeError(f"不支持的 Web 事件: {type(event).__name__}")
 
     def map_context_usage_snapshot(
@@ -289,7 +341,66 @@ class WebEventMapper:
         session_key: str,
         snapshot: Mapping[str, Any],
     ) -> MappedWebEvent:
-        return _mapped(session_key, {"type": "turn.snapshot", **dict(snapshot)})
+        # 运行快照同时供模型恢复使用，可能含有 llm_surface_messages、原始
+        # content blocks 等内部字段；不能用 ``**dict(snapshot)`` 透传到 Web。
+        # 这里只建立协议明确的展示白名单，工具参数/结果再由统一投影处理。
+        payload: JsonPayload = {
+            "type": "turn.snapshot",
+            "session_id": session_key,
+        }
+        for key in ("turn_id", "request_id", "user_message", "content", "thinking", "started_at", "status"):
+            value = snapshot.get(key)
+            if value is None:
+                continue
+            if key in {"user_message", "content", "thinking"}:
+                payload[key] = str(value)
+            else:
+                text = str(value).strip()
+                if text:
+                    payload[key] = text
+        raw_media = snapshot.get("user_media")
+        if isinstance(raw_media, list):
+            payload["user_media"] = [str(item) for item in raw_media if isinstance(item, str)]
+        raw_tools = snapshot.get("tools")
+        if isinstance(raw_tools, list):
+            safe_tools: list[dict[str, Any]] = []
+            for raw_tool in raw_tools:
+                if not isinstance(raw_tool, Mapping):
+                    continue
+                safe_tools.append(project_tool_call(raw_tool))
+            payload["tools"] = safe_tools
+        raw_chain = snapshot.get("tool_chain_partial")
+        if isinstance(raw_chain, list):
+            # snapshot 的 tool_chain_partial 只用于中断恢复，不向 Web 暴露
+            # provider_fields 或原始结果；按工具调用逐项投影。
+            safe_groups: list[dict[str, Any]] = []
+            for group in raw_chain:
+                if not isinstance(group, Mapping):
+                    continue
+                calls = group.get("calls")
+                if not isinstance(calls, list):
+                    continue
+                safe_calls = [
+                    project_tool_call(call)
+                    for call in calls
+                    if isinstance(call, Mapping)
+                ]
+                if safe_calls:
+                    safe_group: dict[str, Any] = {
+                        "iteration": group.get("iteration", 0),
+                        "text": project_result_preview(group.get("text", "")),
+                        "calls": safe_calls,
+                    }
+                    raw_duration = group.get("group_duration_ms")
+                    try:
+                        duration = int(raw_duration) if raw_duration is not None else -1
+                    except (TypeError, ValueError):
+                        duration = -1
+                    if duration >= 0:
+                        safe_group["group_duration_ms"] = duration
+                    safe_groups.append(safe_group)
+            payload["tool_chain_partial"] = safe_groups
+        return _mapped(session_key, payload)
 
     def map_interrupted(
         self,
@@ -337,6 +448,126 @@ def _mapped(session_key: str, payload: JsonPayload) -> MappedWebEvent:
 
 def _non_negative_int(value: object) -> int:
     return max(0, int(value or 0))
+
+
+def _normalize_tool_status(value: object) -> str:
+    status = str(value or "unknown").strip().lower()
+    if status == "ok":
+        return "completed"
+    if status in {
+        "running",
+        "completed",
+        "error",
+        "interrupted",
+        "cancelled",
+        "expired",
+        "unavailable",
+        "rejected",
+        "unknown",
+    }:
+        return status
+    return "unknown"
+
+
+def _add_tool_timing(
+    payload: JsonPayload,
+    *,
+    started_at: object = None,
+    ended_at: object = None,
+    duration_ms: object = None,
+    approval_requested_at: object = None,
+    approval_resolved_at: object = None,
+    approval_wait_ms: object = None,
+    execution_ms: object = None,
+    group_duration_ms: object = None,
+    result_kind: object = None,
+    is_truncated: object = None,
+    exit_code: object = None,
+    error_code: object = None,
+) -> None:
+    """把可选工具计时字段加入 Web 帧，旧事件保持原有形状。"""
+
+    for key, value in (
+        ("started_at", started_at),
+        ("ended_at", ended_at),
+        ("approval_requested_at", approval_requested_at),
+        ("approval_resolved_at", approval_resolved_at),
+        ("result_kind", result_kind),
+        ("error_code", error_code),
+    ):
+        text = str(value or "").strip()
+        if text:
+            payload[key] = text
+    for key, value in (
+        ("duration_ms", duration_ms),
+        ("approval_wait_ms", approval_wait_ms),
+        ("execution_ms", execution_ms),
+        ("group_duration_ms", group_duration_ms),
+        ("exit_code", exit_code),
+    ):
+        if value is None:
+            continue
+        try:
+            number = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            number = -1
+        if key == "exit_code" or number >= 0:
+            payload[key] = number
+    if is_truncated is not None:
+        payload["is_truncated"] = bool(is_truncated)
+
+
+_APPROVAL_PUBLIC_FIELDS = (
+    "id",
+    "session_id",
+    "turn_id",
+    "call_id",
+    "tool_name",
+    "operation",
+    "arguments",
+    "reason",
+    "requested_mode",
+    "state",
+    "created_at",
+    "requested_at",
+    "expires_at",
+    "summary",
+    "scope",
+    "reason_code",
+)
+
+
+def _project_approval_request(value: object) -> dict[str, Any]:
+    """生成审批卡所需的最小安全投影。
+
+    ``fingerprint`` 只用于后端审计和幂等绑定，不是 UI 展示字段；参数再次
+    经过统一工具投影，兼容旧生产者直接塞入原始 arguments 的情况。
+    """
+
+    if not isinstance(value, Mapping):
+        return {}
+    tool_name = str(value.get("tool_name") or "")
+    projected: dict[str, Any] = {}
+    for key in _APPROVAL_PUBLIC_FIELDS:
+        if key not in value:
+            continue
+        raw = value.get(key)
+        if key == "arguments":
+            if isinstance(raw, Mapping):
+                projected[key] = project_tool_arguments(
+                    tool_name,
+                    dict(raw),
+                )
+            continue
+        if raw is None:
+            continue
+        if key in {"operation", "reason", "summary", "scope", "reason_code"}:
+            text = str(raw).strip()
+            if text:
+                projected[key] = project_result_preview(text)
+            continue
+        projected[key] = raw
+    return projected
 
 
 __all__ = [
