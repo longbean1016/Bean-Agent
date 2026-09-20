@@ -12,10 +12,16 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleStop,
+  CircleHelp,
+  Clock3,
   Copy,
   FileText,
+  FilePenLine,
+  FolderOpen,
+  Globe2,
   Image as ImageIcon,
   Menu,
+  MessageCircle,
   MessageSquarePlus,
   Mic,
   Monitor,
@@ -26,6 +32,7 @@ import {
   Search,
   SendHorizontal,
   Settings,
+  SquareTerminal,
   Sun,
   Wrench,
   X,
@@ -43,7 +50,7 @@ import { composeTimeline, reconcileMessages } from "./timeline";
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
-import { ApprovalPanel, PermissionSelector, WorkspaceSelector } from "./SandboxControls";
+import { ApprovalCard, ApprovalPanel, PermissionSelector, WorkspaceSelector } from "./SandboxControls";
 import { SessionSidebar } from "./SessionSidebar";
 import type { ApprovalRequest, ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, SandboxMode, SandboxSnapshot, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry, Workspace } from "./types";
 import { ModelSettingsPage } from "./ModelSettingsPage";
@@ -59,6 +66,9 @@ const MAX_TEXT_ATTACHMENT_SIZE = 2 * 1024 * 1024;
 const MAX_IMAGE_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 const TURN_CONTEXT_BEFORE_MESSAGES = 20;
 const COMPACTION_NOTICE_MIN_MS = 900;
+// 审批提交没有单独的客户端确认帧；超过这个窗口仍无回执时只释放本地锁，
+// 保留 pending 审批供用户重试，服务端仍按 request_id 处理可能迟到的决定。
+const APPROVAL_DECISION_TIMEOUT_MS = 8_000;
 const IMAGE_SUFFIXES = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
 const TEXT_SUFFIXES = new Set([
   ".txt", ".md", ".markdown", ".py", ".json", ".toml", ".yaml", ".yml",
@@ -117,6 +127,15 @@ type BrowserSpeechRecognition = {
 };
 
 type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
+
+type ApprovalDecisionTimer = {
+  requestId: string;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+function approvalDecisionTimerKey(sessionId: string, approvalId: string): string {
+  return `${sessionId}\u0000${approvalId}`;
+}
 
 function getSpeechRecognitionConstructor(): BrowserSpeechRecognitionConstructor | null {
   const speechWindow = window as Window & {
@@ -192,7 +211,14 @@ export function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [sandboxBySession, setSandboxBySession] = useState<Record<string, SandboxSnapshot>>({});
   const [pendingApprovals, setPendingApprovals] = useState<Record<string, ApprovalRequest[]>>({});
-  const [approvalDecisionRequests, setApprovalDecisionRequests] = useState<Record<string, string>>({});
+  // 审批回执可能先于重连 replay 的 requested 到达；按会话记住已决议 id，
+  // 防止迟到请求再次把已结束操作渲染成等待授权。
+  const [resolvedApprovalIds, setResolvedApprovalIds] = useState<Record<string, Record<string, true>>>({});
+  // 决议请求必须按会话隔离；不同会话可能复用 approval_id，不能共用提交锁。
+  const [approvalDecisionRequests, setApprovalDecisionRequests] = useState<Record<string, Record<string, string>>>({});
+  // 虚拟列表只挂载可视消息；仅把当前实际挂载工具行的审批标为 inline，
+  // 其余 pending 保留在输入区兜底，避免审批卡藏在屏幕外无法操作。
+  const [visibleApprovalIdsBySession, setVisibleApprovalIdsBySession] = useState<Record<string, string[]>>({});
   const [sandboxRequest, setSandboxRequest] = useState<{ id: string; sessionId: string } | null>(null);
   const [newSessionWorkspaceId, setNewSessionWorkspaceId] = useState<string | null>(null);
   const [newSessionMode, setNewSessionMode] = useState<SandboxMode>("read-only");
@@ -225,7 +251,9 @@ export function App() {
   const routeSessionRef = useRef(routeSession);
   const workspacesRef = useRef(workspaces);
   const pendingApprovalsRef = useRef(pendingApprovals);
+  const resolvedApprovalIdsRef = useRef(resolvedApprovalIds);
   const approvalDecisionRequestsRef = useRef(approvalDecisionRequests);
+  const approvalDecisionTimersRef = useRef<Record<string, ApprovalDecisionTimer>>({});
   const sandboxRequestRef = useRef(sandboxRequest);
   const newSessionConfigRef = useRef<{ workspaceId: string | null; mode: SandboxMode }>({
     workspaceId: null,
@@ -239,12 +267,15 @@ export function App() {
   routeSessionRef.current = routeSession;
   workspacesRef.current = workspaces;
   pendingApprovalsRef.current = pendingApprovals;
+  resolvedApprovalIdsRef.current = resolvedApprovalIds;
   approvalDecisionRequestsRef.current = approvalDecisionRequests;
   sandboxRequestRef.current = sandboxRequest;
   newSessionConfigRef.current = { workspaceId: newSessionWorkspaceId, mode: newSessionMode };
 
   useEffect(() => () => {
     for (const timer of Object.values(compactionNoticeTimersRef.current)) clearTimeout(timer);
+    for (const entry of Object.values(approvalDecisionTimersRef.current)) clearTimeout(entry.timer);
+    approvalDecisionTimersRef.current = {};
   }, []);
 
   const currentTurn = chat.turnStates[chat.sessionId] ?? idleTurnState;
@@ -261,7 +292,18 @@ export function App() {
   const currentWorkspaceValid = chat.sessionId
     ? (currentSandbox?.workspace_valid ?? currentSessionSummary?.workspace_valid ?? true)
     : (workspaces.find((workspace) => workspace.id === newSessionWorkspaceId)?.valid ?? true);
-  const currentApproval = pendingApprovals[chat.sessionId]?.[0];
+  const currentApprovals = (pendingApprovals[chat.sessionId] ?? []).filter((approval) => (
+    !resolvedApprovalIds[chat.sessionId]?.[approval.id]
+    // approval.requested 可能在 tool.completed 之后才到达（例如重连 replay）。
+    // reducer 会保护工具终态，但独立队列也必须隐藏这类迟到请求，避免用户
+    // 看到一个实际上无法再放行的旧审批卡。
+    && !hasTerminalApprovalTool(chat.messages, approval)
+  ));
+  const currentApprovalDecisionRequests = approvalDecisionRequests[chat.sessionId] ?? {};
+  const visibleApprovalIds = useMemo(
+    () => new Set(visibleApprovalIdsBySession[chat.sessionId] ?? []),
+    [chat.sessionId, visibleApprovalIdsBySession],
+  );
   const turnActive = currentTurn.status === "submitting" || currentTurn.status === "queued" || currentTurn.status === "running" || currentTurn.status === "compacting";
   const restoringSession = Boolean(chat.sessionId && loadingSessionId === chat.sessionId && chat.messages.length === 0);
   const displayMessages = useMemo(() => composeTimeline(
@@ -276,6 +318,12 @@ export function App() {
     mergeNavigationTurns(turnsBySession[chat.sessionId] ?? [], messageTurns)
   ), [chat.sessionId, messageTurns, turnsBySession]);
   const conversationTurnGroups = useMemo(() => groupMessagesIntoNavigationTurns(displayMessages), [displayMessages]);
+  // 正常情况下审批卡跟随对应工具行；只有工具 started 尚未到达时才保留底部兜底，
+  // 避免同一个审批同时出现在消息区和输入区。
+  const inlineApprovalIds = useMemo(() => new Set(currentApprovals
+    .filter((approval) => visibleApprovalIds.has(approval.id))
+    .map((approval) => approval.id)), [currentApprovals, visibleApprovalIds]);
+  const orphanApprovals = currentApprovals.filter((approval) => !inlineApprovalIds.has(approval.id));
   const selectedModel = useMemo(() => {
     if (!selectedModelRoute) return undefined;
     return modelSettings.connections.find((item) => item.id === selectedModelRoute.connection_id)
@@ -384,27 +432,131 @@ export function App() {
     return true;
   }, []);
 
-  const clearApprovalsForSession = useCallback((sessionId: string) => {
-    const approvalIds = new Set(
-      (pendingApprovalsRef.current[sessionId] ?? []).map((approval) => approval.id),
-    );
-    const nextApprovals = { ...pendingApprovalsRef.current, [sessionId]: [] };
-    pendingApprovalsRef.current = nextApprovals;
-    setPendingApprovals(nextApprovals);
-    if (!approvalIds.size) return;
-    const nextRequests = Object.fromEntries(
-      Object.entries(approvalDecisionRequestsRef.current)
-        .filter(([approvalId]) => !approvalIds.has(approvalId)),
-    );
+  const handleVisibleApprovalIdsChange = useCallback((sessionId: string, ids: string[]) => {
+    const normalized = [...new Set(ids)];
+    setVisibleApprovalIdsBySession((current) => {
+      const previous = current[sessionId] ?? [];
+      if (previous.length === normalized.length && previous.every((id, index) => id === normalized[index])) return current;
+      return { ...current, [sessionId]: normalized };
+    });
+  }, []);
+
+  const clearApprovalDecisionTimer = useCallback((sessionId: string, approvalId: string, requestId?: string) => {
+    const key = approvalDecisionTimerKey(sessionId, approvalId);
+    const entry = approvalDecisionTimersRef.current[key];
+    if (!entry || (requestId && entry.requestId !== requestId)) return;
+    clearTimeout(entry.timer);
+    delete approvalDecisionTimersRef.current[key];
+  }, []);
+
+  const releaseApprovalDecisionLock = useCallback((sessionId: string, approvalId: string, requestId?: string) => {
+    const sessionRequests = approvalDecisionRequestsRef.current[sessionId] ?? {};
+    const currentRequestId = sessionRequests[approvalId];
+    if (!currentRequestId || (requestId && currentRequestId !== requestId)) return;
+    clearApprovalDecisionTimer(sessionId, approvalId, currentRequestId);
+    const nextRequests = { ...approvalDecisionRequestsRef.current };
+    const nextSessionRequests = { ...(nextRequests[sessionId] ?? {}) };
+    delete nextSessionRequests[approvalId];
+    if (Object.keys(nextSessionRequests).length) nextRequests[sessionId] = nextSessionRequests;
+    else delete nextRequests[sessionId];
     approvalDecisionRequestsRef.current = nextRequests;
     setApprovalDecisionRequests(nextRequests);
+  }, [clearApprovalDecisionTimer]);
+
+  const clearApprovalDecisionTimersForSession = useCallback((sessionId: string) => {
+    const prefix = `${sessionId}\u0000`;
+    for (const [key, entry] of Object.entries(approvalDecisionTimersRef.current)) {
+      if (!key.startsWith(prefix)) continue;
+      clearTimeout(entry.timer);
+      delete approvalDecisionTimersRef.current[key];
+    }
   }, []);
+
+  const releaseApprovalDecisionLocksForSession = useCallback((sessionId: string) => {
+    clearApprovalDecisionTimersForSession(sessionId);
+    if (!Object.prototype.hasOwnProperty.call(approvalDecisionRequestsRef.current, sessionId)) return;
+    const nextRequests = { ...approvalDecisionRequestsRef.current };
+    delete nextRequests[sessionId];
+    approvalDecisionRequestsRef.current = nextRequests;
+    setApprovalDecisionRequests(nextRequests);
+  }, [clearApprovalDecisionTimersForSession]);
+
+  const scheduleApprovalDecisionTimeout = useCallback((sessionId: string, approvalId: string, requestId: string) => {
+    clearApprovalDecisionTimer(sessionId, approvalId);
+    const timer = setTimeout(() => {
+      // 只释放仍对应本次 request_id 的锁；用户若已重试，旧计时器不能
+      // 把新的提交状态误删。
+      releaseApprovalDecisionLock(sessionId, approvalId, requestId);
+    }, APPROVAL_DECISION_TIMEOUT_MS);
+    approvalDecisionTimersRef.current[approvalDecisionTimerKey(sessionId, approvalId)] = { requestId, timer };
+  }, [clearApprovalDecisionTimer, releaseApprovalDecisionLock]);
+
+  const clearApprovalsForSession = useCallback((
+    sessionId: string,
+    suppress = false,
+    releaseDecisionLocks = false,
+    turnId?: string,
+  ) => {
+    const sessionApprovals = pendingApprovalsRef.current[sessionId] ?? [];
+    // 一个会话通常只有一个活动 Turn，但通知或旧后台任务可能在同一会话
+    // 产生无 turn_id 的 final；按 turn 清理可避免误删另一条仍待处理的审批。
+    const approvalsToClear = turnId
+      ? sessionApprovals.filter((approval) => approval.turn_id === turnId)
+      : sessionApprovals;
+    const approvalIds = new Set(approvalsToClear.map((approval) => approval.id));
+    const nextApprovals = {
+      ...pendingApprovalsRef.current,
+      [sessionId]: turnId
+        ? sessionApprovals.filter((approval) => approval.turn_id !== turnId)
+        : [],
+    };
+    pendingApprovalsRef.current = nextApprovals;
+    setPendingApprovals(nextApprovals);
+    if (suppress && approvalIds.size) {
+      const nextResolved = rememberResolvedApprovalIds(
+        resolvedApprovalIdsRef.current,
+        sessionId,
+        approvalIds,
+      );
+      resolvedApprovalIdsRef.current = nextResolved;
+      setResolvedApprovalIds(nextResolved);
+    }
+    const nextRequests = { ...approvalDecisionRequestsRef.current };
+    if (releaseDecisionLocks || suppress) {
+      // 仅在明确结束当前审批生命周期时释放本地锁；按 Turn 清理时保留
+      // 同会话其它审批的提交状态，重连 replay 则继续保留所有锁。
+      if (turnId) {
+        const prefix = `${sessionId}\u0000`;
+        for (const [key, entry] of Object.entries(approvalDecisionTimersRef.current)) {
+          const approvalId = key.startsWith(prefix) ? key.slice(prefix.length) : "";
+          if (!approvalId || !approvalIds.has(approvalId)) continue;
+          clearTimeout(entry.timer);
+          delete approvalDecisionTimersRef.current[key];
+        }
+      } else {
+        clearApprovalDecisionTimersForSession(sessionId);
+        delete nextRequests[sessionId];
+      }
+    }
+    const sessionRequests = { ...(nextRequests[sessionId] ?? {}) };
+    // 订阅重连时保留已发出的决议请求，避免 replay requested 后按钮重新可点；
+    // Turn 终态清理（suppress=true）则直接释放锁，等待新的审批生命周期。
+    for (const approvalId of approvalIds) {
+      if (suppress || releaseDecisionLocks || !sessionRequests[approvalId]) delete sessionRequests[approvalId];
+    }
+    if (Object.keys(sessionRequests).length) nextRequests[sessionId] = sessionRequests;
+    else delete nextRequests[sessionId];
+    approvalDecisionRequestsRef.current = nextRequests;
+    setApprovalDecisionRequests(nextRequests);
+  }, [clearApprovalDecisionTimersForSession]);
 
   const handleFrame = useCallback((frame: ChatFrame) => {
     if (handleNotificationFrame(frame)) return;
     dispatch(frame);
     if (frame.type === "session.subscribed") {
       // 服务端会在订阅确认后重放当前 pending；先丢弃旧缓存，避免重连产生重复审批卡片。
+      // 已发出的 approval.decide 仍可能在服务端处理中；保留提交锁，直到
+      // approval.resolved 或明确发送错误到达，避免 replay requested 让用户重复提交。
       clearApprovalsForSession(frame.session_id);
     }
     if (frame.type === "sandbox.updated") {
@@ -425,6 +577,11 @@ export function App() {
       }
     }
     if (frame.type === "approval.requested") {
+      if (resolvedApprovalIdsRef.current[frame.session_id]?.[frame.approval.id]) {
+        // 服务器重连时可能重放已决议请求；reducer 仍会消费该帧以补充
+        // 工具时间线，但输入区队列不能再次出现同一审批。
+        return;
+      }
       const existing = pendingApprovalsRef.current[frame.session_id] ?? [];
       const nextApprovals = {
         ...pendingApprovalsRef.current,
@@ -436,6 +593,13 @@ export function App() {
       setPendingApprovals(nextApprovals);
     }
     if (frame.type === "approval.resolved") {
+      const nextResolved = rememberResolvedApprovalIds(
+        resolvedApprovalIdsRef.current,
+        frame.session_id,
+        [frame.approval_id],
+      );
+      resolvedApprovalIdsRef.current = nextResolved;
+      setResolvedApprovalIds(nextResolved);
       const nextApprovals = {
         ...pendingApprovalsRef.current,
         [frame.session_id]: (pendingApprovalsRef.current[frame.session_id] ?? [])
@@ -443,8 +607,12 @@ export function App() {
       };
       pendingApprovalsRef.current = nextApprovals;
       setPendingApprovals(nextApprovals);
+      clearApprovalDecisionTimer(frame.session_id, frame.approval_id);
       const nextRequests = { ...approvalDecisionRequestsRef.current };
-      delete nextRequests[frame.approval_id];
+      const sessionRequests = { ...(nextRequests[frame.session_id] ?? {}) };
+      delete sessionRequests[frame.approval_id];
+      if (Object.keys(sessionRequests).length) nextRequests[frame.session_id] = sessionRequests;
+      else delete nextRequests[frame.session_id];
       approvalDecisionRequestsRef.current = nextRequests;
       setApprovalDecisionRequests(nextRequests);
     }
@@ -453,13 +621,28 @@ export function App() {
         sandboxRequestRef.current = null;
         setSandboxRequest(null);
       }
-      const approvalId = Object.entries(approvalDecisionRequestsRef.current)
-        .find(([, requestId]) => requestId === frame.request_id)?.[0];
-      if (approvalId) {
-        const nextRequests = { ...approvalDecisionRequestsRef.current };
-        delete nextRequests[approvalId];
-        approvalDecisionRequestsRef.current = nextRequests;
-        setApprovalDecisionRequests(nextRequests);
+      let matchedSessionId = frame.session_id;
+      let approvalId: string | undefined;
+      const candidates = matchedSessionId
+        ? [[matchedSessionId, approvalDecisionRequestsRef.current[matchedSessionId] ?? {}] as const]
+        : Object.entries(approvalDecisionRequestsRef.current);
+      for (const [sessionId, sessionRequests] of candidates) {
+        const match = Object.entries(sessionRequests).find(([, requestId]) => requestId === frame.request_id);
+        if (match) {
+          matchedSessionId = sessionId;
+          approvalId = match[0];
+          break;
+        }
+      }
+      if (approvalId && matchedSessionId) {
+        const requestId = approvalDecisionRequestsRef.current[matchedSessionId]?.[approvalId];
+        releaseApprovalDecisionLock(matchedSessionId, approvalId, requestId);
+      } else if (matchedSessionId && (!frame.request_id
+        || frame.code === "approval_unavailable"
+        || frame.code === "invalid_approval")) {
+        // 旧服务端错误帧可能没有 request_id，或审批服务只返回错误码；
+        // 这两类错误都不能让提交锁永久占住按钮，但要保留 pending 卡供重试。
+        releaseApprovalDecisionLocksForSession(matchedSessionId);
       }
     }
     if (frame.type === "context.compaction.started") {
@@ -527,7 +710,16 @@ export function App() {
     }
     if (frame.type === "message.final") {
       // cancelled/unavailable 审批不一定另发 resolved；Turn 结束时必须让 composer 收敛。
-      clearApprovalsForSession(frame.session_id);
+      // 同时抑制迟到的 requested replay，避免已结束 Turn 再次弹出审批卡。
+      const proactive = Boolean(frame.metadata?.proactive || frame.metadata?.notification);
+      if (!proactive) {
+        // 旧 final 可能省略 turn_id；只在本地仍能确定唯一活动 Turn 时清理，
+        // 无法关联时保留审批，避免把另一条后台操作静默收掉。
+        const runtime = chatRef.current.turnStates[frame.session_id];
+        const requestMatches = !frame.request_id || !runtime?.requestId || frame.request_id === runtime.requestId;
+        const terminalTurnId = frame.turn_id || (requestMatches ? runtime?.turnId : "") || "";
+        if (terminalTurnId) clearApprovalsForSession(frame.session_id, true, false, terminalTurnId);
+      }
       void refreshSessions();
       void refreshTurnPreviews(frame.session_id);
     }
@@ -535,9 +727,12 @@ export function App() {
       // 后端发送该帧前已完成中断轮持久化。立刻用带 seq 的权威行替换本地草稿，
       // 避免连续中断时多个无 seq 草稿按客户端时间错序。
       reloadSessionRef.current(frame.session_id);
-      clearApprovalsForSession(frame.session_id);
+      const runtime = chatRef.current.turnStates[frame.session_id];
+      const requestMatches = !frame.request_id || !runtime?.requestId || frame.request_id === runtime.requestId;
+      const interruptedTurnId = frame.turn_id || (requestMatches ? runtime?.turnId : "") || "";
+      if (interruptedTurnId) clearApprovalsForSession(frame.session_id, true, false, interruptedTurnId);
     }
-  }, [clearApprovalsForSession, handleNotificationFrame, refreshSessions, refreshTurnPreviews]);
+  }, [clearApprovalDecisionTimer, clearApprovalsForSession, handleNotificationFrame, refreshSessions, refreshTurnPreviews, releaseApprovalDecisionLock, releaseApprovalDecisionLocksForSession]);
 
   useEffect(() => {
     const client = new BeanWebSocketClient({
@@ -606,23 +801,37 @@ export function App() {
   };
 
   const decideApproval = useCallback((approval: ApprovalRequest, decision: "allowed-once" | "rejected") => {
-    if (approvalDecisionRequestsRef.current[approval.id]) return;
+    const sessionRequests = approvalDecisionRequestsRef.current[approval.session_id] ?? {};
+    if (sessionRequests[approval.id]) return;
     const requestId = crypto.randomUUID();
-    const nextRequests = { ...approvalDecisionRequestsRef.current, [approval.id]: requestId };
+    const nextRequests = {
+      ...approvalDecisionRequestsRef.current,
+      [approval.session_id]: {
+        ...sessionRequests,
+        [approval.id]: requestId,
+      },
+    };
     approvalDecisionRequestsRef.current = nextRequests;
     setApprovalDecisionRequests(nextRequests);
-    const sent = clientRef.current?.send({
-      type: "approval.decide",
-      request_id: requestId,
-      session_id: approval.session_id,
-      approval_id: approval.id,
-      decision,
-    });
+    // 先登记超时，再写入 WebSocket；某些测试/桥接实现可能在 send 内同步
+    // 派发 resolved，先登记才能让该回执可靠清理计时器。
+    scheduleApprovalDecisionTimeout(approval.session_id, approval.id, requestId);
+    let sent = false;
+    try {
+      sent = clientRef.current?.send({
+        type: "approval.decide",
+        request_id: requestId,
+        session_id: approval.session_id,
+        approval_id: approval.id,
+        decision,
+      }) ?? false;
+    } catch {
+      // WebSocket 可能在 readyState 检查与 send 之间断开；按发送失败处理，
+      // 清理本地锁并保留审批卡供用户重试。
+      sent = false;
+    }
     if (!sent) {
-      const currentRequests = { ...approvalDecisionRequestsRef.current };
-      delete currentRequests[approval.id];
-      approvalDecisionRequestsRef.current = currentRequests;
-      setApprovalDecisionRequests(currentRequests);
+      releaseApprovalDecisionLock(approval.session_id, approval.id, requestId);
       dispatch({
         type: "error",
         request_id: requestId,
@@ -632,11 +841,23 @@ export function App() {
       });
       return;
     }
-  }, []);
+  }, [releaseApprovalDecisionLock, scheduleApprovalDecisionTimeout]);
 
   const rejectPendingApprovals = useCallback((sessionId: string) => {
-    for (const approval of pendingApprovalsRef.current[sessionId] ?? []) {
-      if (!approvalDecisionRequestsRef.current[approval.id]) decideApproval(approval, "rejected");
+    const approvals = pendingApprovalsRef.current[sessionId] ?? [];
+    if (!approvals.length) return;
+    // 切换/新建会话时先在展示层关闭旧队列。即使网络随后断开，旧审批
+    // 也不能在切回会话时恢复为可点击状态；服务端仍会收到逐项拒绝。
+    const nextResolved = rememberResolvedApprovalIds(
+      resolvedApprovalIdsRef.current,
+      sessionId,
+      approvals.map((approval) => approval.id),
+    );
+    resolvedApprovalIdsRef.current = nextResolved;
+    setResolvedApprovalIds(nextResolved);
+    const sessionRequests = approvalDecisionRequestsRef.current[sessionId] ?? {};
+    for (const approval of approvals) {
+      if (!sessionRequests[approval.id]) decideApproval(approval, "rejected");
     }
   }, [decideApproval]);
 
@@ -1267,6 +1488,10 @@ export function App() {
                 sessionId={chat.sessionId}
                 requestedTurnId={requestedTurnId}
                 onTurnPositioned={handleTurnPositioned}
+                onVisibleApprovalIdsChange={handleVisibleApprovalIdsChange}
+                approvals={currentApprovals}
+                approvalDecisionRequests={currentApprovalDecisionRequests}
+                onApprovalDecision={decideApproval}
               />
             )}
           </StickToBottom.Content>
@@ -1282,13 +1507,19 @@ export function App() {
           />
         </StickToBottom>
 
-        {currentApproval ? (
-          <ApprovalPanel
-            approval={currentApproval}
-            submitting={Boolean(approvalDecisionRequests[currentApproval.id])}
-            onDecide={(decision) => decideApproval(currentApproval, decision)}
-          />
-        ) : (
+        <div className="composer-stack">
+          {orphanApprovals.length ? (
+            <div className="approval-queue" aria-label={`待处理授权 ${orphanApprovals.length} 项`}>
+              {orphanApprovals.map((approval) => (
+                <ApprovalPanel
+                  key={approval.id}
+                  approval={approval}
+                  submitting={Boolean(currentApprovalDecisionRequests[approval.id])}
+                  onDecide={(decision) => decideApproval(approval, decision)}
+                />
+              ))}
+            </div>
+          ) : null}
           <Composer
             active={turnActive}
             turnStatus={currentTurn.status}
@@ -1328,7 +1559,7 @@ export function App() {
             onWorkspaceChange={handleWorkspaceChange}
             onSandboxModeChange={handleSandboxModeChange}
           />
-        )}
+        </div>
       </main>
     </div>
   );
@@ -1441,13 +1672,39 @@ function ThemeControl({ value, onChange }: { value: ThemePreference; onChange: (
   );
 }
 
-function MessageView({ message, navigationTurnId, turnDurationMs }: {
+function hasTerminalApprovalTool(messages: ChatMessage[], approval: ApprovalRequest): boolean {
+  return messages.some((message) => (
+    message.role === "assistant"
+    && message.turnId === approval.turn_id
+    && message.tools.some((tool) => (
+      tool.callId === approval.call_id && isApprovalTerminalToolStatus(tool.status)
+    ))
+  ));
+}
+
+function isApprovalTerminalToolStatus(status: ToolActivity["status"]): boolean {
+  // unknown 只表示协议状态暂时无法识别，不足以证明工具已经结束；在这种情况下
+  // 仍保留服务端下发的审批入口，避免用户无法处理一个实际仍在等待的调用。
+  return status === "completed"
+    || status === "error"
+    || status === "interrupted"
+    || status === "cancelled"
+    || status === "expired"
+    || status === "unavailable"
+    || status === "rejected";
+}
+
+function MessageView({ message, navigationTurnId, turnDurationMs, approvals = [], approvalDecisionRequests = {}, onApprovalDecision }: {
   message: ChatMessage;
   navigationTurnId: string;
   turnDurationMs?: number;
+  approvals?: ApprovalRequest[];
+  approvalDecisionRequests?: Record<string, string>;
+  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
 }) {
   const isUser = message.role === "user";
   const parsed = useMemo(() => parseMemoryCitations(message.content), [message.content]);
+  const messageApprovals = approvals.filter((approval) => approval.turn_id === message.turnId);
   const [copied, setCopied] = useState(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copyText = isUser || message.content !== "[用户已停止生成]" ? message.content : "";
@@ -1500,7 +1757,14 @@ function MessageView({ message, navigationTurnId, turnDurationMs }: {
         {!isUser && message.source ? <MessageSourceBadge message={message} /> : null}
         {message.media.length ? <AttachmentGallery paths={message.media} /> : null}
         {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} status={message.thinkingStatus} /> : null}
-        {message.tools.length ? <div className="tool-timeline">{message.tools.map((tool) => <ToolStep key={tool.callId} tool={tool} />)}</div> : null}
+        {!isUser && (message.tools.length || messageApprovals.length) ? (
+          <ToolTimeline
+            tools={message.tools}
+            approvals={messageApprovals}
+            approvalDecisionRequests={approvalDecisionRequests}
+            onApprovalDecision={onApprovalDecision}
+          />
+        ) : null}
         {isUser ? <p className="user-text">{message.content}</p> : message.content && message.content !== "[用户已停止生成]" ? (
           <div className="beanagent-markdown">
             <Streamdown
@@ -1571,6 +1835,23 @@ function formatDuration(durationMs?: number): string | null {
   if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs < 0) return null;
   if (durationMs < 1000) return "用时不到1秒";
   return `用时${Math.max(1, Math.round(durationMs / 1000))}秒`;
+}
+
+function rememberResolvedApprovalIds(
+  current: Record<string, Record<string, true>>,
+  sessionId: string,
+  ids: Iterable<string>,
+): Record<string, Record<string, true>> {
+  const session = {
+    ...(current[sessionId] ?? {}),
+    ...Object.fromEntries([...ids].filter(Boolean).map((id) => [id, true as const])),
+  };
+  // 只保留短期 replay 去重窗口，避免长时间运行的前端会话无限累积审批 ID。
+  const entries = Object.keys(session);
+  if (entries.length > 256) {
+    for (const id of entries.slice(0, entries.length - 256)) delete session[id];
+  }
+  return { ...current, [sessionId]: session };
 }
 
 function deriveTurnDuration(messages: ChatMessage[]): number | undefined {
@@ -1662,25 +1943,348 @@ function Thinking({ content, streaming, status }: { content: string; streaming: 
   );
 }
 
-function ToolStep({ tool }: { tool: ToolActivity }) {
-  const icon = tool.status === "completed"
-    ? <Check size={14} />
-    : tool.status === "error"
-      ? <AlertCircle size={14} />
-      : tool.status === "interrupted"
-        ? <CircleStop size={14} />
-        : <Wrench size={14} />;
+/**
+ * 工具活动行使用“动作图标 + 语义文案”表达调用类型，状态图标只在
+ * 等待授权、失败或中断等异常状态下接管。这样完成态不会把所有工具
+ * 都压成同一个勾，而是能直接看出这是命令、浏览器、文件还是消息活动。
+ */
+type ToolVisualKind = "terminal" | "browser" | "tool-loader" | "file-read" | "file-write" | "file-edit" | "directory" | "message" | "mcp" | "generic";
+
+function toolVisualKind(name: string): ToolVisualKind {
+  const normalized = name.trim().toLowerCase().replace(/[\s.:-]+/gu, "_");
+  if (/^(shell|exec|run|terminal|command)(?:_|$)/u.test(normalized)) return "terminal";
+  if (normalized === "web_search" || normalized === "web_fetch" || normalized === "browser" || normalized.startsWith("browser_") || normalized.startsWith("web_")) return "browser";
+  if (normalized === "tool_search" || normalized === "load_skill" || normalized.includes("skill")) return "tool-loader";
+  if (normalized === "read_file" || normalized.includes("read_file") || normalized.includes("get_file") || normalized.includes("fetch_file")) return "file-read";
+  if (normalized === "write_file" || normalized.includes("write_file") || normalized.includes("create_file") || normalized.includes("upload_file")) return "file-write";
+  if (normalized === "edit_file" || normalized.includes("edit_file") || normalized.includes("patch_file") || normalized.includes("update_file")) return "file-edit";
+  if (normalized === "list_dir" || normalized.includes("list_dir") || normalized.includes("list_directory") || normalized.includes("directory")) return "directory";
+  if (normalized === "send_message" || normalized === "notify" || normalized.startsWith("message_") || normalized.startsWith("send_")) return "message";
+  if (normalized.startsWith("mcp_") || normalized.startsWith("plugin_") || normalized.includes("connector")) return "mcp";
+  return "generic";
+}
+
+function toolIcon(kind: ToolVisualKind, size = 16) {
+  if (kind === "terminal") return <SquareTerminal size={size} />;
+  if (kind === "browser") return <Globe2 size={size} />;
+  if (kind === "file-read") return <FileText size={size} />;
+  if (kind === "file-write" || kind === "file-edit") return <FilePenLine size={size} />;
+  if (kind === "directory") return <FolderOpen size={size} />;
+  if (kind === "message") return <MessageCircle size={size} />;
+  if (kind === "mcp") return <PlugZap size={size} />;
+  return <Wrench size={size} />;
+}
+
+function summarizeMessageRecipient(tool: ToolActivity): string {
+  if (!tool.arguments || typeof tool.arguments !== "object" || Array.isArray(tool.arguments)) return "";
+  const args = tool.arguments as Record<string, unknown>;
+  for (const key of ["to", "recipient", "channel", "thread", "target", "name"]) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim()) return truncateToolText(value.trim(), 72);
+  }
+  return "";
+}
+
+function toolActionLabel(tool: ToolActivity, kind: ToolVisualKind): string {
+  if (kind === "terminal") return "运行了命令";
+  if (kind === "browser") return "已使用浏览器运行了命令";
+  if (kind === "tool-loader") return "加载了工具";
+  if (kind === "file-read") return "读取了文件";
+  if (kind === "file-write") return "写入了文件";
+  if (kind === "file-edit") return "编辑了文件";
+  if (kind === "directory") return "查看了目录";
+  if (kind === "message") {
+    const recipient = summarizeMessageRecipient(tool);
+    return recipient ? `已向 ${recipient} 发送消息` : "发送了消息";
+  }
+  if (kind === "mcp") return "调用了 MCP 工具";
+  return "运行了工具";
+}
+
+function ToolTimeline({
+  tools,
+  approvals,
+  approvalDecisionRequests,
+  onApprovalDecision,
+}: {
+  tools: ToolActivity[];
+  approvals: ApprovalRequest[];
+  approvalDecisionRequests: Record<string, string>;
+  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  const hasRunningTimer = tools.some((tool) => tool.status === "running" && tool.startedAt);
+  useEffect(() => {
+    if (!hasRunningTimer) return undefined;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasRunningTimer]);
+
+  const pendingByCall = new Map(approvals.map((approval) => [approval.call_id, approval]));
+  const approvalOrder = new Map(approvals.map((approval, index) => [approval.id, index + 1]));
+  const matchedCallIds = new Set<string>();
+  const runningCount = tools.filter((tool) => tool.status === "running").length;
+  const failedCount = tools.filter((tool) => (
+    tool.status === "error" || tool.status === "rejected" || tool.status === "interrupted"
+      || tool.status === "cancelled" || tool.status === "expired" || tool.status === "unavailable"
+  )).length;
+  const unknownCount = tools.filter((tool) => tool.status === "unknown").length;
+  const pendingCount = approvals.length;
+  const groupDuration = deriveToolGroupDuration(tools, now);
+  const groupState = pendingCount
+    ? `${pendingCount} 项等待授权`
+    : runningCount
+      ? `${runningCount}/${tools.length} 项执行中`
+      : failedCount
+        ? `${tools.length} 项中 ${failedCount} 项失败`
+        : unknownCount
+          ? `${tools.length} 项中 ${unknownCount} 项状态未知`
+          : `${tools.length} 项完成`;
+  const summary = `工具调用 · ${groupState}`;
+  const groupStatus = pendingCount ? "pending" : runningCount ? "running" : failedCount ? "error" : unknownCount ? "unknown" : "completed";
+  const [groupOpen, setGroupOpen] = useState(Boolean(pendingCount || runningCount || failedCount || unknownCount));
+  const previousGroupStatusRef = useRef(groupStatus);
+  useEffect(() => {
+    const previous = previousGroupStatusRef.current;
+    if (pendingCount > 0) {
+      // 等待授权是必须完成的交互；即使用户之前收起了执行组，审批到达后
+      // 也要立即展开，避免把唯一的操作入口藏起来。
+      setGroupOpen(true);
+    } else if (previous !== groupStatus) {
+      // 完成组默认收起；执行重新开始或出现审批/异常时自动展开，用户手动
+      // 展开的完成组不在每次计时刷新时被强制关闭。
+      if (groupStatus === "completed") setGroupOpen(false);
+      else if (previous === "completed") setGroupOpen(true);
+      previousGroupStatusRef.current = groupStatus;
+    }
+  }, [groupStatus, pendingCount]);
+
   return (
-    <Collapsible.Root className={`tool-step ${tool.status}`}>
-      <Collapsible.Trigger className="tool-trigger">
-        <span className="tool-icon">{icon}</span><strong>{tool.name}</strong><span>{tool.status === "running" ? "执行中" : tool.status === "error" ? "失败" : tool.status === "interrupted" ? "已中断" : "完成"}</span><ChevronDown size={14} />
+    <Collapsible.Root
+      className={`tool-timeline tool-group ${groupStatus}`}
+      open={groupOpen || pendingCount > 0}
+      onOpenChange={(nextOpen) => {
+        if (pendingCount > 0 && !nextOpen) return;
+        setGroupOpen(nextOpen);
+      }}
+    >
+      <Collapsible.Trigger className="tool-group-trigger" aria-disabled={pendingCount > 0} aria-label={`${summary}，${groupOpen || pendingCount > 0 ? "收起" : "展开"}工具详情`}>
+        <span className="tool-group-icon" aria-hidden="true">
+          {pendingCount ? <Clock3 size={15} /> : failedCount ? <AlertCircle size={15} /> : unknownCount ? <CircleHelp size={15} /> : <Wrench size={15} />}
+        </span>
+        <span className="tool-group-summary">
+          <strong>工具调用</strong>
+          <span className="tool-group-separator" aria-hidden="true">·</span>
+          <span className="tool-group-state" aria-live="polite" aria-atomic="true">{groupState}</span>
+        </span>
+        {groupDuration !== null ? <time className="tool-group-duration">{formatCompactDuration(groupDuration)}</time> : null}
+        <ChevronDown size={14} aria-hidden="true" />
       </Collapsible.Trigger>
-      <Collapsible.Content className="tool-detail">
-        <pre>{JSON.stringify(tool.arguments, null, 2)}</pre>
-        {tool.resultPreview ? <p>{tool.resultPreview}</p> : null}
+      <Collapsible.Content className="tool-group-content">
+        {tools.map((tool) => {
+          const approval = pendingByCall.get(tool.callId);
+          if (approval) matchedCallIds.add(approval.id);
+          return (
+            <ToolStep
+              key={tool.callId}
+              tool={tool}
+              now={now}
+              approval={approval}
+              queuePosition={approval ? approvalOrder.get(approval.id) : undefined}
+              queueTotal={approvals.length}
+              submitting={Boolean(approval && approvalDecisionRequests[approval.id])}
+              onApprovalDecision={onApprovalDecision}
+            />
+          );
+        })}
+        {approvals.filter((approval) => !matchedCallIds.has(approval.id)).map((approval) => (
+          <div className="tool-orphan-approval" key={approval.id}>
+            <ApprovalCard
+              approval={approval}
+              queuePosition={approvalOrder.get(approval.id)}
+              queueTotal={approvals.length}
+              submitting={Boolean(approvalDecisionRequests[approval.id])}
+              onDecide={(decision) => onApprovalDecision?.(approval, decision)}
+              inline
+            />
+          </div>
+        ))}
       </Collapsible.Content>
     </Collapsible.Root>
   );
+}
+
+function ToolStep({
+  tool,
+  now,
+  approval,
+  queuePosition,
+  queueTotal,
+  submitting,
+  onApprovalDecision,
+}: {
+  tool: ToolActivity;
+  now: number;
+  approval?: ApprovalRequest;
+  queuePosition?: number;
+  queueTotal: number;
+  submitting: boolean;
+  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
+}) {
+  const [stepOpen, setStepOpen] = useState(Boolean(approval || tool.status === "running" || tool.status === "error" || tool.status === "unknown"));
+  useLayoutEffect(() => {
+    if (approval) {
+      // 待授权是工具行唯一的继续入口；审批到达后即使用户此前收起了该行，
+      // 也要强制展开，避免把“允许/拒绝”按钮藏在不可见详情里。
+      setStepOpen(true);
+    }
+  }, [approval]);
+  const kind = toolVisualKind(tool.name);
+  const actionLabel = toolActionLabel(tool, kind);
+  const icon = approval
+    ? <Clock3 size={14} />
+    : tool.status === "completed" || tool.status === "running"
+      ? toolIcon(kind, 16)
+      : tool.status === "error" || tool.status === "rejected"
+        ? <AlertCircle size={14} />
+        : tool.status === "interrupted" || tool.status === "cancelled"
+          ? <CircleStop size={14} />
+          : tool.status === "unknown" || tool.status === "unavailable" || tool.status === "expired"
+            ? <CircleHelp size={14} />
+            : toolIcon(kind, 16);
+  const statusLabel = approval
+    ? "等待授权"
+    : tool.approvalState === "allowed-once" && tool.status === "running" ? "已允许本次"
+      : tool.approvalState === "rejected" ? "已拒绝"
+        : tool.approvalState === "cancelled" ? "已取消"
+          : tool.approvalState === "expired" ? "授权超时"
+            : tool.approvalState === "unavailable" ? "授权不可用"
+    : tool.status === "running" ? "执行中"
+      : tool.status === "error" || tool.status === "rejected" ? "失败"
+        : tool.status === "interrupted" || tool.status === "cancelled" ? "已中断"
+          : tool.status === "expired" ? "已超时"
+            : tool.status === "unavailable" ? "不可用"
+              : tool.status === "unknown" ? "状态未知" : "完成";
+  const duration = toolDurationForDisplay(tool, now);
+  const target = summarizeToolTarget(tool);
+  return (
+    <Collapsible.Root
+      className={`tool-step ${tool.status}${approval ? " approval-pending" : ""}`}
+      open={stepOpen || Boolean(approval)}
+      onOpenChange={(nextOpen) => {
+        if (approval && !nextOpen) return;
+        setStepOpen(nextOpen);
+      }}
+    >
+      <Collapsible.Trigger className="tool-trigger" aria-disabled={Boolean(approval)} aria-label={`${tool.name}${target ? ` ${target}` : ""}，${actionLabel}，${statusLabel}`}>
+        <span className="tool-icon" aria-hidden="true">{icon}</span>
+        <span className="tool-action">{actionLabel}</span>
+        <strong className="tool-name">{tool.name}</strong>
+        {target && kind !== "message" ? <span className="tool-target">{target}</span> : null}
+        <span className="tool-status-label">{statusLabel}</span>
+        {duration ? <time className="tool-duration">{duration}</time> : null}
+        <ChevronDown size={14} aria-hidden="true" />
+      </Collapsible.Trigger>
+      <Collapsible.Content className="tool-detail">
+        {approval ? (
+          <ApprovalCard
+            approval={approval}
+            queuePosition={queuePosition}
+            queueTotal={queueTotal}
+            submitting={submitting}
+            onDecide={(decision) => onApprovalDecision?.(approval, decision)}
+            inline
+          />
+        ) : null}
+        <dl className="tool-detail-grid">
+          {target ? <div><dt>目标</dt><dd>{target}</dd></div> : null}
+          {tool.startedAt ? <div><dt>开始</dt><dd>{formatToolTimestamp(tool.startedAt)}</dd></div> : null}
+          {tool.endedAt ? <div><dt>结束</dt><dd>{formatToolTimestamp(tool.endedAt)}</dd></div> : null}
+          <div><dt>耗时</dt><dd>{duration || "耗时未知"}</dd></div>
+          {tool.approvalWaitMs !== undefined ? <div><dt>授权等待</dt><dd>{formatCompactDuration(tool.approvalWaitMs)}</dd></div> : null}
+          {tool.executionMs !== undefined ? <div><dt>执行</dt><dd>{formatCompactDuration(tool.executionMs)}</dd></div> : null}
+          {tool.approvalState && tool.approvalState !== "none" && !approval ? <div><dt>授权</dt><dd>{approvalStateLabel(tool.approvalState)}</dd></div> : null}
+          {tool.resultKind ? <div><dt>结果类型</dt><dd>{tool.resultKind}</dd></div> : null}
+          {tool.isTruncated ? <div><dt>输出</dt><dd>已截断</dd></div> : null}
+          {tool.exitCode !== undefined ? <div><dt>退出码</dt><dd>{String(tool.exitCode)}</dd></div> : null}
+          {tool.errorCode ? <div><dt>错误</dt><dd>{tool.errorCode}</dd></div> : null}
+        </dl>
+        {tool.resultPreview ? <p className="tool-result-preview">{truncateToolText(tool.resultPreview)}</p> : null}
+        {tool.status === "unknown" ? <p className="tool-unknown-note" role="status">服务端返回了未识别的工具状态，已按保守状态展示。</p> : null}
+      </Collapsible.Content>
+    </Collapsible.Root>
+  );
+}
+
+function approvalStateLabel(state: NonNullable<ToolActivity["approvalState"]>): string {
+  if (state === "pending") return "等待确认";
+  if (state === "submitting") return "提交中";
+  if (state === "allowed-once") return "已允许本次";
+  if (state === "rejected") return "已拒绝";
+  if (state === "cancelled") return "已取消";
+  if (state === "expired") return "已超时";
+  if (state === "unavailable") return "不可用";
+  return "无";
+}
+
+function deriveToolGroupDuration(tools: ToolActivity[], now: number): number | null {
+  const explicit = tools
+    .map((tool) => tool.groupDurationMs)
+    .filter((value): value is number => value !== undefined && Number.isFinite(value) && value >= 0);
+  const starts = tools.map((tool) => Date.parse(tool.startedAt || "")).filter((value) => Number.isFinite(value));
+  if (!starts.length) return null;
+  const ends = tools.map((tool) => {
+    if (tool.endedAt) return Date.parse(tool.endedAt);
+    if (tool.status === "running") return now;
+    return NaN;
+  }).filter((value) => Number.isFinite(value));
+  if (ends.length) return Math.max(0, Math.max(...ends) - Math.min(...starts));
+  // 历史快照可能只有分组显式耗时，没有完整时间戳；多个 iteration 时取
+  // 最大墙钟值，避免标题误用第一组的耗时。
+  return explicit.length ? Math.max(...explicit) : null;
+}
+
+function toolDurationForDisplay(tool: ToolActivity, now: number): string | null {
+  if (tool.durationMs !== undefined && Number.isFinite(tool.durationMs) && tool.durationMs >= 0) return formatCompactDuration(tool.durationMs);
+  if (tool.status === "running" && tool.startedAt) {
+    const start = Date.parse(tool.startedAt);
+    if (Number.isFinite(start)) return `运行中 · ${formatCompactDuration(Math.max(0, now - start))}`;
+  }
+  return tool.status === "running" ? "耗时未知" : null;
+}
+
+function formatCompactDuration(durationMs: number): string {
+  const milliseconds = Math.max(0, durationMs);
+  const seconds = milliseconds / 1000;
+  if (seconds < 1) return `${seconds.toFixed(1)} 秒`;
+  if (seconds < 60) return `${seconds.toFixed(1).replace(/\.0$/, "")} 秒`;
+  // 先把整秒四舍五入，再拆分分钟，避免 59.6 秒显示成“0 分 60 秒”。
+  const totalSeconds = Math.max(60, Math.round(seconds));
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainder = totalSeconds % 60;
+  return remainder ? `${minutes} 分 ${remainder} 秒` : `${minutes} 分钟`;
+}
+
+function formatToolTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "时间未知";
+  return date.toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function summarizeToolTarget(tool: ToolActivity): string {
+  if (!tool.arguments || typeof tool.arguments !== "object" || Array.isArray(tool.arguments)) return "";
+  const args = tool.arguments as Record<string, unknown>;
+  for (const key of ["path", "file_path", "source", "destination", "cwd", "pattern", "query", "skill", "command", "to", "recipient", "channel", "thread", "target", "name"]) {
+    const value = args[key];
+    if (typeof value !== "string" || !value.trim()) continue;
+    return truncateToolText(value.trim(), key === "command" ? 72 : 96);
+  }
+  return "";
+}
+
+function truncateToolText(value: string, max = 500): string {
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  return normalized.length > max ? `${normalized.slice(0, max)}…` : normalized;
 }
 
 function AttachmentGallery({ paths }: { paths: string[] }) {
@@ -2282,11 +2886,15 @@ function formatContextWindowSource(source: string): string {
   return source;
 }
 
-function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositioned }: {
+function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositioned, onVisibleApprovalIdsChange, approvals = [], approvalDecisionRequests = {}, onApprovalDecision }: {
   groups: ReturnType<typeof groupMessagesIntoNavigationTurns>;
   sessionId: string;
   requestedTurnId: string;
   onTurnPositioned: (turnId: string) => void;
+  onVisibleApprovalIdsChange: (sessionId: string, approvalIds: string[]) => void;
+  approvals?: ApprovalRequest[];
+  approvalDecisionRequests?: Record<string, string>;
+  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [scrollElement, setScrollElement] = useState<HTMLElement | null>(null);
@@ -2326,13 +2934,36 @@ function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositio
     onTurnPositioned(requestedTurnId);
   }, [groups, onTurnPositioned, requestedTurnId, scrollElement, virtualizer]);
 
+  const virtualItems = virtualizer.getVirtualItems();
+  const virtualItemSignature = virtualItems.map((item) => item.index).join(",");
+  const visibleApprovalIds = useMemo(() => {
+    const visibleCallsByTurn = new Map<string, Set<string>>();
+    for (const item of virtualItems) {
+      const group = groups[item.index];
+      if (!group) continue;
+      for (const message of group.messages) {
+        if (message.role !== "assistant" || !message.turnId || !message.tools.length) continue;
+        const calls = visibleCallsByTurn.get(message.turnId) ?? new Set<string>();
+        for (const tool of message.tools) calls.add(tool.callId);
+        visibleCallsByTurn.set(message.turnId, calls);
+      }
+    }
+    return approvals
+      .filter((approval) => visibleCallsByTurn.get(approval.turn_id)?.has(approval.call_id))
+      .map((approval) => approval.id);
+  }, [approvals, groups, virtualItemSignature]);
+
+  useLayoutEffect(() => {
+    onVisibleApprovalIdsChange(sessionId, visibleApprovalIds);
+  }, [onVisibleApprovalIdsChange, sessionId, visibleApprovalIds]);
+
   return (
     <div
       ref={hostRef}
       className="virtual-conversation"
       style={{ height: `${virtualizer.getTotalSize()}px` }}
     >
-      {virtualizer.getVirtualItems().map((item) => {
+      {virtualItems.map((item) => {
         const group = groups[item.index];
         const turnDurationMs = deriveTurnDuration(group.messages);
         return (
@@ -2350,6 +2981,9 @@ function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositio
                 message={message}
                 navigationTurnId={group.navigationTurnId}
                 turnDurationMs={turnDurationMs}
+                approvals={approvals}
+                approvalDecisionRequests={approvalDecisionRequests}
+                onApprovalDecision={onApprovalDecision}
               />
             ))}
           </section>

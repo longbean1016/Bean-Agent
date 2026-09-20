@@ -1,4 +1,4 @@
-import type { ChatAction, ChatMessage, ChatState, ContextUsage, MessageRow, ModelAdapterId, ProactiveNotificationRow, SessionUsage, ToolActivity, TurnRuntimeState } from "./types";
+import type { ApprovalRequest, ChatAction, ChatMessage, ChatState, ContextUsage, MessageRow, ModelAdapterId, ProactiveNotificationRow, ResolvedApproval, SessionUsage, ToolActivity, ToolStatus, TurnRuntimeState } from "./types";
 import { reconcileMessages } from "./timeline";
 
 export const idleTurnState: TurnRuntimeState = {
@@ -14,6 +14,8 @@ export const initialChatState: ChatState = {
   messages: [],
   sessionMessages: {},
   error: "",
+  approvalRequests: {},
+  resolvedApprovals: {},
   turnStates: {},
   contextUsage: {},
   sessionUsage: {},
@@ -24,6 +26,22 @@ function isTurnActive(status: TurnRuntimeState["status"]): boolean {
     || status === "queued"
     || status === "running"
     || status === "compacting";
+}
+
+function isActiveTurnMatch(state: ChatState, sessionId: string, turnId: string): boolean {
+  if (!sessionId || !turnId) return false;
+  const runtime = state.turnStates[sessionId];
+  return runtime?.turnId === turnId
+    || (sessionId === state.sessionId && state.activeTurnId === turnId);
+}
+
+function legacyFrameTurnId(state: ChatState, sessionId: string, requestId?: string): string {
+  const runtime = state.turnStates[sessionId];
+  if (!runtime || !isTurnActive(runtime.status)) return "";
+  // 旧帧可能没有 turn_id，但只要带有 request_id，就不能让上一轮的迟到帧
+  // 覆盖当前请求；没有 request_id 时保留旧版 queued/running 兼容回退。
+  if (requestId && runtime.requestId && requestId !== runtime.requestId) return "";
+  return runtime.turnId || (sessionId === state.sessionId ? state.activeTurnId : "");
 }
 
 export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState {
@@ -138,7 +156,16 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     const existingUser = source.find((item) => (
       item.role === "user" && (item.turnId === action.turn_id || item.id === userId)
     ));
-    const draft = createDraft(action.turn_id);
+    // tool.started 可能先于 turn.started 到达；保留已经收集到的工具行，避免
+    // 服务端确认帧把乱序事件创建的草稿覆盖掉。
+    const existingAssistant = source.find((item) => item.role === "assistant" && item.turnId === action.turn_id);
+    if (existingAssistant && isClosedMessage(existingAssistant)) {
+      // 迟到的 started 不能重新激活已经收到 final/error 的同一 Turn。
+      return state;
+    }
+    const draft = existingAssistant
+      ? { ...existingAssistant, streaming: existingAssistant.streaming ?? true }
+      : createDraft(action.turn_id);
     const sessionMessages = [
       ...source.filter((item) => item.turnId !== action.turn_id && item.id !== userId),
       ...(existingUser ? [{ ...existingUser, turnId: action.turn_id }] : []),
@@ -265,43 +292,55 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       sessionUsage: { ...state.sessionUsage, [action.session_id]: sessionUsage },
     };
   }
-  if (action.type === "message.final" && action.turn_id) {
-    const nextState = {
-      ...state,
-      turnStates: setTurnState(state, action.session_id, idleTurnState),
-    };
-    state = nextState;
-  }
   if (action.type === "turn.interrupted") {
     const current = action.session_id === state.sessionId;
     const interruptedTurnId = action.turn_id
       || state.turnStates[action.session_id]?.turnId
       || (current ? state.activeTurnId : "");
+    // 旧协议的取消帧可能没有 turn_id；此时只能把当前会话的 queued/running
+    // Turn 作为目标，不能因为空 turn_id 把排队状态永久留在 queued。
+    const interruptedOwnsActiveTurn = action.turn_id
+      ? isActiveTurnMatch(state, action.session_id, interruptedTurnId)
+      : Boolean(state.turnStates[action.session_id] && isTurnActive(state.turnStates[action.session_id].status));
     const interruptedAt = action.ended_at || new Date().toISOString();
+    const interruptionToolStatus = normalizeToolStatus(action.status) === "cancelled"
+      ? "cancelled"
+      : normalizeToolStatus(action.status) === "expired" ? "expired" : "interrupted";
     const source = getSessionMessages(state, action.session_id);
     const turnUser = interruptedTurnId
       ? source.find((message) => message.role === "user" && message.turnId === interruptedTurnId)
       : undefined;
     const sessionMessages = interruptedTurnId
       ? source.map((message) => {
-        if (message.turnId !== interruptedTurnId) return message;
-        const durationMs = message.role === "assistant"
-          ? message.durationMs ?? normalizeDuration(action.duration_ms) ?? (isRuntimeMessage(turnUser) ? elapsedDurationMs(turnUser?.timestamp, interruptedAt) : undefined)
-          : message.durationMs;
+        if (message.turnId !== interruptedTurnId || message.role !== "assistant") return message;
+        const durationMs = message.durationMs
+          ?? normalizeDuration(action.duration_ms)
+          ?? (isRuntimeMessage(turnUser) ? elapsedDurationMs(turnUser?.timestamp, interruptedAt) : undefined);
+        const tools = message.tools.map((tool) => interruptTool(tool, interruptedAt, interruptionToolStatus));
+        // 已经收到 completed/error 的助手消息不能因迟到的 interrupted 帧回退；
+        // 但仍要把其中尚未结束的工具收敛为中断，避免 UI 永久显示执行中。
+        const messageTerminal = isTerminalMessageStatus(message.status)
+          || (message.streaming === false && !message.status);
         return {
           ...message,
           streaming: false,
-          status: "interrupted",
-          thinkingStatus: message.thinking ? "interrupted" : message.thinkingStatus,
+          status: messageTerminal ? message.status : "interrupted",
+          thinkingStatus: message.thinking && !messageTerminal ? "interrupted" : message.thinkingStatus,
+          tools,
           ...(durationMs === undefined ? {} : { durationMs }),
         };
       })
       : source;
     const nextState = {
       ...state,
-      activeTurnId: current ? "" : state.activeTurnId,
-      turnStates: setTurnState(state, action.session_id, idleTurnState),
+      activeTurnId: current && interruptedOwnsActiveTurn ? "" : state.activeTurnId,
+      turnStates: interruptedOwnsActiveTurn
+        ? setTurnState(state, action.session_id, idleTurnState)
+        : state.turnStates,
       sessionMessages: setSessionMessages(state, action.session_id, sessionMessages),
+      approvalRequests: interruptedTurnId
+        ? removeApprovalRequestsForTurn(state, action.session_id, interruptedTurnId)
+        : state.approvalRequests,
     };
     if (!current) return nextState;
     return {
@@ -325,11 +364,16 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       requestId: action.request_id ?? "",
     });
     const source = getSessionMessages(state, action.session_id);
+    const existingAssistant = source.find((message) => message.role === "assistant" && message.turnId === action.turn_id);
+    if (existingAssistant && isClosedMessage(existingAssistant)) {
+      // 重连快照可能晚于 final；终态消息不应重新进入 streaming/running。
+      return state;
+    }
     const userId = action.request_id ? `user-${action.request_id}` : `user-${action.turn_id}`;
     const user: ChatMessage = {
       id: userId,
       role: "user",
-      content: action.user_message,
+      content: String(action.user_message ?? ""),
       thinking: "",
       media: action.user_media ?? [],
       tools: [],
@@ -337,24 +381,37 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       streaming: false,
       timestamp: startedAt,
     };
-    const incomingTools = action.tools.map((tool) => ({
+    const incomingTools = (action.tools ?? []).map((tool) => decorateToolWithApproval(state, action.session_id, action.turn_id, {
       callId: tool.call_id,
       name: tool.name,
-      status: tool.status === "error" ? "error" as const : tool.status === "running" ? "running" as const : "completed" as const,
+      status: normalizeToolStatus(tool.status),
       arguments: tool.arguments,
-      resultPreview: tool.result_preview,
+      resultPreview: String(tool.result_preview ?? ""),
+      ...(tool.started_at ? { startedAt: tool.started_at } : {}),
+      ...(tool.ended_at ? { endedAt: tool.ended_at } : {}),
+      ...(normalizeOptionalDuration(tool.duration_ms) !== undefined ? { durationMs: normalizeOptionalDuration(tool.duration_ms) } : {}),
+      ...(tool.approval_id ? { approvalId: tool.approval_id } : {}),
+      ...(tool.approval_state ? { approvalState: normalizeApprovalState(tool.approval_state) } : {}),
+      ...(tool.approval_requested_at ? { approvalRequestedAt: tool.approval_requested_at } : {}),
+      ...(tool.approval_resolved_at ? { approvalResolvedAt: tool.approval_resolved_at } : {}),
+      ...(normalizeOptionalDuration(tool.approval_wait_ms) !== undefined ? { approvalWaitMs: normalizeOptionalDuration(tool.approval_wait_ms) } : {}),
+      ...(normalizeOptionalDuration(tool.execution_ms) !== undefined ? { executionMs: normalizeOptionalDuration(tool.execution_ms) } : {}),
+      ...(normalizeOptionalDuration(tool.group_duration_ms) !== undefined ? { groupDurationMs: normalizeOptionalDuration(tool.group_duration_ms) } : {}),
+      ...(tool.result_kind ? { resultKind: tool.result_kind } : {}),
+      ...(tool.is_truncated === undefined || tool.is_truncated === null ? {} : { isTruncated: Boolean(tool.is_truncated) }),
+      ...(normalizeOptionalNumber(tool.exit_code) !== undefined ? { exitCode: normalizeOptionalNumber(tool.exit_code) } : {}),
+      ...(tool.error_code ? { errorCode: tool.error_code } : {}),
     }));
     const existingUser = source.find((message) => (
       message.role === "user" && (message.turnId === action.turn_id || message.id === userId)
     ));
-    const existingAssistant = source.find((message) => message.role === "assistant" && message.turnId === action.turn_id);
     const assistant: ChatMessage = {
       ...(existingAssistant ?? createDraft(action.turn_id)),
       id: action.turn_id,
       turnId: action.turn_id,
       role: "assistant",
-      content: longestText(existingAssistant?.content ?? "", action.content ?? ""),
-      thinking: longestText(existingAssistant?.thinking ?? "", action.thinking ?? ""),
+      content: longestText(existingAssistant?.content ?? "", String(action.content ?? "")),
+      thinking: longestText(existingAssistant?.thinking ?? "", String(action.thinking ?? "")),
       thinkingStatus: (action.thinking || existingAssistant?.thinking)
         ? "running"
         : existingAssistant?.thinkingStatus,
@@ -382,44 +439,169 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     };
   }
   if (action.type === "answer.delta") {
-    return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
-      ...message,
-      content: message.content + action.delta,
-      streaming: true,
-    }));
+    return updateSessionTurn(state, action.session_id, action.turn_id, (message) => {
+      if (isClosedMessage(message)) return message;
+      return {
+        ...message,
+        content: message.content + action.delta,
+        streaming: true,
+      };
+    });
   }
   if (action.type === "react.thinking.delta") {
-    return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
-      ...message,
-      thinking: message.thinking + action.delta,
-      streaming: true,
-      thinkingStatus: message.thinkingStatus === "completed" ? "completed" : "running",
-    }));
+    return updateSessionTurn(state, action.session_id, action.turn_id, (message) => {
+      if (isClosedMessage(message)) return message;
+      return {
+        ...message,
+        thinking: message.thinking + action.delta,
+        streaming: true,
+        thinkingStatus: message.thinkingStatus === "completed" ? "completed" : "running",
+      };
+    });
+  }
+  if (action.type === "approval.requested") {
+    const requestedAt = action.approval.requested_at || action.approval.created_at;
+    const resolved = state.resolvedApprovals?.[action.session_id]?.[action.approval.id];
+    // resolved 可能在重连 replay 中先于 requested 到达；不要把已结束的审批
+    // 重新放回等待队列，只把终态补到已经存在的工具行。
+    if (resolved && resolved.session_id === action.session_id) {
+      // 某些旧服务端回执只携带 approval_id；requested replay 才带有
+      // turn/call/created_at。先补齐关联信息，后续无 approval_id 的工具帧
+      // 才能通过 turn_id + call_id 找到这条已决议记录。
+      const enrichedResolution = mergeResolvedApproval(resolved, {
+        ...resolved,
+        turn_id: resolved.turn_id || action.approval.turn_id,
+        call_id: resolved.call_id || action.approval.call_id,
+        requested_at: resolved.requested_at || requestedAt,
+      });
+      const next = updateToolApproval(state, action.session_id, {
+        turnId: enrichedResolution.turn_id || action.approval.turn_id,
+        callId: enrichedResolution.call_id || action.approval.call_id,
+        approvalId: action.approval.id,
+      }, (tool) => applyResolvedApproval(tool, enrichedResolution));
+      return {
+        ...next,
+        resolvedApprovals: rememberResolvedApproval(state.resolvedApprovals, enrichedResolution),
+      };
+    }
+    const source = getSessionMessages(state, action.session_id);
+    const terminalToolMatched = source.some((message) => message.role === "assistant"
+      && (!action.approval.turn_id || message.turnId === action.approval.turn_id)
+      && message.tools.some((tool) => (
+        (tool.callId === action.approval.call_id || tool.approvalId === action.approval.id)
+         && isKnownTerminalToolStatus(tool.status)
+      )));
+    const next = updateToolApproval(state, action.session_id, {
+      turnId: action.approval.turn_id,
+      callId: action.approval.call_id,
+      approvalId: action.approval.id,
+    }, (tool) => isKnownTerminalToolStatus(tool.status)
+      // 终态优先：迟到的 requested 只能补关联时间，不能把工具重新打开为 pending。
+      ? {
+          ...tool,
+          approvalId: action.approval.id,
+          ...(requestedAt ? { approvalRequestedAt: tool.approvalRequestedAt || requestedAt } : {}),
+        }
+      : {
+          ...tool,
+          approvalId: action.approval.id,
+          approvalState: "pending",
+          ...(requestedAt ? { approvalRequestedAt: requestedAt } : {}),
+        });
+    // 如果已经有终态工具，审批请求本身也是迟到 replay；不要生成没有对应
+    // 工具行的可点击卡片，等待服务端的 resolved/历史终态完成收敛。
+    if (terminalToolMatched) return next;
+    return {
+      ...next,
+      approvalRequests: {
+        ...(state.approvalRequests ?? {}),
+        [action.session_id]: {
+          ...(state.approvalRequests?.[action.session_id] ?? {}),
+          [action.approval.id]: action.approval,
+        },
+      },
+    };
+  }
+  if (action.type === "approval.resolved") {
+    const remembered = state.approvalRequests?.[action.session_id]?.[action.approval_id];
+    const resolvedState = normalizeResolutionState(action.state, action.decision);
+    const resolvedAt = action.decided_at || new Date().toISOString();
+    const incomingResolution: ResolvedApproval = {
+      id: action.approval_id,
+      session_id: action.session_id,
+      turn_id: action.turn_id || remembered?.turn_id,
+      call_id: action.call_id || remembered?.call_id,
+      decision: normalizeApprovalDecision(action.decision, resolvedState),
+      state: resolvedState,
+      requested_at: remembered?.requested_at || remembered?.created_at,
+      decided_at: resolvedAt,
+      ...(action.error_code ? { error_code: action.error_code } : {}),
+    };
+    const resolution = mergeResolvedApproval(
+      state.resolvedApprovals?.[action.session_id]?.[action.approval_id],
+      incomingResolution,
+    );
+    const next = updateToolApproval(state, action.session_id, {
+      turnId: resolution.turn_id,
+      callId: resolution.call_id,
+      approvalId: action.approval_id,
+    }, (tool) => applyResolvedApproval(tool, resolution));
+    const approvalRequests = { ...(state.approvalRequests ?? {}) };
+    const sessionRequests = { ...(approvalRequests[action.session_id] ?? {}) };
+    delete sessionRequests[action.approval_id];
+    if (Object.keys(sessionRequests).length) approvalRequests[action.session_id] = sessionRequests;
+    else delete approvalRequests[action.session_id];
+    return {
+      ...next,
+      approvalRequests,
+      resolvedApprovals: rememberResolvedApproval(state.resolvedApprovals, resolution),
+    };
   }
   if (action.type === "react.tool.started") {
+    const rememberedApproval = findPendingApproval(state, action.session_id, action.turn_id, action.call_id, action.approval_id);
+    const resolvedApproval = findResolvedApproval(state, action.session_id, action.turn_id, action.call_id, action.approval_id);
+    const approvalId = action.approval_id || rememberedApproval?.id || resolvedApproval?.id;
+    const incoming = decorateToolWithApproval(state, action.session_id, action.turn_id, {
+      callId: action.call_id,
+      name: action.tool_name,
+      status: "running",
+      arguments: action.arguments,
+      resultPreview: "",
+      ...(action.started_at ? { startedAt: action.started_at } : {}),
+      ...(action.approval_requested_at ? { approvalRequestedAt: action.approval_requested_at } : {}),
+      ...(approvalId ? { approvalId } : {}),
+      ...(action.approval_state ? { approvalState: normalizeApprovalState(action.approval_state) } : {}),
+    });
     return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
       ...message,
       thinkingStatus: message.thinking ? "running" : message.thinkingStatus,
-      tools: mergeTools(message.tools, [{
-        callId: action.call_id,
-        name: action.tool_name,
-        status: "running",
-        arguments: action.arguments,
-        resultPreview: "",
-      }]),
-    }));
+      tools: mergeTools(message.tools, [incoming]),
+    }), true);
   }
   if (action.type === "react.tool.completed") {
+    const incoming = decorateToolWithApproval(state, action.session_id, action.turn_id, {
+      callId: action.call_id,
+      name: action.tool_name,
+      status: normalizeToolStatus(action.status),
+      arguments: undefined,
+      resultPreview: action.result_preview,
+      ...(action.started_at ? { startedAt: action.started_at } : {}),
+      ...(action.ended_at ? { endedAt: action.ended_at } : {}),
+      ...(normalizeOptionalDuration(action.duration_ms) !== undefined ? { durationMs: normalizeOptionalDuration(action.duration_ms) } : {}),
+      ...(action.approval_requested_at ? { approvalRequestedAt: action.approval_requested_at } : {}),
+      ...(action.approval_resolved_at ? { approvalResolvedAt: action.approval_resolved_at } : {}),
+      ...(normalizeOptionalDuration(action.approval_wait_ms) !== undefined ? { approvalWaitMs: normalizeOptionalDuration(action.approval_wait_ms) } : {}),
+      ...(normalizeOptionalDuration(action.execution_ms) !== undefined ? { executionMs: normalizeOptionalDuration(action.execution_ms) } : {}),
+      ...(normalizeOptionalDuration(action.group_duration_ms) !== undefined ? { groupDurationMs: normalizeOptionalDuration(action.group_duration_ms) } : {}),
+      ...(action.result_kind ? { resultKind: action.result_kind } : {}),
+      ...(action.is_truncated === undefined ? {} : { isTruncated: action.is_truncated }),
+      ...(normalizeOptionalNumber(action.exit_code) !== undefined ? { exitCode: normalizeOptionalNumber(action.exit_code) } : {}),
+      ...(action.error_code ? { errorCode: action.error_code } : {}),
+    });
     return updateSessionTurn(state, action.session_id, action.turn_id, (message) => ({
       ...message,
-      tools: mergeTools(message.tools, [{
-        callId: action.call_id,
-        name: action.tool_name,
-        status: action.status === "error" ? "error" : "completed",
-        arguments: undefined,
-        resultPreview: action.result_preview,
-      }]),
-    }));
+      tools: mergeTools(message.tools, [incoming]),
+    }), true);
   }
   if (action.type === "message.final") {
     if (!action.turn_id && (action.metadata?.proactive || action.metadata?.notification)) {
@@ -449,11 +631,20 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       };
     }
     // final 是服务端的权威快照，必须覆盖草稿，不能继续追加 delta。
+    // 迟到的旧 Turn final 不能清空同一会话已经开始的新 Turn；只有当
+    // final 对应当前运行态时才收敛 turnStates，历史/后台 Turn 仍可正常落行。
+    const finalTurnId = action.turn_id || legacyFrameTurnId(
+      state,
+      action.session_id,
+      action.request_id,
+    );
+    const finalOwnsActiveTurn = Boolean(finalTurnId)
+      && isActiveTurnMatch(state, action.session_id, finalTurnId);
     const source = getSessionMessages(state, action.session_id);
-    const turnUser = source.find((message) => message.role === "user" && message.turnId === action.turn_id);
+    const turnUser = source.find((message) => message.role === "user" && message.turnId === finalTurnId);
     const finalReceivedAt = new Date().toISOString();
     const metadataDuration = durationFromMetadata(action.metadata);
-    const next = updateSessionTurn(state, action.session_id, action.turn_id, (message) => {
+    const next = updateSessionTurn(state, action.session_id, finalTurnId, (message) => {
       const timestamp = String(action.metadata?.generated_at || "")
         || (message.streaming ? finalReceivedAt : message.timestamp);
       const durationMs = message.durationMs
@@ -471,10 +662,17 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
         modelRoute: modelRouteFromMetadata(action.metadata) ?? message.modelRoute,
         ...(durationMs === undefined ? {} : { durationMs }),
       };
-    });
+    }, true);
     return {
       ...next,
-      activeTurnId: action.session_id === state.sessionId ? "" : next.activeTurnId,
+      turnStates: finalOwnsActiveTurn
+        ? setTurnState(state, action.session_id, idleTurnState)
+        : next.turnStates,
+      activeTurnId: action.session_id === state.sessionId
+        && finalOwnsActiveTurn ? "" : next.activeTurnId,
+      approvalRequests: finalTurnId
+        ? removeApprovalRequestsForTurn(state, action.session_id, finalTurnId)
+        : state.approvalRequests,
     };
   }
   return state;
@@ -531,17 +729,354 @@ function mergeTools(current: ToolActivity[], incoming: ToolActivity[]): ToolActi
       continue;
     }
     const existing = merged[index];
-    if ((existing.status === "completed" || existing.status === "error") && tool.status === "running") {
+    if ((existing.approvalState === "rejected" || existing.approvalState === "cancelled"
+      || existing.approvalState === "expired" || existing.approvalState === "unavailable")
+      && tool.status === "running") {
       continue;
     }
-    merged[index] = {
-      ...existing,
-      ...tool,
-      arguments: tool.arguments === undefined ? existing.arguments : tool.arguments,
-      resultPreview: tool.resultPreview || existing.resultPreview,
-    };
+    if ((existing.approvalState === "rejected" || existing.approvalState === "cancelled"
+      || existing.approvalState === "expired" || existing.approvalState === "unavailable")
+      && tool.status === "completed") {
+      // 审批拒绝/失效后迟到的 completed 不能把安全终态伪装成成功。
+      continue;
+    }
+    // 终态不能因重连快照或迟到 started 事件回退；未知终态也不能被伪装成成功。
+    if (isTerminalToolStatus(existing.status) && !isTerminalToolStatus(tool.status)) {
+      // 虽然状态保持终态，迟到 started 仍可能携带此前缺失的目标、参数和
+      // 开始时间；合并这些展示字段，避免乱序只剩一行“未知工具”。
+      merged[index] = mergeToolFields(existing, tool, true);
+      continue;
+    }
+    if (isKnownTerminalToolStatus(existing.status)
+      && tool.status === "unknown"
+      && !isKnownTerminalToolStatus(tool.status)) {
+      merged[index] = mergeToolFields(existing, tool, true);
+      continue;
+    }
+    if (isKnownTerminalToolStatus(existing.status)
+      && isKnownTerminalToolStatus(tool.status)
+      && existing.status !== tool.status
+      && !isLaterToolTerminal(tool, existing)) {
+      // 同一 call 的终态事件可能因重连乱序到达；有可靠结束时间时只接收
+      // 更新的一条，没有时间戳则保留先到终态，避免重复帧随机改写结果。
+      continue;
+    }
+    merged[index] = mergeToolFields(existing, tool);
   }
   return merged;
+}
+
+function mergeToolFields(existing: ToolActivity, incoming: ToolActivity, preserveStatus = false): ToolActivity {
+  return {
+    ...existing,
+    ...incoming,
+    ...(preserveStatus ? { status: existing.status } : {}),
+    arguments: incoming.arguments === undefined ? existing.arguments : incoming.arguments,
+    resultPreview: incoming.resultPreview || existing.resultPreview,
+    startedAt: incoming.startedAt || existing.startedAt,
+    endedAt: incoming.endedAt || existing.endedAt,
+    durationMs: incoming.durationMs ?? existing.durationMs,
+    approvalRequestedAt: incoming.approvalRequestedAt || existing.approvalRequestedAt,
+    approvalResolvedAt: incoming.approvalResolvedAt || existing.approvalResolvedAt,
+    approvalWaitMs: incoming.approvalWaitMs ?? existing.approvalWaitMs,
+    executionMs: incoming.executionMs ?? existing.executionMs,
+    groupDurationMs: incoming.groupDurationMs ?? existing.groupDurationMs,
+    approvalId: incoming.approvalId || existing.approvalId,
+    approvalState: incoming.approvalState ?? existing.approvalState,
+    resultKind: incoming.resultKind || existing.resultKind,
+    isTruncated: incoming.isTruncated ?? existing.isTruncated,
+    exitCode: incoming.exitCode ?? existing.exitCode,
+    errorCode: incoming.errorCode || existing.errorCode,
+  };
+}
+
+function removeApprovalRequestsForTurn(state: ChatState, sessionId: string, turnId: string): NonNullable<ChatState["approvalRequests"]> {
+  const requests = state.approvalRequests ?? {};
+  const next = { ...requests };
+  const sessionRequests = { ...(next[sessionId] ?? {}) };
+  for (const [approvalId, approval] of Object.entries(sessionRequests)) {
+    if (!turnId || approval.turn_id === turnId) delete sessionRequests[approvalId];
+  }
+  if (Object.keys(sessionRequests).length) next[sessionId] = sessionRequests;
+  else delete next[sessionId];
+  return next;
+}
+
+/** 将服务端 wire 状态映射为有限集合；未知值必须落到 unknown。 */
+export function normalizeToolStatus(status: unknown): ToolStatus {
+  const value = String(status ?? "").trim().toLowerCase();
+  if (value === "running" || value === "in_progress" || value === "pending") return "running";
+  if (value === "ok" || value === "completed" || value === "complete" || value === "success" || value === "done") return "completed";
+  if (value === "error" || value === "failed" || value === "failure") return "error";
+  if (value === "interrupted" || value === "stopped") return "interrupted";
+  if (value === "cancelled" || value === "canceled") return "cancelled";
+  if (value === "expired" || value === "timeout" || value === "timed_out") return "expired";
+  if (value === "unavailable" || value === "disconnected") return "unavailable";
+  if (value === "rejected" || value === "denied") return "rejected";
+  return "unknown";
+}
+
+function isTerminalToolStatus(status: ToolStatus): boolean {
+  // unknown 来自 completed/历史快照时也必须按 fail-closed 终态处理，
+  // 防止迟到的 approval.requested 把一次已经结束的调用重新打开。
+  return status !== "running";
+}
+
+function isKnownTerminalToolStatus(status: ToolStatus): boolean {
+  return status === "completed"
+    || status === "error"
+    || status === "interrupted"
+    || status === "cancelled"
+    || status === "expired"
+    || status === "unavailable"
+    || status === "rejected";
+}
+
+function isLaterToolTerminal(incoming: ToolActivity, existing: ToolActivity): boolean {
+  if (!incoming.endedAt || !existing.endedAt) return false;
+  const incomingAt = Date.parse(incoming.endedAt);
+  const existingAt = Date.parse(existing.endedAt);
+  return Number.isFinite(incomingAt) && Number.isFinite(existingAt) && incomingAt >= existingAt;
+}
+
+function isTerminalApprovalState(state: ToolActivity["approvalState"]): boolean {
+  return state === "rejected" || state === "cancelled" || state === "expired" || state === "unavailable";
+}
+
+function normalizeApprovalState(value: unknown): NonNullable<ToolActivity["approvalState"]> {
+  const state = String(value ?? "").trim().toLowerCase();
+  if (state === "pending" || state === "submitting" || state === "allowed-once"
+    || state === "rejected" || state === "cancelled" || state === "expired" || state === "unavailable") {
+    return state;
+  }
+  return "none";
+}
+
+function normalizeApprovalDecision(
+  decision: unknown,
+  state: ToolActivity["approvalState"],
+): ResolvedApproval["decision"] {
+  if (decision === "rejected" || decision === "cancelled" || decision === "expired" || decision === "unavailable") {
+    return decision;
+  }
+  if (state === "rejected") {
+    return state;
+  }
+  // cancelled/expired/unavailable 是服务端终态，不是用户的允许/拒绝决定；
+  // 保留 null 让诊断层能区分“没有用户决定”和明确 rejected。
+  if (state === "cancelled" || state === "expired" || state === "unavailable") return null;
+  // 没有可识别的 state/decision 时只记录未知回执，不把它伪装成放行。
+  return state === "allowed-once" ? "allowed-once" : null;
+}
+
+function normalizeResolutionState(state: unknown, decision: unknown): NonNullable<ToolActivity["approvalState"]> {
+  const fromState = normalizeApprovalState(state);
+  const fromDecision = normalizeApprovalState(decision);
+  // 旧服务端可能同时携带 state=pending 与明确 decision；合法 decision
+  // 优先，避免 UI 在已决定后继续显示等待授权。
+  if (decision === "allowed-once" || decision === "rejected" || decision === "cancelled"
+    || decision === "expired" || decision === "unavailable") {
+    return fromDecision;
+  }
+  // resolved 只能携带终态；pending/submitting 即使来自旧服务端也不能
+  // 让前端移除审批卡后继续显示一个没有操作入口的永久等待状态。
+  if (fromState === "allowed-once" || fromState === "rejected"
+    || fromState === "cancelled" || fromState === "expired" || fromState === "unavailable") {
+    return fromState;
+  }
+  // 缺失或未知的终态不能默认成 allowed-once；否则一帧损坏/未来版本的
+  // approval.resolved 可能被 UI 误解为已放行。按不可用收敛，既保持
+  // fail-closed，也让等待中的工具有明确终态而不会永久卡在 running。
+  return "unavailable";
+}
+
+function mergeResolvedApproval(previous: ResolvedApproval | undefined, incoming: ResolvedApproval): ResolvedApproval {
+  if (!previous || previous.session_id !== incoming.session_id) return incoming;
+  // 终态一旦确认不能被迟到的 allowed-once/未知回执重新打开；若两个回执
+  // 都是终态，保留第一次决定并补充后到的关联字段。
+  if (isTerminalApprovalState(previous.state)) {
+    return {
+      ...incoming,
+      ...previous,
+      turn_id: previous.turn_id || incoming.turn_id,
+      call_id: previous.call_id || incoming.call_id,
+      requested_at: previous.requested_at || incoming.requested_at,
+      decided_at: previous.decided_at || incoming.decided_at,
+      error_code: previous.error_code || incoming.error_code,
+    };
+  }
+  return {
+    ...previous,
+    ...incoming,
+    turn_id: incoming.turn_id || previous.turn_id,
+    call_id: incoming.call_id || previous.call_id,
+    requested_at: incoming.requested_at || previous.requested_at,
+    decided_at: incoming.decided_at || previous.decided_at,
+    error_code: incoming.error_code || previous.error_code,
+  };
+}
+
+function rememberResolvedApproval(
+  current: ChatState["resolvedApprovals"],
+  resolution: ResolvedApproval,
+): NonNullable<ChatState["resolvedApprovals"]> {
+  const next = {
+    ...(current ?? {}),
+    [resolution.session_id]: {
+      ...(current?.[resolution.session_id] ?? {}),
+      [resolution.id]: resolution,
+    },
+  };
+  const entries = Object.entries(next[resolution.session_id]);
+  if (entries.length <= 256) return next;
+  // 只保留短期乱序窗口，避免长时间运行的会话在浏览器内无限增长。
+  entries.sort(([, left], [, right]) => {
+    const leftTime = Date.parse(left.decided_at || "");
+    const rightTime = Date.parse(right.decided_at || "");
+    return (Number.isFinite(leftTime) ? leftTime : 0) - (Number.isFinite(rightTime) ? rightTime : 0);
+  });
+  for (const [id] of entries.slice(0, entries.length - 256)) delete next[resolution.session_id][id];
+  return next;
+}
+
+function findPendingApproval(
+  state: ChatState,
+  sessionId: string,
+  turnId: string,
+  callId: string,
+  approvalId?: string,
+): ApprovalRequest | undefined {
+  const requests = Object.values(state.approvalRequests?.[sessionId] ?? {});
+  if (approvalId) {
+    const direct = state.approvalRequests?.[sessionId]?.[approvalId];
+    if (direct) return direct;
+  }
+  return requests.find((approval) => (
+    approval.session_id === sessionId
+    && approval.turn_id === turnId
+    && approval.call_id === callId
+  ));
+}
+
+function findResolvedApproval(
+  state: ChatState,
+  sessionId: string,
+  turnId: string,
+  callId: string,
+  approvalId?: string,
+): ResolvedApproval | undefined {
+  const resolutions = Object.values(state.resolvedApprovals?.[sessionId] ?? {});
+  if (approvalId) {
+    const direct = state.resolvedApprovals?.[sessionId]?.[approvalId];
+    if (direct) return direct;
+  }
+  return resolutions.find((resolution) => (
+    resolution.session_id === sessionId
+    && (!!turnId && resolution.turn_id === turnId)
+    && (!!callId && resolution.call_id === callId)
+  ));
+}
+
+function approvalTerminalStatus(state: ToolActivity["approvalState"]): ToolStatus | undefined {
+  if (state === "rejected" || state === "cancelled" || state === "expired" || state === "unavailable") return state;
+  return undefined;
+}
+
+function applyResolvedApproval(
+  tool: ToolActivity,
+  resolution: ResolvedApproval,
+  options: { priorToToolEvent?: boolean } = {},
+): ToolActivity {
+  const terminalStatus = approvalTerminalStatus(resolution.state);
+  const resolvedAt = resolution.decided_at;
+  const toolEndedAt = tool.endedAt ? Date.parse(tool.endedAt) : NaN;
+  const approvalResolvedAt = resolvedAt ? Date.parse(resolvedAt) : NaN;
+  // 已完成工具缺少任一端时间时无法证明审批先于工具终态；保守保留
+  // completed，避免旧协议的迟到 rejected 把成功结果回退成失败。
+  const resolvedBeforeToolEnd = Number.isFinite(toolEndedAt)
+    && Number.isFinite(approvalResolvedAt)
+    && approvalResolvedAt <= toolEndedAt;
+  const canSetApprovalTerminal = tool.status === "running" || tool.status === "unknown"
+    || (Boolean(terminalStatus) && tool.status === "completed"
+      && (resolvedBeforeToolEnd || options.priorToToolEvent === true));
+  const changesToApprovalTerminal = Boolean(terminalStatus && canSetApprovalTerminal);
+  const requestedAt = tool.approvalRequestedAt || resolution.requested_at;
+  const approvalWaitMs = tool.approvalWaitMs ?? elapsedDurationMs(requestedAt, resolvedAt);
+  return {
+    ...tool,
+    status: terminalStatus && canSetApprovalTerminal ? terminalStatus : tool.status,
+    approvalId: resolution.id,
+    approvalState: resolution.state,
+    ...(changesToApprovalTerminal ? { resultPreview: "" } : {}),
+    ...(requestedAt ? { approvalRequestedAt: requestedAt } : {}),
+    ...(resolvedAt ? { approvalResolvedAt: resolvedAt } : {}),
+    ...(approvalWaitMs === undefined ? {} : { approvalWaitMs }),
+    ...(resolution.error_code ? { errorCode: resolution.error_code } : {}),
+  };
+}
+
+function decorateToolWithApproval(
+  state: ChatState,
+  sessionId: string,
+  turnId: string,
+  tool: ToolActivity,
+): ToolActivity {
+  const pending = findPendingApproval(state, sessionId, turnId, tool.callId, tool.approvalId);
+  const resolved = findResolvedApproval(state, sessionId, turnId, tool.callId, tool.approvalId);
+  if (resolved) return applyResolvedApproval(tool, resolved, { priorToToolEvent: true });
+  if (!pending) return tool;
+  const requestedAt = pending.requested_at || pending.created_at;
+  if (isKnownTerminalToolStatus(tool.status)) {
+    // 终态工具不能因迟到的审批请求重新进入 pending；保留关联时间供详情展示，
+    // 但等待卡由服务端 resolved/历史状态决定。
+    return {
+      ...tool,
+      approvalId: pending.id,
+      ...(requestedAt ? { approvalRequestedAt: requestedAt } : {}),
+    };
+  }
+  return {
+    ...tool,
+    approvalId: pending.id,
+    approvalState: "pending",
+    ...(requestedAt ? { approvalRequestedAt: requestedAt } : {}),
+  };
+}
+
+function isTerminalMessageStatus(status: string | undefined): boolean {
+  return status === "completed" || status === "ok" || status === "error"
+    || status === "interrupted" || status === "cancelled" || status === "expired"
+    || status === "unavailable" || status === "rejected";
+}
+
+function isClosedMessage(message: ChatMessage): boolean {
+  return message.streaming === false || isTerminalMessageStatus(message.status);
+}
+
+function interruptTool(tool: ToolActivity, endedAt: string, terminalStatus: "interrupted" | "cancelled" | "expired"): ToolActivity {
+  const waiting = tool.approvalState === "pending" || tool.approvalState === "submitting";
+  // unknown 没有可靠的终态语义；Turn 中断时按未完成工具收敛，避免
+  // 重连后长期停在“状态未知”且没有结束时间。
+  if (tool.status !== "running" && tool.status !== "unknown" && !waiting) return tool;
+  const durationMs = tool.durationMs ?? elapsedDurationMs(tool.startedAt, endedAt);
+  return {
+    ...tool,
+    status: terminalStatus,
+    approvalState: waiting ? "cancelled" : tool.approvalState,
+    endedAt: tool.endedAt || endedAt,
+    errorCode: tool.errorCode || "turn_interrupted",
+    ...(durationMs === undefined ? {} : { durationMs }),
+  };
+}
+
+function normalizeOptionalNumber(value: unknown): number | undefined {
+  const number = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function normalizeOptionalDuration(value: unknown): number | undefined {
+  const duration = normalizeOptionalNumber(value);
+  return duration !== undefined && duration >= 0 ? duration : undefined;
 }
 
 function updateSessionTurn(
@@ -549,12 +1084,30 @@ function updateSessionTurn(
   sessionId: string,
   turnId: string,
   updater: (message: ChatMessage) => ChatMessage,
+  allowMissingBackground = false,
 ): ChatState {
+  if (!sessionId || !turnId) return state;
   const source = getSessionMessages(state, sessionId);
-  const index = source.findIndex((message) => message.role === "assistant" && message.turnId === turnId);
-  if (index < 0) return state;
+  let index = source.findIndex((message) => message.role === "assistant" && message.turnId === turnId);
   const messages = [...source];
-  messages[index] = updater(messages[index]);
+  if (index < 0) {
+    const knownTurn = state.turnStates[sessionId]?.turnId === turnId
+      || source.some((message) => message.turnId === turnId)
+      || Object.values(state.approvalRequests?.[sessionId] ?? {}).some((approval) => (
+        approval.session_id === sessionId && approval.turn_id === turnId
+      ))
+      || Object.values(state.resolvedApprovals?.[sessionId] ?? {}).some((approval) => (
+        approval.turn_id === turnId
+      ));
+    if (sessionId !== state.sessionId && !knownTurn && !allowMissingBackground) return state;
+    // WebSocket 帧可能乱序或重连后只收到增量事件；先创建可合并的草稿，
+    // 后续 turn.started/turn.snapshot 会复用它而不是丢弃工具生命周期。
+    index = messages.length;
+    messages.push(createDraft(turnId));
+  }
+  const updated = updater(messages[index]);
+  if (updated === messages[index]) return state;
+  messages[index] = updated;
   return {
     ...state,
     messages: sessionId === state.sessionId ? messages : state.messages,
@@ -677,14 +1230,52 @@ function toolChainToActivities(chain: MessageRow["tool_chain"]): ToolActivity[] 
   return (chain ?? []).flatMap((group) => (group.calls ?? []).map((call) => ({
     callId: String(call.call_id ?? ""),
     name: String(call.name ?? "tool"),
-    status: call.status === "error"
-      ? "error"
-      : call.status === "running"
-        ? "running"
-        : call.status === "interrupted"
-          ? "interrupted"
-          : "completed",
+    status: normalizeToolStatus(call.status),
     arguments: call.arguments,
-    resultPreview: String(call.result ?? ""),
+    resultPreview: String(call.result_preview ?? call.result ?? ""),
+    ...(call.approval_id ? { approvalId: call.approval_id } : {}),
+    ...(call.approval_state ? { approvalState: normalizeApprovalState(call.approval_state) } : {}),
+    ...(call.started_at ? { startedAt: call.started_at } : {}),
+    ...(call.ended_at ? { endedAt: call.ended_at } : {}),
+    ...(normalizeOptionalDuration(call.duration_ms) !== undefined ? { durationMs: normalizeOptionalDuration(call.duration_ms) } : {}),
+    ...(call.approval_requested_at ? { approvalRequestedAt: call.approval_requested_at } : {}),
+    ...(call.approval_resolved_at ? { approvalResolvedAt: call.approval_resolved_at } : {}),
+    ...(normalizeOptionalDuration(call.approval_wait_ms) !== undefined ? { approvalWaitMs: normalizeOptionalDuration(call.approval_wait_ms) } : {}),
+    ...(normalizeOptionalDuration(call.execution_ms) !== undefined ? { executionMs: normalizeOptionalDuration(call.execution_ms) } : {}),
+    ...(normalizeOptionalDuration(call.group_duration_ms) !== undefined ? { groupDurationMs: normalizeOptionalDuration(call.group_duration_ms) } : {}),
+    ...(call.result_kind ? { resultKind: call.result_kind } : {}),
+    ...(call.is_truncated === undefined || call.is_truncated === null ? {} : { isTruncated: Boolean(call.is_truncated) }),
+    ...(normalizeOptionalNumber(call.exit_code) !== undefined ? { exitCode: normalizeOptionalNumber(call.exit_code) } : {}),
+    ...(call.error_code ? { errorCode: call.error_code } : {}),
   })));
+}
+
+function updateToolApproval(
+  state: ChatState,
+  sessionId: string,
+  matcher: { turnId?: string; callId?: string; approvalId?: string },
+  updater: (tool: ToolActivity) => ToolActivity,
+): ChatState {
+  const source = getSessionMessages(state, sessionId);
+  let changed = false;
+  const messages = source.map((message) => {
+    if (message.role !== "assistant") return message;
+    if (matcher.turnId && message.turnId !== matcher.turnId) return message;
+    let messageChanged = false;
+    const tools = message.tools.map((tool) => {
+      const matches = (matcher.callId && tool.callId === matcher.callId)
+        || (matcher.approvalId && tool.approvalId === matcher.approvalId);
+      if (!matches) return tool;
+      changed = true;
+      messageChanged = true;
+      return updater(tool);
+    });
+    return messageChanged ? { ...message, tools } : message;
+  });
+  if (!changed) return state;
+  return {
+    ...state,
+    messages: sessionId === state.sessionId ? messages : state.messages,
+    sessionMessages: setSessionMessages(state, sessionId, messages),
+  };
 }

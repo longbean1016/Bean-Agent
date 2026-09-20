@@ -397,7 +397,8 @@ it("审批面板锁定单次决定并等待服务端终态", async () => {
 
   expect(screen.getByLabelText("待处理权限审批")).toBeVisible();
   expect(screen.getByText("Set-Content D:\\outside.txt 'value'")).toBeVisible();
-  expect(screen.queryByPlaceholderText("输入消息，或附加文本与图片")).not.toBeInTheDocument();
+  // 审批卡是工具活动的局部确认，不应替换 Composer；用户仍可准备下一条消息。
+  expect(screen.getByPlaceholderText("输入消息，或附加文本与图片")).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "仅允许本次" }));
   expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
   const decision = socket.sent.find((frame) => frame.type === "approval.decide");
@@ -408,6 +409,390 @@ it("审批面板锁定单次决定并等待服务端终态", async () => {
     approval_id: "approval-1", decision: "allowed-once",
   }) } as MessageEvent));
   expect(screen.getByPlaceholderText("输入消息，或附加文本与图片")).toBeVisible();
+});
+
+it("审批 resolved 先到且 replay requested 时不重新显示旧队列", async () => {
+  window.history.replaceState({}, "", "/chat/approval-replay");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  const approval = {
+    id: "approval-replay", session_id: "web:approval-replay", turn_id: "turn-replay", call_id: "call-replay",
+    tool_name: "write_file", operation: "写入文件", arguments: { path: "D:\\outside.txt" },
+    reason: "超出范围", requested_mode: "read-only", fingerprint: "fp-replay", state: "pending",
+    created_at: "2026-09-20T08:00:00.000Z",
+  } as const;
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.resolved", request_id: "resolve-replay", session_id: approval.session_id,
+    approval_id: approval.id, decision: "rejected", turn_id: approval.turn_id, call_id: approval.call_id,
+    decided_at: "2026-09-20T08:00:00.500Z",
+  }) } as MessageEvent));
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.requested", session_id: approval.session_id, approval,
+  }) } as MessageEvent));
+
+  expect(screen.queryByLabelText("待处理权限审批")).not.toBeInTheDocument();
+  expect(screen.getByPlaceholderText("输入消息，或附加文本与图片")).toBeVisible();
+});
+
+it("工具已进入终态后迟到的 approval.requested 不重新显示审批卡", async () => {
+  window.history.replaceState({}, "", "/chat/approval-late-request");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  const approval = {
+    id: "approval-late-request", session_id: "web:approval-late-request", turn_id: "turn-late-request", call_id: "call-late-request",
+    tool_name: "write_file", operation: "写入文件", arguments: { path: "D:\\outside.txt" },
+    reason: "超出范围", requested_mode: "read-only", fingerprint: "fp-late-request", state: "pending",
+    created_at: "2026-09-20T08:00:00.000Z",
+  } as const;
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.started", request_id: "req-late-request", session_id: approval.session_id, turn_id: approval.turn_id,
+  }) } as MessageEvent));
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "react.tool.started", session_id: approval.session_id, turn_id: approval.turn_id, call_id: approval.call_id,
+    tool_name: approval.tool_name, arguments: approval.arguments, started_at: "2026-09-20T08:00:00.000Z",
+  }) } as MessageEvent));
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "react.tool.completed", session_id: approval.session_id, turn_id: approval.turn_id, call_id: approval.call_id,
+    tool_name: approval.tool_name, status: "ok", result_preview: "done", ended_at: "2026-09-20T08:00:00.200Z", duration_ms: 200,
+  }) } as MessageEvent));
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.requested", session_id: approval.session_id, approval,
+  }) } as MessageEvent));
+
+  expect(screen.queryByLabelText("待处理权限审批")).not.toBeInTheDocument();
+  expect(screen.getByPlaceholderText("输入消息，或附加文本与图片")).toBeVisible();
+});
+
+it("相同 approval id 的提交锁按会话隔离", async () => {
+  window.history.replaceState({}, "", "/chat/approval-lock-a");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  const makeApproval = (sessionId: string, turnId: string, callId: string) => ({
+    id: "approval-shared-lock", session_id: sessionId, turn_id: turnId, call_id: callId,
+    tool_name: "write_file", operation: "写入文件", arguments: { path: `${sessionId}.txt` },
+    reason: "超出范围", requested_mode: "read-only", fingerprint: "fp-lock", state: "pending",
+    created_at: "2026-09-20T08:00:00.000Z",
+  });
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.requested", session_id: "web:approval-lock-a",
+    approval: makeApproval("web:approval-lock-a", "turn-a", "call-a"),
+  }) } as MessageEvent));
+  fireEvent.click(screen.getByRole("button", { name: "仅允许本次" }));
+  expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
+
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.requested", session_id: "web:approval-lock-b",
+    approval: makeApproval("web:approval-lock-b", "turn-b", "call-b"),
+  }) } as MessageEvent));
+  window.history.pushState({}, "", "/chat/approval-lock-b");
+  act(() => window.dispatchEvent(new PopStateEvent("popstate")));
+
+  await waitFor(() => expect(screen.getByLabelText("待处理权限审批")).toBeVisible());
+  expect(screen.getByRole("button", { name: "仅允许本次" })).toBeEnabled();
+});
+
+it("重连 replay requested 时保留正在提交的审批锁", async () => {
+  window.history.replaceState({}, "", "/chat/approval-reconnect");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  const approval = {
+    id: "approval-reconnect", session_id: "web:approval-reconnect", turn_id: "turn-reconnect", call_id: "call-reconnect",
+    tool_name: "write_file", operation: "写入文件", arguments: { path: "outside.txt" }, reason: "超出范围",
+    requested_mode: "read-only", fingerprint: "fp-reconnect", state: "pending",
+    created_at: "2026-09-20T08:00:00.000Z",
+  };
+  const requested = () => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.requested", session_id: approval.session_id, approval,
+  }) } as MessageEvent);
+  act(requested);
+  fireEvent.click(screen.getByRole("button", { name: "仅允许本次" }));
+  const firstDecisionCount = socket.sent.filter((frame) => frame.type === "approval.decide").length;
+  expect(firstDecisionCount).toBe(1);
+
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "session.subscribed", request_id: "sub-reconnect", session_id: approval.session_id,
+  }) } as MessageEvent));
+  act(requested);
+
+  expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
+  expect(socket.sent.filter((frame) => frame.type === "approval.decide")).toHaveLength(1);
+});
+
+it("审批提交超时后释放本地锁并允许重试", async () => {
+  window.history.replaceState({}, "", "/chat/approval-timeout");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  const approval = {
+    id: "approval-timeout", session_id: "web:approval-timeout", turn_id: "turn-timeout", call_id: "call-timeout",
+    tool_name: "write_file", operation: "写入文件", arguments: { path: "outside.txt" }, reason: "超出范围",
+    requested_mode: "read-only", fingerprint: "fp-timeout", state: "pending",
+    created_at: "2026-09-20T08:00:00.000Z",
+  };
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.requested", session_id: approval.session_id, approval,
+  }) } as MessageEvent));
+
+  vi.useFakeTimers();
+  try {
+    fireEvent.click(screen.getByRole("button", { name: "仅允许本次" }));
+    expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
+    expect(socket.sent.filter((frame) => frame.type === "approval.decide")).toHaveLength(1);
+
+    act(() => vi.advanceTimersByTime(7_999));
+    expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
+    act(() => vi.advanceTimersByTime(1));
+    expect(screen.getByRole("button", { name: "仅允许本次" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "仅允许本次" }));
+    expect(socket.sent.filter((frame) => frame.type === "approval.decide")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("审批服务错误释放提交锁并保留待处理卡片", async () => {
+  window.history.replaceState({}, "", "/chat/approval-error");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  const approval = {
+    id: "approval-error", session_id: "web:approval-error", turn_id: "turn-error", call_id: "call-error",
+    tool_name: "write_file", operation: "写入文件", arguments: { path: "outside.txt" }, reason: "超出范围",
+    requested_mode: "read-only", fingerprint: "fp-error", state: "pending",
+    created_at: "2026-09-20T08:00:00.000Z",
+  };
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.requested", session_id: approval.session_id, approval,
+  }) } as MessageEvent));
+  fireEvent.click(screen.getByRole("button", { name: "仅允许本次" }));
+  const firstDecision = socket.sent.find((frame) => frame.type === "approval.decide");
+  expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
+
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "error", request_id: firstDecision?.request_id, session_id: approval.session_id,
+    code: "approval_unavailable", message: "审批服务不可用",
+  }) } as MessageEvent));
+  expect(screen.getByRole("button", { name: "仅允许本次" })).toBeEnabled();
+  expect(screen.getByLabelText("待处理权限审批")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "仅允许本次" }));
+  expect(socket.sent.filter((frame) => frame.type === "approval.decide")).toHaveLength(2);
+});
+
+it("工具行审批链按 call 关联且允许本次后保留输入区", async () => {
+  window.history.replaceState({}, "", "/chat/inline-approval");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.started", request_id: "req-inline", session_id: "web:inline-approval", turn_id: "turn-inline",
+  }) } as MessageEvent));
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "react.tool.started", session_id: "web:inline-approval", turn_id: "turn-inline", call_id: "call-inline",
+    tool_name: "write_file", arguments: { path: "D:/outside.txt" }, started_at: "2026-09-20T08:00:00.000Z",
+  }) } as MessageEvent));
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.requested", session_id: "web:inline-approval", approval: {
+      id: "approval-inline", session_id: "web:inline-approval", turn_id: "turn-inline", call_id: "call-inline",
+      tool_name: "write_file", operation: "写入文件", arguments: { path: "D:/outside.txt" }, reason: "超出范围",
+      requested_mode: "read-only", fingerprint: "fp-inline", summary: "需要确认文件写入", state: "pending", created_at: "2026-09-20T08:00:00.100Z",
+    },
+  }) } as MessageEvent));
+
+  expect(screen.getAllByText("等待授权")[0]).toBeVisible();
+  expect(screen.getByText("原因：超出范围")).toBeVisible();
+  expect(screen.getAllByLabelText("待处理权限审批")).toHaveLength(1);
+  expect(screen.getByPlaceholderText("输入消息，或附加文本与图片")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "仅允许本次" }));
+  expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
+  const decision = socket.sent.find((frame) => frame.type === "approval.decide");
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.resolved", request_id: decision?.request_id, session_id: "web:inline-approval",
+    approval_id: "approval-inline", decision: "allowed-once", turn_id: "turn-inline", call_id: "call-inline",
+    decided_at: "2026-09-20T08:00:00.400Z",
+  }) } as MessageEvent));
+  expect(screen.queryByText("等待授权")).not.toBeInTheDocument();
+});
+
+it("未知工具状态不会隐藏对应的审批入口", async () => {
+  window.history.replaceState({}, "", "/chat/unknown-tool-approval");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  const sessionId = "web:unknown-tool-approval";
+  const turnId = "turn-unknown-tool";
+  const callId = "call-unknown-tool";
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.started", request_id: "req-unknown-tool", session_id: sessionId, turn_id: turnId,
+  }) } as MessageEvent));
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "react.tool.completed", session_id: sessionId, turn_id: turnId, call_id: callId,
+    tool_name: "write_file", status: "future_state", result_preview: "",
+  }) } as MessageEvent));
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.requested", session_id: sessionId, approval: {
+      id: "approval-unknown-tool", session_id: sessionId, turn_id: turnId, call_id: callId,
+      tool_name: "write_file", operation: "写入文件", arguments: { path: "D:/outside.txt" }, reason: "超出范围",
+      requested_mode: "read-only", state: "pending", created_at: "2026-09-20T08:00:00.100Z",
+    },
+  }) } as MessageEvent));
+
+  expect(screen.getByLabelText("待处理权限审批")).toBeVisible();
+  expect(screen.getByRole("button", { name: "仅允许本次" })).toBeEnabled();
+});
+
+it("工具活动按类型显示语义图标和动作文案，而不是统一的完成勾", async () => {
+  window.history.replaceState({}, "", "/chat/tool-activity-copy");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  const sessionId = "web:component";
+  const turnId = "turn-tool-activity-copy";
+  const startedAt = "2026-09-20T08:00:00.000Z";
+
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "session.created", request_id: "req-tool-activity-copy", session_id: sessionId,
+  }) } as MessageEvent));
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.started", request_id: "req-tool-activity-copy", session_id: sessionId, turn_id: turnId,
+  }) } as MessageEvent));
+  const calls = [
+    { call_id: "call-shell-copy", tool_name: "shell", arguments: { command: "echo done" }, action: "运行了命令" },
+    { call_id: "call-browser-copy", tool_name: "web_search", arguments: { query: "Bean Agent" }, action: "已使用浏览器运行了命令" },
+    { call_id: "call-message-copy", tool_name: "send_message", arguments: { recipient: "Backend tool timing" }, action: "已向 Backend tool timing 发送消息" },
+    { call_id: "call-unknown-copy", tool_name: "mystery_tool", arguments: {}, action: "运行了工具" },
+  ];
+  act(() => {
+    for (const call of calls) {
+      socket.onmessage?.({ data: JSON.stringify({
+        type: "react.tool.started", session_id: sessionId, turn_id: turnId, call_id: call.call_id,
+        tool_name: call.tool_name, arguments: call.arguments, started_at: startedAt,
+      }) } as MessageEvent);
+      socket.onmessage?.({ data: JSON.stringify({
+        type: "react.tool.completed", session_id: sessionId, turn_id: turnId, call_id: call.call_id,
+        tool_name: call.tool_name, status: "completed", result_preview: "done", started_at: startedAt,
+        ended_at: "2026-09-20T08:00:00.200Z", duration_ms: 200,
+      }) } as MessageEvent);
+    }
+    socket.onmessage?.({ data: JSON.stringify({
+      type: "message.final", session_id: sessionId, turn_id: turnId, content: "完成", thinking: "", media: [],
+    }) } as MessageEvent);
+  });
+
+  const group = screen.getByRole("button", { name: /工具调用 · 4 项完成/ });
+  expect(group.querySelector("svg.lucide-wrench")).toBeInTheDocument();
+  expect(group.querySelector("svg.lucide-activity")).not.toBeInTheDocument();
+  fireEvent.click(group);
+  expect(screen.getByText("运行了命令")).toBeVisible();
+  expect(screen.getByText("已使用浏览器运行了命令")).toBeVisible();
+  expect(screen.getByText("已向 Backend tool timing 发送消息")).toBeVisible();
+  expect(screen.getByText("运行了工具")).toBeVisible();
+  expect(screen.getByRole("button", { name: /shell.*运行了命令.*完成/ })).toBeVisible();
+  expect(screen.getByRole("button", { name: /web_search.*已使用浏览器运行了命令.*完成/ })).toBeVisible();
+  expect(screen.getByRole("button", { name: /send_message.*已向 Backend tool timing 发送消息.*完成/ })).toBeVisible();
+  expect(screen.getByRole("button", { name: /mystery_tool.*运行了工具.*完成/ })).toBeVisible();
+  expect(document.querySelectorAll(".tool-icon svg")).toHaveLength(4);
+  expect(document.querySelectorAll(".tool-icon svg[data-lucide='check']")).toHaveLength(0);
+});
+
+it("收起工具组或工具行后收到审批仍自动展开并保持可操作", async () => {
+  window.history.replaceState({}, "", "/chat/approval-expand-pending");
+  render(<App />);
+  await screen.findByText("已连接");
+  const socket = FakeWebSocket.instances[0];
+  const sessionId = "web:approval-expand-pending";
+  const turnId = "turn-expand-pending";
+  const callId = "call-expand-pending";
+
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "turn.started", request_id: "req-expand-pending", session_id: sessionId, turn_id: turnId,
+  }) } as MessageEvent));
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "react.tool.started", session_id: sessionId, turn_id: turnId, call_id: callId,
+    tool_name: "write_file", arguments: { path: "D:/outside.txt" }, started_at: "2026-09-20T08:00:00.000Z",
+  }) } as MessageEvent));
+
+  const groupTrigger = screen.getByRole("button", { name: /工具调用 · 1\/1 项执行中，收起工具详情/ });
+  const toolTrigger = screen.getByRole("button", { name: /write_file.*执行中/ });
+  expect(groupTrigger).toHaveAttribute("aria-expanded", "true");
+  expect(toolTrigger).toHaveAttribute("aria-expanded", "true");
+  fireEvent.click(toolTrigger);
+  expect(toolTrigger).toHaveAttribute("aria-expanded", "false");
+  fireEvent.click(groupTrigger);
+  expect(groupTrigger).toHaveAttribute("aria-expanded", "false");
+
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.requested", session_id: sessionId, approval: {
+      id: "approval-expand-pending", session_id: sessionId, turn_id: turnId, call_id: callId,
+      tool_name: "write_file", operation: "写入文件", arguments: { path: "D:/outside.txt" },
+      reason: "超出范围", requested_mode: "read-only", state: "pending", created_at: "2026-09-20T08:00:00.100Z",
+    },
+  }) } as MessageEvent));
+
+  await waitFor(() => {
+    expect(screen.getByRole("button", { name: /工具调用 · 1 项等待授权/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /write_file.*等待授权/ })).toHaveAttribute("aria-expanded", "true");
+  });
+  expect(screen.getByRole("button", { name: "仅允许本次" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "拒绝" })).toBeVisible();
+});
+
+it("虚拟列表外的待审批工具仍在输入区保留可操作兜底", async () => {
+  const sessionId = "web:virtual-approval";
+  const rows = Array.from({ length: 20 }, (_, index) => {
+    const turnId = `turn-virtual-${index}`;
+    const timestamp = `2026-09-20T08:${String(index).padStart(2, "0")}:00.000Z`;
+    return [
+      { id: `user-${index}`, role: "user", content: `问题 ${index}`, turn_id: turnId, tool_chain: [], timestamp },
+      {
+        id: `assistant-${index}`,
+        role: "assistant",
+        content: `回答 ${index}`,
+        turn_id: turnId,
+        tool_chain: [{ calls: [{
+          call_id: `call-virtual-${index}`, name: "write_file", status: "running", arguments: { path: `D:/outside-${index}.txt` }, result_preview: "",
+        }] }],
+        timestamp,
+      },
+    ];
+  }).flat();
+  localStorage.setItem("beanagent.session_id", sessionId);
+  window.history.replaceState({}, "", "/chat/virtual-approval");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/messages")) return { ok: true, json: async () => ({ items: rows, total: rows.length, has_more: false }) } as Response;
+    if (url.includes("/sessions?page=")) return { ok: true, json: async () => ({ items: [{
+      key: sessionId, title: "虚拟审批", first_message_content: "问题 0", message_count: rows.length,
+      created_at: "2026-09-20T08:00:00.000Z", updated_at: "2026-09-20T08:19:00.000Z",
+    }], total: 1 }) } as Response;
+    return { ok: true, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+
+  render(<App />);
+  await waitFor(() => expect(document.querySelectorAll(".virtual-turn-section").length).toBeGreaterThan(0));
+  const visibleIndexes = new Set([...document.querySelectorAll<HTMLElement>(".virtual-turn-section")]
+    .map((section) => Number(section.dataset.index)));
+  const targetIndex = [...Array(20).keys()].find((index) => !visibleIndexes.has(index));
+  expect(targetIndex).toBeDefined();
+  const targetTurnId = `turn-virtual-${targetIndex}`;
+  const targetCallId = `call-virtual-${targetIndex}`;
+  const socket = FakeWebSocket.instances[0];
+  act(() => socket.onmessage?.({ data: JSON.stringify({
+    type: "approval.requested", session_id: sessionId, approval: {
+      id: "approval-offscreen", session_id: sessionId, turn_id: targetTurnId, call_id: targetCallId,
+      tool_name: "write_file", operation: "写入文件", arguments: { path: `D:/outside-${targetIndex}.txt` }, reason: "超出当前权限范围",
+      requested_mode: "read-only", state: "pending", created_at: "2026-09-20T08:00:01.000Z",
+    },
+  }) } as MessageEvent));
+
+  expect(screen.getByLabelText("待处理权限审批")).toBeVisible();
+  expect(screen.getByRole("button", { name: "仅允许本次" })).toBeEnabled();
 });
 
 it("Turn 最终消息会清理未单独回执的审批", async () => {
@@ -1218,6 +1603,9 @@ it("切回后台运行会话时恢复用户问题流式内容和工具状态", a
   fireEvent.click(screen.getByRole("button", { name: "新对话" }));
   expect(await screen.findByText("分析当前项目", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByText("阶段结果")).toBeVisible();
+  const completedTools = screen.getByRole("button", { name: /工具调用 · 1 项完成/ });
+  expect(completedTools).toHaveAttribute("aria-expanded", "false");
+  fireEvent.click(completedTools);
   expect(screen.getByText("list_dir")).toBeVisible();
   expect(screen.queryByText("排队中 · 即将开始")).not.toBeInTheDocument();
 });
