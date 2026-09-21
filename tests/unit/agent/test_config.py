@@ -23,6 +23,7 @@ def test_config_defaults_and_nested_instances_are_independent() -> None:
     ]
     assert first.llm.model == "deepseek-v4-flash"
     assert first.llm.max_tokens == 8192
+    assert first.memory.enabled is True
     assert first.memory.embedding.dimensions == 1024
     assert first.memory.retrieval.procedure_threshold == 0.66
     assert first.memory.retrieval.max_forced_procedures == 3
@@ -166,6 +167,20 @@ def test_legacy_session_history_window_does_not_configure_token_gate(
 
     assert config.memory.context_window == 0
     assert not hasattr(config, "session")
+
+
+def test_memory_is_enabled_when_config_omits_memory_section(tmp_path: Path) -> None:
+    config_path = tmp_path / "without-memory-section.toml"
+    config_path.write_text("[llm]\nmodel = \"test-model\"\n", encoding="utf-8")
+
+    assert load_config(config_path).memory.enabled is True
+
+
+def test_memory_can_still_be_disabled_explicitly(tmp_path: Path) -> None:
+    config_path = tmp_path / "memory-disabled.toml"
+    config_path.write_text("[memory]\nenabled = false\n", encoding="utf-8")
+
+    assert load_config(config_path).memory.enabled is False
 
 
 def test_legacy_memory_context_window_is_not_a_message_strategy(tmp_path: Path) -> None:

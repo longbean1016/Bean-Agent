@@ -14,6 +14,10 @@ ADAPTER_IDS = frozenset({
     "qwen_dashscope",
     "openai_reasoning",
 })
+# 能力路由复用 ``model_routes.scope``，不为每种能力增加重复的关系型列。
+# primary 是主对话模型；其余能力没有独立覆盖时自动回退到 primary。
+MODEL_CAPABILITIES = ("primary", "embedding", "vision")
+INDEPENDENT_MODEL_CAPABILITIES = frozenset({"embedding", "vision"})
 REASONING_EFFORT_ORDER = (
     "none", "enabled", "minimal", "low", "medium", "high", "xhigh", "max",
 )
@@ -189,6 +193,8 @@ class ModelRoute:
 
 __all__ = [
     "ADAPTER_IDS",
+    "MODEL_CAPABILITIES",
+    "INDEPENDENT_MODEL_CAPABILITIES",
     "REASONING_EFFORT_ORDER",
     "REASONING_EFFORTS",
     "ModelConnection",

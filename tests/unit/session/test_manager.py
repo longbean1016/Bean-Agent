@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 
 from session.manager import Session, SessionManager
+from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
 from session.store import NewSurfaceEvent
 
 
@@ -100,6 +101,113 @@ async def test_load_history_replays_model_user_projection_and_context_frame(
         {"role": "user", "content": model_user},
         {"role": "assistant", "content": "回答", "reasoning_content": ""},
     ]
+
+
+@pytest.mark.asyncio
+async def test_tool_chain_private_model_fields_survive_reload_for_model_history(
+    manager: SessionManager,
+) -> None:
+    session = await manager.get_or_create("web:model-surface")
+    user = session.add_message("user", "执行任务", turn_id="turn-1")
+    assistant = session.add_message(
+        "assistant",
+        "完成",
+        turn_id="turn-1",
+        tool_chain=[{
+            "iteration": 1,
+            "text": "展示摘要",
+            "calls": [{
+                "call_id": "call-1",
+                "name": "write_file",
+                "arguments": {"path": "a.txt", "content_length": 9},
+                "_model_arguments": {"path": "a.txt", "content": "原始正文"},
+                "result": "安全摘要",
+                "_model_result": "模型需要的完整结果",
+                "status": "completed",
+            }],
+        }],
+    )
+    await manager.append_messages(session, [user, assistant])
+    manager.invalidate("web:model-surface")
+
+    history = (await manager.get_or_create("web:model-surface")).get_history()
+
+    assert history[1]["tool_calls"][0]["function"]["arguments"] == (
+        '{"path": "a.txt", "content": "原始正文"}'
+    )
+    assert history[2] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "模型需要的完整结果",
+    }
+
+
+@pytest.mark.asyncio
+async def test_legacy_projected_tool_chain_still_replays_without_private_fields(
+    manager: SessionManager,
+) -> None:
+    session = await manager.get_or_create("web:legacy-tool-chain")
+    user = session.add_message("user", "读取", turn_id="turn-1")
+    assistant = session.add_message(
+        "assistant",
+        "完成",
+        turn_id="turn-1",
+        tool_chain=[{
+            "iteration": 1,
+            "calls": [{
+                "call_id": "call-legacy",
+                "name": "read_file",
+                "arguments": {"path": "a.txt"},
+                "result": "旧结果",
+                "status": "completed",
+            }],
+        }],
+    )
+    await manager.append_messages(session, [user, assistant])
+    manager.invalidate("web:legacy-tool-chain")
+
+    history = (await manager.get_or_create("web:legacy-tool-chain")).get_history()
+
+    assert history[1]["tool_calls"][0]["function"]["arguments"] == (
+        '{"path": "a.txt"}'
+    )
+    assert history[2]["content"] == "旧结果"
+
+
+@pytest.mark.asyncio
+async def test_error_turn_replays_interrupted_tool_with_placeholder(
+    manager: SessionManager,
+) -> None:
+    """异常 Turn 也不能把未完成工具的空结果伪装成成功。"""
+
+    session = await manager.get_or_create("web:error-tool-replay")
+    user = session.add_message("user", "执行命令", turn_id="turn-1")
+    assistant = session.add_message(
+        "assistant",
+        "出错",
+        turn_id="turn-1",
+        status="error",
+        tool_chain=[{
+            "iteration": 1,
+            "calls": [{
+                "call_id": "call-interrupted",
+                "name": "shell",
+                "arguments": {"command": "sleep 10"},
+                "result": "",
+                "status": "interrupted",
+            }],
+        }],
+    )
+    await manager.append_messages(session, [user, assistant])
+    manager.invalidate("web:error-tool-replay")
+
+    history = (await manager.get_or_create("web:error-tool-replay")).get_history()
+
+    assert history[2] == {
+        "role": "tool",
+        "tool_call_id": "call-interrupted",
+        "content": INTERRUPTED_TOOL_RESULT_CONTENT,
+    }
 
 @pytest.mark.asyncio
 async def test_peek_next_message_id_uses_persisted_next_sequence(

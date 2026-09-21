@@ -179,6 +179,61 @@ def test_chat_api_lists_sessions_and_messages(tmp_path: Path) -> None:
     assert not any(key.startswith("llm_") for key in messages["items"][0])
 
 
+def test_chat_api_projects_tool_chain_without_private_model_payloads(tmp_path: Path) -> None:
+    client, runtime = _client(tmp_path)
+    runtime.sessions.store.add_message(
+        NewMessage(
+            session_key="web:projection",
+            role="assistant",
+            content="已完成",
+            tool_chain=[{
+                "iteration": 1,
+                "text": "调用工具",
+                "calls": [{
+                    "call_id": "call-private",
+                    "name": "write_file",
+                    "arguments": {
+                        "path": "D:/workspace/a.txt",
+                        "content": "DO_NOT_SEND_THIS_BODY",
+                    },
+                    "result": "raw result TOKEN=raw-secret",
+                    "content_blocks": [{"type": "text", "text": "raw block"}],
+                    "_model_arguments": {
+                        "path": "D:/workspace/a.txt",
+                        "content": "DO_NOT_SEND_THIS_BODY",
+                    },
+                    "_model_result": "raw model result TOKEN=raw-secret",
+                    "_model_content_blocks": [{"type": "text", "text": "raw block"}],
+                    "status": "completed",
+                }],
+            }],
+        )
+    )
+
+    with client:
+        latest = client.get("/api/chat/sessions/web:projection/messages").json()
+        older = client.get(
+            "/api/chat/sessions/web:projection/messages/older?before_seq=1"
+        ).json()
+        around = client.get(
+            "/api/chat/sessions/web:projection/messages/around?anchor_seq=0"
+        ).json()
+
+    for payload in (latest, older, around):
+        call = payload["items"][0]["tool_chain"][0]["calls"][0]
+        assert "_model_arguments" not in call
+        assert "_model_result" not in call
+        assert "_model_content_blocks" not in call
+        assert "content_blocks" not in call
+        assert "DO_NOT_SEND_THIS_BODY" not in str(payload)
+        assert "raw model result" not in str(payload)
+        assert call["arguments"] == {
+            "path": "D:/workspace/a.txt",
+            "content_length": len("DO_NOT_SEND_THIS_BODY"),
+        }
+        assert "raw-secret" not in call["result"]
+
+
 def test_workspace_api_and_session_sandbox_closed_loop(tmp_path: Path) -> None:
     client, runtime = _client(tmp_path)
     project = tmp_path / "project"
@@ -402,9 +457,12 @@ def test_chat_api_messages_appends_running_snapshot_without_persisting(tmp_path:
             "thinking": "partial thinking",
             "tools": [{
                 "call_id": "call-1",
-                "name": "read_file",
+                "name": "shell",
                 "status": "running",
-                "arguments": {"path": "README.md"},
+                "arguments": {
+                    "command": "curl -H 'Authorization: Bearer live-secret' https://example.test",
+                    "cwd": "D:/private-workdir",
+                },
                 "result_preview": "",
             }],
             "status": "running",
@@ -422,6 +480,10 @@ def test_chat_api_messages_appends_running_snapshot_without_persisting(tmp_path:
     assert messages["items"][1]["content"] == "partial answer"
     assert messages["items"][1]["reasoning_content"] == "partial thinking"
     assert messages["items"][1]["metadata"]["running"] is True
+    running_tool = messages["items"][1]["tool_chain"][0]["calls"][0]
+    assert "live-secret" not in str(running_tool)
+    assert running_tool["arguments"]["cwd"] == "[已隐藏]"
+    assert "Authorization" in running_tool["arguments"]["command"]
     assert persisted == []
 
 

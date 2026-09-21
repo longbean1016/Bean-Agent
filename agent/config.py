@@ -191,8 +191,8 @@ def _load_memory_config(data: dict[str, Any]) -> MemoryConfig:
     dedup_raw = _as_dict(raw.get("dedup"))
 
     return MemoryConfig(
-        # enabled=False 时，后续 bootstrap 会跳过整个记忆引擎的创建。
-        enabled=bool(raw.get("enabled", False)),
+        # 默认启动记忆闭环；只有配置明确写 false 时才跳过记忆引擎。
+        enabled=bool(raw.get("enabled", True)),
         engine_name=str(raw.get("engine_name", "default")),
         # 旧的 memory.context_window 仅保留在 dataclass 中兼容读取；这里不再
         # 将它解释为历史窗口或压缩阈值，真正的 token 上限属于 [llm] 配置。

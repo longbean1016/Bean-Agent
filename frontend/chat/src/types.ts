@@ -1,5 +1,16 @@
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "offline";
-export type ToolStatus = "running" | "completed" | "error" | "interrupted";
+/** 工具状态必须保守归一化；未知状态不能被当成成功。 */
+export type ToolStatus =
+  | "running"
+  | "completed"
+  | "error"
+  | "interrupted"
+  | "cancelled"
+  | "expired"
+  | "unavailable"
+  | "rejected"
+  | "unknown";
+export type ApprovalState = "none" | "pending" | "submitting" | "allowed-once" | "rejected" | "cancelled" | "expired" | "unavailable";
 export type ThinkingStatus = "running" | "completed" | "interrupted";
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 
@@ -35,17 +46,55 @@ export interface ApprovalRequest {
   arguments: Record<string, unknown>;
   reason: string;
   requested_mode: SandboxMode;
-  fingerprint: string;
+  /** 默认 Web 投影不下发内部指纹；历史/调试回放若带有仍可兼容读取。 */
+  fingerprint?: string;
   state: "pending";
   created_at: string;
+  /** 后端可选的脱敏展示投影；前端不应自行解析原始 arguments。 */
+  summary?: string;
+  scope?: string;
+  reason_code?: string;
+  expires_at?: string;
+  requested_at?: string;
+}
+
+/**
+ * 已收到的审批终态短期缓存。它不是审计记录，只用于处理 resolved 先于
+ * tool.started/approval.requested 到达时的乱序事件，并按 session 隔离。
+ */
+export interface ResolvedApproval {
+  id: string;
+  session_id: string;
+  turn_id?: string;
+  call_id?: string;
+  decision?: "allowed-once" | "rejected" | "cancelled" | "expired" | "unavailable" | null;
+  state: ApprovalState;
+  requested_at?: string;
+  decided_at?: string;
+  error_code?: string;
 }
 
 export interface ToolActivity {
   callId: string;
   name: string;
   status: ToolStatus;
-  arguments: unknown;
+  arguments?: unknown;
   resultPreview: string;
+  /** 工具生命周期时间，内部使用 camelCase，线上事件保持 snake_case。 */
+  startedAt?: string;
+  endedAt?: string;
+  durationMs?: number;
+  approvalRequestedAt?: string;
+  approvalResolvedAt?: string;
+  approvalWaitMs?: number;
+  executionMs?: number;
+  groupDurationMs?: number;
+  approvalId?: string;
+  approvalState?: ApprovalState;
+  resultKind?: string;
+  isTruncated?: boolean;
+  exitCode?: number;
+  errorCode?: string;
 }
 
 export interface ChatMessage {
@@ -83,6 +132,10 @@ export interface ChatState {
   messages: ChatMessage[];
   sessionMessages: Record<string, ChatMessage[]>;
   error: string;
+  /** 按 session_id + approval id 保存尚未关联到工具行的请求，避免跨会话同名 id 覆盖。 */
+  approvalRequests?: Record<string, Record<string, ApprovalRequest>>;
+  /** 按 session_id + approval id 保存最近的审批终态，防止跨会话串联。 */
+  resolvedApprovals?: Record<string, Record<string, ResolvedApproval>>;
   turnStates: Record<string, TurnRuntimeState>;
   contextUsage: Record<string, ContextUsage>;
   sessionUsage: Record<string, SessionUsage>;
@@ -163,7 +216,28 @@ export interface MessageRow {
   interrupted_display_reasoning?: string;
   interrupted_thinking_status?: ThinkingStatus;
   media?: string[];
-  tool_chain?: Array<{ calls?: Array<{ call_id?: string; name?: string; arguments?: unknown; result?: string; status?: string }> }>;
+  tool_chain?: Array<{ calls?: Array<{
+    call_id?: string;
+    name?: string;
+    arguments?: unknown;
+    result?: string;
+    result_preview?: string;
+    status?: string;
+    approval_id?: string | null;
+    approval_state?: ApprovalState | string | null;
+    started_at?: string | null;
+    ended_at?: string | null;
+    duration_ms?: number | string | null;
+    approval_requested_at?: string | null;
+    approval_resolved_at?: string | null;
+    approval_wait_ms?: number | string | null;
+    execution_ms?: number | string | null;
+    group_duration_ms?: number | string | null;
+    result_kind?: string | null;
+    is_truncated?: boolean | null;
+    exit_code?: number | string | null;
+    error_code?: string | null;
+  }> }>;
   status?: string;
   timestamp?: string;
   duration_ms?: number;
@@ -239,6 +313,12 @@ export interface ProactiveNotificationRow {
 
 export type ModelAdapterId = "generic_openai" | "deepseek" | "qwen_dashscope" | "openai_reasoning";
 
+/** 模型能力配置入口；primary 复用现有默认路由，另外两项可独立指定模型。 */
+export type ModelCapability = "primary" | "embedding" | "vision";
+
+/** 能力路由模式。后端可能返回 inherit/follow/follow_main，前端统一按 follow 处理。 */
+export type CapabilityRouteMode = "follow" | "inherit" | "follow_main" | "independent";
+
 export interface ModelProfile {
   connection_id: string;
   model_id: string;
@@ -291,11 +371,28 @@ export interface ModelRoute {
   reasoning_effort?: string | null;
 }
 
+export interface CapabilityRouteState {
+  capability?: ModelCapability | string;
+  mode?: CapabilityRouteMode | string | null;
+  follows_primary?: boolean;
+  requires_restart?: boolean;
+  runtime_effective_at?: "now" | "next_start" | string | null;
+  route?: ModelRoute | null;
+  override_route?: ModelRoute | null;
+  connection?: ModelConnection | null;
+  /** 测试结果仅用于设置页反馈，不持久化密钥。 */
+  dimensions?: number | null;
+  expected_dimension?: number | null;
+}
+
 export interface ModelSettingsPayload {
   connections: ModelConnection[];
   default_route: ModelRoute | null;
   catalog: { updated_at?: string | null };
   routing_required: boolean;
+  /** 新版后端返回 capability_routes；capabilities 保留兼容预览和旧客户端。 */
+  capability_routes?: Partial<Record<ModelCapability, CapabilityRouteState>>;
+  capabilities?: Partial<Record<Exclude<ModelCapability, "primary">, CapabilityRouteState>>;
 }
 
 export type ChatFrame =
@@ -304,8 +401,8 @@ export type ChatFrame =
   | { type: "session.subscribed"; request_id: string; session_id: string }
   | { type: "sandbox.updated"; request_id: string; sandbox: SandboxSnapshot }
   | { type: "approval.requested"; session_id: string; approval: ApprovalRequest }
-  | { type: "approval.resolved"; request_id: string; session_id: string; approval_id: string; decision: "allowed-once" | "rejected" }
-  | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message: string; user_media: string[]; content: string; thinking: string; tools: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments: unknown; result_preview: string }>; started_at?: string; status: "running" }
+  | { type: "approval.resolved"; request_id: string; session_id: string; approval_id: string; decision?: "allowed-once" | "rejected" | "cancelled" | "expired" | "unavailable" | null; turn_id?: string; call_id?: string; state?: ApprovalState | string | null; decided_at?: string; error_code?: string }
+  | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message?: string; user_media?: string[]; content?: string; thinking?: string; tools?: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments?: unknown; result_preview?: string; started_at?: string | null; ended_at?: string | null; duration_ms?: number | string | null; approval_id?: string | null; approval_state?: ApprovalState | string | null; approval_requested_at?: string | null; approval_resolved_at?: string | null; approval_wait_ms?: number | string | null; execution_ms?: number | string | null; group_duration_ms?: number | string | null; result_kind?: string | null; is_truncated?: boolean | null; exit_code?: number | string | null; error_code?: string | null }>; started_at?: string; status: "running" }
   | { type: "turn.queued"; request_id: string; session_id: string; position: number }
   | { type: "turn.started"; request_id?: string; session_id: string; turn_id: string }
   | { type: "context.compaction.started"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number }
@@ -316,8 +413,8 @@ export type ChatFrame =
   | { type: "session.usage.updated"; session_id: string; turn_id: string; total_uncached_input_tokens: number; total_cache_read_tokens: number; total_cache_write_tokens: number; total_input_tokens: number; cache_hit_rate: number | null; total_output_tokens: number }
   | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }
   | { type: "react.thinking.delta"; session_id: string; turn_id: string; delta: string }
-  | { type: "react.tool.started"; session_id: string; turn_id: string; call_id: string; tool_name: string; arguments: unknown }
-  | { type: "react.tool.completed"; session_id: string; turn_id: string; call_id: string; tool_name: string; status: string; result_preview: string }
+  | { type: "react.tool.started"; session_id: string; turn_id: string; call_id: string; tool_name: string; arguments: unknown; started_at?: string; approval_id?: string; approval_state?: ApprovalState | string; approval_requested_at?: string | null }
+  | { type: "react.tool.completed"; session_id: string; turn_id: string; call_id: string; tool_name: string; status: string; result_preview: string; started_at?: string; ended_at?: string; duration_ms?: number | string | null; approval_requested_at?: string; approval_resolved_at?: string; approval_wait_ms?: number | string | null; execution_ms?: number | string | null; group_duration_ms?: number | string | null; result_kind?: string; is_truncated?: boolean; exit_code?: number | string | null; error_code?: string }
   | { type: "message.final"; request_id?: string; session_id: string; turn_id: string; content: string; thinking?: string; media?: string[]; message_id?: string; metadata?: Record<string, unknown> }
   | { type: "turn.interrupted"; request_id: string; session_id: string; turn_id?: string; status: string; message?: string; duration_ms?: number; ended_at?: string }
   | { type: "error"; request_id: string; session_id?: string; code?: string; message: string }

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
 from session.store import NewMessage, NewSessionEvent, NewSurfaceEvent, SessionStore
 
 
@@ -604,6 +605,36 @@ async def test_load_history_keeps_finished_tools_from_interrupted_turn(
         },
         {"role": "assistant", "content": "[用户已停止生成]"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_load_history_replays_interrupted_call_in_error_turn(
+    store: SessionStore,
+) -> None:
+    store.add_message(NewMessage(session_key="web:error-tool", role="user", content="question"))
+    store.add_message(NewMessage(
+        session_key="web:error-tool",
+        role="assistant",
+        content="出错",
+        status="error",
+        tool_chain=[{
+            "calls": [{
+                "call_id": "call-interrupted",
+                "name": "shell",
+                "status": "interrupted",
+                "arguments": {"command": "sleep 10"},
+                "result": "",
+            }],
+        }],
+    ))
+
+    history = store.load_history("web:error-tool", limit=40)
+
+    assert history[2] == {
+        "role": "tool",
+        "tool_call_id": "call-interrupted",
+        "content": INTERRUPTED_TOOL_RESULT_CONTENT,
+    }
 
 
 @pytest.mark.asyncio

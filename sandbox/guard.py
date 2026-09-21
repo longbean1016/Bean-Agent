@@ -31,6 +31,20 @@ class SandboxGuard:
     def policy(self, session_key: str) -> SandboxPolicy:
         return self._resolver.resolve(session_key)
 
+    async def approval_timing(
+        self,
+        session_key: str,
+        turn_id: str,
+        call_id: str,
+    ) -> dict[str, object]:
+        """读取当前工具的审批时间线，供工具活动摘要补齐可选指标。"""
+
+        reader = getattr(self._approvals, "timing_for_call", None)
+        if not callable(reader):
+            return {}
+        value = await reader(session_key, turn_id, call_id)
+        return dict(value) if isinstance(value, dict) else {}
+
     async def authorize_file_mutation(
         self,
         *,
@@ -108,7 +122,8 @@ class SandboxGuard:
         if outcome != "allowed-once":
             messages = {
                 "rejected": "用户拒绝了本次越权操作",
-                "cancelled": "本次越权授权已取消或超时",
+                "cancelled": "本次越权授权已取消",
+                "expired": "本次越权授权已超时",
                 "unavailable": "当前没有可用审批界面",
             }
             raise SandboxAccessDenied(messages.get(outcome, "本次越权操作未获授权"))

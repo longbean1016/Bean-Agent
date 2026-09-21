@@ -21,6 +21,7 @@ from agent.event_bus import (
 )
 from agent.message_bus import InboundMessage, MessageBus, OutboundMessage, PipelineResult
 from agent.turn_scheduler import QueuePosition, TurnScheduler
+from agent.tool_projection import project_tool_call, project_tool_chain
 from session.manager import SessionManager
 from session.model_surface import (
     INTERRUPTED_TOOL_RESULT_CONTENT,
@@ -34,6 +35,22 @@ logger = logging.getLogger(__name__)
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 INTERRUPTED_ASSISTANT_CONTENT = "[用户已停止生成]"
+
+# 工具快照只在已经发出 tool-call 并进入执行生命周期后写入；无论随后是
+# 正常完成、工具错误、审批终态还是 Turn 中断，模型恢复都应收到“结果未知”
+# 占位，而不是把一个已经发出的调用误判成尚未启动。旧协议的 ``ok`` 也保留。
+_STARTED_TOOL_STATUSES = frozenset({
+    "ok",
+    "running",
+    "completed",
+    "error",
+    "interrupted",
+    "cancelled",
+    "expired",
+    "unavailable",
+    "rejected",
+    "unknown",
+})
 
 
 class PipelineApi(Protocol):
@@ -294,7 +311,9 @@ class AgentLoop:
         assistant_fields: dict[str, Any] = {
             "turn_id": turn_id,
             "reasoning_content": result.thinking,
-            "tool_chain": result.tool_chain,
+            # 语义消息是前端/历史 API 的展示边界；模型侧完整参数只在
+            # durable surface 内部重放，不把原始结果写入 tool_chain。
+            "tool_chain": project_tool_chain(result.tool_chain, include_model_fields=True),
             "tools_used": result.tools_used,
             "status": "ok",
             "metadata": assistant_metadata,
@@ -385,7 +404,15 @@ class AgentLoop:
             partial_tool_chain = []
         if not isinstance(live_tools, list):
             live_tools = []
-        tool_chain = interrupted_tool_chain(partial_tool_chain, live_tools)
+        duration_reader = getattr(self._pipeline, "interrupt_tool_durations", None)
+        if callable(duration_reader):
+            _apply_tool_durations(live_tools, duration_reader(turn_id))
+        tool_chain = interrupted_tool_chain(
+            partial_tool_chain,
+            live_tools,
+            ended_at=ended_at,
+        )
+        tool_chain = project_tool_chain(tool_chain, include_model_fields=True)
         tools_used = list(dict.fromkeys(
             str(call.get("name") or "")
             for group in tool_chain
@@ -475,6 +502,7 @@ class AgentLoop:
         turn_id = self._active_turn_ids.get(session_key, "")
         state = self._active_turn_states.get(session_key)
         interrupted: TurnInterruptState | None = None
+        interrupt_durations: dict[str, int] = {}
         if task is not None and not task.done() and state is not None:
             snapshotter = getattr(self._pipeline, "snapshot_interrupt_state", None)
             snapshot = snapshotter(turn_id) if callable(snapshotter) else {}
@@ -499,8 +527,17 @@ class AgentLoop:
                 turn_started_at=str(snapshot.get("turn_started_at") or ""),
                 iteration=max(0, int(snapshot.get("iteration") or 0)),
             )
+            duration_reader = getattr(self._pipeline, "interrupt_tool_durations", None)
+            if callable(duration_reader):
+                interrupt_durations = dict(duration_reader(turn_id) or {})
         result = await self._scheduler.cancel(session_key)
         if result.status == "interrupted" and task is not None and interrupted is not None:
+            duration_reader = getattr(self._pipeline, "interrupt_tool_durations", None)
+            if callable(duration_reader):
+                # 取消调度与 wrapper finally 之间存在竞态；优先采用取消后仍可读到的
+                # 单调值，否则沿用取消前快照，最后才由 ISO 时间作兼容回退。
+                interrupt_durations.update(dict(duration_reader(turn_id) or {}))
+            _apply_tool_durations(interrupted.tools, interrupt_durations)
             await asyncio.gather(task, return_exceptions=True)
             await self._persist_interrupted_turn(interrupted, turn_id)
         timing = await self._load_turn_timing(session_key, turn_id) if turn_id else {}
@@ -528,7 +565,12 @@ class AgentLoop:
         )
         duration_ms = _duration_value(timing.get("duration_ms"))
         ended_at = str(timing.get("ended_at") or "")
-        tool_chain = interrupted_tool_chain(state.tool_chain_partial, state.tools)
+        tool_chain = interrupted_tool_chain(
+            state.tool_chain_partial,
+            state.tools,
+            ended_at=ended_at,
+        )
+        tool_chain = project_tool_chain(tool_chain, include_model_fields=True)
         has_unfinished_tool = any(
             str(call.get("status") or "") in {"running", "interrupted"}
             for group in tool_chain
@@ -548,13 +590,7 @@ class AgentLoop:
             # 语义 assistant 中保存，不能把第二个 assistant 消息插入模型前缀。
             _repair_interrupted_surface(
                 surface,
-                started_call_ids={
-                    str(item.get("call_id") or "")
-                    for item in state.tools
-                    if isinstance(item, dict)
-                    and str(item.get("call_id") or "")
-                    and str(item.get("status") or "") in {"running", "completed", "error"}
-                },
+                started_call_ids=_started_call_ids(state.tools),
             )
         user_fields: dict[str, Any] = {
             "turn_id": turn_id,
@@ -839,17 +875,14 @@ class AgentLoop:
             return None
         snapshotter = getattr(self._pipeline, "snapshot_interrupt_state", None)
         snapshot = snapshotter(turn_id) if callable(snapshotter) else {}
-        tools = [
-            {
-                "call_id": str(tool.get("call_id") or ""),
-                "name": str(tool.get("name") or "tool"),
-                "arguments": dict(tool.get("arguments") or {}),
-                "status": _normalize_snapshot_tool_status(tool.get("status")),
-                "result_preview": str(tool.get("result_preview") or ""),
-            }
-            for tool in snapshot.get("tools") or []
-            if isinstance(tool, dict)
-        ]
+        tools = []
+        for tool in snapshot.get("tools") or []:
+            if not isinstance(tool, dict):
+                continue
+            projected = project_tool_call(tool)
+            projected["status"] = _normalize_snapshot_tool_status(tool.get("status"))
+            projected.update(_tool_timing_projection(tool))
+            tools.append(projected)
         return {
             "session_id": session_key,
             "turn_id": turn_id,
@@ -897,13 +930,7 @@ def _model_projection_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     if isinstance(surface, list) and surface:
         _repair_interrupted_surface(
             surface,
-            started_call_ids={
-                str(item.get("call_id") or "")
-                for item in snapshot.get("tools") or []
-                if isinstance(item, dict)
-                and str(item.get("call_id") or "")
-                and str(item.get("status") or "") in {"running", "completed", "error"}
-            },
+            started_call_ids=_started_call_ids(snapshot.get("tools")),
         )
     return projection
 
@@ -918,13 +945,7 @@ def _model_projection_from_state(state: TurnInterruptState) -> dict[str, Any]:
         llm_epoch_id=state.llm_epoch_id,
         llm_surface_messages=state.llm_surface_messages,
         llm_surface_persisted=state.llm_surface_persisted,
-        started_call_ids={
-            str(item.get("call_id") or "")
-            for item in state.tools
-            if isinstance(item, dict)
-            and str(item.get("call_id") or "")
-            and str(item.get("status") or "") in {"running", "completed", "error"}
-        },
+        started_call_ids=_started_call_ids(state.tools),
     )
 
 
@@ -958,11 +979,31 @@ def _model_projection(
     return projection
 
 
+def _started_call_ids(tools: object) -> set[str]:
+    """提取已经进入工具生命周期的调用 ID，供中断模型面补结果。"""
+
+    if not isinstance(tools, list):
+        return set()
+    return {
+        str(item.get("call_id") or "")
+        for item in tools
+        if isinstance(item, dict)
+        and str(item.get("call_id") or "")
+        and str(item.get("status") or "").strip().lower() in _STARTED_TOOL_STATUSES
+    }
+
+
 def interrupted_tool_chain(
     tool_chain: list[dict[str, Any]],
     live_tools: list[dict[str, Any]],
+    *,
+    ended_at: str = "",
 ) -> list[dict[str, Any]]:
-    """保留已发起的工具快照，并将未结束调用标记为中断。"""
+    """保留已发起的工具快照，并将未结束调用标记为中断。
+
+    中断没有 ``react.tool.completed`` 帧，因此在语义消息落库时补上终态时间；
+    旧快照没有开始时间时只保留状态，不伪造耗时。
+    """
 
     completed: list[dict[str, Any]] = []
     for group in tool_chain:
@@ -973,12 +1014,33 @@ def interrupted_tool_chain(
         for call in calls:
             if not isinstance(call, dict):
                 continue
-            status = str(call.get("status") or "")
-            if status not in {"ok", "completed", "error", "running", "interrupted"}:
+            status = str(call.get("status") or "").strip().lower()
+            if status not in {
+                "ok",
+                "completed",
+                "error",
+                "running",
+                "interrupted",
+                "cancelled",
+                "expired",
+                "unavailable",
+                "rejected",
+                "unknown",
+            }:
                 continue
-            copied_call = dict(call)
+            copied_call = project_tool_call(call)
+            # 兼容历史语义消息仍使用 ``ok``，但所有未知值已由投影收敛为
+            # ``unknown``，不能让迟到/脏状态伪装成成功。
+            if status == "ok":
+                copied_call["status"] = "ok"
+            if status == "unknown":
+                # 中断时未知调用按未完成处理，模型侧必须收到占位结果，
+                # 不能把可能不完整的原始结果当成成功证据继续推理。
+                copied_call["status"] = "interrupted"
+                _finish_interrupted_call_timing(copied_call, ended_at)
             if status == "running":
                 copied_call["status"] = "interrupted"
+                _finish_interrupted_call_timing(copied_call, ended_at)
             retained.append(copied_call)
         if retained:
             copied = dict(group)
@@ -990,20 +1052,48 @@ def interrupted_tool_chain(
         for call in group.get("calls", [])
         if isinstance(call, dict)
     }
-    interrupted_calls = [
-        {
-            "call_id": str(tool.get("call_id") or ""),
+    # 取消竞态下，live snapshot 可能已经把某个调用写成 completed/error，
+    # 但对应的 tool_chain_partial 尚未刷新；不能只补 running，否则该终态会
+    # 从中断语义链丢失。已结束调用保留原状态，未结束调用才收敛为 interrupted。
+    live_only_calls: list[dict[str, Any]] = []
+    live_terminal_statuses = {
+        "ok",
+        "completed",
+        "error",
+        "interrupted",
+        "cancelled",
+        "expired",
+        "unavailable",
+        "rejected",
+        "unknown",
+        "running",
+    }
+    for tool in live_tools:
+        if not isinstance(tool, dict):
+            continue
+        call_id = str(tool.get("call_id") or "")
+        status = str(tool.get("status") or "").strip().lower()
+        if not call_id or call_id in known_call_ids or status not in live_terminal_statuses:
+            continue
+        call = {
+            "call_id": call_id,
             "name": str(tool.get("name") or "tool"),
             "arguments": dict(tool.get("arguments") or {}),
             "result": str(tool.get("result_preview") or ""),
-            "status": "interrupted",
+            "status": status,
+            **_tool_timing_projection(tool),
         }
-        for tool in live_tools
-        if isinstance(tool, dict)
-        and str(tool.get("call_id") or "")
-        and str(tool.get("call_id") or "") not in known_call_ids
-        and str(tool.get("status") or "") == "running"
-    ]
+        if status in {"running", "unknown"}:
+            call["status"] = "interrupted"
+            _finish_interrupted_call_timing(call, ended_at)
+        projected = project_tool_call(call)
+        if status in {"running", "unknown"}:
+            projected["status"] = "interrupted"
+        elif status == "ok":
+            # 保持语义消息对旧模型 surface 的兼容标记。
+            projected["status"] = "ok"
+        live_only_calls.append(projected)
+    interrupted_calls = live_only_calls
     if interrupted_calls:
         if completed:
             completed[-1]["calls"] = [*completed[-1]["calls"], *interrupted_calls]
@@ -1077,7 +1167,96 @@ def _normalize_snapshot_tool_status(value: object) -> str:
         return "error"
     if text == "running":
         return "running"
-    return "completed"
+    if text in {"ok", "completed"}:
+        return "completed"
+    if text in {"interrupted", "cancelled", "expired", "unavailable", "rejected", "unknown"}:
+        return text
+    # 未知状态必须保守展示，不能在重连快照中被伪装成成功。
+    return "unknown"
+
+
+_TOOL_TIMING_FIELDS = (
+    "started_at",
+    "ended_at",
+    "duration_ms",
+    "approval_requested_at",
+    "approval_resolved_at",
+    "approval_wait_ms",
+    "execution_ms",
+    "group_duration_ms",
+    "result_kind",
+    "is_truncated",
+    "exit_code",
+    "error_code",
+)
+
+
+def _tool_timing_projection(value: object) -> dict[str, Any]:
+    """复制工具计时扩展字段，避免快照投影丢失未来可选指标。"""
+
+    if not isinstance(value, dict):
+        return {}
+    projected: dict[str, Any] = {}
+    for key in _TOOL_TIMING_FIELDS:
+        raw = value.get(key)
+        if key.endswith("_ms") or key == "exit_code":
+            if raw is None:
+                continue
+            try:
+                number = int(raw)
+            except (TypeError, ValueError):
+                continue
+            # 退出码允许负值（例如进程被信号终止）；耗时类指标仍必须
+            # 保持非负，避免中断快照丢失有效诊断信息。
+            if key == "exit_code" or number >= 0:
+                projected[key] = number
+            continue
+        if key == "is_truncated":
+            if raw is not None:
+                projected[key] = bool(raw)
+            continue
+        text = str(raw or "").strip()
+        if text:
+            projected[key] = text[:80]
+    return projected
+
+
+def _apply_tool_durations(
+    tools: list[dict[str, Any]],
+    durations: object,
+) -> None:
+    """把进程内单调时钟结果合并到中断副本，不让时钟值进入协议。"""
+
+    if not isinstance(durations, dict):
+        return
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        call_id = str(tool.get("call_id") or "")
+        if not call_id or call_id not in durations:
+            continue
+        duration = _duration_value(durations.get(call_id))
+        if duration is not None:
+            tool["duration_ms"] = duration
+
+
+def _finish_interrupted_call_timing(call: dict[str, Any], ended_at: str) -> None:
+    """为中断工具补终态时间；没有可靠起点时不计算伪造耗时。"""
+
+    if not ended_at:
+        return
+    # 取消竞态下，live snapshot 可能已经带有真实的工具完成时间，而
+    # tool_chain_partial 尚未刷新。此时 ``ended_at`` 是工具终态时间，不能
+    # 被 Turn 的中断时间覆盖；只有确实缺失时才用中断时间闭合调用。
+    effective_ended_at = str(call.get("ended_at") or "").strip() or ended_at
+    call["ended_at"] = effective_ended_at
+    if _duration_value(call.get("duration_ms")) is not None:
+        call.pop("_started_monotonic", None)
+        return
+    started_at = str(call.get("started_at") or "")
+    duration = _elapsed_duration_ms(started_at, effective_ended_at) if started_at else None
+    if duration is not None:
+        call["duration_ms"] = duration
 
 
 def _duration_value(value: object) -> int | None:

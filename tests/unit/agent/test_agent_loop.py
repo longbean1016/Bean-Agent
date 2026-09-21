@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from agent.agent_loop import AgentLoop, TurnInterruptState, _repair_interrupted_surface
+from agent.agent_loop import (
+    AgentLoop,
+    TurnInterruptState,
+    _repair_interrupted_surface,
+    _started_call_ids,
+    interrupted_tool_chain,
+)
 from agent.event_bus import EventBus, SessionUpdated, TurnCommitted, TurnStarted
 from agent.message_bus import InboundMessage, MessageBus, PipelineResult
 from agent.config_models import MemoryConfig
@@ -35,6 +41,30 @@ class BlockingContextGuard:
 class PreparingContextGuard(BlockingContextGuard):
     def needs_context_preparation(self, session_key: str) -> bool:
         return True
+
+
+def test_interrupted_tool_chain_keeps_terminal_live_tool_when_partial_chain_lags() -> None:
+    chain = interrupted_tool_chain(
+        [],
+        [{
+            "call_id": "call-completed",
+            "name": "read_file",
+            "arguments": {"path": "a.txt"},
+            "result_preview": "内容摘要",
+            "status": "completed",
+            "started_at": "2026-09-20T10:00:00+08:00",
+            "ended_at": "2026-09-20T10:00:00.120000+08:00",
+            "duration_ms": 120,
+            "exit_code": -1,
+        }],
+        ended_at="2026-09-20T10:00:01+08:00",
+    )
+
+    assert chain[0]["calls"][0]["call_id"] == "call-completed"
+    assert chain[0]["calls"][0]["status"] == "completed"
+    assert chain[0]["calls"][0]["ended_at"] == "2026-09-20T10:00:00.120000+08:00"
+    assert chain[0]["calls"][0]["duration_ms"] == 120
+    assert chain[0]["calls"][0]["exit_code"] == -1
 
 
 @pytest.mark.asyncio
@@ -769,6 +799,24 @@ def test_repair_interrupted_surface_is_idempotent() -> None:
     assert surface[1]["tool_call_id"] == "pending-call"
 
 
+@pytest.mark.parametrize("status", ["interrupted", "cancelled", "unavailable"])
+def test_terminal_snapshot_status_is_treated_as_started_for_surface_repair(status: str) -> None:
+    surface = [{
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "already-started",
+            "type": "function",
+            "function": {"name": "write_file", "arguments": "{}"},
+        }],
+    }]
+
+    started = _started_call_ids([{"call_id": "already-started", "status": status}])
+    _repair_interrupted_surface(surface, started_call_ids=started)
+
+    assert "结果未知" in surface[-1]["content"]
+
+
 def test_interrupted_surface_keeps_partial_assistant_separate_from_semantic_marker() -> None:
     surface = [
         {"role": "user", "content": "当前问题"},
@@ -805,6 +853,10 @@ async def test_active_turn_snapshot_exports_running_state_for_resubscribe(tmp_pa
                         "arguments": {"path": "README.md"},
                         "status": "completed",
                         "result_preview": "project docs",
+                        "result_kind": "text",
+                        "is_truncated": True,
+                        "exit_code": 7,
+                        "error_code": "tool_error",
                     }
                 ],
             }
@@ -840,6 +892,10 @@ async def test_active_turn_snapshot_exports_running_state_for_resubscribe(tmp_pa
         assert snapshot["content"] == "partial answer"
         assert snapshot["thinking"] == "partial thinking"
         assert snapshot["tools"][0]["status"] == "completed"
+        assert snapshot["tools"][0]["result_kind"] == "text"
+        assert snapshot["tools"][0]["is_truncated"] is True
+        assert snapshot["tools"][0]["exit_code"] == 7
+        assert snapshot["tools"][0]["error_code"] == "tool_error"
         assert snapshot["status"] == "running"
     finally:
         running.cancel()

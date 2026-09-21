@@ -195,18 +195,26 @@ export function PermissionSelector(props: {
   );
 }
 
-export function ApprovalPanel(props: {
+export function ApprovalCard(props: {
   approval: ApprovalRequest;
   submitting: boolean;
   onDecide: (decision: "allowed-once" | "rejected") => void;
+  inline?: boolean;
+  queuePosition?: number;
+  queueTotal?: number;
 }) {
-  const entries = Object.entries(props.approval.arguments);
+  const entries = safeApprovalEntries(props.approval);
+  const summary = props.approval.summary?.trim() || "";
+  const reason = props.approval.reason?.trim() || "";
+  const queueLabel = props.queuePosition && props.queueTotal && props.queueTotal > 1
+    ? `队列 ${props.queuePosition}/${props.queueTotal}`
+    : "";
   return (
-    <footer className="composer-wrap approval-wrap">
-      <section className="approval-panel" aria-label="待处理权限审批">
-        <div className="approval-strip"><span aria-hidden="true" />等待授权</div>
+    <section className={`approval-panel${props.inline ? " approval-inline" : ""}`} aria-label="待处理权限审批" aria-live="polite">
+        <div className="approval-strip"><span aria-hidden="true" />等待授权{queueLabel ? <small>{queueLabel}</small> : null}</div>
         <div className="approval-body" tabIndex={0} role="group" aria-label="越权操作详情">
-          <strong>{props.approval.reason || `${props.approval.tool_name} 请求临时提高权限`}</strong>
+          <strong>{summary || reason || `${props.approval.tool_name} 请求临时提高权限`}</strong>
+          {summary && reason && summary !== reason ? <span className="approval-reason">原因：{reason}</span> : null}
           <span className="approval-operation">{props.approval.operation}</span>
           {entries.length ? (
             <dl className="approval-arguments">
@@ -221,6 +229,19 @@ export function ApprovalPanel(props: {
           <button className="primary-action" disabled={props.submitting} onClick={() => props.onDecide("allowed-once")}>{props.submitting ? "提交中…" : "仅允许本次"}</button>
         </div>
       </section>
+  );
+}
+
+export function ApprovalPanel(props: {
+  approval: ApprovalRequest;
+  submitting: boolean;
+  onDecide: (decision: "allowed-once" | "rejected") => void;
+  queuePosition?: number;
+  queueTotal?: number;
+}) {
+  return (
+    <footer className="composer-wrap approval-wrap">
+      <ApprovalCard {...props} />
     </footer>
   );
 }
@@ -256,4 +277,25 @@ function displayApprovalArgument(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+/** 审批卡只展示后端允许的摘要字段，避免把正文、token 或内部参数原样送进 UI。 */
+function safeApprovalEntries(approval: ApprovalRequest): Array<[string, unknown]> {
+  const allowed = new Set([
+    "path", "source", "destination", "cwd", "command", "pattern", "query",
+    "content_length", "old_text_length", "new_text_length", "replace_all", "timeout",
+  ]);
+  const raw = approval.arguments;
+  const argumentsObject = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {};
+  return Object.entries(argumentsObject).filter(([key]) => allowed.has(key)).map(([key, value]) => [
+    key,
+    typeof value === "string" ? truncateApprovalValue(value, key === "command" ? 240 : 180) : value,
+  ]);
+}
+
+function truncateApprovalValue(value: string, max: number): string {
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  return normalized.length > max ? `${normalized.slice(0, max)}…` : normalized;
 }

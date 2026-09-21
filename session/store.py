@@ -598,7 +598,7 @@ class SessionStore:
                     id, session_key, turn_id, call_id, tool_name, operation,
                     arguments, reason, requested_mode, fingerprint, state,
                     created_at, decided_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(request["id"]),
@@ -613,6 +613,7 @@ class SessionStore:
                     str(request["fingerprint"]),
                     str(request["state"]),
                     str(request["created_at"]),
+                    str(request.get("decided_at") or "") or None,
                 ),
             )
             self._conn.commit()
@@ -3102,13 +3103,16 @@ class SessionStore:
                     call for call in calls
                     if isinstance(call, dict)
                     and str(call.get("status") or "")
-                    in {"ok", "completed", "error", "running", "interrupted"}
+                    in {
+                        "ok", "completed", "error", "running", "interrupted",
+                        "cancelled", "expired", "unavailable", "rejected", "unknown",
+                    }
                 ]
             if not calls:
                 continue
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
-                "content": str(group.get("text") or ""),
+                "content": str(group.get("_model_text", group.get("text")) or ""),
                 "tool_calls": [
                     {
                         "id": str(call.get("call_id", "")),
@@ -3116,7 +3120,7 @@ class SessionStore:
                         "function": {
                             "name": str(call.get("name", "")),
                             "arguments": json.dumps(
-                                call.get("arguments", {}),
+                                call.get("_model_arguments", call.get("arguments", {})),
                                 ensure_ascii=False,
                             ),
                         },
@@ -3135,9 +3139,12 @@ class SessionStore:
                 ]
             result.append(assistant_message)
             for call in calls:
-                interrupted_call = interrupted and str(call.get("status") or "") in {
-                    "running", "interrupted"
+                # 异常 Turn 的 assistant status 可能是 ``error``；未完成工具
+                # 仍按中断占位结果重放，避免空结果被序列化成“工具执行完成”。
+                interrupted_call = str(call.get("status") or "") in {
+                    "running", "interrupted", "unknown"
                 }
+                model_result = call.get("_model_result", call.get("result", ""))
                 result.append(
                     {
                         "role": "tool",
@@ -3145,7 +3152,7 @@ class SessionStore:
                         "content": (
                             INTERRUPTED_TOOL_RESULT_CONTENT
                             if interrupted_call
-                            else str(call.get("result", ""))
+                            else str(model_result)
                         ),
                     }
                 )

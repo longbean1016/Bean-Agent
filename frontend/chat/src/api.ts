@@ -1,4 +1,4 @@
-import type { MessagePage, MessageRow, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile, Workspace } from "./types";
+import type { CapabilityRouteState, MessagePage, MessageRow, ModelCapability, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile, Workspace } from "./types";
 
 // 仅控制聊天页面的滚动分页，不参与模型上下文 token gate 或 checkpoint 边界。
 const MESSAGE_WINDOW_LIMIT = 60;
@@ -201,10 +201,20 @@ export async function deleteReminder(sessionId: string, reminderId: string): Pro
   if (!response.ok) throw new Error("无法删除提醒");
 }
 
+class SettingsRequestError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "SettingsRequestError";
+    this.status = status;
+  }
+}
+
 async function settingsRequest<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   const payload = await response.json().catch(() => ({})) as T & { detail?: string };
-  if (!response.ok) throw new Error(payload.detail || `模型设置请求失败 (${response.status})`);
+  if (!response.ok) throw new SettingsRequestError(payload.detail || `模型设置请求失败 (${response.status})`, response.status);
   return payload;
 }
 
@@ -215,7 +225,70 @@ export async function fetchModelSettings(): Promise<ModelSettingsPayload> {
     default_route: payload.default_route ?? null,
     catalog: payload.catalog ?? {},
     routing_required: payload.routing_required ?? false,
+    capability_routes: payload.capability_routes ?? (payload.capabilities
+      ? { ...payload.capabilities }
+      : undefined),
+    capabilities: payload.capabilities,
   };
+}
+
+/** 读取 Embedding/视觉能力的独立路由；缺少该接口时由调用方回退到主模型。 */
+export async function fetchCapabilityRoute(capability: Exclude<ModelCapability, "primary">): Promise<CapabilityRouteState | null> {
+  try {
+    return await settingsRequest<CapabilityRouteState>(`/api/settings/capabilities/${encodeURIComponent(capability)}`);
+  } catch (firstError) {
+    if (!(firstError instanceof SettingsRequestError) || firstError.status !== 404) throw firstError;
+    // 兼容先行实现的 routes/capability 路径；真正的错误仍交给页面展示。
+    try {
+      return await settingsRequest<CapabilityRouteState>(`/api/settings/routes/capability/${encodeURIComponent(capability)}`);
+    } catch {
+      throw firstError;
+    }
+  }
+}
+
+export async function saveCapabilityRoute(
+  capability: Exclude<ModelCapability, "primary">,
+  values: { mode: "follow" | "inherit" | "independent"; connection_id?: string; model_id?: string; reasoning_effort?: string | null },
+): Promise<CapabilityRouteState> {
+  try {
+    return await settingsRequest<CapabilityRouteState>(`/api/settings/capabilities/${encodeURIComponent(capability)}`, {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(values),
+    });
+  } catch (firstError) {
+    if (!(firstError instanceof SettingsRequestError) || firstError.status !== 404) throw firstError;
+    try {
+      return await settingsRequest<CapabilityRouteState>(`/api/settings/routes/capability/${encodeURIComponent(capability)}`, {
+        method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(values),
+      });
+    } catch {
+      throw firstError;
+    }
+  }
+}
+
+export interface CapabilityTestResult {
+  ok: boolean;
+  capability?: ModelCapability | string;
+  connection_id?: string;
+  connection_name?: string;
+  model_id?: string;
+  model_display_name?: string;
+  dimensions?: number | null;
+  expected_dimension?: number | null;
+  vision_received?: boolean;
+  duration_ms?: number;
+  error_code?: string;
+  detail?: string;
+}
+
+export async function testCapability(
+  capability: Exclude<ModelCapability, "primary">,
+  values: { connection_id?: string; model_id?: string; dimensions?: number | null },
+): Promise<CapabilityTestResult> {
+  return settingsRequest<CapabilityTestResult>(`/api/settings/capabilities/${encodeURIComponent(capability)}/test`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(values),
+  });
 }
 
 export async function fetchSessionModelRoute(sessionId: string): Promise<ModelRoute | null> {
@@ -240,13 +313,6 @@ export async function updateModelConnection(id: string, values: Record<string, u
   return settingsRequest(`/api/settings/connections/${encodeURIComponent(id)}`, {
     method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(values),
   });
-}
-
-export async function fetchModelConnectionApiKey(id: string): Promise<string> {
-  const payload = await settingsRequest<{ api_key: string }>(
-    `/api/settings/connections/${encodeURIComponent(id)}/api-key`,
-  );
-  return payload.api_key;
 }
 
 export async function deleteModelConnection(id: string): Promise<void> {

@@ -128,6 +128,9 @@ class ToolCallStarted:
     call_id: str
     tool_name: str
     arguments: dict[str, Any]
+    # 工具时间字段是可选的，保留默认值以兼容旧的事件生产者和测试夹具。
+    started_at: str | None = None
+    approval_requested_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +141,19 @@ class ToolCallCompleted:
     tool_name: str
     status: str
     result_preview: str
+    # started_at 在完成帧中重复携带，便于断线重连只收到终态时仍可渲染完整计时。
+    started_at: str | None = None
+    ended_at: str | None = None
+    duration_ms: int | None = None
+    approval_requested_at: str | None = None
+    approval_resolved_at: str | None = None
+    approval_wait_ms: int | None = None
+    execution_ms: int | None = None
+    group_duration_ms: int | None = None
+    result_kind: str | None = None
+    is_truncated: bool | None = None
+    exit_code: int | None = None
+    error_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +162,23 @@ class SandboxApprovalRequested:
 
     session_key: str
     request: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxApprovalResolved:
+    """审批首次进入终态后的幂等回执；取消/不可用也必须显式通知前端。"""
+
+    session_key: str
+    request_id: str
+    turn_id: str
+    call_id: str
+    state: str
+    decision: str | None
+    decided_at: str
+    error_code: str | None = None
+    # 发起 approval.decide 的 Web request_id；超时、断线等无客户端操作时为空。
+    # approval_id 仍由 request_id 字段承载，保持旧事件构造兼容。
+    client_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +253,7 @@ __all__ = [
     "EventHandler",
     "SessionUpdated",
     "SandboxApprovalRequested",
+    "SandboxApprovalResolved",
     "StreamDeltaReady",
     "ToolCallCompleted",
     "ToolCallStarted",

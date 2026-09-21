@@ -1,20 +1,21 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { ArrowLeft, Check, CircleCheck, Copy, Database, Eye, EyeOff, KeyRound, ListChecks, Play, Plus, RefreshCw, Search, Settings, Trash2, TriangleAlert } from "lucide-react";
+import { ArrowLeft, Bot, BrainCircuit, Check, CircleCheck, Database, Image, KeyRound, ListChecks, Play, Plus, RefreshCw, Search, Settings, Trash2, TriangleAlert } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import {
   createModelConnection,
   deleteModelConnection,
-  fetchModelConnectionApiKey,
   refreshConnectionModels,
+  saveCapabilityRoute,
   saveDefaultModelRoute,
+  testCapability,
   testModelConnection,
   testConnectionModel,
   updateModelCatalog,
   updateModelConnection,
   updateModelProfile,
 } from "./api";
-import type { ModelAdapterId, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload } from "./types";
+import type { CapabilityRouteMode, ModelAdapterId, ModelCapability, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload } from "./types";
 import { REASONING_CHOICES, reasoningStatusForModel, updateReasoningOptions } from "./reasoning";
 
 const ADAPTERS: Array<{ id: ModelAdapterId; label: string }> = [
@@ -34,12 +35,42 @@ const EMPTY_DRAFT: ConnectionDraft = {
   default_adapter: "generic_openai",
 };
 
+type ConfigurableCapability = Exclude<ModelCapability, "primary">;
+
+const CAPABILITY_TABS: Array<{ id: ModelCapability; label: string; description: string }> = [
+  { id: "primary", label: "主模型", description: "对话、推理与工具调用" },
+  { id: "embedding", label: "Embedding 模型", description: "记忆检索与向量化" },
+  { id: "vision", label: "视觉模型", description: "图片理解与识别" },
+];
+
+function capabilityMode(state: { mode?: CapabilityRouteMode | string | null; follows_primary?: boolean } | null | undefined): "follow" | "independent" {
+  if (state?.follows_primary === false || state?.mode === "independent") return "independent";
+  return "follow";
+}
+
+function capabilityIcon(capability: ModelCapability) {
+  if (capability === "embedding") return <BrainCircuit size={16} aria-hidden="true" />;
+  if (capability === "vision") return <Image size={16} aria-hidden="true" />;
+  return <Bot size={16} aria-hidden="true" />;
+}
+
+function maskedApiKeyPreview(value: string | null | undefined): string {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "已配置（仅显示掩码）";
+  // 只接受固定的首尾掩码格式；意外返回的完整值即使包含省略号也要重新截断。
+  if (/^[^.…*]{1,4}(?:\.{3}|…|•+|\*+)[^.…*]{1,4}$/.test(normalized)) return normalized;
+  if (normalized.length <= 7) return "••••••••";
+  return `${normalized.slice(0, 3)}…${normalized.slice(-4)}`;
+}
+
 export function ModelSettingsPage(props: {
   settings: ModelSettingsPayload;
   onBack: () => void;
   onRefresh: () => Promise<ModelSettingsPayload>;
   onDefaultRoute: (route: ModelRoute) => void;
 }) {
+  const [activeCapability, setActiveCapability] = useState<ModelCapability>("primary");
+  const [capabilityModeOverrides, setCapabilityModeOverrides] = useState<Partial<Record<ConfigurableCapability, "follow" | "independent">>>({});
   const [selectedId, setSelectedId] = useState("");
   const [creating, setCreating] = useState(false);
   const [draft, setDraft] = useState<ConnectionDraft>(EMPTY_DRAFT);
@@ -50,17 +81,46 @@ export function ModelSettingsPage(props: {
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
-  const [revealedApiKey, setRevealedApiKey] = useState("");
-  const [showApiKey, setShowApiKey] = useState(false);
   const [deleteConfirmationOpen, setDeleteConfirmationOpen] = useState(false);
   const selected = props.settings.connections.find((item) => item.id === selectedId) ?? null;
+
+  const capabilityState = (capability: ConfigurableCapability) => (
+    props.settings.capability_routes?.[capability]
+    ?? props.settings.capabilities?.[capability]
+    ?? null
+  );
+  const activeCapabilityState = activeCapability === "primary" ? null : capabilityState(activeCapability);
+  const activeMode: "follow" | "independent" = activeCapability === "primary"
+    ? "independent"
+    : (capabilityModeOverrides[activeCapability] ?? capabilityMode(activeCapabilityState));
+  const effectiveCapabilityRoute = activeCapability === "primary"
+    ? props.settings.default_route
+    : (activeCapabilityState?.route
+      ?? activeCapabilityState?.override_route
+      ?? (activeMode === "follow" ? props.settings.default_route : null));
+  const activeCapabilityConnection = effectiveCapabilityRoute
+    ? props.settings.connections.find((item) => item.id === effectiveCapabilityRoute.connection_id) ?? null
+    : null;
+  const connectionEditable = activeCapability === "primary" || activeMode === "independent";
+  const capabilityStateSignature = useMemo(
+    () => JSON.stringify(props.settings.capability_routes ?? props.settings.capabilities ?? {}),
+    [props.settings.capability_routes, props.settings.capabilities],
+  );
 
   useEffect(() => {
     if (creating) return;
     if (selectedId && props.settings.connections.some((item) => item.id === selectedId)) return;
-    selectConnection(props.settings.connections[0] ?? null);
+    const preferred = effectiveCapabilityRoute?.connection_id
+      ? props.settings.connections.find((item) => item.id === effectiveCapabilityRoute?.connection_id)
+      : null;
+    selectConnection(preferred ?? props.settings.connections[0] ?? null, effectiveCapabilityRoute?.model_id);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [creating, props.settings.connections, selectedId]);
+
+  // 服务端刷新后以持久化路由为准，避免切换会话或其他窗口修改设置后沿用旧草稿状态。
+  useEffect(() => {
+    setCapabilityModeOverrides({});
+  }, [capabilityStateSignature]);
 
   const availableModels = useMemo(
     () => selected?.models.filter((model) => model.available) ?? [],
@@ -74,14 +134,18 @@ export function ModelSettingsPage(props: {
       || model.model_id.toLocaleLowerCase().includes(query)
     ));
   }, [availableModels, modelQuery]);
+  const capabilityRouteForSelection = activeCapability === "primary"
+    ? props.settings.default_route
+    : (activeCapabilityState?.route ?? activeCapabilityState?.override_route
+      ?? (activeMode === "follow" ? props.settings.default_route : null));
   const testModel = availableModels.find((model) => model.model_id === testModelId)
-    ?? availableModels.find((model) => props.settings.default_route?.connection_id === selected?.id && props.settings.default_route?.model_id === model.model_id)
+    ?? availableModels.find((model) => capabilityRouteForSelection?.connection_id === selected?.id && capabilityRouteForSelection?.model_id === model.model_id)
     ?? availableModels[0];
   const testEffort = testModel?.supports_reasoning
     ? (testModel.capabilities_json?.reasoning?.native?.at(-1) ?? testModel.reasoning_options.at(-1) ?? null)
     : null;
 
-  const selectConnection = (connection: ModelConnection | null) => {
+  const selectConnection = (connection: ModelConnection | null, preferredModelId?: string) => {
     setCreating(connection === null);
     setSelectedId(connection?.id ?? "");
     setDraft(connection ? {
@@ -94,18 +158,33 @@ export function ModelSettingsPage(props: {
     } : EMPTY_DRAFT);
     setEditingModel(null);
     const defaultRoute = props.settings.default_route;
-    const defaultModelId = defaultRoute && connection && defaultRoute.connection_id === connection.id
-      ? defaultRoute.model_id
-      : "";
+    const defaultModelId = preferredModelId
+      ?? (defaultRoute && connection && defaultRoute.connection_id === connection.id ? defaultRoute.model_id : "");
     setTestModelId(connection?.models.find((model) => (
       model.available && model.model_id === defaultModelId
     ))?.model_id ?? connection?.models.find((model) => model.available)?.model_id ?? "");
     setModelQuery("");
-    setRevealedApiKey("");
-    setShowApiKey(false);
     setDeleteConfirmationOpen(false);
     setError("");
     setNotice("");
+  };
+
+  const selectCapability = (capability: ModelCapability) => {
+    setActiveCapability(capability);
+    if (capability === "primary") {
+      const route = props.settings.default_route;
+      const connection = route
+        ? props.settings.connections.find((item) => item.id === route.connection_id)
+        : props.settings.connections[0];
+      if (connection) selectConnection(connection, route?.model_id);
+      return;
+    }
+    const state = capabilityState(capability);
+    const route = state?.route ?? state?.override_route ?? props.settings.default_route;
+    const connection = route
+      ? props.settings.connections.find((item) => item.id === route.connection_id)
+      : props.settings.connections[0];
+    if (connection) selectConnection(connection, route?.model_id);
   };
 
   const run = async (key: string, operation: () => Promise<void>) => {
@@ -115,7 +194,52 @@ export function ModelSettingsPage(props: {
     } finally { setBusy(""); }
   };
 
+  const setCapabilityMode = (mode: "follow" | "independent") => {
+    if (activeCapability === "primary") return;
+    const capability = activeCapability;
+    if (mode === "independent") {
+      // 独立模式先只打开编辑态；等用户明确点击“设为当前”后再写入路由，
+      // 避免把当前聊天模型误保存成 Embedding/视觉模型。
+      setCapabilityModeOverrides((current) => ({ ...current, [capability]: mode }));
+      setError("");
+      setNotice("已进入独立连接配置，请选择连接并设为当前模型");
+      return;
+    }
+    void run(`capability-${capability}`, async () => {
+      const saved = await saveCapabilityRoute(capability, { mode: "follow" });
+      setCapabilityModeOverrides((current) => ({ ...current, [capability]: mode }));
+      await props.onRefresh();
+      const label = capability === "vision" ? "视觉" : "Embedding";
+      setNotice(saved.requires_restart === false
+        ? `${label} 已跟随主模型`
+        : `${label} 已跟随主模型，重启后生效`);
+    });
+  };
+
+  const saveCapabilityModel = (model: ModelProfile) => {
+    if (activeCapability === "primary") {
+      return run("default", async () => {
+        const route = await saveDefaultModelRoute({ connection_id: selected?.id || model.connection_id, model_id: model.model_id });
+        setTestModelId(model.model_id);
+        props.onDefaultRoute(route);
+        await props.onRefresh();
+        setNotice("已设为默认并切换当前会话");
+      });
+    }
+    if (activeMode !== "independent" || !selected) return;
+    const capability = activeCapability;
+    return run("capability-route", async () => {
+      const saved = await saveCapabilityRoute(capability, { mode: "independent", connection_id: selected.id, model_id: model.model_id });
+      setTestModelId(model.model_id);
+      await props.onRefresh();
+      setNotice(`${capability === "vision" ? "视觉" : "Embedding"} 模型已更新，${saved.requires_restart === false ? "当前运行时已生效" : "重启后生效"}`);
+    });
+  };
+
   const saveConnection = () => run("save", async () => {
+    if (activeCapability !== "primary" && activeMode === "follow") {
+      throw new Error("当前能力跟随主模型，请切换为独立连接后再编辑连接信息");
+    }
     const payload = { ...draft };
     if (selected && !payload.api_key) delete (payload as Partial<ConnectionDraft>).api_key;
     const saved = selected
@@ -126,28 +250,29 @@ export function ModelSettingsPage(props: {
     setNotice("连接已保存");
   });
 
-  const loadApiKey = async (): Promise<string> => {
-    if (!selected) throw new Error("请先选择连接");
-    if (revealedApiKey) return revealedApiKey;
-    const apiKey = await fetchModelConnectionApiKey(selected.id);
-    setRevealedApiKey(apiKey);
-    return apiKey;
-  };
-
-  const toggleApiKey = () => run("api-key", async () => {
-    if (showApiKey) {
-      setShowApiKey(false);
+  const runCapabilityTest = () => {
+    if (activeCapability === "primary") return;
+    const capability = activeCapability;
+    const connectionId = activeMode === "follow"
+      ? effectiveCapabilityRoute?.connection_id
+      : selected?.id;
+    const modelId = activeMode === "follow"
+      ? effectiveCapabilityRoute?.model_id
+      : testModel?.model_id;
+    if (!connectionId || !modelId) {
+      setError("请先获取并选择模型");
       return;
     }
-    await loadApiKey();
-    setShowApiKey(true);
-  });
-
-  const copyApiKey = () => run("copy-key", async () => {
-    const apiKey = await loadApiKey();
-    await navigator.clipboard.writeText(apiKey);
-    setNotice("API Key 已复制");
-  });
+    void run(`test-${capability}`, async () => {
+      const result = await testCapability(capability, { connection_id: connectionId, model_id: modelId });
+      if (capability === "embedding") {
+        const dimension = result.dimensions ?? result.expected_dimension;
+        setNotice(`Embedding 调用成功${dimension ? `，向量维度 ${dimension}` : ""}${result.duration_ms != null ? `，耗时 ${result.duration_ms} ms` : ""}`);
+      } else {
+        setNotice(`视觉模型调用成功${result.vision_received === false ? "，未检测到图片响应" : "，图片能力已验证"}${result.duration_ms != null ? `，耗时 ${result.duration_ms} ms` : ""}`);
+      }
+    });
+  };
 
   return (
     <section className="model-settings-page" aria-labelledby="model-settings-title">
@@ -155,9 +280,31 @@ export function ModelSettingsPage(props: {
         <button type="button" className="icon-button" aria-label="返回会话" title="返回会话" onClick={props.onBack}><ArrowLeft size={18} /></button>
         <div><h1 id="model-settings-title">模型连接</h1><p>管理 OpenAI-compatible 地址、密钥和模型能力</p></div>
       </header>
+      <nav className="model-capability-tabs" aria-label="模型能力">
+        {CAPABILITY_TABS.map((tab) => {
+          const state = tab.id === "primary" ? null : capabilityState(tab.id);
+          const mode = tab.id === "primary" ? "primary" : (capabilityModeOverrides[tab.id] ?? capabilityMode(state));
+          return <button
+            key={tab.id}
+            type="button"
+            className={`model-capability-tab${activeCapability === tab.id ? " active" : ""}`}
+            aria-current={activeCapability === tab.id ? "page" : undefined}
+            onClick={() => selectCapability(tab.id)}
+          >
+            <span className="model-capability-icon">{capabilityIcon(tab.id)}</span>
+            <span><strong>{tab.label}</strong><small>{tab.id === "primary" ? tab.description : mode === "follow" ? "跟随主模型" : tab.description}</small></span>
+            {tab.id !== "primary" ? <span className={`model-capability-state ${mode === "follow" ? "follow" : "independent"}`}>{mode === "follow" ? "跟随" : "独立"}</span> : null}
+          </button>;
+        })}
+      </nav>
       <div className="model-settings-layout">
             <aside className="connection-list">
-              <button className={`connection-item ${creating ? "active" : ""}`} onClick={() => selectConnection(null)}><Plus size={15} />新增连接</button>
+              <button className={`connection-item ${creating ? "active" : ""}`} onClick={() => {
+                if (activeCapability !== "primary") {
+                  setCapabilityModeOverrides((current) => ({ ...current, [activeCapability]: "independent" }));
+                }
+                selectConnection(null);
+              }}><Plus size={15} />新增连接</button>
               {props.settings.connections.map((connection) => (
                 <button key={connection.id} className={`connection-item ${selectedId === connection.id ? "active" : ""}`} onClick={() => selectConnection(connection)}>
                   <span className={`connection-dot ${connection.enabled ? "online" : ""}`} />
@@ -170,24 +317,33 @@ export function ModelSettingsPage(props: {
               })}><Database size={15} />{busy === "catalog" ? "更新中" : "更新模型资料库"}</button>
             </aside>
             <section className="connection-editor">
+              {activeCapability !== "primary" ? <section className="capability-routing-panel" aria-label={`${activeCapability === "vision" ? "视觉" : "Embedding"} 模型连接方式`}>
+                <div className="capability-routing-copy">
+                  <strong>{activeCapability === "vision" ? "视觉模型" : "Embedding 模型"}连接方式</strong>
+                  <span>{activeCapability === "vision" ? "主模型具备图片能力时可直接复用；需要单独服务时再切换。" : "默认复用主模型连接，也可以为记忆检索选择独立向量服务。"} {activeCapabilityState?.runtime_effective_at === "now" || activeCapabilityState?.requires_restart === false ? "保存后立即生效。" : "保存路由后重启服务生效。"}{activeCapability === "embedding" && activeCapabilityState?.expected_dimension ? ` 当前向量维度 ${activeCapabilityState.expected_dimension}。` : ""}</span>
+                </div>
+                <div className="capability-mode-toggle" role="radiogroup" aria-label="连接方式">
+                  <button type="button" role="radio" aria-checked={activeMode === "follow"} className={activeMode === "follow" ? "active" : ""} disabled={Boolean(busy)} onClick={() => setCapabilityMode("follow")}>跟随主模型</button>
+                  <button type="button" role="radio" aria-checked={activeMode === "independent"} className={activeMode === "independent" ? "active" : ""} disabled={Boolean(busy)} onClick={() => setCapabilityMode("independent")}>独立连接</button>
+                </div>
+                {activeMode === "follow" ? <p className="capability-follow-summary">
+                  当前使用：<strong>{activeCapabilityConnection?.name || "主模型默认连接"}</strong>{effectiveCapabilityRoute?.model_id ? ` / ${effectiveCapabilityRoute.model_id}` : ""}。需要更换 URL、密钥或模型时，请切换到独立连接。
+                </p> : <p className="capability-follow-summary">独立模式复用连接列表中的连接；需要不同 URL 或密钥时，请先在左侧新增连接。</p>}
+              </section> : null}
               <div className="connection-form-grid">
-                <label><span>连接名称</span><input maxLength={80} value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} placeholder="例如：DeepSeek 官方" /></label>
-                <label><span>目录供应商</span><input maxLength={80} value={draft.provider} onChange={(e) => setDraft({ ...draft, provider: e.target.value })} placeholder="models.dev provider id，可留空" /></label>
-                <label className="wide"><span>Base URL</span><input value={draft.base_url} onChange={(e) => setDraft({ ...draft, base_url: e.target.value })} placeholder="https://api.example.com/v1" /></label>
+                <label><span>连接名称</span><input disabled={!connectionEditable} maxLength={80} value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} placeholder="例如：DeepSeek 官方" /></label>
+                <label><span>目录供应商</span><input disabled={!connectionEditable} maxLength={80} value={draft.provider} onChange={(e) => setDraft({ ...draft, provider: e.target.value })} placeholder="models.dev provider id，可留空" /></label>
+                <label className="wide"><span>Base URL</span><input disabled={!connectionEditable} value={draft.base_url} onChange={(e) => setDraft({ ...draft, base_url: e.target.value })} placeholder="https://api.example.com/v1" /></label>
                 <label className="wide api-key-field"><span className="field-label"><span>API Key</span>{selected ? <span className={`api-key-state ${selected.has_api_key ? "configured" : "missing"}`}>{selected.has_api_key ? <CircleCheck size={13} /> : <KeyRound size={13} />}{selected.has_api_key ? "已配置" : "未配置"}</span> : null}</span>
-                  {selected?.has_api_key ? <span className="stored-api-key">
-                    <code>{showApiKey ? revealedApiKey : selected.api_key_preview || "已保存"}</code>
-                    <button type="button" className="icon-button" title={showApiKey ? "隐藏 API Key" : "明文查看 API Key"} aria-label={showApiKey ? "隐藏 API Key" : "明文查看 API Key"} disabled={Boolean(busy)} onClick={() => void toggleApiKey()}>{showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}</button>
-                    <button type="button" className="icon-button" title="复制 API Key" aria-label="复制 API Key" disabled={Boolean(busy)} onClick={() => void copyApiKey()}><Copy size={16} /></button>
-                  </span> : null}
-                  <input type="password" autoComplete="new-password" value={draft.api_key} onChange={(e) => setDraft({ ...draft, api_key: e.target.value })} placeholder={selected?.has_api_key ? "输入新值可替换当前密钥" : "输入 API Key"} />
+                  {selected?.has_api_key ? <span className="stored-api-key"><code aria-label="API Key 掩码">{maskedApiKeyPreview(selected.api_key_preview)}</code><small>仅显示掩码</small></span> : null}
+                  <input disabled={!connectionEditable} type="password" autoComplete="new-password" value={draft.api_key} onChange={(e) => setDraft({ ...draft, api_key: e.target.value })} placeholder={selected?.has_api_key ? "输入新值可替换当前密钥" : "输入 API Key"} />
                 </label>
-                <label><span>默认适配器</span><select value={draft.default_adapter} onChange={(e) => setDraft({ ...draft, default_adapter: e.target.value as ModelAdapterId })}>{ADAPTERS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-                <label className="connection-enabled"><input type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} /><span>启用连接</span></label>
+                {activeCapability === "primary" ? <label><span>默认适配器</span><select value={draft.default_adapter} onChange={(e) => setDraft({ ...draft, default_adapter: e.target.value as ModelAdapterId })}>{ADAPTERS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label> : <div className="capability-auto-adapter"><span>调用方式</span><strong>直接调用对应接口</strong><small>{activeCapability === "embedding" ? "使用 /embeddings 验证向量维度" : "使用图片输入验证视觉响应"}，无需手动配置适配器</small></div>}
+                <label className="connection-enabled"><input disabled={!connectionEditable} type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} /><span>启用连接</span></label>
               </div>
               <div className="connection-toolbar">
-                {selected ? <button className="danger-text" disabled={Boolean(busy)} onClick={() => setDeleteConfirmationOpen(true)}><Trash2 size={15} />删除</button> : null}
-                <button className="primary-action" disabled={Boolean(busy)} onClick={() => void saveConnection()}><Check size={15} />{busy === "save" ? "保存中" : "保存连接"}</button>
+                {selected && connectionEditable ? <button className="danger-text" disabled={Boolean(busy)} onClick={() => setDeleteConfirmationOpen(true)}><Trash2 size={15} />删除</button> : null}
+                <button className="primary-action" disabled={Boolean(busy) || !connectionEditable} title={!connectionEditable ? "跟随主模型时请切换到独立连接" : ""} onClick={() => void saveConnection()}><Check size={15} />{busy === "save" ? "保存中" : "保存连接"}</button>
               </div>
               {selected ? <>
                 {!selected.enabled ? <p className="connection-disabled-message">连接已停用。启用并保存后，才能设为默认或调用模型。</p> : null}
@@ -201,11 +357,11 @@ export function ModelSettingsPage(props: {
                     const result = await testModelConnection(selected.id);
                     setNotice(`连接“${result.connection_name}”的模型列表可用，共返回 ${result.model_count} 个模型`);
                   })}><ListChecks size={15} />{busy === "test-list" ? "测试中" : "测试模型列表"}</button>
-                  <button disabled={Boolean(busy) || !testModel} onClick={() => run("test-model", async () => {
+                  {activeCapability === "primary" ? <button disabled={Boolean(busy) || !testModel} onClick={() => run("test-model", async () => {
                     if (!testModel) return;
                     const result = await testConnectionModel(selected.id, testModel.model_id, testEffort);
                     setNotice(`“${result.connection_name} / ${result.model_display_name}”调用成功${result.thinking_received ? `，思考模式 ${result.effective_effort || testEffort || "已验证"}` : ""}，耗时 ${result.duration_ms} ms`);
-                  })}><Play size={15} />{busy === "test-model" ? "调用中" : "测试所选模型"}</button>
+                  })}><Play size={15} />{busy === "test-model" ? "调用中" : "测试所选模型"}</button> : <button disabled={Boolean(busy) || !testModel || (activeMode === "follow" && !effectiveCapabilityRoute)} onClick={runCapabilityTest}><Play size={15} />{busy === `test-${activeCapability}` ? "验证中" : "测试所选模型"}</button>}
                 </div>
                 {error ? <p className="model-test-message error" role="alert">{error}</p> : null}
                 {notice ? <p className="model-test-message" role="status">{notice}</p> : null}
@@ -216,22 +372,28 @@ export function ModelSettingsPage(props: {
                 </div>
                 <div className="model-profile-list">
                   {filteredModels.length ? filteredModels.map((model) => {
-                    const isDefault = props.settings.default_route?.connection_id === selected.id && props.settings.default_route?.model_id === model.model_id;
+                    const isDefault = effectiveCapabilityRoute?.connection_id === selected.id && effectiveCapabilityRoute?.model_id === model.model_id;
                     return <div className={`model-profile-row ${testModel?.model_id === model.model_id ? "selected" : ""}`} key={model.model_id}>
-                      <button className="model-profile-main" onClick={() => { setTestModelId(model.model_id); setEditingModel(model); setContextDraft(model.context_window ? String(model.context_window) : ""); }}>
+                      <button className="model-profile-main" onClick={() => {
+                        setTestModelId(model.model_id);
+                        if (activeCapability === "primary") {
+                          setEditingModel(model);
+                          setContextDraft(model.context_window ? String(model.context_window) : "");
+                        } else {
+                          setEditingModel(null);
+                        }
+                      }}>
                         <strong>{model.display_name}</strong><small>{model.model_id}</small>
                       </button>
                       <span className="model-capacity">上下文 {formatCapacity(model.context_window)}</span>
                       <span className="model-source">{model.supports_reasoning
                         ? reasoningStatusForModel(model)
                         : Object.prototype.hasOwnProperty.call(model.user_overrides, "context_window") ? "手动设置" : "思考关闭"}</span>
-                      <button className={isDefault ? "default-model active" : "default-model"} disabled={Boolean(busy) || !selected.enabled} title={!selected.enabled ? "连接已停用，请先启用并保存" : ""} onClick={() => run("default", async () => {
-                        const route = await saveDefaultModelRoute({ connection_id: selected.id, model_id: model.model_id }); setTestModelId(model.model_id); props.onDefaultRoute(route); await props.onRefresh(); setNotice("已设为默认并切换当前会话");
-                      })}>{isDefault ? "默认" : "设为默认"}</button>
+                      <button className={isDefault ? "default-model active" : "default-model"} disabled={Boolean(busy) || !selected.enabled || (activeCapability !== "primary" && activeMode !== "independent")} title={!selected.enabled ? "连接已停用，请先启用并保存" : activeCapability !== "primary" && activeMode !== "independent" ? "跟随主模型时不能单独选择" : ""} onClick={() => void saveCapabilityModel(model)}>{isDefault ? (activeCapability === "primary" ? "默认" : "当前") : activeCapability === "primary" ? "设为默认" : "设为当前"}</button>
                     </div>;
                   }) : <p className="model-list-empty">{availableModels.length ? "没有匹配的模型。" : "请先获取模型。"}</p>}
                 </div>
-                {editingModel ? <div className="model-override-editor">
+                {editingModel && activeCapability === "primary" ? <div className="model-override-editor">
                   <div><strong>{editingModel.display_name}</strong><span>覆盖模型容量、推理能力与适配器</span></div>
                   <label><span>上下文 token</span><input type="number" min="1" value={contextDraft} onChange={(e) => setContextDraft(e.target.value)} placeholder="未知" /></label>
                   <label><span>适配器</span><select value={editingModel.adapter} onChange={(e) => setEditingModel({ ...editingModel, adapter: e.target.value as ModelAdapterId })}>{ADAPTERS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>

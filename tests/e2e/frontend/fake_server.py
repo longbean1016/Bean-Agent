@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
@@ -56,6 +57,18 @@ def sessions() -> dict[str, object]:
             "sandbox_mode": "workspace-write",
         }],
         "total": 1,
+    }
+
+
+@app.get("/api/settings")
+def model_settings() -> dict[str, object]:
+    """返回聊天页启动所需的最小模型设置，避免夹具制造无关的 404。"""
+
+    return {
+        "connections": [],
+        "default_route": None,
+        "catalog": {},
+        "routing_required": False,
     }
 
 
@@ -173,6 +186,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     workspace_id: str | None = None
     sandbox_mode = "read-only"
     pending_approval = ""
+    approval_started_at = ""
+    approval_requested_at = ""
+
+    def event_time(offset_ms: int = 0) -> str:
+        """为离线夹具生成单调递进的 ISO 时间，覆盖前端计时展示。"""
+
+        timestamp = datetime.now(timezone.utc) + timedelta(milliseconds=offset_ms)
+        return timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
     def sandbox_snapshot() -> dict[str, object]:
         has_workspace = workspace_id == DEMO_WORKSPACE["id"]
@@ -197,14 +218,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             "tool_name": "shell",
             "operation": "执行完整 Shell 命令",
             "arguments": {
-                "command": "Set-Content D:\\outside.txt 'approved'",
-                "cwd": "D:/projects/bean-demo",
+                # 夹具直接模拟后端的安全投影，不把原始内部参数交给浏览器。
+                "command": "Set-Content D:\\outside.txt '[内容已隐藏]'",
+                "cwd": "[已隐藏]",
             },
             "reason": "命令需要写入当前工作目录之外的位置",
             "requested_mode": "danger-full-access",
-            "fingerprint": "playwright-fingerprint",
             "state": "pending",
-            "created_at": "2026-09-03T12:00:00+08:00",
+            "created_at": approval_requested_at or event_time(),
+            "requested_at": approval_requested_at or event_time(),
+            "expires_at": event_time(30_000),
+            "summary": "运行命令需要确认",
+            "reason_code": "workspace_boundary",
         }
 
     try:
@@ -228,6 +253,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "session.subscribed", "request_id": request_id, "session_id": session_id})
                 await websocket.send_json({"type": "sandbox.updated", "request_id": "", "sandbox": sandbox_snapshot()})
                 if pending_approval:
+                    await websocket.send_json({
+                        "type": "react.tool.started",
+                        "session_id": session_id,
+                        "turn_id": active_turn,
+                        "call_id": "call-approval",
+                        "tool_name": "shell",
+                        "arguments": approval_snapshot()["arguments"],
+                        "started_at": approval_started_at,
+                        "approval_id": pending_approval,
+                        "approval_state": "pending",
+                        "approval_requested_at": approval_requested_at,
+                    })
                     await websocket.send_json({"type": "approval.requested", "session_id": session_id, "approval": approval_snapshot()})
                 continue
             if frame_type == "sandbox.mode.set":
@@ -243,10 +280,43 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if frame_type == "approval.decide":
                 approval_id = str(frame.get("approval_id") or "")
                 decision = str(frame.get("decision") or "rejected")
-                await websocket.send_json({"type": "approval.resolved", "request_id": request_id, "session_id": session_id, "approval_id": approval_id, "decision": decision})
                 if approval_id == pending_approval:
+                    resolved_at = event_time(100)
+                    resolved_state = "allowed-once" if decision == "allowed-once" else "rejected"
+                    await websocket.send_json({
+                        "type": "approval.resolved",
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "approval_id": approval_id,
+                        "decision": decision,
+                        "state": resolved_state,
+                        "turn_id": active_turn,
+                        "call_id": "call-approval",
+                        "decided_at": resolved_at,
+                        **({} if decision == "allowed-once" else {"error_code": "user_rejected"}),
+                    })
+                    await websocket.send_json({
+                        "type": "react.tool.completed",
+                        "session_id": session_id,
+                        "turn_id": active_turn,
+                        "call_id": "call-approval",
+                        "tool_name": "shell",
+                        "status": "completed" if decision == "allowed-once" else "rejected",
+                        "result_preview": "命令已执行" if decision == "allowed-once" else "",
+                        "started_at": approval_started_at,
+                        "ended_at": event_time(200),
+                        "duration_ms": 200,
+                        "approval_requested_at": approval_requested_at,
+                        "approval_resolved_at": resolved_at,
+                        "approval_wait_ms": 100,
+                        "execution_ms": 100,
+                        "result_kind": "text",
+                        **({} if decision == "allowed-once" else {"error_code": "user_rejected"}),
+                    })
                     await websocket.send_json({"type": "message.final", "request_id": request_id, "session_id": session_id, "turn_id": active_turn, "content": "审批流程已结束", "thinking": "", "media": []})
                     pending_approval = ""
+                    approval_started_at = ""
+                    approval_requested_at = ""
                     active_turn = ""
                 continue
             if frame_type == "turn.stop":
@@ -271,13 +341,28 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if text == "排队测试":
                 queued_request = request_id
                 await websocket.send_json({"type": "turn.queued", "request_id": request_id, "session_id": session_id, "position": 1})
-                await asyncio.sleep(0.05)
+                # 给窄屏设备留出一次渲染帧，确保排队首个位置不是瞬态而无法被断言。
+                await asyncio.sleep(0.25)
                 await websocket.send_json({"type": "turn.queued", "request_id": request_id, "session_id": session_id, "position": 2})
                 continue
             active_turn = f"turn-{request_id}"
             await websocket.send_json({"type": "turn.started", "request_id": request_id, "session_id": session_id, "turn_id": active_turn})
             if text == "审批测试":
                 pending_approval = "approval-playwright"
+                approval_started_at = event_time()
+                approval_requested_at = event_time(50)
+                await websocket.send_json({
+                    "type": "react.tool.started",
+                    "session_id": session_id,
+                    "turn_id": active_turn,
+                    "call_id": "call-approval",
+                    "tool_name": "shell",
+                    "arguments": approval_snapshot()["arguments"],
+                    "started_at": approval_started_at,
+                    "approval_id": pending_approval,
+                    "approval_state": "pending",
+                    "approval_requested_at": approval_requested_at,
+                })
                 await websocket.send_json({
                     "type": "approval.requested",
                     "session_id": session_id,
@@ -303,8 +388,30 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
             await websocket.send_json({"type": "react.thinking.delta", "session_id": session_id, "turn_id": active_turn, "delta": "正在分析用户请求"})
             await websocket.send_json({"type": "answer.delta", "session_id": session_id, "turn_id": active_turn, "delta": "流式草稿"})
-            await websocket.send_json({"type": "react.tool.started", "session_id": session_id, "turn_id": active_turn, "call_id": "call-1", "tool_name": "list_dir", "arguments": {"path": "."}})
-            await websocket.send_json({"type": "react.tool.completed", "session_id": session_id, "turn_id": active_turn, "call_id": "call-1", "tool_name": "list_dir", "status": "ok", "result_preview": "agent, tests"})
+            tool_started_at = event_time()
+            await websocket.send_json({
+                "type": "react.tool.started",
+                "session_id": session_id,
+                "turn_id": active_turn,
+                "call_id": "call-1",
+                "tool_name": "list_dir",
+                "arguments": {"path": "."},
+                "started_at": tool_started_at,
+            })
+            await websocket.send_json({
+                "type": "react.tool.completed",
+                "session_id": session_id,
+                "turn_id": active_turn,
+                "call_id": "call-1",
+                "tool_name": "list_dir",
+                "status": "completed",
+                "result_preview": "agent, tests",
+                "started_at": tool_started_at,
+                "ended_at": event_time(120),
+                "duration_ms": 120,
+                "execution_ms": 120,
+                "result_kind": "text",
+            })
             content = "最终内容\n\n```python\ndef greet(name: str) -> str:\n    message = f'你好，{name}'\n    return message\n\nprint(greet('BeanAgent'))\n```\n\n```mermaid\ngraph LR\n  A[WebSocket] --> B[Agent]\n```"
             await websocket.send_json({"type": "message.final", "request_id": request_id, "session_id": session_id, "turn_id": active_turn, "content": content, "thinking": "已经分析用户请求", "media": []})
             active_turn = ""
