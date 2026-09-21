@@ -1,5 +1,5 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { ArrowLeft, Bot, BrainCircuit, Check, CircleCheck, Database, Eye, EyeOff, KeyRound, ListChecks, Play, Plus, RefreshCw, Search, Settings, Trash2, TriangleAlert } from "lucide-react";
+import { ArrowLeft, Bot, BrainCircuit, Check, CircleCheck, Database, Eye, EyeOff, Image, KeyRound, ListChecks, Play, Plus, RefreshCw, Search, Settings, Trash2, TriangleAlert } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -46,6 +46,7 @@ type ConfigurableCapability = Exclude<ModelCapability, "primary">;
 const CAPABILITY_TABS: Array<{ id: ModelCapability; label: string; description: string }> = [
   { id: "primary", label: "主模型", description: "对话、推理与工具调用" },
   { id: "embedding", label: "Embedding 模型", description: "记忆检索与向量化" },
+  { id: "vision", label: "视觉模型", description: "图片理解与识别" },
 ];
 
 function capabilityMode(state: { mode?: CapabilityRouteMode | string | null; follows_primary?: boolean } | null | undefined): "follow" | "independent" {
@@ -55,6 +56,7 @@ function capabilityMode(state: { mode?: CapabilityRouteMode | string | null; fol
 
 function capabilityIcon(capability: ModelCapability) {
   if (capability === "embedding") return <BrainCircuit size={16} aria-hidden="true" />;
+  if (capability === "vision") return <Image size={16} aria-hidden="true" />;
   return <Bot size={16} aria-hidden="true" />;
 }
 

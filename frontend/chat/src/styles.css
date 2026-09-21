@@ -719,7 +719,7 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .model-settings-header { display: grid; grid-template-columns: 34px minmax(0, 1fr); align-items: center; gap: 10px; padding: 16px 18px; border-bottom: 1px solid var(--border); }
 .model-settings-header h1 { margin: 0 0 3px; font-size: 17px; }
 .model-settings-header p { margin: 0; color: var(--text-muted); font-size: 12px; }
-.model-capability-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; padding: 8px 16px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.model-capability-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; padding: 8px 16px; border-bottom: 1px solid var(--border); background: var(--surface); }
 .model-capability-tab { display: grid; grid-template-columns: 27px minmax(0, 1fr) auto; min-width: 0; align-items: center; gap: 7px; min-height: 44px; padding: 5px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); color: var(--text); text-align: left; cursor: pointer; }
 .model-capability-tab:hover, .model-capability-tab:focus-visible { border-color: var(--primary-border); outline: none; background: var(--primary-tint); }
 .model-capability-tab.active { border-color: var(--primary); background: var(--primary-tint); box-shadow: inset 0 -2px 0 var(--primary); }

@@ -229,7 +229,7 @@ it("按名称或 ID 搜索当前连接已获取的模型", async () => {
   expect(screen.getByText("没有匹配的模型。")).toBeVisible();
 });
 
-it("顶部能力入口显示当前模型，当前模型在列表中置顶且不展示视觉入口", async () => {
+it("设置页三个能力入口显示当前模型，当前模型在列表中置顶", async () => {
   const modelB = {
     ...settings.connections[0].models[0],
     model_id: "model-b",
@@ -249,7 +249,7 @@ it("顶部能力入口显示当前模型，当前模型在列表中置顶且不�
 
   expect(screen.getByRole("button", { name: /主模型当前：Model B/ })).toBeVisible();
   expect(screen.getByRole("button", { name: /Embedding 模型.*跟随主模型.*Model B/ })).toBeVisible();
-  expect(screen.queryByRole("button", { name: /视觉模型/ })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /视觉模型.*跟随主模型.*Model B/ })).toBeVisible();
   const rows = screen.getAllByRole("button", { name: /Model [AB]model-/ });
   expect(rows[0]).toHaveAccessibleName("Model Bmodel-b");
 });
