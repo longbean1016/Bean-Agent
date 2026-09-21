@@ -1,10 +1,11 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { ArrowLeft, Bot, BrainCircuit, Check, CircleCheck, Database, Image, KeyRound, ListChecks, Play, Plus, RefreshCw, Search, Settings, Trash2, TriangleAlert } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { ArrowLeft, Bot, BrainCircuit, Check, CircleCheck, Database, Eye, EyeOff, KeyRound, ListChecks, Play, Plus, RefreshCw, Search, Settings, Trash2, TriangleAlert } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   createModelConnection,
   deleteModelConnection,
+  fetchModelConnectionApiKey,
   refreshConnectionModels,
   saveCapabilityRoute,
   saveDefaultModelRoute,
@@ -45,7 +46,6 @@ type ConfigurableCapability = Exclude<ModelCapability, "primary">;
 const CAPABILITY_TABS: Array<{ id: ModelCapability; label: string; description: string }> = [
   { id: "primary", label: "主模型", description: "对话、推理与工具调用" },
   { id: "embedding", label: "Embedding 模型", description: "记忆检索与向量化" },
-  { id: "vision", label: "视觉模型", description: "图片理解与识别" },
 ];
 
 function capabilityMode(state: { mode?: CapabilityRouteMode | string | null; follows_primary?: boolean } | null | undefined): "follow" | "independent" {
@@ -55,7 +55,6 @@ function capabilityMode(state: { mode?: CapabilityRouteMode | string | null; fol
 
 function capabilityIcon(capability: ModelCapability) {
   if (capability === "embedding") return <BrainCircuit size={16} aria-hidden="true" />;
-  if (capability === "vision") return <Image size={16} aria-hidden="true" />;
   return <Bot size={16} aria-hidden="true" />;
 }
 
@@ -87,7 +86,9 @@ export function ModelSettingsPage(props: {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [toast, setToast] = useState<SettingsToast | null>(null);
+  const [revealedApiKey, setRevealedApiKey] = useState<{ connectionId: string; value: string } | null>(null);
   const [deleteConfirmationOpen, setDeleteConfirmationOpen] = useState(false);
+  const selectionInitialized = useRef(false);
   const selected = props.settings.connections.find((item) => item.id === selectedId) ?? null;
 
   const capabilityState = (capability: ConfigurableCapability) => (
@@ -119,7 +120,9 @@ export function ModelSettingsPage(props: {
   );
 
   useEffect(() => {
-    if (creating) return;
+    // 初次设置数据可能异步到达；空列表阶段不要把页面锁在“新增连接”空态。
+    if (!props.settings.connections.length) return;
+    if (selectionInitialized.current && creating) return;
     if (selectedId && props.settings.connections.some((item) => item.id === selectedId)) return;
     const preferred = effectiveCapabilityRoute?.connection_id
       ? props.settings.connections.find((item) => item.id === effectiveCapabilityRoute?.connection_id)
@@ -157,6 +160,15 @@ export function ModelSettingsPage(props: {
     ? props.settings.default_route
     : (activeCapabilityState?.route ?? activeCapabilityState?.override_route
       ?? (activeMode === "follow" ? props.settings.default_route : null));
+  const orderedModels = useMemo(() => {
+    const pinnedModelId = capabilityRouteForSelection?.connection_id === selected?.id
+      ? capabilityRouteForSelection?.model_id ?? ""
+      : "";
+    if (!pinnedModelId) return filteredModels;
+    return [...filteredModels].sort((left, right) => (
+      Number(right.model_id === pinnedModelId) - Number(left.model_id === pinnedModelId)
+    ));
+  }, [capabilityRouteForSelection?.connection_id, capabilityRouteForSelection?.model_id, filteredModels, selected?.id]);
   const testModel = availableModels.find((model) => model.model_id === testModelId)
     ?? availableModels.find((model) => capabilityRouteForSelection?.connection_id === selected?.id && capabilityRouteForSelection?.model_id === model.model_id)
     ?? availableModels[0];
@@ -164,7 +176,20 @@ export function ModelSettingsPage(props: {
     ? (testModel.capabilities_json?.reasoning?.native?.at(-1) ?? testModel.reasoning_options.at(-1) ?? null)
     : null;
 
+  const currentModelLabel = (capability: ModelCapability): string => {
+    const state = capability === "primary" ? null : capabilityState(capability);
+    const route = capability === "primary"
+      ? props.settings.default_route
+      : (state?.route ?? state?.override_route ?? props.settings.default_route);
+    if (!route) return "未选择模型";
+    const connection = props.settings.connections.find((item) => item.id === route.connection_id);
+    return connection?.models.find((model) => model.model_id === route.model_id)?.display_name
+      ?? route.model_id
+      ?? "未选择模型";
+  };
+
   const selectConnection = (connection: ModelConnection | null, preferredModelId?: string) => {
+    selectionInitialized.current = true;
     setCreating(connection === null);
     setSelectedId(connection?.id ?? "");
     setDraft(connection ? {
@@ -184,6 +209,7 @@ export function ModelSettingsPage(props: {
     ))?.model_id ?? connection?.models.find((model) => model.available)?.model_id ?? "");
     setModelQuery("");
     setDeleteConfirmationOpen(false);
+    setRevealedApiKey(null);
     setError("");
     setNotice("");
   };
@@ -280,6 +306,20 @@ export function ModelSettingsPage(props: {
     setNotice(creatingConnection ? "新增连接成功" : "连接保存成功");
   });
 
+  const toggleApiKeyVisibility = () => {
+    if (!selected) return;
+    if (revealedApiKey?.connectionId === selected.id) {
+      setRevealedApiKey(null);
+      return;
+    }
+    const connectionId = selected.id;
+    void run("api-key", async () => {
+      const value = await fetchModelConnectionApiKey(connectionId);
+      setRevealedApiKey({ connectionId, value });
+      setNotice("完整密钥已显示，切换连接后会自动隐藏");
+    });
+  };
+
   const runCapabilityTest = () => {
     if (activeCapability === "primary") return;
     const capability = activeCapability;
@@ -314,6 +354,7 @@ export function ModelSettingsPage(props: {
         {CAPABILITY_TABS.map((tab) => {
           const state = tab.id === "primary" ? null : capabilityState(tab.id);
           const mode = tab.id === "primary" ? "primary" : (capabilityModeOverrides[tab.id] ?? capabilityMode(state));
+          const currentModel = currentModelLabel(tab.id);
           return <button
             key={tab.id}
             type="button"
@@ -322,7 +363,7 @@ export function ModelSettingsPage(props: {
             onClick={() => selectCapability(tab.id)}
           >
             <span className="model-capability-icon">{capabilityIcon(tab.id)}</span>
-            <span><strong>{tab.label}</strong><small>{tab.id === "primary" ? tab.description : mode === "follow" ? "跟随主模型" : tab.description}</small></span>
+            <span><strong>{tab.label}</strong><small title={currentModel}>{tab.id === "primary" ? `当前：${currentModel}` : mode === "follow" ? `跟随主模型 · ${currentModel}` : `当前：${currentModel}`}</small></span>
             {tab.id !== "primary" ? <span className={`model-capability-state ${mode === "follow" ? "follow" : "independent"}`}>{mode === "follow" ? "跟随" : "独立"}</span> : null}
           </button>;
         })}
@@ -365,7 +406,14 @@ export function ModelSettingsPage(props: {
                 <label><span>目录供应商</span><input disabled={!connectionEditable} maxLength={80} value={draft.provider} onChange={(e) => setDraft({ ...draft, provider: e.target.value })} placeholder="models.dev provider id，可留空" /></label>
                 <label className="wide"><span>Base URL</span><input disabled={!connectionEditable} value={draft.base_url} onChange={(e) => setDraft({ ...draft, base_url: e.target.value })} placeholder="https://api.example.com/v1" /></label>
                 <label className="wide api-key-field"><span className="field-label"><span>API Key</span>{selected ? <span className={`api-key-state ${selected.has_api_key ? "configured" : "missing"}`}>{selected.has_api_key ? <CircleCheck size={13} /> : <KeyRound size={13} />}{selected.has_api_key ? "已配置" : "未配置"}</span> : null}</span>
-                  {selected?.has_api_key ? <span className="stored-api-key"><code aria-label="API Key 掩码">{maskedApiKeyPreview(selected.api_key_preview)}</code><small>仅显示掩码</small></span> : null}
+                  {selected?.has_api_key ? <span className="stored-api-key">
+                    <code aria-label={revealedApiKey?.connectionId === selected.id ? "API Key 完整值" : "API Key 掩码"}>{revealedApiKey?.connectionId === selected.id ? revealedApiKey.value : maskedApiKeyPreview(selected.api_key_preview)}</code>
+                    <small>{revealedApiKey?.connectionId === selected.id ? "已显示完整值" : "仅显示掩码"}</small>
+                    <button type="button" className="api-key-visibility" disabled={Boolean(busy)} onClick={toggleApiKeyVisibility} aria-label={revealedApiKey?.connectionId === selected.id ? "隐藏完整 API Key" : "显示完整 API Key"} title={revealedApiKey?.connectionId === selected.id ? "隐藏完整 API Key" : "显示完整 API Key"}>
+                      {revealedApiKey?.connectionId === selected.id ? <EyeOff size={14} /> : <Eye size={14} />}
+                      {revealedApiKey?.connectionId === selected.id ? "隐藏" : "显示"}
+                    </button>
+                  </span> : null}
                   <input disabled={!connectionEditable} type="password" autoComplete="new-password" value={draft.api_key} onChange={(e) => setDraft({ ...draft, api_key: e.target.value })} placeholder={selected?.has_api_key ? "输入新值可替换当前密钥" : "输入 API Key"} />
                 </label>
                 {activeCapability === "primary" ? <label><span>默认适配器</span><select value={draft.default_adapter} onChange={(e) => setDraft({ ...draft, default_adapter: e.target.value as ModelAdapterId })}>{ADAPTERS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label> : <div className="capability-auto-adapter"><span>调用方式</span><strong>直接调用对应接口</strong><small>{activeCapability === "embedding" ? "使用 /embeddings 验证向量维度" : "使用图片输入验证视觉响应"}，无需手动配置适配器</small></div>}
@@ -399,7 +447,7 @@ export function ModelSettingsPage(props: {
                   <span>{filteredModels.length}/{availableModels.length}</span>
                 </div>
                 <div className="model-profile-list">
-                  {filteredModels.length ? filteredModels.map((model) => {
+                  {orderedModels.length ? orderedModels.map((model) => {
                     const isDefault = effectiveCapabilityRoute?.connection_id === selected.id && effectiveCapabilityRoute?.model_id === model.model_id;
                     return <div className={`model-profile-row ${testModel?.model_id === model.model_id ? "selected" : ""}`} key={model.model_id}>
                       <button className="model-profile-main" onClick={() => {

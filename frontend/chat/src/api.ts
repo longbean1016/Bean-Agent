@@ -315,6 +315,11 @@ export async function updateModelConnection(id: string, values: Record<string, u
   });
 }
 
+export async function fetchModelConnectionApiKey(id: string): Promise<string> {
+  const payload = await settingsRequest<{ api_key: string }>(`/api/settings/connections/${encodeURIComponent(id)}/api-key`);
+  return payload.api_key;
+}
+
 export async function deleteModelConnection(id: string): Promise<void> {
   const response = await fetch(`/api/settings/connections/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (!response.ok) throw new Error("无法删除连接");
