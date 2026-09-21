@@ -313,6 +313,12 @@ export interface ProactiveNotificationRow {
 
 export type ModelAdapterId = "generic_openai" | "deepseek" | "qwen_dashscope" | "openai_reasoning";
 
+/** 模型能力配置入口；primary 复用现有默认路由，另外两项可独立指定模型。 */
+export type ModelCapability = "primary" | "embedding" | "vision";
+
+/** 能力路由模式。后端可能返回 inherit/follow/follow_main，前端统一按 follow 处理。 */
+export type CapabilityRouteMode = "follow" | "inherit" | "follow_main" | "independent";
+
 export interface ModelProfile {
   connection_id: string;
   model_id: string;
@@ -365,11 +371,28 @@ export interface ModelRoute {
   reasoning_effort?: string | null;
 }
 
+export interface CapabilityRouteState {
+  capability?: ModelCapability | string;
+  mode?: CapabilityRouteMode | string | null;
+  follows_primary?: boolean;
+  requires_restart?: boolean;
+  runtime_effective_at?: "now" | "next_start" | string | null;
+  route?: ModelRoute | null;
+  override_route?: ModelRoute | null;
+  connection?: ModelConnection | null;
+  /** 测试结果仅用于设置页反馈，不持久化密钥。 */
+  dimensions?: number | null;
+  expected_dimension?: number | null;
+}
+
 export interface ModelSettingsPayload {
   connections: ModelConnection[];
   default_route: ModelRoute | null;
   catalog: { updated_at?: string | null };
   routing_required: boolean;
+  /** 新版后端返回 capability_routes；capabilities 保留兼容预览和旧客户端。 */
+  capability_routes?: Partial<Record<ModelCapability, CapabilityRouteState>>;
+  capabilities?: Partial<Record<Exclude<ModelCapability, "primary">, CapabilityRouteState>>;
 }
 
 export type ChatFrame =

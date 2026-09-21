@@ -47,17 +47,8 @@ afterEach(() => {
 });
 
 it("明确显示密钥状态并反馈模型列表和所选模型测试结果", async () => {
-  const writeText = vi.fn(async () => undefined);
-  Object.defineProperty(navigator, "clipboard", {
-    configurable: true,
-    value: { writeText },
-  });
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
-    if (url.endsWith("/api-key")) return {
-      ok: true,
-      json: async () => ({ api_key: "sk-test-12345678" }),
-    } as Response;
     if (url.endsWith("/models/model-a/test")) return {
       ok: true,
       json: async () => ({
@@ -92,18 +83,72 @@ it("明确显示密钥状态并反馈模型列表和所选模型测试结果", a
   expect(screen.getByRole("heading", { name: "模型连接" })).toBeVisible();
   expect(screen.queryByRole("dialog", { name: "模型连接" })).not.toBeInTheDocument();
   expect(screen.getByText("sk-t...5678")).toBeVisible();
+  expect(screen.getByText("仅显示掩码")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "明文查看 API Key" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "复制 API Key" })).not.toBeInTheDocument();
   expect(screen.getByText("上下文 128K")).toBeVisible();
-
-  fireEvent.click(screen.getByRole("button", { name: "明文查看 API Key" }));
-  expect(await screen.findByText("sk-test-12345678")).toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: "复制 API Key" }));
-  await waitFor(() => expect(writeText).toHaveBeenCalledWith("sk-test-12345678"));
 
   fireEvent.click(screen.getByRole("button", { name: "测试模型列表" }));
   expect(await screen.findByText(/模型列表可用，共返回 3 个模型/)).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "测试所选模型" }));
   await waitFor(() => expect(screen.getByText(/公司 API \/ Model A.*调用成功/)).toBeVisible());
+});
+
+it("Embedding 与视觉入口默认跟随主模型，独立模式隐藏手动适配器并支持能力测试", async () => {
+  const capabilitySettings: ModelSettingsPayload = {
+    ...settings,
+    capability_routes: {
+      primary: { capability: "primary", route: settings.default_route, mode: "primary", follows_primary: false },
+      embedding: { capability: "embedding", route: settings.default_route, mode: "follow", follows_primary: true },
+      vision: { capability: "vision", route: settings.default_route, mode: "follow", follows_primary: true },
+    },
+  };
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/capabilities/embedding") && init?.method === "PUT") {
+      return { ok: true, json: async () => ({ capability: "embedding", mode: "independent", follows_primary: false, route: { connection_id: "company", model_id: "model-a" } }) } as Response;
+    }
+    if (url.endsWith("/capabilities/embedding/test")) {
+      return { ok: true, json: async () => ({ ok: true, capability: "embedding", dimensions: 1024, duration_ms: 18 }) } as Response;
+    }
+    return { ok: true, json: async () => ({}) } as Response;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<ModelSettingsPage
+    settings={capabilitySettings}
+    onBack={vi.fn()}
+    onRefresh={vi.fn(async () => ({ ...capabilitySettings, capability_routes: {
+      ...capabilitySettings.capability_routes,
+      embedding: { capability: "embedding", mode: "independent", follows_primary: false, route: { connection_id: "company", model_id: "model-a" } },
+    } }))}
+    onDefaultRoute={vi.fn()}
+  />);
+
+  fireEvent.click(screen.getByRole("button", { name: /Embedding 模型/ }));
+  expect(screen.getByRole("radio", { name: "跟随主模型" })).toBeChecked();
+  expect(screen.queryByText("默认适配器")).not.toBeInTheDocument();
+  expect(screen.getByText("使用 /embeddings 验证向量维度，无需手动配置适配器")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("radio", { name: "独立连接" }));
+  expect(screen.getByText("独立模式复用连接列表中的连接；需要不同 URL 或密钥时，请先在左侧新增连接。")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "当前" }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    "/api/settings/capabilities/embedding",
+    expect.objectContaining({ method: "PUT" }),
+  ));
+  fireEvent.click(screen.getByRole("button", { name: "测试所选模型" }));
+  await waitFor(() => expect(screen.getByText(/Embedding 调用成功.*1024/)).toBeVisible());
+});
+
+it("即使后端返回未掩码预览，前端也只展示首尾片段", async () => {
+  const unsafeSettings: ModelSettingsPayload = {
+    ...settings,
+    connections: settings.connections.map((connection) => ({ ...connection, api_key_preview: "sk-live-secret-value" })),
+  };
+  render(<ModelSettingsPage settings={unsafeSettings} onBack={vi.fn()} onRefresh={vi.fn(async () => unsafeSettings)} onDefaultRoute={vi.fn()} />);
+  expect(screen.getByText("sk-…alue")).toBeVisible();
+  expect(screen.queryByText("sk-live-secret-value")).not.toBeInTheDocument();
 });
 
 it("新增连接保持独立草稿，不会切回并覆盖已有连接", async () => {
