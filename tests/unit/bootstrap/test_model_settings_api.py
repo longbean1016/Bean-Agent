@@ -117,3 +117,45 @@ def test_session_route_api_rejects_non_web_scope(tmp_path: Path) -> None:
     with test_client:
         response = test_client.get("/api/settings/routes/session/global")
     assert response.status_code == 400
+
+
+def test_capability_route_api_supports_follow_and_independent_modes(tmp_path: Path) -> None:
+    test_client, runtime = client(tmp_path)
+    with test_client:
+        connection = test_client.post("/api/settings/connections", json={
+            "name": "能力网关", "base_url": "https://example.com/v1", "api_key": "secret",
+        }).json()
+        test_client.post(
+            f"/api/settings/connections/{connection['id']}/models",
+            json={"model_id": "main-model"},
+        )
+        primary = test_client.put("/api/settings/routes/default", json={
+            "connection_id": connection["id"], "model_id": "main-model",
+        })
+        assert primary.status_code == 200
+
+        initial = test_client.get("/api/settings/capabilities/embedding")
+        assert initial.status_code == 200
+        assert initial.json()["mode"] == "follow"
+        assert initial.json()["route"]["model_id"] == "main-model"
+
+        independent = test_client.put("/api/settings/capabilities/embedding", json={
+            "mode": "independent", "connection_id": connection["id"], "model_id": "main-model",
+        })
+        assert independent.status_code == 200
+        assert independent.json()["mode"] == "independent"
+        assert independent.json()["override_route"]["model_id"] == "main-model"
+        assert independent.json()["requires_restart"] is True
+        assert independent.json()["runtime_effective_at"] == "next_start"
+
+        reset = test_client.put("/api/settings/capabilities/embedding", json={"mode": "follow"})
+        assert reset.status_code == 200
+        assert reset.json()["mode"] == "follow"
+        settings = test_client.get("/api/settings").json()
+        assert settings["capability_routes"]["vision"]["mode"] == "follow"
+        assert "secret" not in str(settings)
+
+        invalid = test_client.put("/api/settings/capabilities/embedding", json={"mode": "unknown"})
+        assert invalid.status_code == 400
+
+    runtime.model_store.close()

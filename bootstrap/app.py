@@ -21,7 +21,7 @@ from PIL import Image, UnidentifiedImageError
 
 from agent.agent_loop import AgentLoop
 from agent.channel import WebChannel
-from agent.config_models import Config
+from agent.config_models import Config, EmbeddingConfig, VisionConfig
 from agent.event_bus import EventBus, SandboxApprovalRequested, SandboxApprovalResolved
 from agent.message_bus import MessageBus
 from agent.mcp.manage_tools import McpAddTool, McpListTool, McpRemoveTool
@@ -56,7 +56,12 @@ from model_settings.discovery import (
 from model_settings.models import ModelRoute
 from model_settings.provider_manager import ModelInvocationTestError, ProviderManager
 from model_settings.secrets import SecretStore, SecretStoreError, SqliteSecretStore
-from model_settings.service import ModelSettingsNotFound, ModelSettingsService, ModelSettingsValidationError
+from model_settings.service import (
+    ModelCapabilityTestError,
+    ModelSettingsNotFound,
+    ModelSettingsService,
+    ModelSettingsValidationError,
+)
 from model_settings.store import ModelSettingsConflict, ModelSettingsStore
 from proactive.agent_tools import ProactiveToolFactory
 from proactive.chat_loop import ProactiveChatLoop
@@ -311,6 +316,119 @@ class CoreRuntime:
     vision_provider: Any | None = None
 
 
+def _saved_route_parts(
+    settings: ModelSettingsService,
+    route: ModelRoute | None,
+    *,
+    capability: str,
+) -> tuple[Any, Any, str] | None:
+    """读取能力路由所需的连接、模型和密钥；失败时不把密钥带入日志。"""
+
+    if route is None:
+        return None
+    try:
+        connection = settings.store.get_connection(route.connection_id)
+        profile = settings.store.get_model(route.connection_id, route.model_id)
+        if connection is None or profile is None or not connection.enabled or not profile.available:
+            raise ModelSettingsValidationError("能力路由连接或模型不可用")
+        api_key = settings.get_connection_api_key(connection.id)
+        if not api_key:
+            raise ModelSettingsValidationError("能力路由未配置 API Key")
+        return connection, profile, api_key
+    except (ModelSettingsNotFound, ModelSettingsValidationError, SecretStoreError) as error:
+        logger.warning(
+            "%s 能力路由暂不可用于本次启动，将回退兼容配置: %s",
+            capability,
+            type(error).__name__,
+        )
+        return None
+
+
+def _resolve_embedding_config(
+    settings: ModelSettingsService,
+    config: Config,
+) -> EmbeddingConfig:
+    """按能力路由组装向量配置，follow 模式保留旧配置中的模型名。"""
+
+    legacy = replace(
+        config.memory.embedding,
+        api_key=config.memory.embedding.api_key or config.llm.api_key,
+        base_url=config.memory.embedding.base_url or str(config.llm.base_url or ""),
+    )
+    # 独立覆盖明确选择了 Embedding 模型，必须使用其模型 ID、地址和密钥。
+    independent = settings.get_capability_route(
+        "embedding", resolve_fallback=False
+    )
+    independent_parts = _saved_route_parts(
+        settings, independent, capability="Embedding"
+    )
+    if independent_parts is not None:
+        connection, profile, api_key = independent_parts
+        return replace(
+            legacy,
+            model=profile.model_id,
+            api_key=api_key,
+            base_url=connection.base_url,
+        )
+
+    # follow 主模型时只复用连接凭据和地址；主模型通常是聊天模型，不能把
+    # 它的 model_id 盲目当成 /embeddings 的模型，否则默认记忆会立即失效。
+    primary_parts = _saved_route_parts(
+        settings, settings.get_route(), capability="Embedding"
+    )
+    if primary_parts is not None:
+        connection, _profile, api_key = primary_parts
+        return replace(
+            legacy,
+            api_key=legacy.api_key or api_key,
+            base_url=legacy.base_url or connection.base_url,
+        )
+    return legacy
+
+
+def _resolve_vision_config(
+    settings: ModelSettingsService,
+    config: Config,
+    *,
+    multimodal: bool,
+) -> VisionConfig | None:
+    """按能力路由构造视觉 Provider 配置；旧 TOML 视觉配置继续兼容。"""
+
+    legacy = config.llm.vl
+    independent = settings.get_capability_route("vision", resolve_fallback=False)
+    independent_parts = _saved_route_parts(
+        settings, independent, capability="视觉"
+    )
+    if independent_parts is not None:
+        connection, profile, api_key = independent_parts
+        return VisionConfig(
+            provider=connection.provider,
+            model=profile.model_id,
+            api_key=api_key,
+            base_url=connection.base_url,
+            max_tokens=legacy.max_tokens if legacy else 2048,
+            request_timeout_s=legacy.request_timeout_s if legacy else 90.0,
+        )
+
+    # 主模型自身支持图片时由 Pipeline 直接传 image_url；只有文本主模型且
+    # 能力资料明确支持视觉时，才用同一路由注册 read_image_vision 工具。
+    primary_parts = _saved_route_parts(
+        settings, settings.get_route(), capability="视觉"
+    )
+    if primary_parts is not None and not multimodal:
+        connection, profile, api_key = primary_parts
+        if profile.supports_vision is True:
+            return VisionConfig(
+                provider=connection.provider,
+                model=profile.model_id,
+                api_key=api_key,
+                base_url=connection.base_url,
+                max_tokens=legacy.max_tokens if legacy else 2048,
+                request_timeout_s=legacy.request_timeout_s if legacy else 90.0,
+            )
+    return legacy
+
+
 def build_core_runtime(
     config: Config,
     workspace: Path,
@@ -377,6 +495,7 @@ def build_core_runtime(
         secrets,
         OpenAIModelDiscovery(),
         ModelCatalogService(root / "catalog" / "models-dev-catalog.json"),
+        embedding_dimensions=config.memory.embedding.dimensions,
     )
     _import_legacy_model_settings(model_settings, config)
     provider_manager = ProviderManager(model_store, secrets, AdapterRegistry(), config.llm)
@@ -385,27 +504,31 @@ def build_core_runtime(
     actual_embedder = embedder
     if config.memory.enabled:
         if actual_embedder is None:
-            embedding_config = replace(
-                config.memory.embedding,
-                api_key=config.memory.embedding.api_key or config.llm.api_key,
-                base_url=config.memory.embedding.base_url or str(config.llm.base_url or ""),
-            )
+            embedding_config = _resolve_embedding_config(model_settings, config)
             actual_embedder = Embedder(embedding_config)
         # SessionManager 是 SessionStore 的唯一所有者；MemoryEngine 只使用同一 Store
         # 回源已提交消息，close() 不会关闭 sessions.store。
         memory = MemoryEngine(root, actual_embedder, main_provider, sessions.store, config=config.memory)
         memory.bind_events(events)
 
-    vision_provider = create_vision_provider(config.llm.vl)
+    # 主模型是否直接接收图片仍由既有运行配置决定；能力资料只用于设置页提示和
+    # 独立视觉路由，不在启动时覆盖主模型调用路径。
+    effective_multimodal = bool(config.llm.multimodal)
+    vision_config = _resolve_vision_config(
+        model_settings,
+        config,
+        multimodal=effective_multimodal,
+    )
+    vision_provider = create_vision_provider(vision_config)
     skills = SkillsLoader(root)
     prompt_cache_log = PromptCacheLogWriter(root)
     tools = ToolRegistry()
     register_all(
         tools,
         allowed_dir=None,
-        multimodal=config.llm.multimodal,
+        multimodal=effective_multimodal,
         vl_provider=vision_provider,
-        vl_model=config.llm.vl.model if config.llm.vl else "",
+        vl_model=vision_config.model if vision_config else "",
         session_store=sessions.store,
         memory_engine=memory,
         skills=skills,
@@ -459,7 +582,7 @@ def build_core_runtime(
         max_iterations=config.llm.max_iterations or 10,
         # 主模型和独立视觉模型是两条互斥的图片消费路径：前者直接接收图片块，
         # 后者只通过 read_image_vision 工具读取本地上传路径。
-        multimodal=config.llm.multimodal,
+        multimodal=effective_multimodal,
         vl_available=vision_provider is not None,
         sandbox_guard=sandbox_guard,
         provider_manager=provider_manager,
@@ -654,6 +777,10 @@ def create_fastapi_app(
         lambda _request, error: settings_error(error.status_code, error.code, error),
     )
     app.add_exception_handler(
+        ModelCapabilityTestError,
+        lambda _request, error: settings_error(error.status_code, error.code, error),
+    )
+    app.add_exception_handler(
         CatalogUpdateError,
         lambda _request, error: settings_error(502, "catalog_update_failed", error),
     )
@@ -661,15 +788,101 @@ def create_fastapi_app(
     @app.get("/api/settings")
     async def get_model_settings() -> dict[str, Any]:
         route = settings.get_route()
+        capability_routes = settings.capability_settings()
         return {
             "connections": settings.list_connections(),
             "default_route": route.public_dict() if route else None,
+            # 能力覆盖复用 model_routes.scope；缺少独立覆盖时返回跟随主模型。
+            "capability_routes": capability_routes,
+            # 保留短名称，兼容早期设置页预览客户端。
+            "capabilities": {
+                key: value for key, value in capability_routes.items() if key != "primary"
+            },
             "catalog": settings.store.get_catalog_state(),
             "routing_required": not (
                 application.core.legacy_model_available
                 and not settings.store.list_connections()
             ),
         }
+
+    @app.get("/api/settings/capabilities")
+    async def get_model_capabilities() -> dict[str, Any]:
+        return {"capabilities": settings.capability_settings()}
+
+    @app.get("/api/settings/capabilities/{capability}")
+    async def get_model_capability(capability: str) -> dict[str, Any]:
+        return settings.capability_state(capability)
+
+    @app.put("/api/settings/capabilities/{capability}")
+    async def set_model_capability(
+        capability: str, payload: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        if str(capability).strip().lower() == "primary":
+            raise ModelSettingsValidationError("主模型请使用默认路由接口")
+        mode = str(payload.get("mode") or "").strip().lower()
+        if mode in {"inherit", "follow_main"}:
+            mode = "follow"
+        raw_follow = _json_bool(payload.get("follow_primary"))
+        if not mode and raw_follow:
+            mode = "follow"
+        if not mode and (payload.get("connection_id") or payload.get("model_id")):
+            mode = "independent"
+        if mode not in {"follow", "independent"}:
+            raise ModelSettingsValidationError("能力路由模式无效")
+        # 显式 mode 优先；旧客户端只有 follow_primary 时，上面已转换为 follow。
+        # 避免 contradictory payload 把用户选择的 independent 静默改回跟随。
+        follow_primary = mode == "follow"
+        if follow_primary:
+            settings.set_capability_route(capability, follow_primary=True)
+        else:
+            route = ModelRoute(
+                str(payload.get("connection_id") or ""),
+                str(payload.get("model_id") or ""),
+                str(payload.get("reasoning_effort") or "") or None,
+            )
+            settings.set_capability_route(capability, route)
+        state = settings.capability_state(capability)
+        # MemoryEngine 与视觉工具在进程启动时持有客户端；保存路由不热替换正在执行的请求。
+        return {
+            **state,
+            "requires_restart": state["capability"] in {"embedding", "vision"},
+            "runtime_effective_at": "next_start",
+        }
+
+    @app.post("/api/settings/capabilities/{capability}/test")
+    async def test_model_capability(
+        capability: str, payload: dict[str, Any] | None = Body(default=None)
+    ) -> dict[str, Any]:
+        values = payload or {}
+        connection_id = str(values.get("connection_id") or "").strip()
+        model_id = str(values.get("model_id") or "").strip()
+        route = (
+            ModelRoute(
+                connection_id,
+                model_id,
+                str(values.get("reasoning_effort") or "") or None,
+            )
+            if connection_id or model_id
+            else None
+        )
+        dimensions = values.get("dimensions")
+        return await settings.test_capability(
+            capability,
+            route=route,
+            dimensions=dimensions,
+        )
+
+    # 旧预览客户端曾使用 routes/capability 路径；保留别名避免设置页升级时
+    # 因后端先后部署顺序出现短暂不可用。
+    @app.get("/api/settings/routes/capability/{capability}")
+    async def get_model_capability_route(capability: str) -> dict[str, Any]:
+        return settings.capability_state(capability)
+
+    @app.put("/api/settings/routes/capability/{capability}")
+    async def set_model_capability_route(
+        capability: str, payload: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        return await set_model_capability(capability, payload)
 
     @app.post("/api/settings/connections", status_code=201)
     async def create_model_connection(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
@@ -1177,6 +1390,16 @@ def _validate_settings_session_key(session_key: str) -> None:
         or any(char in session_key for char in ("/", "\\", "\x00"))
     ):
         raise ModelSettingsValidationError("会话标识无效")
+
+
+def _json_bool(value: object) -> bool:
+    """兼容 JSON 布尔值与旧客户端传来的字符串布尔值。"""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _scheduled_job_payload(job: Any) -> dict[str, Any]:
