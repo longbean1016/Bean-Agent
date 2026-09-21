@@ -30,6 +30,11 @@ type ConnectionDraft = {
   enabled: boolean; default_adapter: ModelAdapterId;
 };
 
+type SettingsToast = {
+  kind: "success" | "error";
+  message: string;
+};
+
 const EMPTY_DRAFT: ConnectionDraft = {
   name: "", provider: "", base_url: "", api_key: "", enabled: true,
   default_adapter: "generic_openai",
@@ -81,6 +86,7 @@ export function ModelSettingsPage(props: {
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [toast, setToast] = useState<SettingsToast | null>(null);
   const [deleteConfirmationOpen, setDeleteConfirmationOpen] = useState(false);
   const selected = props.settings.connections.find((item) => item.id === selectedId) ?? null;
 
@@ -102,6 +108,11 @@ export function ModelSettingsPage(props: {
     ? props.settings.connections.find((item) => item.id === effectiveCapabilityRoute.connection_id) ?? null
     : null;
   const connectionEditable = activeCapability === "primary" || activeMode === "independent";
+  const configuredIndependentRoute = activeCapabilityState?.route ?? activeCapabilityState?.override_route ?? null;
+  const independentRoute = activeCapability === "primary" || activeMode !== "independent" || activeCapabilityState?.mode !== "independent"
+    || configuredIndependentRoute?.connection_id === props.settings.default_route?.connection_id
+    ? null
+    : configuredIndependentRoute;
   const capabilityStateSignature = useMemo(
     () => JSON.stringify(props.settings.capability_routes ?? props.settings.capabilities ?? {}),
     [props.settings.capability_routes, props.settings.capabilities],
@@ -121,6 +132,14 @@ export function ModelSettingsPage(props: {
   useEffect(() => {
     setCapabilityModeOverrides({});
   }, [capabilityStateSignature]);
+
+  // 提示只在设置页短暂显示；清理定时器避免切换页面后留下悬挂回调。
+  useEffect(() => {
+    if (!notice && !error) return;
+    setToast({ kind: error ? "error" : "success", message: error || notice });
+    const timer = window.setTimeout(() => setToast(null), 4200);
+    return () => window.clearTimeout(timer);
+  }, [notice, error]);
 
   const availableModels = useMemo(
     () => selected?.models.filter((model) => model.available) ?? [],
@@ -198,11 +217,18 @@ export function ModelSettingsPage(props: {
     if (activeCapability === "primary") return;
     const capability = activeCapability;
     if (mode === "independent") {
-      // 独立模式先只打开编辑态；等用户明确点击“设为当前”后再写入路由，
-      // 避免把当前聊天模型误保存成 Embedding/视觉模型。
       setCapabilityModeOverrides((current) => ({ ...current, [capability]: mode }));
+      const primaryConnectionId = props.settings.default_route?.connection_id;
+      const existingIndependent = activeCapabilityState?.mode === "independent"
+        ? (activeCapabilityState.route ?? activeCapabilityState.override_route)
+        : null;
+      // 历史配置可能把独立路由指向主连接；此时必须新建草稿，不能再覆盖主连接。
+      const reusable = existingIndependent && existingIndependent.connection_id !== primaryConnectionId
+        ? props.settings.connections.find((item) => item.id === existingIndependent.connection_id)
+        : null;
+      if (reusable) selectConnection(reusable, existingIndependent?.model_id);
       setError("");
-      setNotice("已进入独立连接配置，请选择连接并设为当前模型");
+      setNotice(reusable ? "已切换到独立连接，可编辑后保存" : "已进入独立连接配置，保存时会新增连接，不会修改主模型连接");
       return;
     }
     void run(`capability-${capability}`, async () => {
@@ -242,12 +268,16 @@ export function ModelSettingsPage(props: {
     }
     const payload = { ...draft };
     if (selected && !payload.api_key) delete (payload as Partial<ConnectionDraft>).api_key;
-    const saved = selected
-      ? await updateModelConnection(selected.id, payload)
+    const isIndependent = activeCapability !== "primary" && activeMode === "independent";
+    const canUpdateSelected = Boolean(selected) && (!isIndependent || selected?.id === independentRoute?.connection_id);
+    const creatingConnection = !canUpdateSelected;
+    // 独立能力只允许更新自己已绑定的连接；主连接或其他连接一律复制为新配置。
+    const saved = canUpdateSelected
+      ? await updateModelConnection(selected!.id, payload)
       : await createModelConnection(payload);
     const settings = await props.onRefresh();
     selectConnection(settings.connections.find((item) => item.id === saved.id) ?? null);
-    setNotice("连接已保存");
+    setNotice(creatingConnection ? "新增连接成功" : "连接保存成功");
   });
 
   const runCapabilityTest = () => {
@@ -363,8 +393,6 @@ export function ModelSettingsPage(props: {
                     setNotice(`“${result.connection_name} / ${result.model_display_name}”调用成功${result.thinking_received ? `，思考模式 ${result.effective_effort || testEffort || "已验证"}` : ""}，耗时 ${result.duration_ms} ms`);
                   })}><Play size={15} />{busy === "test-model" ? "调用中" : "测试所选模型"}</button> : <button disabled={Boolean(busy) || !testModel || (activeMode === "follow" && !effectiveCapabilityRoute)} onClick={runCapabilityTest}><Play size={15} />{busy === `test-${activeCapability}` ? "验证中" : "测试所选模型"}</button>}
                 </div>
-                {error ? <p className="model-test-message error" role="alert">{error}</p> : null}
-                {notice ? <p className="model-test-message" role="status">{notice}</p> : null}
                 <div className="model-search-row">
                   <Search size={16} aria-hidden="true" />
                   <input type="search" aria-label="搜索当前连接的模型" value={modelQuery} onChange={(event) => setModelQuery(event.target.value)} placeholder="搜索模型名称或模型 ID" />
@@ -386,7 +414,9 @@ export function ModelSettingsPage(props: {
                         <strong>{model.display_name}</strong><small>{model.model_id}</small>
                       </button>
                       <span className="model-capacity">上下文 {formatCapacity(model.context_window)}</span>
-                      <span className="model-source">{model.supports_reasoning
+                      <span className="model-source" title={model.supports_reasoning == null || (model.supports_reasoning && model.capability_confidence !== "high")
+                        ? "模型资料标记支持思考，但尚未通过实际调用验证"
+                        : undefined}>{model.supports_reasoning
                         ? reasoningStatusForModel(model)
                         : Object.prototype.hasOwnProperty.call(model.user_overrides, "context_window") ? "手动设置" : "思考关闭"}</span>
                       <button className={isDefault ? "default-model active" : "default-model"} disabled={Boolean(busy) || !selected.enabled || (activeCapability !== "primary" && activeMode !== "independent")} title={!selected.enabled ? "连接已停用，请先启用并保存" : activeCapability !== "primary" && activeMode !== "independent" ? "跟随主模型时不能单独选择" : ""} onClick={() => void saveCapabilityModel(model)}>{isDefault ? (activeCapability === "primary" ? "默认" : "当前") : activeCapability === "primary" ? "设为默认" : "设为当前"}</button>
@@ -423,10 +453,12 @@ export function ModelSettingsPage(props: {
                   })}>保存能力</button>
                 </div> : null}
               </> : <div className="new-connection-empty"><Settings size={28} /><strong>新增模型连接</strong><span>保存后即可测试地址并获取模型。</span></div>}
-              {!selected && error ? <p className="settings-message error" role="alert">{error}</p> : null}
-              {!selected && notice ? <p className="settings-message" role="status">{notice}</p> : null}
             </section>
       </div>
+      {toast ? <div className={`settings-toast ${toast.kind}`} role={toast.kind === "error" ? "alert" : "status"} aria-live={toast.kind === "error" ? "assertive" : "polite"}>
+        <span aria-hidden="true">{toast.kind === "error" ? "!" : "✓"}</span><p>{toast.message}</p>
+        <button type="button" aria-label="关闭提示" onClick={() => setToast(null)}>×</button>
+      </div> : null}
       {selected ? <DeleteConnectionDialog
         open={deleteConfirmationOpen}
         connectionName={selected.name}
@@ -438,6 +470,7 @@ export function ModelSettingsPage(props: {
             await deleteModelConnection(selected.id);
             const settings = await props.onRefresh();
             selectConnection(settings.connections[0] ?? null);
+            setNotice("连接删除成功");
           });
         }}
       /> : null}

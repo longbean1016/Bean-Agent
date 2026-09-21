@@ -815,6 +815,15 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .settings-message.error { border-color: var(--danger-border); background: var(--danger-soft); color: var(--danger-text); }
 .model-test-message { margin: -2px 0 10px; padding: 8px 10px; border-left: 3px solid var(--primary); background: var(--primary-tint); color: var(--primary-active); font-size: 11px; line-height: 1.45; }
 .model-test-message.error { border-left-color: var(--danger-strong); background: var(--danger-soft); color: var(--danger-text); }
+.settings-toast { position: fixed; z-index: 60; top: 18px; right: 18px; display: grid; grid-template-columns: 22px minmax(0, 1fr) 22px; align-items: center; gap: 8px; width: min(380px, calc(100vw - 36px)); min-height: 46px; padding: 9px 10px; border: 1px solid var(--primary-border); border-radius: 8px; background: var(--surface); color: var(--text-strong); box-shadow: var(--shadow-lg); animation: settings-toast-in .18s ease-out; }
+.settings-toast > span { display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; background: var(--primary); color: var(--primary-foreground); font-size: 12px; font-weight: 700; }
+.settings-toast p { margin: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 1.4; }
+.settings-toast button { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--text-muted); font-size: 18px; line-height: 1; cursor: pointer; }
+.settings-toast button:hover { background: var(--surface-hover); color: var(--text); }
+.settings-toast.error { border-color: var(--danger-border); }
+.settings-toast.error > span { background: var(--danger); color: #fff; }
+@keyframes settings-toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .settings-toast { animation: none; } }
 .confirmation-overlay { z-index: 40; }
 .connection-delete-dialog { position: fixed; z-index: 50; top: 50%; left: 50%; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px; width: min(420px, calc(100vw - 32px)); padding: 18px; border: 1px solid var(--danger-border); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow-lg); transform: translate(-50%, -50%); animation: dialog-in .16s ease-out; }
 .connection-delete-dialog > svg { margin-top: 1px; color: var(--danger-text); }

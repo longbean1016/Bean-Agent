@@ -141,6 +141,43 @@ it("Embedding 与视觉入口默认跟随主模型，独立模式隐藏手动适
   await waitFor(() => expect(screen.getByText(/Embedding 调用成功.*1024/)).toBeVisible());
 });
 
+it("独立模式保存主连接草稿时新增连接，不更新主连接", async () => {
+  const capabilitySettings: ModelSettingsPayload = {
+    ...settings,
+    capability_routes: {
+      embedding: { capability: "embedding", mode: "follow", follows_primary: true, route: settings.default_route },
+    },
+  };
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === "/api/settings/connections" && init?.method === "POST") {
+      return { ok: true, json: async () => ({ ...settings.connections[0], id: "embedding-copy", name: "Embedding 独立连接" }) } as Response;
+    }
+    return { ok: true, json: async () => ({}) } as Response;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<ModelSettingsPage
+    settings={capabilitySettings}
+    onBack={vi.fn()}
+    onRefresh={vi.fn(async () => capabilitySettings)}
+    onDefaultRoute={vi.fn()}
+  />);
+
+  fireEvent.click(screen.getByRole("button", { name: /Embedding 模型/ }));
+  fireEvent.click(screen.getByRole("radio", { name: "独立连接" }));
+  fireEvent.change(screen.getByPlaceholderText("例如：DeepSeek 官方"), { target: { value: "Embedding 独立连接" } });
+  fireEvent.click(screen.getByRole("button", { name: "保存连接" }));
+
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    "/api/settings/connections",
+    expect.objectContaining({ method: "POST" }),
+  ));
+  expect(fetchMock).not.toHaveBeenCalledWith(
+    "/api/settings/connections/company",
+    expect.objectContaining({ method: "PUT" }),
+  );
+  expect(await screen.findByText("新增连接成功")).toBeVisible();
+});
+
 it("即使后端返回未掩码预览，前端也只展示首尾片段", async () => {
   const unsafeSettings: ModelSettingsPayload = {
     ...settings,
