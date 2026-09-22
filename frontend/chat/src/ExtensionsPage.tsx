@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { createMcpExtension, createSkillExtension, discoverMcpSources, fetchMcpExtensions, fetchPluginExtensions, fetchSkillDetail, fetchSkillExtensions, importDiscoveredMcpExtensions, importMcpExtensions, importSkillExtension, refreshMcpExtension, refreshSkillExtension, removeMcpExtension, removeSkillExtension, setMcpEnabled, setSkillEnabled, updateMcpExtension, updateSkillExtension } from "./api";
+import { createMcpExtension, createSkillExtension, discoverMcpSources, fetchMcpExtensions, fetchPluginExtensions, fetchSkillDetail, fetchSkillExtensions, fetchSkillRevision, importDiscoveredMcpExtensions, importMcpExtensions, importSkillExtension, refreshMcpExtension, refreshSkillExtension, removeMcpExtension, removeSkillExtension, setMcpEnabled, setSkillEnabled, updateMcpExtension, updateSkillExtension } from "./api";
 import type { McpExtensionConfigPayload } from "./api";
 import type { ExtensionScope, McpExtensionRecord, PluginExtensionRecord, SkillExtensionRecord } from "./types";
 import type { ExtensionKind } from "./chatRoute";
@@ -35,9 +35,11 @@ const pageMeta: Record<ExtensionKind, { title: string; subtitle: string; icon: t
 export function ExtensionsPage({
   kind,
   onBack,
+  workspaceId = null,
 }: {
   kind: ExtensionKind;
   onBack: () => void;
+  workspaceId?: string | null;
 }) {
   const [scope, setScope] = useState<ExtensionScope>("workspace");
   const [query, setQuery] = useState("");
@@ -87,7 +89,7 @@ export function ExtensionsPage({
   };
   const openEditSkill = async (record: SkillExtensionRecord) => {
     setError("");
-    try { const detail = await fetchSkillDetail(record.id, scope); setSkillDetail(detail); setSkillEditing(record); setSkillName(record.name); setSkillContent(detail.content || ""); setSkillDialogOpen(true); }
+    try { const detail = await fetchSkillDetail(record.id, scope, workspaceId); setSkillDetail(detail); setSkillEditing(record); setSkillName(record.name); setSkillContent(detail.content || ""); setSkillDialogOpen(true); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "无法加载 Skill 详情"); }
   };
 
@@ -100,7 +102,7 @@ export function ExtensionsPage({
         ? await fetchPluginExtensions(scope)
         : kind === "mcp"
           ? await fetchMcpExtensions(scope)
-          : await fetchSkillExtensions(scope);
+          : await fetchSkillExtensions(scope, workspaceId);
       if (requestVersion !== refreshVersionRef.current) return;
       setRecords(Array.isArray(next) ? next : []);
     } catch (reason) {
@@ -115,7 +117,25 @@ export function ExtensionsPage({
   useEffect(() => {
     void refresh();
     return () => { refreshVersionRef.current += 1; };
-  }, [kind, scope]);
+  }, [kind, scope, workspaceId]);
+
+  useEffect(() => {
+    if (kind !== "skills") return;
+    let disposed = false;
+    let knownRevision = "";
+    const checkRevision = async () => {
+      try {
+        const revision = await fetchSkillRevision(workspaceId);
+        if (!disposed && knownRevision && revision !== knownRevision) void refresh();
+        if (!disposed) knownRevision = revision;
+      } catch {
+        // 目录轮询失败不覆盖当前可用列表，用户仍可手动刷新并查看错误。
+      }
+    };
+    void checkRevision();
+    const timer = window.setInterval(() => { void checkRevision(); }, 3000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [kind, workspaceId]);
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -142,14 +162,14 @@ export function ExtensionsPage({
         <div className="extensions-toolbar">
           <div className="extension-scope" role="group" aria-label="扩展范围">
             <button className={scope === "user" ? "active" : ""} onClick={() => setScope("user")}><Monitor size={14} />用户级</button>
-            <button className={scope === "workspace" ? "active" : ""} onClick={() => setScope("workspace")}><FolderOpen size={14} />工作区级</button>
+            <button className={scope === "workspace" ? "active" : ""} onClick={() => setScope("workspace")}><FolderOpen size={14} />{kind === "skills" ? "当前项目级" : "工作区级"}</button>
           </div>
           <div className="extensions-type-label"><Icon size={16} />{meta.title}<span>{filtered.length}</span></div>
           <label className="extensions-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`搜索${meta.title}…`} aria-label={`搜索${meta.title}`} /></label>
         </div>
 
         <div className="extensions-actions-row">
-          <div><h2>{kind === "plugins" ? "已安装" : kind === "mcp" ? "已配置" : "已安装"} <small>{filtered.length}</small></h2><span className="extensions-scope-hint">{scope === "workspace" ? "当前工作区" : "当前用户"}</span></div>
+          <div><h2>{kind === "plugins" ? "已安装" : kind === "mcp" ? "已配置" : "已安装"} <small>{filtered.length}</small></h2><span className="extensions-scope-hint">{scope === "workspace" ? (kind === "skills" ? "当前项目" : "当前工作区") : "当前用户"}</span></div>
           <div className="extensions-actions">
             <button className="icon-button" aria-label="刷新扩展" title="刷新" onClick={() => void refresh()} disabled={loading}><RefreshCw size={16} className={loading ? "spin" : ""} /></button>
             <button className="secondary-action" onClick={() => { if (kind === "mcp") setMcpImportOpen(true); else if (kind === "skills") setSkillImportOpen(true); }} disabled={kind === "plugins"}><Upload size={15} />导入{kind === "mcp" ? " JSON" : ""}</button>
@@ -162,7 +182,7 @@ export function ExtensionsPage({
           <div className="extensions-empty"><Icon size={30} /><strong>{meta.empty}</strong><span>{kind === "mcp" ? "可以通过导入 JSON 或新建服务开始配置。" : "可以通过导入或新建开始配置。"}</span></div>
         ) : (
           <div className={`extensions-list extensions-list-${kind}`}>
-            {filtered.map((record) => <ExtensionRow key={record.id} kind={kind} record={record} onRemoveMcp={async (item) => { await removeMcpExtension(item.name, scope, item.revision); await refresh(); }} onEditMcp={(item) => { setMcpEditing(item); setMcpName(item.name); setMcpType(item.transport === "http" || item.transport === "sse" ? item.transport : "stdio"); setMcpCommand(item.command || ""); setMcpUrl(item.url || ""); setMcpHeaders(""); setMcpOauth(""); setMcpCwd(item.cwd || ""); setMcpTimeout(item.timeout_ms ? String(item.timeout_ms) : ""); setMcpDialogOpen(true); }} onToggleMcp={async (item) => { await setMcpEnabled(item.id, scope, !item.enabled, item.revision); await refresh(); }} onRefreshMcp={async (item) => { await refreshMcpExtension(item.id, scope); await refresh(); }} onRemoveSkill={async (item) => { if (!window.confirm(`确认删除 Skill「${item.name}」？`)) return; await removeSkillExtension(item.name, scope); await refresh(); }} onEditSkill={(item) => { void openEditSkill(item); }} onToggleSkill={async (item) => { await setSkillEnabled(item.name, scope, !item.enabled); await refresh(); }} onRefreshSkill={async (item) => { await refreshSkillExtension(item.name, scope); await refresh(); }} onDetailSkill={(item) => { void openEditSkill(item); }} />)}
+            {filtered.map((record) => <ExtensionRow key={record.id} kind={kind} record={record} onRemoveMcp={async (item) => { await removeMcpExtension(item.name, scope, item.revision); await refresh(); }} onEditMcp={(item) => { setMcpEditing(item); setMcpName(item.name); setMcpType(item.transport === "http" || item.transport === "sse" ? item.transport : "stdio"); setMcpCommand(item.command || ""); setMcpUrl(item.url || ""); setMcpHeaders(""); setMcpOauth(""); setMcpCwd(item.cwd || ""); setMcpTimeout(item.timeout_ms ? String(item.timeout_ms) : ""); setMcpDialogOpen(true); }} onToggleMcp={async (item) => { await setMcpEnabled(item.id, scope, !item.enabled, item.revision); await refresh(); }} onRefreshMcp={async (item) => { await refreshMcpExtension(item.id, scope); await refresh(); }} onRemoveSkill={async (item) => { if (!window.confirm(`确认删除 Skill「${item.name}」？`)) return; await removeSkillExtension(item.name, scope, workspaceId); await refresh(); }} onEditSkill={(item) => { void openEditSkill(item); }} onToggleSkill={async (item) => { await setSkillEnabled(item.name, scope, !item.enabled, workspaceId); await refresh(); }} onRefreshSkill={async (item) => { await refreshSkillExtension(item.name, scope, workspaceId); await refresh(); }} onDetailSkill={(item) => { void openEditSkill(item); }} />)}
           </div>
         )}
       </main>
@@ -215,8 +235,8 @@ export function ExtensionsPage({
         }}
       />
       <McpImportDialog open={mcpImportOpen} text={mcpImportText} onText={setMcpImportText} onClose={() => setMcpImportOpen(false)} onImport={async () => { const parsed = JSON.parse(mcpImportText) as unknown; const result = await importMcpExtensions(parsed, scope); if (result.failed.length) setError(`导入完成：成功 ${result.imported.length}，跳过 ${result.skipped.length}，失败 ${result.failed.length}`); setMcpImportOpen(false); setMcpImportText(""); await refresh(); }} onImportSelections={async (selections) => { const result = await importDiscoveredMcpExtensions(selections, scope); if (result.failed.length) setError(`导入完成：成功 ${result.imported.length}，跳过 ${result.skipped.length}，失败 ${result.failed.length}`); setMcpImportOpen(false); await refresh(); }} />
-      <SkillEditorDialog open={skillDialogOpen} editing={skillEditing} name={skillName} content={skillContent} saving={skillSaving} onName={setSkillName} onContent={setSkillContent} onClose={() => { if (!skillSaving) setSkillDialogOpen(false); }} onSubmit={async () => { if (!skillName.trim() || !skillContent.trim() || skillSaving) return; setSkillSaving(true); setError(""); try { if (skillEditing) await updateSkillExtension(skillEditing.name, scope, skillContent, skillEditing.revision); else await createSkillExtension({ name: skillName.trim(), scope, content: skillContent }); setSkillDialogOpen(false); setSkillEditing(null); await refresh(); } catch (reason) { setError(reason instanceof Error ? reason.message : "无法保存 Skill"); } finally { setSkillSaving(false); } }} />
-      <SkillImportDialog open={skillImportOpen} type={skillImportType} path={skillImportPath} revision={skillImportRevision} saving={skillSaving} onType={setSkillImportType} onPath={setSkillImportPath} onRevision={setSkillImportRevision} onClose={() => { if (!skillSaving) setSkillImportOpen(false); }} onSubmit={async () => { setSkillSaving(true); setError(""); try { await importSkillExtension({ scope, type: skillImportType, path: skillImportType === "directory" ? skillImportPath.trim() : undefined, url: skillImportType === "git" ? skillImportPath.trim() : undefined, revision: skillImportRevision.trim() || undefined }); setSkillImportOpen(false); setSkillImportPath(""); setSkillImportRevision(""); await refresh(); } catch (reason) { setError(reason instanceof Error ? reason.message : "无法导入 Skill"); } finally { setSkillSaving(false); } }} />
+      <SkillEditorDialog open={skillDialogOpen} editing={skillEditing} name={skillName} content={skillContent} saving={skillSaving} onName={setSkillName} onContent={setSkillContent} onClose={() => { if (!skillSaving) setSkillDialogOpen(false); }} onSubmit={async () => { if (!skillName.trim() || !skillContent.trim() || skillSaving) return; setSkillSaving(true); setError(""); try { if (skillEditing) await updateSkillExtension(skillEditing.name, scope, skillContent, skillEditing.revision, workspaceId); else await createSkillExtension({ name: skillName.trim(), scope, content: skillContent, workspaceId }); setSkillDialogOpen(false); setSkillEditing(null); await refresh(); } catch (reason) { setError(reason instanceof Error ? reason.message : "无法保存 Skill"); } finally { setSkillSaving(false); } }} />
+      <SkillImportDialog open={skillImportOpen} type={skillImportType} path={skillImportPath} revision={skillImportRevision} saving={skillSaving} onType={setSkillImportType} onPath={setSkillImportPath} onRevision={setSkillImportRevision} onClose={() => { if (!skillSaving) setSkillImportOpen(false); }} onSubmit={async () => { setSkillSaving(true); setError(""); try { await importSkillExtension({ scope, type: skillImportType, path: skillImportType === "directory" ? skillImportPath.trim() : undefined, url: skillImportType === "git" ? skillImportPath.trim() : undefined, revision: skillImportRevision.trim() || undefined, workspace_id: workspaceId }); setSkillImportOpen(false); setSkillImportPath(""); setSkillImportRevision(""); await refresh(); } catch (reason) { setError(reason instanceof Error ? reason.message : "无法导入 Skill"); } finally { setSkillSaving(false); } }} />
       {skillDetail && !skillDialogOpen ? <div className="extensions-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSkillDetail(null); }}><section className="extensions-dialog"><header><div><strong>{skillDetail.name}</strong><span>Skill 详情</span></div><button type="button" className="icon-button" onClick={() => setSkillDetail(null)} aria-label="关闭">×</button></header><p className="extension-detail-line">{skillDetail.description} · {skillDetail.status || "unknown"}</p><pre className="skill-preview">{skillDetail.content || "暂无 SKILL.md 内容"}</pre></section></div> : null}
     </div>
   );

@@ -1392,17 +1392,38 @@ def create_fastapi_app(
             raise HTTPException(status_code=404, detail=message)
         return Response(status_code=204)
 
+    def _skills_loader_for_request(workspace_id: str | None = None) -> SkillsLoader:
+        """把 Skills 管理请求绑定到已注册工作区，不接受前端任意磁盘路径。"""
+
+        clean_id = str(workspace_id or "").strip()
+        if not clean_id:
+            return application.core.skills
+        workspace = application.core.sessions.store.get_workspace(clean_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        return application.core.skills.for_workspace(str(workspace["canonical_path"]))
+
+    def _normalize_skill_scope(scope: str) -> str:
+        # 保留旧客户端传入的 workspace 别名；新的管理语义统一称为 project。
+        if scope in {"workspace", "project"}:
+            return "workspace"
+        return "user" if scope == "user" else "workspace"
+
     @app.get("/api/extensions/skills")
-    def list_skill_extensions(scope: str = Query("workspace")) -> dict[str, Any]:
-        normalized_scope = scope if scope in {"user", "workspace"} else "workspace"
-        records = application.core.skills.list_skill_records(filter_unavailable=False, scope=normalized_scope)
+    def list_skill_extensions(
+        scope: str = Query("workspace"),
+        workspace_id: str | None = Query(None),
+    ) -> dict[str, Any]:
+        normalized_scope = _normalize_skill_scope(scope)
+        skill_loader = _skills_loader_for_request(workspace_id)
+        records = skill_loader.list_skill_records(filter_unavailable=False, scope=normalized_scope)
         items = [
             {
                 "id": f"{record.source}:{record.name}",
                 "name": record.name,
                 "description": record.description,
                 "source": record.source,
-                "scope": record.scope,
+                "scope": "project" if record.scope == "workspace" else record.scope,
                 "available": record.available,
                 "enabled": record.enabled,
                 "always": record.always,
@@ -1416,24 +1437,34 @@ def create_fastapi_app(
             }
             for record in records
         ]
-        return {"items": items, "scope": normalized_scope}
+        return {"items": items, "scope": "project" if normalized_scope == "workspace" else normalized_scope, "revision": skill_loader.directory_revision()}
 
-    def _skill_record_or_404(skill_name: str, scope: str) -> Any:
-        record = application.core.skills.get_skill_record(skill_name, scope=scope)
+    @app.get("/api/extensions/skills/revision")
+    def get_skill_revision(workspace_id: str | None = Query(None)) -> dict[str, str]:
+        skill_loader = _skills_loader_for_request(workspace_id)
+        return {"revision": skill_loader.directory_revision()}
+
+    def _skill_record_or_404(skill_name: str, scope: str, skill_loader: SkillsLoader | None = None) -> Any:
+        record = (skill_loader or application.core.skills).get_skill_record(skill_name, scope=scope)
         if record is None:
             raise HTTPException(status_code=404, detail="Skill 不存在")
         return record
 
     @app.get("/api/extensions/skills/{skill_name}")
-    def get_skill_extension(skill_name: str, scope: str = Query("workspace")) -> dict[str, Any]:
-        normalized_scope = scope if scope in {"user", "workspace"} else "workspace"
-        record = _skill_record_or_404(skill_name, normalized_scope)
+    def get_skill_extension(
+        skill_name: str,
+        scope: str = Query("workspace"),
+        workspace_id: str | None = Query(None),
+    ) -> dict[str, Any]:
+        normalized_scope = _normalize_skill_scope(scope)
+        skill_loader = _skills_loader_for_request(workspace_id)
+        record = _skill_record_or_404(skill_name, normalized_scope, skill_loader)
         return {
             "id": f"{record.source}:{record.name}",
             "name": record.name,
             "description": record.description,
             "source": record.source,
-            "scope": record.scope,
+            "scope": "project" if record.scope == "workspace" else record.scope,
             "version": record.version,
             "status": record.status,
             "available": record.available,
@@ -1447,27 +1478,29 @@ def create_fastapi_app(
 
     def _skill_scope(payload: dict[str, Any]) -> str:
         scope = payload.get("scope")
-        if scope not in {"user", "workspace"}:
-            raise HTTPException(status_code=400, detail="Skill scope 必须是 user 或 workspace")
-        return str(scope)
+        if scope not in {"user", "workspace", "project"}:
+            raise HTTPException(status_code=400, detail="Skill scope 必须是 user 或 project")
+        return _normalize_skill_scope(str(scope))
 
     @app.post("/api/extensions/skills", status_code=201)
     async def create_skill_extension(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         scope = _skill_scope(payload)
+        skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
         try:
             record = await asyncio.to_thread(
-                application.core.skills.create_skill,
+                skill_loader.create_skill,
                 str(payload.get("name") or ""),
                 scope,
                 str(payload.get("content") or ""),
             )
         except (ValueError, KeyError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
-        return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": record.scope, "status": record.status, "revision": record.revision}
+        return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": "project" if record.scope == "workspace" else record.scope, "status": record.status, "revision": record.revision}
 
     @app.put("/api/extensions/skills/{skill_name}")
     async def update_skill_extension(skill_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         scope = _skill_scope(payload)
+        skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
         expected = payload.get("revision")
         try:
             expected_revision = int(expected) if expected is not None else None
@@ -1475,7 +1508,7 @@ def create_fastapi_app(
             raise HTTPException(status_code=400, detail="revision 必须是整数") from error
         try:
             record = await asyncio.to_thread(
-                application.core.skills.update_skill,
+                skill_loader.update_skill,
                 skill_name,
                 scope,
                 str(payload.get("content") or ""),
@@ -1487,51 +1520,59 @@ def create_fastapi_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except (ValueError, PermissionError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
-        return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": record.scope, "status": record.status, "revision": record.revision}
+        return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": "project" if record.scope == "workspace" else record.scope, "status": record.status, "revision": record.revision}
 
     @app.post("/api/extensions/skills/{skill_name}/{action}")
     async def skill_extension_action(skill_name: str, action: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         scope = _skill_scope(payload)
+        skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
         if action not in {"enable", "disable", "refresh"}:
             raise HTTPException(status_code=404, detail="Skill 操作不存在")
         try:
             if action == "refresh":
-                record = _skill_record_or_404(skill_name, scope)
+                record = _skill_record_or_404(skill_name, scope, skill_loader)
             else:
-                record = await asyncio.to_thread(application.core.skills.set_skill_enabled, skill_name, scope, action == "enable")
+                record = await asyncio.to_thread(skill_loader.set_skill_enabled, skill_name, scope, action == "enable")
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except PermissionError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
-        return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": record.scope, "status": record.status, "enabled": record.enabled, "revision": record.revision}
+        return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": "project" if record.scope == "workspace" else record.scope, "status": record.status, "enabled": record.enabled, "revision": record.revision}
 
     @app.post("/api/extensions/skills/import")
     async def import_skill_extensions(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         scope = _skill_scope(payload)
+        skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
         mode = str(payload.get("mode") or "copy")
         imported: list[dict[str, Any]] = []
         try:
             if payload.get("type") == "git" or payload.get("url"):
-                records = await asyncio.to_thread(application.core.skills.install_git, str(payload.get("url") or ""), scope, revision=payload.get("revision"), mode=mode)
+                records = await asyncio.to_thread(skill_loader.install_git, str(payload.get("url") or ""), scope, revision=payload.get("revision"), mode=mode)
             else:
-                records = await asyncio.to_thread(application.core.skills.install_directory, str(payload.get("path") or ""), scope, mode=mode, name=payload.get("name"))
-            imported = [{"name": record.name, "status": "imported", "scope": record.scope} for record in records]
+                records = await asyncio.to_thread(skill_loader.install_directory, str(payload.get("path") or ""), scope, mode=mode, name=payload.get("name"))
+            imported = [{"name": record.name, "status": "imported", "scope": "project" if record.scope == "workspace" else record.scope} for record in records]
         except (ValueError, RuntimeError, OSError) as error:
             return {"imported": imported, "skipped": [], "failed": [{"name": str(payload.get("name") or payload.get("url") or payload.get("path") or "skill"), "status": "failed", "reason": str(error)}]}
         return {"imported": imported, "skipped": [], "failed": []}
 
     @app.post("/api/extensions/skills/discover")
-    def discover_skill_sources() -> dict[str, Any]:
-        roots: list[dict[str, Any]] = [{"id": "workspace", "scope": "workspace", "path": str(application.core.skills.skills_dir)}]
+    def discover_skill_sources(workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        skill_loader = _skills_loader_for_request(workspace_id)
+        roots: list[dict[str, Any]] = [{"id": "project", "scope": "project", "path": str(skill_loader.skills_dir)}]
         if application.core.skills.user_skills_dir is not None:
             roots.append({"id": "user", "scope": "user", "path": str(application.core.skills.user_skills_dir)})
         return {"sources": [{**root, "exists": Path(root["path"]).is_dir()} for root in roots]}
 
     @app.delete("/api/extensions/skills/{skill_name}", status_code=204)
-    async def delete_skill_extension(skill_name: str, scope: str = Query("workspace")) -> Response:
-        normalized_scope = scope if scope in {"user", "workspace"} else "workspace"
+    async def delete_skill_extension(
+        skill_name: str,
+        scope: str = Query("workspace"),
+        workspace_id: str | None = Query(None),
+    ) -> Response:
+        normalized_scope = _normalize_skill_scope(scope)
+        skill_loader = _skills_loader_for_request(workspace_id)
         try:
-            await asyncio.to_thread(application.core.skills.delete_skill, skill_name, normalized_scope)
+            await asyncio.to_thread(skill_loader.delete_skill, skill_name, normalized_scope)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except PermissionError as error:
