@@ -73,11 +73,36 @@ def seed_builtin_skills(
         if target.exists():
             skipped.append(name)
             previous = manifest.get(name) if isinstance(manifest.get(name), dict) else {}
+            previous_seed_hash = str(previous.get("seed_hash") or "")
+            target_hash = _hash_skill_tree(target) if target.is_dir() else ""
+            # 只有目标仍等于上次种子版本时才允许升级；用户改过的副本永远
+            # 保留原内容，manifest 仅记录可供页面提示的最新内置哈希。
+            if (
+                previous_seed_hash
+                and previous_seed_hash == target_hash
+                and source_hash != target_hash
+                and bool(previous.get("managed", False))
+            ):
+                temporary = target_root / f".{name}.upgrade-{uuid.uuid4().hex}.tmp"
+                backup = target_root / f".{name}.upgrade-{uuid.uuid4().hex}.old"
+                try:
+                    shutil.copytree(source, temporary, symlinks=False)
+                    target.rename(backup)
+                    temporary.replace(target)
+                    shutil.rmtree(backup, ignore_errors=True)
+                    seeded.append(name)
+                    target_hash = source_hash
+                except (OSError, shutil.Error):
+                    shutil.rmtree(temporary, ignore_errors=True)
+                    if not target.exists() and backup.exists():
+                        backup.rename(target)
+                    logger.warning("内置 Skill 升级失败: name=%s", name)
             manifest[name] = {
                 "source": "builtin",
-                "seed_hash": str(previous.get("seed_hash") or source_hash),
+                "seed_hash": str(source_hash if target_hash == source_hash else (previous_seed_hash or target_hash)),
                 "current_builtin_hash": source_hash,
-                "managed": bool(previous.get("managed", False)),
+                "managed": bool(previous.get("managed", False)) and target_hash == source_hash,
+                "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
             continue
         temporary = target_root / f".{name}.seed-{uuid.uuid4().hex}.tmp"
@@ -94,6 +119,7 @@ def seed_builtin_skills(
             "seed_hash": source_hash,
             "current_builtin_hash": source_hash,
             "managed": True,
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
     if manifest:
         _atomic_write_path(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2))

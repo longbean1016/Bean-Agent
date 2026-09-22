@@ -195,6 +195,34 @@ def test_seed_builtin_skills_is_idempotent_and_does_not_overwrite_user_file(tmp_
     assert manifest.is_file()
 
 
+def test_seed_builtin_skills_upgrades_unmodified_copy_but_preserves_user_edit(tmp_path: Path) -> None:
+    builtin = tmp_path / "builtin"
+    user = tmp_path / "user"
+    _write_skill(builtin, "weather", description="版本一", body="正文一")
+    seed_builtin_skills(user, builtin_skills_dir=builtin)
+    (builtin / "weather" / "SKILL.md").write_text(
+        "---\nname: weather\ndescription: 版本二\n---\n正文二\n",
+        encoding="utf-8",
+    )
+
+    upgraded = seed_builtin_skills(user, builtin_skills_dir=builtin)
+    assert "weather" in upgraded["seeded"]
+    assert "正文二" in (user / "weather" / "SKILL.md").read_text(encoding="utf-8")
+
+    (user / "weather" / "SKILL.md").write_text(
+        "---\nname: weather\ndescription: 用户版本\n---\n用户正文\n",
+        encoding="utf-8",
+    )
+    (builtin / "weather" / "SKILL.md").write_text(
+        "---\nname: weather\ndescription: 版本三\n---\n正文三\n",
+        encoding="utf-8",
+    )
+    preserved = seed_builtin_skills(user, builtin_skills_dir=builtin)
+    assert "weather" not in preserved["seeded"]
+    assert "用户正文" in (user / "weather" / "SKILL.md").read_text(encoding="utf-8")
+    assert preserved["manifest"]["weather"]["managed"] is False
+
+
 def test_loader_can_switch_registered_project_and_create_immutable_snapshot(tmp_path: Path) -> None:
     user = tmp_path / "user"
     first = tmp_path / "first"
