@@ -54,7 +54,9 @@ import { ApprovalCard, ApprovalPanel, PermissionSelector, WorkspaceSelector } fr
 import { SessionSidebar } from "./SessionSidebar";
 import type { ApprovalRequest, ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, SandboxMode, SandboxSnapshot, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry, Workspace } from "./types";
 import { ModelSettingsPage } from "./ModelSettingsPage";
-import { isModelSettingsPath, MODEL_SETTINGS_PATH, pathForSession, routeKey, sessionFromPath } from "./chatRoute";
+import { ExtensionsPage } from "./ExtensionsPage";
+import { extensionKindFromPath, EXTENSION_PATHS, isModelSettingsPath, MODEL_SETTINGS_PATH, pathForSession, routeKey, sessionFromPath } from "./chatRoute";
+import type { ExtensionKind } from "./chatRoute";
 import { groupMessagesIntoNavigationTurns, TurnNavigator, turnsFromMessages } from "./TurnNavigator";
 import { BeanWebSocketClient } from "./websocketClient";
 import { reasoningOptionsForModel, reasoningStatusForModel } from "./reasoning";
@@ -197,14 +199,20 @@ function containsClosedMermaidFence(markdown: string): boolean {
 }
 
 export function App() {
-  const initialPage = isModelSettingsPath(window.location.pathname) ? "model-settings" : "chat";
+  const initialExtension = extensionKindFromPath(window.location.pathname);
+  const initialPage = isModelSettingsPath(window.location.pathname)
+    ? "model-settings"
+    : initialExtension
+      ? "extensions"
+      : "chat";
   const initialRouteSession = sessionFromPath(window.location.pathname);
   const initialSession = initialRouteSession || readStoredSession();
   const [chat, dispatch] = useReducer(reduceChatFrame, {
     ...initialChatState,
     sessionId: initialSession,
   });
-  const [activePage, setActivePage] = useState<"chat" | "model-settings">(initialPage);
+  const [activePage, setActivePage] = useState<"chat" | "model-settings" | "extensions">(initialPage);
+  const [activeExtension, setActiveExtension] = useState<ExtensionKind>(initialExtension ?? "plugins");
   const [routeSession, setRouteSession] = useState(initialSession);
   const [connection, setConnection] = useState<ConnectionStatus>("connecting");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -1210,6 +1218,14 @@ export function App() {
 
   useEffect(() => {
     const handlePopState = () => {
+      const extension = extensionKindFromPath(window.location.pathname);
+      if (extension) {
+        activePageRef.current = "extensions";
+        setActivePage("extensions");
+        setActiveExtension(extension);
+        setSidebarOpen(false);
+        return;
+      }
       if (isModelSettingsPath(window.location.pathname)) {
         activePageRef.current = "model-settings";
         setActivePage("model-settings");
@@ -1353,11 +1369,59 @@ export function App() {
     setSidebarOpen(false);
   };
 
+  const openExtensions = (kind: ExtensionKind) => {
+    const path = EXTENSION_PATHS[kind];
+    if (activePageRef.current !== "extensions" || window.location.pathname !== path) {
+      window.history.pushState({}, "", path);
+    }
+    activePageRef.current = "extensions";
+    setActiveExtension(kind);
+    setActivePage("extensions");
+    setSidebarOpen(false);
+  };
+
   const closeModelSettings = () => {
     window.history.replaceState({}, "", pathForSession(routeSessionRef.current));
     activePageRef.current = "chat";
     setActivePage("chat");
   };
+
+  const closeExtensions = () => {
+    window.history.pushState({}, "", pathForSession(routeSessionRef.current));
+    activePageRef.current = "chat";
+    setActivePage("chat");
+  };
+
+  const extensionSidebar = (
+    <SessionSidebar
+      activeSessionId={chat.sessionId}
+      sessions={sessions}
+      workspaces={workspaces}
+      onCreate={createSession}
+      onDelete={handleDeleteSession}
+      onDeleteWorkspace={handleDeleteWorkspace}
+      onOpenWorkspace={handleOpenWorkspace}
+      onRegisterWorkspace={handleRegisterWorkspace}
+      onRename={handleRenameSession}
+      onSetSessionPinned={handleSetSessionPinned}
+      onUpdateWorkspace={handleUpdateWorkspace}
+      onSelect={selectSession}
+      onSettings={openModelSettings}
+      activeExtension={activeExtension}
+      onExtension={openExtensions}
+    />
+  );
+
+  if (activePage === "extensions") {
+    return (
+      <div className="app-shell extensions-app-shell">
+        <aside className="desktop-sidebar">{extensionSidebar}</aside>
+        <main className="chat-workspace extensions-workspace">
+          <ExtensionsPage kind={activeExtension} onBack={closeExtensions} />
+        </main>
+      </div>
+    );
+  }
 
   if (activePage === "model-settings") {
     return (
@@ -1396,6 +1460,8 @@ export function App() {
       onUpdateWorkspace={handleUpdateWorkspace}
       onSelect={selectSession}
       onSettings={openModelSettings}
+      activeExtension={null}
+      onExtension={openExtensions}
     />
   );
 

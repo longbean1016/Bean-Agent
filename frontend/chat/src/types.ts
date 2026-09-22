@@ -14,6 +14,52 @@ export type ApprovalState = "none" | "pending" | "submitting" | "allowed-once" |
 export type ThinkingStatus = "running" | "completed" | "interrupted";
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 
+export type ExtensionScope = "user" | "workspace";
+
+export interface PluginExtensionRecord {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  source: string;
+  scope: ExtensionScope;
+  status: "installed" | "available" | "disabled" | "invalid";
+  enabled: boolean;
+  skills_count: number;
+  mcp_count: number;
+  commands_count: number;
+}
+
+export interface McpExtensionRecord {
+  id: string;
+  name: string;
+  description: string;
+  scope: ExtensionScope;
+  transport: "stdio" | "http" | "sse" | "unknown";
+  status: "connected" | "disconnected" | "error" | "unsupported";
+  enabled: boolean;
+  tool_count: number;
+  command?: string;
+  cwd?: string | null;
+  env_names?: string[];
+  tools?: string[];
+  error?: string | null;
+}
+
+export interface SkillExtensionRecord {
+  id: string;
+  name: string;
+  description: string;
+  source: "workspace" | "builtin" | "plugin" | string;
+  scope: ExtensionScope;
+  available: boolean;
+  enabled: boolean;
+  always: boolean;
+  missing: string;
+  plugin_name?: string | null;
+  version?: string | null;
+}
+
 export interface Workspace {
   id: string;
   canonical_path: string;

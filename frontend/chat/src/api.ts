@@ -1,4 +1,4 @@
-import type { CapabilityRouteState, MessagePage, MessageRow, ModelCapability, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile, Workspace } from "./types";
+import type { CapabilityRouteState, ExtensionScope, McpExtensionRecord, MessagePage, MessageRow, ModelCapability, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, PluginExtensionRecord, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, SkillExtensionRecord, TurnNavigationEntry, UploadedFile, Workspace } from "./types";
 
 // 仅控制聊天页面的滚动分页，不参与模型上下文 token gate 或 checkpoint 边界。
 const MESSAGE_WINDOW_LIMIT = 60;
@@ -199,6 +199,44 @@ export async function fetchReminders(sessionId: string): Promise<ScheduledRemind
 export async function deleteReminder(sessionId: string, reminderId: string): Promise<void> {
   const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/reminders/${encodeURIComponent(reminderId)}`, { method: "DELETE" });
   if (!response.ok) throw new Error("无法删除提醒");
+}
+
+export async function fetchPluginExtensions(scope: ExtensionScope): Promise<PluginExtensionRecord[]> {
+  const response = await fetch(`/api/extensions/plugins?scope=${encodeURIComponent(scope)}`);
+  if (!response.ok) throw new Error("无法加载插件列表");
+  const payload = await response.json() as { items?: PluginExtensionRecord[] };
+  return payload.items ?? [];
+}
+
+export async function fetchMcpExtensions(scope: ExtensionScope): Promise<McpExtensionRecord[]> {
+  const response = await fetch(`/api/extensions/mcp?scope=${encodeURIComponent(scope)}`);
+  if (!response.ok) throw new Error("无法加载 MCP 列表");
+  const payload = await response.json() as { items?: McpExtensionRecord[] };
+  return payload.items ?? [];
+}
+
+export async function createMcpExtension(payload: { name: string; command: string[]; env?: Record<string, string>; cwd?: string }): Promise<McpExtensionRecord> {
+  const response = await fetch("/api/extensions/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json().catch(() => ({})) as McpExtensionRecord & { detail?: string };
+  if (!response.ok || !result.id) throw new Error(result.detail || "无法添加 MCP 服务");
+  return result;
+}
+
+export async function removeMcpExtension(name: string): Promise<void> {
+  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(name)}`, { method: "DELETE" });
+  const result = await response.json().catch(() => ({})) as { detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法移除 MCP 服务");
+}
+
+export async function fetchSkillExtensions(scope: ExtensionScope): Promise<SkillExtensionRecord[]> {
+  const response = await fetch(`/api/extensions/skills?scope=${encodeURIComponent(scope)}`);
+  if (!response.ok) throw new Error("无法加载技能列表");
+  const payload = await response.json() as { items?: SkillExtensionRecord[] };
+  return payload.items ?? [];
 }
 
 class SettingsRequestError extends Error {
