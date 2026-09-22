@@ -235,6 +235,9 @@ class ToolRegistry:
                 merged["current_user_source_ref"] = context[
                     "current_user_source_ref"
                 ]
+            if context and "_skills_view" in context:
+                # 会话快照是运行时身份，不能被模型参数覆盖后退回实时磁盘读取。
+                merged["_skills_view"] = context["_skills_view"]
             return await tool.execute(**merged)
         except Exception as error:
             logger.error("工具 %s 执行出错: %s", name, error, exc_info=True)
