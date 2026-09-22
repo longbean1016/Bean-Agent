@@ -28,6 +28,13 @@ export interface PluginExtensionRecord {
   skills_count: number;
   mcp_count: number;
   commands_count: number;
+  mcp_groups?: Array<{
+    id: string;
+    name: string;
+    transport: string;
+    status: "disabled" | "not_loaded" | "connecting" | "connected" | "error" | string;
+    enabled: boolean;
+  }>;
 }
 
 export interface McpExtensionRecord {
@@ -36,14 +43,22 @@ export interface McpExtensionRecord {
   description: string;
   scope: ExtensionScope;
   transport: "stdio" | "http" | "sse" | "unknown";
-  status: "connected" | "disconnected" | "error" | "unsupported";
+  status: "connected" | "connecting" | "disconnected" | "disabled" | "error" | "unknown" | "unsupported";
   enabled: boolean;
   tool_count: number;
   command?: string;
+  url?: string;
   cwd?: string | null;
   env_names?: string[];
+  header_names?: string[];
   tools?: string[];
   error?: string | null;
+  timeout_ms?: number | null;
+  revision: number;
+  created_at?: string | null;
+  updated_at?: string | null;
+  oauth_configured?: boolean;
+  authorization_required?: boolean;
 }
 
 export interface SkillExtensionRecord {
