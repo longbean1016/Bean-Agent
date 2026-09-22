@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent.skills import SkillsLoader
+import pytest
+
+from agent.skills import SkillRevisionConflict, SkillsLoader
 
 
 def _write_skill(
@@ -134,3 +136,45 @@ def test_loader_ignores_symlinked_skill_directory(tmp_path: Path) -> None:
     loader = SkillsLoader(tmp_path / "workspace", builtin_skills_dir=None)
 
     assert loader.list_skill_records(filter_unavailable=False) == []
+
+
+def test_skill_management_revision_and_enable_state(tmp_path: Path) -> None:
+    loader = SkillsLoader(tmp_path, builtin_skills_dir=None, user_skills_dir=tmp_path / "user-skills")
+    created = loader.create_skill("managed", "workspace", "---\nname: managed\ndescription: one\n---\nbody")
+    assert created.revision == 1
+    updated = loader.update_skill("managed", "workspace", "---\nname: managed\ndescription: two\n---\nnew", expected_revision=1)
+    assert updated.description == "two"
+    assert updated.revision == 2
+    with pytest.raises(SkillRevisionConflict):
+        loader.update_skill("managed", "workspace", "body", expected_revision=1)
+    disabled = loader.set_skill_enabled("managed", "workspace", False)
+    assert disabled.enabled is False and disabled.status == "disabled"
+    assert loader.list_skill_records(filter_unavailable=True) == []
+    loader.set_skill_enabled("managed", "workspace", True)
+    loader.delete_skill("managed", "workspace")
+    assert loader.get_skill_record("managed", scope="workspace") is None
+
+
+def test_invalid_skill_is_visible_with_diagnostics(tmp_path: Path) -> None:
+    directory = tmp_path / "skills" / "broken"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text("---\nname: [broken\n---\nbody", encoding="utf-8")
+    record = SkillsLoader(tmp_path, builtin_skills_dir=None).get_skill_record("broken")
+    assert record is not None
+    assert record.status == "invalid"
+    assert record.available is False
+    assert record.diagnostics
+
+
+def test_scope_priority_and_plugin_group(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    user = tmp_path / "user"
+    plugin = tmp_path / "plugin"
+    _write_skill(user, "same", description="user")
+    _write_skill(workspace / "skills", "same", description="workspace")
+    _write_skill(plugin, "plugin-only", description="plugin")
+    loader = SkillsLoader(workspace, builtin_skills_dir=None, user_skills_dir=user, plugin_skill_roots=[("demo", plugin)])
+    assert loader.get_skill_record("same", scope="workspace").description == "workspace"
+    assert loader.get_skill_record("same", scope="user").description == "user"
+    plugin_record = next(record for record in loader.list_skill_records(filter_unavailable=False) if record.plugin_name == "demo")
+    assert plugin_record.source == "plugin"
