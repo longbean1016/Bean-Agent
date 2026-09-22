@@ -264,6 +264,8 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .extensions-dialog footer button { min-height: 34px; padding: 0 12px; border-radius: 6px; cursor: pointer; font-size: 11px; }
 .extensions-dialog footer .secondary-action { border: 1px solid var(--border-strong); background: var(--surface); color: var(--text); }
 .extensions-dialog footer .primary-action { border: 1px solid var(--primary); background: var(--primary); color: var(--primary-foreground); }
+.skill-editor-dialog { width: min(760px, 100%); }
+.skill-preview { max-height: 52vh; overflow: auto; margin: 0; padding: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--text); font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
 .spin { animation: extension-spin .9s linear infinite; }
 @keyframes extension-spin { to { transform: rotate(360deg); } }
 .sidebar-section-label:first-child { margin-top: 2px; }

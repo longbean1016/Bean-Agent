@@ -73,6 +73,10 @@ export interface SkillExtensionRecord {
   missing: string;
   plugin_name?: string | null;
   version?: string | null;
+  status?: "available" | "missing_dependency" | "invalid" | "disabled" | "conflict" | "error" | "unknown" | string;
+  diagnostics?: string[];
+  revision?: number;
+  updated_at?: string | null;
 }
 
 export interface Workspace {
