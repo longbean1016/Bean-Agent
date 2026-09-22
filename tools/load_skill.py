@@ -34,17 +34,21 @@ class LoadSkillTool(Tool):
         name = skill.strip()
         if not name:
             return "错误：缺少 Skill 名称。"
-        record = self._skills.load_skill_record(name)
+        # Turn 可通过私有执行上下文传入不可变快照，避免旧会话在磁盘变化后
+        # 通过按需工具偷偷读取到新版本；直接调用工具时仍回退到全局索引。
+        skills_view = kwargs.get("_skills_view")
+        loader = skills_view if hasattr(skills_view, "load_skill_record") else self._skills
+        record = loader.load_skill_record(name)
         if record is None:
             available = [
                 item.name
-                for item in self._skills.list_skill_records(filter_unavailable=False)
+                for item in loader.list_skill_records(filter_unavailable=False)
             ]
             suffix = f"\n已发现 Skill：{', '.join(available)}" if available else ""
             return f"错误：未找到 Skill：{name}。{suffix}"
         if not record.available:
             return f"错误：Skill 不可用：{name}。\n缺少依赖：{record.missing}"
-        body = self._skills.load_skill_body(name)
+        body = loader.load_skill_body(name)
         if not body:
             return f"错误：Skill 正文为空：{name}。"
         return (

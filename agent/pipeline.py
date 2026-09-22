@@ -1365,6 +1365,9 @@ class Pipeline:
                     "chat_id": message.chat_id,
                     "request_time": str(message.metadata.get("request_time") or message.metadata.get("received_at") or ""),
                 })
+                if turn_skills is not None:
+                    # 仅在进程内把当前会话快照传给按需加载工具，不进入模型可伪造的参数面。
+                    execution_context["_skills_view"] = turn_skills
                 if call.name == "tool_search":
                     # 搜索工具需要知道哪些 Schema 已在当前 Turn 可见，但不能
                     # 持有 View 本身，否则状态会重新泄漏到全局工具实例。

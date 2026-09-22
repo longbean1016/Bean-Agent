@@ -46,6 +46,29 @@ async def test_load_skill_returns_stable_unknown_error(tmp_path: Path) -> None:
     assert result == "错误：未找到 Skill：missing。\n已发现 Skill：memory"
 
 
+@pytest.mark.asyncio
+async def test_load_skill_can_use_turn_snapshot_instead_of_live_loader(tmp_path: Path) -> None:
+    skill_dir = _write_skill(tmp_path, "review", "新正文")
+    live_loader = SkillsLoader(tmp_path, builtin_skills_dir=None)
+    snapshot = {
+        "revision": "old",
+        "skills": [{
+            "name": "review", "source": "workspace", "scope": "project",
+            "root_dir": str(skill_dir), "skill_file": str(skill_dir / "SKILL.md"),
+            "content": "---\nname: review\ndescription: 旧\n---\n旧正文\n",
+            "description": "旧", "available": True, "enabled": True,
+        }],
+    }
+
+    result = await LoadSkillTool(live_loader).execute(
+        skill="review",
+        _skills_view=SkillsLoader.from_snapshot(snapshot),
+    )
+
+    assert "旧正文" in result
+    assert "新正文" not in result
+
+
 def test_register_all_adds_load_skill_only_when_loader_is_available(
     tmp_path: Path,
 ) -> None:
