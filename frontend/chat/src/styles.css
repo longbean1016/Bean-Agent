@@ -218,6 +218,12 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .plugin-icon { background: var(--info-soft); color: var(--info); }
 .mcp-icon { background: var(--primary-tint); color: var(--primary-active); }
 .skill-icon { background: var(--warning-soft); color: var(--warning-text); }
+.skill-source-group { display: grid; gap: 8px; }
+.skill-source-group + .skill-source-group { margin-top: 14px; }
+.skill-source-group-header { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text-muted); font-size: 12px; }
+.skill-source-group-header strong { color: var(--text); }
+.skill-source-group-header span { margin-left: auto; }
+.extension-detail-meta { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 8px 0 12px; color: var(--text-muted); font-size: 12px; }
 .extension-row-copy { min-width: 0; }
 .extension-row-actions { display: flex; align-items: center; gap: 3px; }
 .extension-row-copy strong { display: block; overflow: hidden; color: var(--text-strong); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }

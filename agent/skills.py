@@ -179,6 +179,10 @@ class SkillRecord:
     diagnostics: tuple[str, ...] = ()
     revision: int = 1
     enabled: bool = True
+    slug: str | None = None
+    owner: str | None = None
+    published_at: str | None = None
+    file_size: int = 0
 
 
 class SkillSnapshotView:
@@ -222,6 +226,10 @@ class SkillSnapshotView:
                     diagnostics=tuple(str(item) for item in raw.get("diagnostics", []) if str(item)),
                     revision=int(raw.get("record_revision", 1) or 1),
                     enabled=bool(raw.get("enabled", True)),
+                    slug=str(raw.get("slug") or "") or None,
+                    owner=str(raw.get("owner") or "") or None,
+                    published_at=str(raw.get("published_at") or "") or None,
+                    file_size=int(raw.get("file_size", 0) or 0),
                 )
             )
         self._records = tuple(sorted(records, key=lambda item: item.name))
@@ -380,6 +388,10 @@ class SkillsLoader:
                     "diagnostics": list(record.diagnostics),
                     "record_revision": record.revision,
                     "enabled": record.enabled,
+                    "slug": record.slug,
+                    "owner": record.owner,
+                    "published_at": record.published_at,
+                    "file_size": record.file_size,
                 }
                 for record in records
             ],
@@ -662,30 +674,48 @@ class SkillsLoader:
             skill_file = skill_dir / "SKILL.md"
             if not skill_file.is_file() or (reject_symlinks and skill_file.is_symlink()):
                 continue
-            diagnostics: tuple[str, ...] = ()
+            diagnostic_items: list[str] = []
             content = ""
             metadata: dict[str, Any] = {}
+            file_size = 0
             try:
-                if skill_file.stat().st_size > 1024 * 1024:
-                    raise ValueError("SKILL.md 超过 1 MiB 限制")
+                file_size = skill_file.stat().st_size
+                if file_size > 1024 * 1024:
+                    raise ValueError("file_too_large")
                 content = skill_file.read_text(encoding="utf-8")
+                if not content.startswith("---"):
+                    diagnostic_items.append("missing_frontmatter")
                 metadata = self._parse_frontmatter(content)
             except (OSError, UnicodeError, yaml.YAMLError) as error:
-                diagnostics = (f"无法解析 SKILL.md：{error}",)
+                diagnostic_items.extend(("frontmatter_invalid", str(error)))
                 logger.warning("Skill 解析失败: path=%s error=%s", skill_file, error)
             except ValueError as error:
                 content = ""
                 metadata = {}
-                diagnostics = (str(error),)
+                diagnostic_items.append(str(error))
             name = str(metadata.get("name") or skill_dir.name).strip()
             if not name:
                 logger.warning("跳过名称为空的 Skill: path=%s", skill_file)
                 continue
+            if not _SKILL_NAME.fullmatch(name):
+                diagnostic_items.append("invalid_name")
+            if not str(metadata.get("description") or "").strip():
+                diagnostic_items.append("missing_description")
+            if len(str(metadata.get("description") or "")) > 500:
+                diagnostic_items.append("description_too_long")
+            unknown_fields = sorted(set(metadata) - {"name", "description", "when_to_use", "version", "slug", "owner", "published_at", "metadata", "always"})
+            diagnostic_items.extend(f"unknown_field:{field}" for field in unknown_fields)
+            if name in {item.name for item in records}:
+                diagnostic_items.append("duplicate_name")
             config = self._skill_config(metadata.get("metadata"))
             missing = self._missing_requirements(config)
+            if missing:
+                diagnostic_items.append("missing_dependency")
             state = self._read_state().get(self._state_key(name, scope), {})
             enabled = bool(state.get("enabled", True)) if isinstance(state, dict) else True
-            status = "invalid" if diagnostics else "missing_dependency" if missing else "disabled" if not enabled else "available"
+            diagnostics = tuple(dict.fromkeys(diagnostic_items))
+            invalid_diagnostics = tuple(item for item in diagnostics if item != "missing_dependency")
+            status = "invalid" if invalid_diagnostics else "missing_dependency" if missing else "disabled" if not enabled else "available"
             records.append(
                 SkillRecord(
                     name=name,
@@ -698,7 +728,7 @@ class SkillsLoader:
                     when_to_use=str(metadata.get("when_to_use") or ""),
                     always=self._as_bool(metadata.get("always"))
                     or self._as_bool(config.get("always")),
-                    available=not missing and not diagnostics,
+                    available=not missing and not invalid_diagnostics,
                     missing=missing,
                     scope=scope,
                     version=str(metadata.get("version") or "") or None,
@@ -707,6 +737,10 @@ class SkillsLoader:
                     diagnostics=diagnostics,
                     revision=int(state.get("revision", 1)) if isinstance(state, dict) and isinstance(state.get("revision", 1), int) else 1,
                     enabled=enabled,
+                    slug=str(metadata.get("slug") or "") or None,
+                    owner=str(metadata.get("owner") or "") or None,
+                    published_at=str(metadata.get("published_at") or "") or None,
+                    file_size=file_size,
                 )
             )
         return records
