@@ -428,6 +428,56 @@ async def test_pipeline_injects_explicit_skill_mention_into_dynamic_frame(
 
 
 @pytest.mark.asyncio
+async def test_pipeline_keeps_session_skill_snapshot_until_explicit_refresh(tmp_path: Path) -> None:
+    skill_file = tmp_path / "skills" / "review" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text("---\nname: review\ndescription: 旧描述\n---\n旧正文\n", encoding="utf-8")
+
+    class FinalProvider:
+        def __init__(self) -> None:
+            self.messages: list[list[dict[str, object]]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages.append(messages)
+            return LLMResponse("完成")
+
+    stored: dict[str, dict[str, object]] = {}
+
+    async def load_snapshot(session_key: str):
+        return stored.get(session_key)
+
+    async def save_snapshot(session_key: str, snapshot: dict[str, object]):
+        stored[session_key] = snapshot
+        return snapshot
+
+    provider = FinalProvider()
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        EventBus(),
+        PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        ),
+        workspace=str(tmp_path),
+        skills=SkillsLoader(tmp_path, builtin_skills_dir=None),
+        skill_snapshot_loader=load_snapshot,
+        skill_snapshot_writer=save_snapshot,
+    )
+
+    await pipeline.process(InboundMessage("web", "u", "c", "$review 第一次"), turn_id="snapshot-1")
+    skill_file.write_text("---\nname: review\ndescription: 新描述\n---\n新正文\n", encoding="utf-8")
+    await pipeline.process(InboundMessage("web", "u", "c", "$review 第二次"), turn_id="snapshot-2")
+
+    assert "旧正文" in str(provider.messages[0][-2]["content"])
+    assert "旧正文" in str(provider.messages[1][-2]["content"])
+    assert "新正文" not in str(provider.messages[1][-2]["content"])
+    await pipeline.refresh_skill_snapshot("web:c")
+    await pipeline.process(InboundMessage("web", "u", "c", "$review 第三次"), turn_id="snapshot-3")
+    assert "新正文" in str(provider.messages[2][-2]["content"])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("prompt_tokens", "hit_tokens", "expected"),
     [

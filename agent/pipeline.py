@@ -41,7 +41,7 @@ from agent.prompt_cache_diagnostics import (
 )
 from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import ContextLengthError, LLMResponse, ProviderUsage
-from agent.skills import SkillsLoader, collect_skill_mentions
+from agent.skills import SkillSnapshotView, SkillsLoader, collect_skill_mentions
 from agent.tool_projection import (
     project_result_preview,
     project_tool_arguments,
@@ -76,6 +76,9 @@ ContextCompactor = Callable[..., Awaitable[bool]]
 ContextUsageLoader = Callable[[str], Awaitable[dict[str, Any] | None]]
 ContextUsageWriter = Callable[[str, dict[str, Any]], Awaitable[None]]
 SessionUsageWriter = Callable[[str, str, int, dict[str, Any]], Awaitable[dict[str, Any]]]
+WorkspaceLoader = Callable[[str], Awaitable[str | None]]
+SkillSnapshotLoader = Callable[[str], Awaitable[dict[str, Any] | None]]
+SkillSnapshotWriter = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] | None]]
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +221,9 @@ class Pipeline:
         vl_available: bool = False,
         sandbox_guard: SandboxGuard | None = None,
         provider_manager: ProviderManagerApi | None = None,
+        workspace_loader: WorkspaceLoader | None = None,
+        skill_snapshot_loader: SkillSnapshotLoader | None = None,
+        skill_snapshot_writer: SkillSnapshotWriter | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -244,6 +250,9 @@ class Pipeline:
         self._vl_available = bool(vl_available)
         self._sandbox_guard = sandbox_guard
         self._provider_manager = provider_manager
+        self._workspace_loader = workspace_loader
+        self._skill_snapshot_loader = skill_snapshot_loader
+        self._skill_snapshot_writer = skill_snapshot_writer
         # 中断快照只服务于当前进程内的停止/续跑语义，不进入 Session 或长期记忆。
         self._interrupt_snapshots: dict[str, dict[str, Any]] = {}
         # 工具起点的单调时钟只保存在进程内，用于取消/异常时补算终态耗时；
@@ -252,6 +261,43 @@ class Pipeline:
         # 只保存每个会话最近一次供应商 usage 锚点；完整快照由 SessionStore
         # 持久化，进程重启或 WebSocket 重连都不会依赖这份内存缓存。
         self._context_measurements: dict[str, dict[str, Any]] = {}
+
+    async def refresh_skill_snapshot(self, session_key: str) -> dict[str, Any] | None:
+        """按会话绑定项目立即生成新快照，供设置页主动刷新使用。"""
+
+        loader = await self._resolve_workspace_skills(session_key)
+        if loader is None or self._skill_snapshot_writer is None:
+            return None
+        snapshot = loader.create_snapshot()
+        await self._skill_snapshot_writer(session_key, snapshot)
+        return snapshot
+
+    async def _resolve_workspace_skills(self, session_key: str) -> SkillsLoader | None:
+        if self._skills is None:
+            return None
+        workspace_path = None
+        if self._workspace_loader is not None:
+            workspace_path = await self._workspace_loader(session_key)
+        if workspace_path:
+            return self._skills.for_workspace(workspace_path)
+        return self._skills
+
+    async def _resolve_turn_skills(
+        self,
+        session_key: str,
+    ) -> tuple[SkillsLoader | SkillSnapshotView | None, str]:
+        """解析项目索引并固定会话快照；无快照回调时保持旧测试/调用方语义。"""
+
+        loader = await self._resolve_workspace_skills(session_key)
+        if loader is None:
+            return None, self._workspace
+        if self._skill_snapshot_loader is None or self._skill_snapshot_writer is None:
+            return loader, str(loader.workspace)
+        snapshot = await self._skill_snapshot_loader(session_key)
+        if snapshot is None:
+            snapshot = loader.create_snapshot()
+            await self._skill_snapshot_writer(session_key, snapshot)
+        return SkillsLoader.from_snapshot(snapshot), str(loader.workspace)
 
     async def process(self, message: InboundMessage, *, turn_id: str) -> PipelineResult:
         route = message.metadata.get("model_route")
@@ -338,9 +384,10 @@ class Pipeline:
         measurement = await self._load_context_measurement(message.session_key)
         retrieved = await self._memory.retrieve_for_turn(message) if self._memory and not skip_memory else ""
         names = list(tool_view.visible_order)
+        turn_skills, turn_workspace = await self._resolve_turn_skills(message.session_key)
         available_skills = (
-            [record.name for record in self._skills.list_skill_records()]
-            if self._skills
+            [record.name for record in turn_skills.list_skill_records()]
+            if turn_skills
             else []
         )
         active_skills = collect_skill_mentions(message.content, available_skills)
@@ -351,14 +398,14 @@ class Pipeline:
             if callable(read_checkpoint):
                 checkpoint_summary = str(read_checkpoint(message.session_key) or "")
         context = TurnContext(
-            workspace=self._workspace,
+            workspace=turn_workspace,
             channel=message.channel,
             chat_id=message.chat_id,
             memory=None if skip_memory else self._memory,
             retrieved_memory_block=retrieved,
             checkpoint_summary=checkpoint_summary,
             active_tool_names=names,
-            skills=self._skills,
+            skills=turn_skills,
             active_skill_names=active_skills,
             deferred_tools_hint=deferred_hint,
         )

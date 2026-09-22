@@ -352,6 +352,40 @@ class SessionManager:
             self._cache[key] = session
             return session
 
+    async def load_skill_snapshot(self, session_key: str) -> dict[str, Any] | None:
+        """读取会话绑定的 Skill 快照，不让运行时直接操作 SQLite。"""
+
+        session = await self.get_or_create(session_key)
+        snapshot = session.metadata.get("skill_snapshot")
+        return deepcopy(snapshot) if isinstance(snapshot, dict) else None
+
+    async def save_skill_snapshot(
+        self,
+        session_key: str,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        """保存 Skill 快照及 revision；历史消息和 workspace 数据保持不变。"""
+
+        key = self._validate_session_key(session_key)
+        session = await self.get_or_create(key)
+        async with self._lock_for(key):
+            self._ensure_not_deleted(key)
+            session.metadata["skill_snapshot"] = deepcopy(snapshot)
+            session.metadata["skill_snapshot_revision"] = str(snapshot.get("revision") or "")
+            await self._save_metadata(session)
+            return deepcopy(snapshot)
+
+    async def clear_skill_snapshot(self, session_key: str) -> None:
+        """清除快照使下一次 Turn 按当前项目目录重新生成。"""
+
+        key = self._validate_session_key(session_key)
+        session = await self.get_or_create(key)
+        async with self._lock_for(key):
+            self._ensure_not_deleted(key)
+            session.metadata.pop("skill_snapshot", None)
+            session.metadata.pop("skill_snapshot_revision", None)
+            await self._save_metadata(session)
+
     async def peek_next_message_id(self, session_key: str) -> str:
         """预测当前会话下一条持久化消息 ID，供 Turn 内工具记录原文来源。"""
 

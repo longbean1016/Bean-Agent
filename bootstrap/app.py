@@ -532,6 +532,16 @@ def build_core_runtime(
     user_skills_dir = Path.home() / ".beanagent" / "skills"
     seed_builtin_skills(user_skills_dir)
     skills = SkillsLoader(root, user_skills_dir=user_skills_dir)
+
+    async def resolve_session_workspace(session_key: str) -> str | None:
+        """只从 SessionStore 读取已注册项目，避免前端路径直接进入 SkillsLoader。"""
+
+        sandbox = await asyncio.to_thread(sessions.store.get_session_sandbox, session_key)
+        if not isinstance(sandbox, dict):
+            return str(root)
+        workspace_path = str(sandbox.get("workspace_path") or "").strip()
+        return workspace_path or str(root)
+
     prompt_cache_log = PromptCacheLogWriter(root)
     tools = ToolRegistry()
     register_all(
@@ -608,6 +618,9 @@ def build_core_runtime(
         vl_available=vision_provider is not None,
         sandbox_guard=sandbox_guard,
         provider_manager=provider_manager,
+        workspace_loader=resolve_session_workspace,
+        skill_snapshot_loader=sessions.load_skill_snapshot,
+        skill_snapshot_writer=sessions.save_skill_snapshot,
     )
     agent_loop = AgentLoop(
         messages,
@@ -1737,6 +1750,19 @@ def create_fastapi_app(
         if snapshot is None:
             raise HTTPException(status_code=404, detail="会话不存在")
         return snapshot
+
+    @app.post("/api/chat/sessions/{session_key:path}/skills/refresh")
+    async def refresh_session_skills(session_key: str) -> dict[str, Any]:
+        """主动替换当前会话快照；不会改写历史消息或 workspace 数据。"""
+
+        require_web_session(session_key)
+        snapshot = await application.core.pipeline.refresh_skill_snapshot(session_key)
+        if snapshot is None:
+            raise HTTPException(status_code=409, detail="当前运行时未启用 Skills 快照")
+        return {
+            "revision": str(snapshot.get("revision") or ""),
+            "skills_count": len(snapshot.get("skills") or []),
+        }
 
     def require_web_session(session_key: str) -> None:
         """主动设置只属于当前 Web channel，禁止借 path 参数访问其他渠道。"""
