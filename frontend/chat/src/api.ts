@@ -385,6 +385,13 @@ export async function fetchSkillRevision(workspaceId?: string | null): Promise<s
   return String(result.revision || "");
 }
 
+export async function refreshSessionSkills(sessionId: string): Promise<{ revision: string; skills_count: number }> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/skills/refresh`, { method: "POST" });
+  const result = await response.json().catch(() => ({})) as { revision?: string; skills_count?: number; detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法刷新当前会话技能");
+  return { revision: String(result.revision || ""), skills_count: Number(result.skills_count || 0) };
+}
+
 class SettingsRequestError extends Error {
   readonly status: number;
 

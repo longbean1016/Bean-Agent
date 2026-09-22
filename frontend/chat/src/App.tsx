@@ -1417,7 +1417,7 @@ export function App() {
       <div className="app-shell extensions-app-shell">
         <aside className="desktop-sidebar">{extensionSidebar}</aside>
         <main className="chat-workspace extensions-workspace">
-          <ExtensionsPage kind={activeExtension} onBack={closeExtensions} workspaceId={currentWorkspaceId} />
+          <ExtensionsPage kind={activeExtension} onBack={closeExtensions} workspaceId={currentWorkspaceId} sessionId={chat.sessionId} />
         </main>
       </div>
     );

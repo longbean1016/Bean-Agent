@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { createMcpExtension, createSkillExtension, discoverMcpSources, fetchMcpExtensions, fetchPluginExtensions, fetchSkillDetail, fetchSkillExtensions, fetchSkillRevision, importDiscoveredMcpExtensions, importMcpExtensions, importSkillExtension, refreshMcpExtension, refreshSkillExtension, removeMcpExtension, removeSkillExtension, setMcpEnabled, setSkillEnabled, updateMcpExtension, updateSkillExtension } from "./api";
+import { createMcpExtension, createSkillExtension, discoverMcpSources, fetchMcpExtensions, fetchPluginExtensions, fetchSkillDetail, fetchSkillExtensions, fetchSkillRevision, importDiscoveredMcpExtensions, importMcpExtensions, importSkillExtension, refreshMcpExtension, refreshSessionSkills, refreshSkillExtension, removeMcpExtension, removeSkillExtension, setMcpEnabled, setSkillEnabled, updateMcpExtension, updateSkillExtension } from "./api";
 import type { McpExtensionConfigPayload } from "./api";
 import type { ExtensionScope, McpExtensionRecord, PluginExtensionRecord, SkillExtensionRecord } from "./types";
 import type { ExtensionKind } from "./chatRoute";
@@ -36,10 +36,12 @@ export function ExtensionsPage({
   kind,
   onBack,
   workspaceId = null,
+  sessionId = "",
 }: {
   kind: ExtensionKind;
   onBack: () => void;
   workspaceId?: string | null;
+  sessionId?: string;
 }) {
   const [scope, setScope] = useState<ExtensionScope>("workspace");
   const [query, setQuery] = useState("");
@@ -172,6 +174,7 @@ export function ExtensionsPage({
           <div><h2>{kind === "plugins" ? "已安装" : kind === "mcp" ? "已配置" : "已安装"} <small>{filtered.length}</small></h2><span className="extensions-scope-hint">{scope === "workspace" ? (kind === "skills" ? "当前项目" : "当前工作区") : "当前用户"}</span></div>
           <div className="extensions-actions">
             <button className="icon-button" aria-label="刷新扩展" title="刷新" onClick={() => void refresh()} disabled={loading}><RefreshCw size={16} className={loading ? "spin" : ""} /></button>
+            {kind === "skills" && sessionId ? <button className="secondary-action" onClick={async () => { setSkillSaving(true); setError(""); try { await refreshSessionSkills(sessionId); await refresh(); } catch (reason) { setError(reason instanceof Error ? reason.message : "无法刷新当前会话技能"); } finally { setSkillSaving(false); } }} disabled={skillSaving}>刷新当前会话技能</button> : null}
             <button className="secondary-action" onClick={() => { if (kind === "mcp") setMcpImportOpen(true); else if (kind === "skills") setSkillImportOpen(true); }} disabled={kind === "plugins"}><Upload size={15} />导入{kind === "mcp" ? " JSON" : ""}</button>
             <button className="primary-action" onClick={() => { if (kind === "mcp") openCreateMcp(); else if (kind === "skills") openCreateSkill(); }} disabled={kind === "plugins"}><Plus size={16} />新建</button>
           </div>
