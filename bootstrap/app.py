@@ -1535,13 +1535,13 @@ def create_fastapi_app(
         return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": "project" if record.scope == "workspace" else record.scope, "status": record.status, "revision": record.revision}
 
     @app.post("/api/extensions/skills/{skill_name}/{action}")
-    async def skill_extension_action(skill_name: str, action: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    async def skill_extension_action(skill_name: str, action: str, request: Request, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         scope = _skill_scope(payload)
         skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
-        if action not in {"enable", "disable", "refresh"}:
+        if action not in {"enable", "disable", "refresh", "open"}:
             raise HTTPException(status_code=404, detail="Skill 操作不存在")
         try:
-            if action == "refresh":
+            if action in {"refresh", "open"}:
                 record = _skill_record_or_404(skill_name, scope, skill_loader)
             else:
                 record = await asyncio.to_thread(skill_loader.set_skill_enabled, skill_name, scope, action == "enable")
@@ -1549,6 +1549,14 @@ def create_fastapi_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except PermissionError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        if action == "open":
+            require_local_host(request)
+            try:
+                host_directories.open_directory(record.root_dir.resolve())
+            except NativeHostUnavailable as error:
+                raise HTTPException(status_code=501, detail=str(error)) from error
+            except NativeHostError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
         return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": "project" if record.scope == "workspace" else record.scope, "status": record.status, "enabled": record.enabled, "revision": record.revision}
 
     @app.post("/api/extensions/skills/import")

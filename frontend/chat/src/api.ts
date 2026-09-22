@@ -365,6 +365,12 @@ export async function refreshSkillExtension(name: string, scope: ExtensionScope,
   if (!response.ok) throw new Error("无法刷新 Skill");
 }
 
+export async function openSkillDirectory(name: string, scope: ExtensionScope, workspaceId?: string | null): Promise<void> {
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}/open`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, workspace_id: workspaceId }) });
+  const result = await response.json().catch(() => ({})) as { detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法打开 Skill 所在目录");
+}
+
 export async function removeSkillExtension(name: string, scope: ExtensionScope, workspaceId?: string | null): Promise<void> {
   const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
   const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}${workspaceQuery}`, { method: "DELETE" });
