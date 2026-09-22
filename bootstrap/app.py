@@ -33,7 +33,7 @@ from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
 from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import LLMProvider, create_vision_provider
-from agent.skills import SkillRevisionConflict, SkillsLoader
+from agent.skills import SkillRevisionConflict, SkillsLoader, seed_builtin_skills
 from agent.tool_projection import project_tool_call, project_tool_chain
 from bootstrap.native_folder_picker import (
     DirectoryPicker,
@@ -529,7 +529,9 @@ def build_core_runtime(
         multimodal=effective_multimodal,
     )
     vision_provider = create_vision_provider(vision_config)
-    skills = SkillsLoader(root, user_skills_dir=Path.home() / ".beanagent" / "skills")
+    user_skills_dir = Path.home() / ".beanagent" / "skills"
+    seed_builtin_skills(user_skills_dir)
+    skills = SkillsLoader(root, user_skills_dir=user_skills_dir)
     prompt_cache_log = PromptCacheLogWriter(root)
     tools = ToolRegistry()
     register_all(

@@ -9,12 +9,14 @@ Skill 目录摘要会进入稳定 Prompt 前缀，因此扫描和输出顺序必
 from __future__ import annotations
 
 import logging
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +36,86 @@ class SkillRevisionConflict(RuntimeError):
         super().__init__(f"Skill 配置已更新（期望 revision={expected}，当前 revision={actual}）")
         self.expected = expected
         self.actual = actual
+
+
+def seed_builtin_skills(
+    user_skills_dir: str | Path,
+    *,
+    builtin_skills_dir: str | Path | None = BUILTIN_SKILLS_DIR,
+) -> dict[str, Any]:
+    """首启幂等复制内置 Skill；已有用户目录永远不被覆盖。"""
+
+    target_root = Path(user_skills_dir).expanduser().resolve()
+    source_root = (
+        Path(builtin_skills_dir).expanduser().resolve()
+        if builtin_skills_dir is not None
+        else None
+    )
+    if source_root is None or not source_root.is_dir():
+        return {"seeded": [], "skipped": [], "manifest": {}}
+    target_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = target_root.parent / "skills-seed-manifest.json"
+    seeded: list[str] = []
+    skipped: list[str] = []
+    manifest: dict[str, Any] = {}
+    try:
+        raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+        if isinstance(raw_manifest, dict):
+            manifest = raw_manifest
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        manifest = {}
+    for source in sorted(source_root.iterdir(), key=lambda item: item.name):
+        if not source.is_dir() or not (source / "SKILL.md").is_file():
+            continue
+        name = source.name
+        target = target_root / name
+        source_hash = _hash_skill_tree(source)
+        if target.exists():
+            skipped.append(name)
+            previous = manifest.get(name) if isinstance(manifest.get(name), dict) else {}
+            manifest[name] = {
+                "source": "builtin",
+                "seed_hash": str(previous.get("seed_hash") or source_hash),
+                "current_builtin_hash": source_hash,
+                "managed": bool(previous.get("managed", False)),
+            }
+            continue
+        temporary = target_root / f".{name}.seed-{uuid.uuid4().hex}.tmp"
+        try:
+            shutil.copytree(source, temporary, symlinks=False)
+            temporary.replace(target)
+        except (OSError, shutil.Error):
+            shutil.rmtree(temporary, ignore_errors=True)
+            logger.warning("内置 Skill 首次复制失败: name=%s", name)
+            continue
+        seeded.append(name)
+        manifest[name] = {
+            "source": "builtin",
+            "seed_hash": source_hash,
+            "current_builtin_hash": source_hash,
+            "managed": True,
+        }
+    if manifest:
+        _atomic_write_path(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2))
+    return {"seeded": seeded, "skipped": skipped, "manifest": manifest}
+
+
+def _hash_skill_tree(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(relative)
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _atomic_write_path(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
 
 
 def collect_skill_mentions(content: str, available_names: list[str]) -> list[str]:
@@ -344,7 +426,7 @@ class SkillsLoader:
                 source="builtin",
                 source_id="builtin",
                 reject_symlinks=False,
-                scope="user",
+                scope="builtin",
             ):
                 records.setdefault(record.name, record)
         return sorted(records.values(), key=lambda record: record.name)
@@ -367,7 +449,7 @@ class SkillsLoader:
                 for record in self._scan_skills_dir(self.user_skills_dir, source="user", source_id="user", reject_symlinks=True, scope="user"):
                     records[record.name] = record
             if self.builtin_skills_dir is not None:
-                for record in self._scan_skills_dir(self.builtin_skills_dir, source="builtin", source_id="builtin", reject_symlinks=False, scope="user"):
+                for record in self._scan_skills_dir(self.builtin_skills_dir, source="builtin", source_id="builtin", reject_symlinks=False, scope="builtin"):
                     records.setdefault(record.name, record)
         return sorted(records.values(), key=lambda record: record.name)
 
@@ -524,10 +606,7 @@ class SkillsLoader:
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(content, encoding="utf-8")
-        temporary.replace(path)
+        _atomic_write_path(path, content)
 
     @staticmethod
     def _parse_frontmatter(content: str) -> dict[str, Any]:
@@ -596,4 +675,4 @@ class SkillsLoader:
         )
 
 
-__all__ = ["SkillRecord", "SkillRevisionConflict", "SkillsLoader", "collect_skill_mentions"]
+__all__ = ["SkillRecord", "SkillRevisionConflict", "SkillsLoader", "collect_skill_mentions", "seed_builtin_skills"]

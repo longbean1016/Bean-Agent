@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.skills import SkillRevisionConflict, SkillsLoader
+from agent.skills import SkillRevisionConflict, SkillsLoader, seed_builtin_skills
 
 
 def _write_skill(
@@ -178,3 +178,18 @@ def test_scope_priority_and_plugin_group(tmp_path: Path) -> None:
     assert loader.get_skill_record("same", scope="user").description == "user"
     plugin_record = next(record for record in loader.list_skill_records(filter_unavailable=False) if record.plugin_name == "demo")
     assert plugin_record.source == "plugin"
+
+
+def test_seed_builtin_skills_is_idempotent_and_does_not_overwrite_user_file(tmp_path: Path) -> None:
+    builtin = tmp_path / "builtin"
+    user = tmp_path / "user"
+    _write_skill(builtin, "skill-creator", description="默认版本")
+    first = seed_builtin_skills(user, builtin_skills_dir=builtin)
+    assert first["seeded"] == ["skill-creator"]
+    target = user / "skill-creator" / "SKILL.md"
+    target.write_text("---\nname: skill-creator\ndescription: 用户修改\n---\nbody", encoding="utf-8")
+    second = seed_builtin_skills(user, builtin_skills_dir=builtin)
+    assert second["seeded"] == []
+    assert "用户修改" in target.read_text(encoding="utf-8")
+    manifest = user.parent / "skills-seed-manifest.json"
+    assert manifest.is_file()
