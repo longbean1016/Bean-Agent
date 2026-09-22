@@ -2,6 +2,8 @@ import * as Dialog from "@radix-ui/react-dialog";
 import {
   AlertCircle,
   Bell,
+  ChevronDown,
+  ChevronRight,
   Folder,
   FolderOpen,
   FolderPlus,
@@ -10,7 +12,11 @@ import {
   Pencil,
   Pin,
   PinOff,
+  PlugZap,
+  Plus,
+  Puzzle,
   Settings,
+  Sparkles,
   Trash2,
   Unlink,
   X,
@@ -31,6 +37,7 @@ import type {
   SessionSummary,
   Workspace,
 } from "./types";
+import type { ExtensionKind } from "./chatRoute";
 
 export function SessionSidebar(props: {
   sessions: SessionSummary[];
@@ -46,6 +53,8 @@ export function SessionSidebar(props: {
   onUpdateWorkspace: (id: string, patch: { title?: string; pinned?: boolean }) => Promise<void>;
   onSelect: (id: string) => void;
   onSettings: () => void;
+  activeExtension?: ExtensionKind | null;
+  onExtension?: (kind: ExtensionKind) => void;
 }) {
   const [menuSessionId, setMenuSessionId] = useState("");
   const [menuWorkspaceId, setMenuWorkspaceId] = useState("");
@@ -66,6 +75,7 @@ export function SessionSidebar(props: {
   const [deletingWorkspace, setDeletingWorkspace] = useState(false);
   const [registeringWorkspace, setRegisteringWorkspace] = useState(false);
   const [scrollbarVisible, setScrollbarVisible] = useState(false);
+  const [extensionsExpanded, setExtensionsExpanded] = useState(true);
   const scrollbarHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionListRef = useRef<HTMLElement>(null);
 
@@ -84,6 +94,10 @@ export function SessionSidebar(props: {
   useEffect(() => () => {
     if (scrollbarHideTimerRef.current !== null) clearTimeout(scrollbarHideTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    if (props.activeExtension) setExtensionsExpanded(true);
+  }, [props.activeExtension]);
 
   const showSessionScrollbar = () => {
     if (scrollbarHideTimerRef.current !== null) {
@@ -160,7 +174,12 @@ export function SessionSidebar(props: {
             }}
           />
         ) : (
-          <button className="session-row-select" onClick={() => props.onSelect(session.key)}>
+          <button
+            className="session-row-select"
+            onClick={() => props.onSelect(session.key)}
+            // 新对话既是默认会话标题，也是顶部操作按钮文案；补充动作语义避免读屏和自动化查询混淆。
+            aria-label={title === "新对话" ? "打开会话“新对话”" : undefined}
+          >
             <span>{session.pinned_at ? <Pin className="session-row-pin" size={13} /> : null}{title}</span>
           </button>
         )}
@@ -287,13 +306,26 @@ export function SessionSidebar(props: {
         <strong>BeanAgent</strong>
       </div>
       <div className="sidebar-primary-actions">
-        <button className="new-chat-button" onClick={() => props.onCreate(null)}><MessageSquarePlus size={17} />新建会话</button>
+        <button className="new-chat-button" onClick={() => props.onCreate(null)}><Plus size={15} />新对话</button>
         <button className="add-workspace-button" onClick={() => {
           setWorkspaceError("");
           setWorkspacePath("");
           setWorkspaceTitle("");
           setWorkspaceDialogOpen(true);
         }}><FolderPlus size={17} />添加工作目录</button>
+      </div>
+      <div className={`sidebar-extensions${extensionsExpanded ? " expanded" : " collapsed"}`} aria-label="扩展">
+        <button className="sidebar-extensions-title" onClick={() => setExtensionsExpanded((current) => !current)} aria-expanded={extensionsExpanded}>
+          <span className="sidebar-extensions-title-main">{extensionsExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}<strong>扩展</strong></span>
+          <small>插件、MCP 与技能</small>
+        </button>
+        {extensionsExpanded ? <div className="sidebar-extension-links">
+          {(["plugins", "mcp", "skills"] as ExtensionKind[]).map((kind) => {
+            const labels: Record<ExtensionKind, string> = { plugins: "插件", mcp: "MCP", skills: "技能 Skills" };
+            const icons: Record<ExtensionKind, ReactNode> = { plugins: <Puzzle size={15} />, mcp: <PlugZap size={15} />, skills: <Sparkles size={15} /> };
+            return <button key={kind} className={`sidebar-extension-link${props.activeExtension === kind ? " active" : ""}`} onClick={() => props.onExtension?.(kind)} disabled={!props.onExtension} aria-current={props.activeExtension === kind ? "page" : undefined}>{icons[kind]}<span>{labels[kind]}</span></button>;
+          })}
+        </div> : null}
       </div>
       <nav
         ref={sessionListRef}
