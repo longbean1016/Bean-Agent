@@ -6,6 +6,7 @@ import asyncio
 import json
 import mimetypes
 import logging
+import os
 from datetime import datetime
 from io import BytesIO
 from contextlib import asynccontextmanager
@@ -26,7 +27,7 @@ from agent.config_models import Config, EmbeddingConfig, VisionConfig
 from agent.event_bus import EventBus, SandboxApprovalRequested, SandboxApprovalResolved
 from agent.message_bus import MessageBus
 from agent.mcp.manage_tools import McpAddTool, McpListTool, McpRemoveTool
-from agent.mcp.registry import McpServerRegistry
+from agent.mcp.registry import McpRevisionConflict, McpServerRegistry
 from agent.pipeline import Pipeline
 from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
@@ -236,6 +237,8 @@ class AppRuntime:
                 raise RuntimeError("AppRuntime 已关闭")
             # MCP 工具目录必须在第一条消息进入 AgentLoop 前恢复完成，避免启动
             # 窗口内同一配置在不同 Turn 中呈现不同能力。
+            if self.core.user_mcp_registry is not None:
+                await self.core.user_mcp_registry.load_and_connect_all()
             await self.core.mcp_registry.load_and_connect_all()
             # 恢复旧 outbox 必须先于 AgentLoop 接受新消息，保持事件顺序可审计。
             if self.maintenance is not None:
@@ -262,6 +265,8 @@ class AppRuntime:
                 self.agent_task.cancel()
                 await asyncio.gather(self.agent_task, return_exceptions=True)
             await _cleanup_step("mcp_registry.shutdown", self.core.mcp_registry.shutdown)
+            if self.core.user_mcp_registry is not None:
+                await _cleanup_step("user_mcp_registry.shutdown", self.core.user_mcp_registry.shutdown)
             await _cleanup_step("sandbox_runtime.close", self.core.sandbox_runtime.close)
             if self.maintenance is not None:
                 await _cleanup_step("memory_maintenance.close", self.maintenance.close)
@@ -316,6 +321,7 @@ class CoreRuntime:
     provider_manager: ProviderManager
     legacy_model_available: bool
     vision_provider: Any | None = None
+    user_mcp_registry: McpServerRegistry | None = None
 
 
 def _saved_route_parts(
@@ -438,6 +444,7 @@ def build_core_runtime(
     provider: Any | None = None,
     embedder: Any | None = None,
     model_secret_store: SecretStore | None = None,
+    user_mcp_path: Path | None = None,
 ) -> CoreRuntime:
     """按依赖方向构造核心组件，不启动任务或监听端口。"""
 
@@ -544,7 +551,18 @@ def build_core_runtime(
     tools.register(ScheduleTaskTool(proactive_store), risk="write", always_on=True)
     tools.register(ListSchedulesTool(proactive_store), risk="read-only", always_on=True)
     tools.register(CancelScheduleTool(proactive_store), risk="write", always_on=True)
-    mcp_registry = McpServerRegistry(root / "mcp_servers.json", tools)
+    mcp_registry = McpServerRegistry(
+        root / "mcp_servers.json",
+        tools,
+        default_scope="workspace",
+        secret_store=secrets,
+    )
+    user_mcp_registry = McpServerRegistry(
+        user_mcp_path or (Path.home() / ".beanagent" / "mcp_servers.json"),
+        tools,
+        default_scope="user",
+        secret_store=secrets,
+    )
     # 管理工具必须与运行时持有的 Registry 共享同一实例，动态添加和关闭才能
     # 作用于同一批 Client；三者常驻可见，远端工具本身仍需搜索解锁。
     tools.register(
@@ -623,6 +641,7 @@ def build_core_runtime(
         memory=memory,
         tools=tools,
         mcp_registry=mcp_registry,
+        user_mcp_registry=user_mcp_registry,
         skills=skills,
         message_bus=messages,
         event_bus=events,
@@ -1000,6 +1019,21 @@ def create_fastapi_app(
                     manifest = {}
                 if not isinstance(manifest, dict):
                     manifest = {}
+                raw_plugin_mcp = manifest.get("mcp") or manifest.get("mcpServers") or {}
+                plugin_mcp = raw_plugin_mcp if isinstance(raw_plugin_mcp, dict) else {
+                    str(index): item for index, item in enumerate(raw_plugin_mcp) if isinstance(item, dict)
+                } if isinstance(raw_plugin_mcp, list) else {}
+                mcp_groups = [
+                    {
+                        "id": str(mcp_name),
+                        "name": str(mcp_name),
+                        "transport": str(mcp_config.get("type") or ("stdio" if mcp_config.get("command") else "http")),
+                        "status": "disabled" if not bool(manifest.get("enabled", True)) else "not_loaded",
+                        "enabled": bool(manifest.get("enabled", True)),
+                    }
+                    for mcp_name, mcp_config in plugin_mcp.items()
+                    if isinstance(mcp_config, dict)
+                ]
                 items.append({
                     "id": directory.name,
                     "name": str(manifest.get("name") or directory.name),
@@ -1010,43 +1044,335 @@ def create_fastapi_app(
                     "status": "installed",
                     "enabled": True,
                     "skills_count": len(manifest.get("skills") or []) if isinstance(manifest.get("skills"), list) else 0,
-                    "mcp_count": len(manifest.get("mcp") or manifest.get("mcpServers") or []) if isinstance(manifest.get("mcp") or manifest.get("mcpServers"), list) else 0,
+                    "mcp_count": len(mcp_groups),
+                    "mcp_groups": mcp_groups,
                     "commands_count": len(manifest.get("commands") or []) if isinstance(manifest.get("commands"), list) else 0,
                 })
         return {"items": items, "scope": normalized_scope}
 
+    def _normalize_mcp_scope(scope: str | None) -> str:
+        return scope if scope in {"user", "workspace"} else "workspace"
+
+    def _parse_revision(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        try:
+            revision = int(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="revision 必须是正整数") from None
+        if revision <= 0:
+            raise HTTPException(status_code=400, detail="revision 必须是正整数")
+        return revision
+
+    def _raise_mcp_conflict(error: McpRevisionConflict) -> None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "revision_conflict",
+                "detail": str(error),
+                "expected_revision": error.expected,
+                "actual_revision": error.actual,
+                "retryable": True,
+            },
+        ) from error
+
+    def _mcp_registry_for_scope(scope: str | None) -> tuple[str, McpServerRegistry]:
+        normalized_scope = _normalize_mcp_scope(scope)
+        registry = (
+            application.core.user_mcp_registry
+            if normalized_scope == "user"
+            else application.core.mcp_registry
+        )
+        # 老的 CoreRuntime 构造方式可能没有用户注册表；此时用户级请求仍然
+        # 返回明确的空结果，而不会错误地读写工作区配置。
+        if registry is None:
+            raise HTTPException(status_code=503, detail="用户级 MCP 注册表未初始化")
+        return normalized_scope, registry
+
+    def _find_mcp_record(
+        server_name: str,
+        scope: str | None = None,
+    ) -> tuple[str, McpServerRegistry, dict[str, Any]] | None:
+        scopes = [_normalize_mcp_scope(scope)] if scope in {"user", "workspace"} else ["workspace", "user"]
+        for candidate_scope in scopes:
+            try:
+                normalized_scope, registry = _mcp_registry_for_scope(candidate_scope)
+            except HTTPException:
+                continue
+            record = next(
+                (item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name),
+                None,
+            )
+            if record is not None and str(record.get("scope") or normalized_scope) == normalized_scope:
+                return normalized_scope, registry, record
+        return None
+
+    def _discover_external_mcp_sources() -> list[dict[str, Any]]:
+        """只返回外部配置的安全摘要；导入时由后端重新读取原文件。"""
+
+        appdata = Path(os.environ.get("APPDATA", "")) if os.environ.get("APPDATA") else None
+        candidates: list[tuple[str, Path | None, str]] = [
+            ("claude-desktop", appdata / "Claude" / "claude_desktop_config.json" if appdata else None, "global"),
+            ("cursor", appdata / "Cursor" / "User" / "mcp.json" if appdata else None, "global"),
+            ("windsurf", Path.home() / ".codeium" / "windsurf" / "mcp_config.json", "global"),
+            ("generic-user", Path.home() / ".mcp.json", "global"),
+            ("workspace", application.core.workspace / ".vscode" / "mcp.json", "project"),
+            ("workspace-mcp", application.core.workspace / "mcp.json", "project"),
+        ]
+        seen: set[str] = set()
+        sources: list[dict[str, Any]] = []
+        for agent, path, source_scope in candidates:
+            if path is None:
+                continue
+            resolved = path.expanduser().resolve()
+            key = str(resolved).lower()
+            if key in seen or not resolved.is_file():
+                continue
+            seen.add(key)
+            try:
+                payload = json.loads(resolved.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            servers: Any = payload.get("mcpServers") or payload.get("servers")
+            if not isinstance(servers, dict) and isinstance(payload.get("mcp"), dict):
+                servers = payload["mcp"].get("servers")
+            if not isinstance(servers, dict):
+                continue
+            summaries: list[dict[str, Any]] = []
+            for name, raw_config in servers.items():
+                if not isinstance(raw_config, dict):
+                    continue
+                transport = str(raw_config.get("type") or ("stdio" if raw_config.get("command") else "http"))
+                command = raw_config.get("command")
+                summary = " ".join(command[:3]) if isinstance(command, list) else str(raw_config.get("url") or "")
+                summaries.append({
+                    "name": str(name),
+                    "transport": transport,
+                    "summary": summary[:180],
+                    "has_secrets": bool(raw_config.get("env") or raw_config.get("headers") or raw_config.get("oauth")),
+                })
+            if summaries:
+                sources.append({
+                    "id": f"{agent}:{key}",
+                    "agent": agent,
+                    "path": str(resolved),
+                    "scope": source_scope,
+                    "server_count": len(summaries),
+                    "servers": summaries,
+                })
+        return sources
+
+    @app.get("/api/extensions/mcp/discover")
+    def discover_mcp_sources() -> dict[str, Any]:
+        sources = _discover_external_mcp_sources()
+        return {
+            "sources": sources,
+            "source_count": len(sources),
+            "server_count": sum(int(source["server_count"]) for source in sources),
+        }
+
     @app.get("/api/extensions/mcp")
     def list_mcp_extensions(scope: str = Query("workspace")) -> dict[str, Any]:
-        normalized_scope = scope if scope in {"user", "workspace"} else "workspace"
-        items = application.core.mcp_registry.list_server_records(scope=normalized_scope)
-        if normalized_scope == "user":
-            items = []
+        normalized_scope, registry = _mcp_registry_for_scope(scope)
+        items = [
+            item
+            for item in registry.list_server_records(scope=normalized_scope)
+            if str(item.get("scope") or normalized_scope) == normalized_scope
+        ]
         return {"items": items, "scope": normalized_scope}
 
     @app.post("/api/extensions/mcp", status_code=201)
     async def create_mcp_extension(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         name = str(payload.get("name") or "").strip()
-        command = payload.get("command")
-        if isinstance(command, str):
-            command = [part for part in command.split() if part]
-        env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
-        cwd = str(payload.get("cwd") or "").strip() or None
-        if not name or not isinstance(command, list):
-            raise HTTPException(status_code=400, detail="MCP 名称和启动命令不能为空")
-        message = await application.core.mcp_registry.add(name, command, env=env, cwd=cwd)
-        if not message.startswith("已连接 MCP server"):
-            raise HTTPException(status_code=400, detail=message)
+        config = dict(payload)
+        config.pop("name", None)
+        config.pop("revision", None)
+        if isinstance(config.get("command"), str):
+            config["command"] = [part for part in str(config["command"]).split() if part]
+        normalized_scope, registry = _mcp_registry_for_scope(payload.get("scope"))
+        config["scope"] = normalized_scope
+        if not name:
+            raise HTTPException(status_code=400, detail="MCP 名称不能为空")
+        try:
+            await registry.create(name, config)
+        except (ValueError, KeyError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         record = next(
-            (item for item in application.core.mcp_registry.list_server_records() if item["id"] == name),
+            (item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == name),
             None,
         )
         if record is None:
             raise HTTPException(status_code=500, detail="MCP 已连接但无法读取服务摘要")
         return record
 
+    @app.get("/api/extensions/mcp/{server_name}")
+    def get_mcp_extension(server_name: str, scope: str = Query("workspace")) -> dict[str, Any]:
+        found = _find_mcp_record(server_name, scope)
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        return found[2]
+
+    @app.put("/api/extensions/mcp/{server_name}")
+    async def update_mcp_extension(server_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        config = dict(payload)
+        expected_revision = _parse_revision(config.get("revision"))
+        config.pop("name", None)
+        if isinstance(config.get("command"), str):
+            config["command"] = [part for part in str(config["command"]).split() if part]
+        found = _find_mcp_record(server_name, payload.get("scope"))
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        normalized_scope, registry, _old_record = found
+        config["scope"] = normalized_scope
+        try:
+            await registry.update(server_name, config, expected_revision=expected_revision)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except McpRevisionConflict as error:
+            _raise_mcp_conflict(error)
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        record = next(
+            (item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name),
+            None,
+        )
+        if record is None:
+            raise HTTPException(status_code=500, detail="MCP 更新后无法读取服务摘要")
+        return record
+
+    @app.post("/api/extensions/mcp/{server_name}/test")
+    async def test_mcp_extension(server_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        config = dict(payload)
+        config.pop("name", None)
+        if isinstance(config.get("command"), str):
+            config["command"] = [part for part in str(config["command"]).split() if part]
+        _normalized_scope, registry = _mcp_registry_for_scope(payload.get("scope"))
+        try:
+            return await registry.test(server_name, config)
+        except (ValueError, KeyError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/extensions/mcp/{server_name}/enable")
+    async def enable_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None)) -> dict[str, Any]:
+        found = _find_mcp_record(server_name, scope)
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        normalized_scope, registry, _old_record = found
+        try:
+            await registry.enable(server_name, expected_revision=_parse_revision(revision))
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except McpRevisionConflict as error:
+            _raise_mcp_conflict(error)
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return next(item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name)
+
+    @app.post("/api/extensions/mcp/{server_name}/disable")
+    async def disable_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None)) -> dict[str, Any]:
+        found = _find_mcp_record(server_name, scope)
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        normalized_scope, registry, _old_record = found
+        try:
+            await registry.disable(server_name, expected_revision=_parse_revision(revision))
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except McpRevisionConflict as error:
+            _raise_mcp_conflict(error)
+        return next(item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name)
+
+    @app.post("/api/extensions/mcp/{server_name}/refresh")
+    async def refresh_mcp_extension(server_name: str, scope: str = Query("workspace")) -> dict[str, Any]:
+        found = _find_mcp_record(server_name, scope)
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        normalized_scope, registry, _old_record = found
+        try:
+            result = await registry.refresh(server_name)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        record = next(item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name)
+        return {"item": record, "changes": result}
+
+    @app.post("/api/extensions/mcp/import")
+    async def import_mcp_extensions(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        raw_servers: Any = payload.get("servers", payload)
+        selections = payload.get("selections")
+        if isinstance(selections, list):
+            discovered = {str(source["id"]): source for source in _discover_external_mcp_sources()}
+            selected_servers: dict[str, dict[str, Any]] = {}
+            for selection in selections:
+                if not isinstance(selection, dict):
+                    continue
+                source = discovered.get(str(selection.get("source_id") or selection.get("sourceId") or ""))
+                if source is None:
+                    continue
+                selected_names = selection.get("names")
+                if not isinstance(selected_names, list):
+                    selected_names = [item.get("name") for item in source.get("servers", [])]
+                try:
+                    source_payload = json.loads(Path(str(source["path"])).read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(source_payload, dict):
+                    continue
+                source_servers: Any = source_payload.get("mcpServers") or source_payload.get("servers")
+                if not isinstance(source_servers, dict) and isinstance(source_payload.get("mcp"), dict):
+                    source_servers = source_payload["mcp"].get("servers")
+                if not isinstance(source_servers, dict):
+                    continue
+                for selected_name in selected_names:
+                    if isinstance(selected_name, str) and isinstance(source_servers.get(selected_name), dict):
+                        selected_servers[selected_name] = dict(source_servers[selected_name])
+            raw_servers = selected_servers
+        if isinstance(raw_servers, dict) and isinstance(raw_servers.get("mcpServers"), dict):
+            raw_servers = raw_servers["mcpServers"]
+        if not isinstance(raw_servers, dict):
+            raise HTTPException(status_code=400, detail="MCP 导入内容必须是服务对象")
+        imported: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for name, raw_config in raw_servers.items():
+            if not isinstance(raw_config, dict):
+                failed.append({"name": str(name), "status": "failed", "reason": "配置必须是对象"})
+                continue
+            try:
+                config = dict(raw_config)
+                normalized_scope, registry = _mcp_registry_for_scope(payload.get("scope"))
+                config["scope"] = normalized_scope
+                await registry.create(str(name), config)
+                imported.append({"name": str(name), "status": "imported"})
+            except ValueError as error:
+                if "已存在" in str(error):
+                    skipped.append({"name": str(name), "status": "skipped", "reason": "same_name_exists"})
+                else:
+                    failed.append({"name": str(name), "status": "failed", "reason": str(error)})
+            except Exception as error:
+                failed.append({"name": str(name), "status": "failed", "reason": str(error)})
+        return {
+            "imported": imported,
+            "skipped": skipped,
+            "failed": failed,
+            "success_count": len(imported),
+            "skipped_count": len(skipped),
+            "failed_count": len(failed),
+        }
+
     @app.delete("/api/extensions/mcp/{server_name}", status_code=204)
-    async def delete_mcp_extension(server_name: str) -> Response:
-        message = await application.core.mcp_registry.remove(server_name)
+    async def delete_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None)) -> Response:
+        found = _find_mcp_record(server_name, scope)
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        _normalized_scope, registry, _old_record = found
+        try:
+            message = await registry.remove(server_name, expected_revision=_parse_revision(revision))
+        except McpRevisionConflict as error:
+            _raise_mcp_conflict(error)
         if "不存在" in message:
             raise HTTPException(status_code=404, detail=message)
         return Response(status_code=204)
