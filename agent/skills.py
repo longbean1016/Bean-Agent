@@ -155,6 +155,104 @@ class SkillRecord:
     enabled: bool = True
 
 
+class SkillSnapshotView:
+    """基于会话快照的只读 Skill 视图。
+
+    快照保存正文而不是只保存文件路径，确保磁盘上的文件被修改或删除后，
+    已有会话仍然能够重放创建快照时的内容。视图只实现 Prompt 所需的窄接口，
+    不把管理操作和运行时上下文耦合在一起。
+    """
+
+    def __init__(self, snapshot: dict[str, Any]) -> None:
+        self.revision = str(snapshot.get("revision") or "")
+        records: list[SkillRecord] = []
+        raw_records = snapshot.get("skills")
+        if not isinstance(raw_records, list):
+            raw_records = []
+        for raw in raw_records:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            content = str(raw.get("content") or "")
+            if not name:
+                continue
+            records.append(
+                SkillRecord(
+                    name=name,
+                    source=str(raw.get("source") or "unknown"),
+                    source_id=str(raw.get("source_id") or ""),
+                    root_dir=Path(str(raw.get("root_dir") or "")),
+                    skill_file=Path(str(raw.get("skill_file") or "")),
+                    content=content,
+                    description=str(raw.get("description") or name),
+                    when_to_use=str(raw.get("when_to_use") or ""),
+                    always=bool(raw.get("always")),
+                    available=bool(raw.get("available", False)),
+                    missing=str(raw.get("missing") or ""),
+                    scope=str(raw.get("scope") or "project"),
+                    version=str(raw.get("version") or "") or None,
+                    plugin_name=str(raw.get("plugin_name") or "") or None,
+                    status=str(raw.get("status") or "unknown"),
+                    diagnostics=tuple(str(item) for item in raw.get("diagnostics", []) if str(item)),
+                    revision=int(raw.get("record_revision", 1) or 1),
+                    enabled=bool(raw.get("enabled", True)),
+                )
+            )
+        self._records = tuple(sorted(records, key=lambda item: item.name))
+
+    def list_skill_records(self, *, filter_unavailable: bool = True, scope: str | None = None) -> list[SkillRecord]:
+        records = list(self._records)
+        if scope in {"user", "workspace", "project"}:
+            records = [record for record in records if record.scope in {scope, "workspace" if scope == "project" else scope}]
+        if filter_unavailable:
+            records = [record for record in records if record.available and record.enabled]
+        return records
+
+    def load_skill_record(self, name: str) -> SkillRecord | None:
+        return next((record for record in self._records if record.name == str(name).strip()), None)
+
+    def load_skill_body(self, name: str) -> str | None:
+        record = self.load_skill_record(name)
+        if record is None or not record.available or not record.enabled:
+            return None
+        return SkillsLoader._strip_frontmatter(record.content)
+
+    def get_always_skills(self) -> list[str]:
+        return [record.name for record in self.list_skill_records() if record.always]
+
+    def load_skills_for_context(self, names: list[str]) -> str:
+        parts: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            body = self.load_skill_body(name)
+            if body:
+                parts.append(f"### Skill: {name}\n\n{body}")
+        return "\n\n---\n\n".join(parts)
+
+    def build_skills_summary(self) -> str:
+        records = self.list_skill_records(filter_unavailable=False)
+        if not records:
+            return ""
+        lines = ["<skills>"]
+        for record in records:
+            lines.append(
+                f'  <skill name="{SkillsLoader._escape_xml(record.name)}" '
+                f'available="{str(record.available).lower()}" '
+                f'source="{SkillsLoader._escape_xml(record.source)}">'
+            )
+            lines.append(f"    <description>{SkillsLoader._escape_xml(record.description)}</description>")
+            if record.when_to_use:
+                lines.append(f"    <when_to_use>{SkillsLoader._escape_xml(record.when_to_use)}</when_to_use>")
+            if not record.available and record.missing:
+                lines.append(f"    <requires>{SkillsLoader._escape_xml(record.missing)}</requires>")
+            lines.append("  </skill>")
+        lines.append("</skills>")
+        return "\n".join(lines)
+
+
 class SkillsLoader:
     """扫描并读取工作区 ``skills/*/SKILL.md``。
 
@@ -201,6 +299,68 @@ class SkillsLoader:
         if filter_unavailable:
             return [record for record in records if record.available and record.enabled]
         return records
+
+    def for_workspace(self, workspace_path: str | Path) -> "SkillsLoader":
+        """为已注册项目创建独立索引，复用全局来源配置但不共享项目路径状态。"""
+
+        return SkillsLoader(
+            Path(workspace_path).expanduser().resolve(),
+            builtin_skills_dir=self.builtin_skills_dir,
+            user_skills_dir=self.user_skills_dir,
+            plugin_skill_roots=self.plugin_skill_roots,
+        )
+
+    def directory_revision(self) -> str:
+        """返回规范化目录 revision，文件遍历顺序不会造成无意义变化。"""
+
+        digest = hashlib.sha256()
+        for record in self.list_skill_records(filter_unavailable=False):
+            digest.update(record.name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(record.source.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(hashlib.sha256(record.content.encode("utf-8")).digest())
+            digest.update(str(record.enabled).encode("ascii"))
+            digest.update(b"\0")
+            digest.update("|".join(record.diagnostics).encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def create_snapshot(self) -> dict[str, Any]:
+        """创建可持久化会话快照；正文随快照保存以隔离后续磁盘变化。"""
+
+        records = self.list_skill_records(filter_unavailable=False)
+        return {
+            "schema": 1,
+            "revision": self.directory_revision(),
+            "skills": [
+                {
+                    "name": record.name,
+                    "source": record.source,
+                    "source_id": record.source_id,
+                    "scope": "project" if record.scope == "workspace" and record.source == "workspace" else record.scope,
+                    "root_dir": str(record.root_dir),
+                    "skill_file": str(record.skill_file),
+                    "content": record.content,
+                    "description": record.description,
+                    "when_to_use": record.when_to_use,
+                    "always": record.always,
+                    "available": record.available,
+                    "missing": record.missing,
+                    "version": record.version,
+                    "plugin_name": record.plugin_name,
+                    "status": record.status,
+                    "diagnostics": list(record.diagnostics),
+                    "record_revision": record.revision,
+                    "enabled": record.enabled,
+                }
+                for record in records
+            ],
+        }
+
+    @staticmethod
+    def from_snapshot(snapshot: dict[str, Any]) -> SkillSnapshotView:
+        return SkillSnapshotView(snapshot)
 
     def get_skill_record(self, name: str, *, scope: str = "workspace") -> SkillRecord | None:
         return next(
@@ -419,7 +579,7 @@ class SkillsLoader:
                 scope="workspace",
                 plugin_name=plugin_name,
             ):
-                records.setdefault(f"plugin:{plugin_name}:{record.name}", record)
+                records.setdefault(record.name, record)
         if self.builtin_skills_dir is not None:
             for record in self._scan_skills_dir(
                 self.builtin_skills_dir,
@@ -675,4 +835,4 @@ class SkillsLoader:
         )
 
 
-__all__ = ["SkillRecord", "SkillRevisionConflict", "SkillsLoader", "collect_skill_mentions", "seed_builtin_skills"]
+__all__ = ["SkillRecord", "SkillRevisionConflict", "SkillSnapshotView", "SkillsLoader", "collect_skill_mentions", "seed_builtin_skills"]

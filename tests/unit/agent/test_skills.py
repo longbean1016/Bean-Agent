@@ -193,3 +193,24 @@ def test_seed_builtin_skills_is_idempotent_and_does_not_overwrite_user_file(tmp_
     assert "用户修改" in target.read_text(encoding="utf-8")
     manifest = user.parent / "skills-seed-manifest.json"
     assert manifest.is_file()
+
+
+def test_loader_can_switch_registered_project_and_create_immutable_snapshot(tmp_path: Path) -> None:
+    user = tmp_path / "user"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_skill(user, "shared", description="用户版本", body="用户正文")
+    _write_skill(first / "skills", "project", description="项目一", body="项目一正文")
+    _write_skill(second / "skills", "project", description="项目二", body="项目二正文")
+    loader = SkillsLoader(first, builtin_skills_dir=None, user_skills_dir=user)
+
+    assert loader.for_workspace(second).load_skill_body("project") == "项目二正文"
+    snapshot = loader.create_snapshot()
+    revision = loader.directory_revision()
+    (first / "skills" / "project" / "SKILL.md").write_text(
+        "---\nname: project\ndescription: 已修改\n---\n新正文\n",
+        encoding="utf-8",
+    )
+    frozen = SkillsLoader.from_snapshot(snapshot)
+    assert frozen.load_skill_body("project") == "项目一正文"
+    assert snapshot["revision"] == revision
