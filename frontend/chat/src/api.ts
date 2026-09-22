@@ -332,6 +332,47 @@ export async function fetchSkillExtensions(scope: ExtensionScope): Promise<Skill
   return payload.items ?? [];
 }
 
+export async function fetchSkillDetail(id: string, scope: ExtensionScope): Promise<SkillExtensionRecord & { content?: string; diagnostics?: string[] }> {
+  const name = id.includes(":") ? id.slice(id.indexOf(":") + 1) : id;
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}`);
+  const result = await response.json().catch(() => ({})) as SkillExtensionRecord & { detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法加载 Skill 详情");
+  return result;
+}
+
+export async function createSkillExtension(payload: { name: string; scope: ExtensionScope; content: string }): Promise<void> {
+  const response = await fetch("/api/extensions/skills", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+  const result = await response.json().catch(() => ({})) as { detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法创建 Skill");
+}
+
+export async function updateSkillExtension(name: string, scope: ExtensionScope, content: string, revision?: number): Promise<void> {
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, content, revision }) });
+  const result = await response.json().catch(() => ({})) as { detail?: string };
+  if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "无法更新 Skill");
+}
+
+export async function setSkillEnabled(name: string, scope: ExtensionScope, enabled: boolean): Promise<void> {
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}/${enabled ? "enable" : "disable"}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope }) });
+  if (!response.ok) throw new Error("无法更新 Skill 状态");
+}
+
+export async function refreshSkillExtension(name: string, scope: ExtensionScope): Promise<void> {
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}/refresh`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope }) });
+  if (!response.ok) throw new Error("无法刷新 Skill");
+}
+
+export async function removeSkillExtension(name: string, scope: ExtensionScope): Promise<void> {
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}`, { method: "DELETE" });
+  if (!response.ok) throw new Error("无法删除 Skill");
+}
+
+export async function importSkillExtension(payload: { scope: ExtensionScope; type: "directory" | "git"; path?: string; url?: string; revision?: string; mode?: "copy" | "symlink" }): Promise<void> {
+  const response = await fetch("/api/extensions/skills/import", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+  const result = await response.json().catch(() => ({})) as { failed?: Array<{ reason?: string }> };
+  if (!response.ok || result.failed?.length) throw new Error(result.failed?.[0]?.reason || "无法导入 Skill");
+}
+
 class SettingsRequestError extends Error {
   readonly status: number;
 
