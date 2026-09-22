@@ -229,7 +229,8 @@ class SkillSnapshotView:
     def list_skill_records(self, *, filter_unavailable: bool = True, scope: str | None = None) -> list[SkillRecord]:
         records = list(self._records)
         if scope in {"user", "workspace", "project"}:
-            records = [record for record in records if record.scope in {scope, "workspace" if scope == "project" else scope}]
+            wanted_scope = "project" if scope == "workspace" else scope
+            records = [record for record in records if record.scope == wanted_scope]
         if filter_unavailable:
             records = [record for record in records if record.available and record.enabled]
         return records
