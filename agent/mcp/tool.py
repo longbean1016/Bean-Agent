@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent.mcp.client import McpClient, McpToolInfo
+from agent.mcp.client import McpToolInfo
 from tools.base import Tool
 
 
@@ -13,7 +13,7 @@ class McpToolWrapper(Tool):
 
     def __init__(
         self,
-        client: McpClient,
+        client: Any,
         info: McpToolInfo,
         *,
         server_name: str | None = None,
@@ -35,7 +35,16 @@ class McpToolWrapper(Tool):
         return self._info.input_schema
 
     async def execute(self, **kwargs: Any) -> str:
-        return await self._client.call(self._info.name, kwargs)
+        try:
+            return await self._client.call(self._info.name, kwargs)
+        except Exception:
+            # 远端连接可能在工具调用前断开；只允许一次受控重连，避免模型
+            # 调用触发无限重试。若客户端不支持重连则沿用原始异常。
+            reconnect = getattr(self._client, "reconnect", None)
+            if not callable(reconnect):
+                raise
+            await reconnect()
+            return await self._client.call(self._info.name, kwargs)
 
 
 __all__ = ["McpToolWrapper"]
