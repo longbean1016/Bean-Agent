@@ -1557,6 +1557,39 @@ def create_fastapi_app(
         skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
         mode = str(payload.get("mode") or "copy")
         imported: list[dict[str, Any]] = []
+        selections = payload.get("selections")
+        if isinstance(selections, list):
+            discovered = {
+                str(source.get("id")): source
+                for source in _discover_skill_sources(payload.get("workspace_id"))
+                if isinstance(source, dict)
+            }
+            skipped: list[dict[str, Any]] = []
+            failed: list[dict[str, Any]] = []
+            for selection in selections:
+                if not isinstance(selection, dict):
+                    failed.append({"name": "unknown", "status": "failed", "reason": "导入选择格式无效"})
+                    continue
+                source = discovered.get(str(selection.get("source_id") or ""))
+                names = selection.get("names") if isinstance(selection.get("names"), list) else []
+                candidates = {str(item.get("name")): item for item in (source or {}).get("candidates", []) if isinstance(item, dict)}
+                for raw_name in names:
+                    name = str(raw_name or "").strip()
+                    candidate = candidates.get(name)
+                    if candidate is None:
+                        failed.append({"name": name or "unknown", "status": "failed", "reason": "来源中不存在该 Skill"})
+                        continue
+                    try:
+                        records = await asyncio.to_thread(skill_loader.install_directory, str(candidate.get("path") or ""), scope, mode=mode, name=name)
+                        imported.extend({"name": record.name, "status": "imported", "scope": "project" if record.scope == "workspace" else record.scope} for record in records)
+                    except ValueError as error:
+                        if "已存在" in str(error):
+                            skipped.append({"name": name, "status": "skipped", "reason": str(error)})
+                        else:
+                            failed.append({"name": name, "status": "failed", "reason": str(error)})
+                    except (RuntimeError, OSError) as error:
+                        failed.append({"name": name, "status": "failed", "reason": str(error)})
+            return {"imported": imported, "skipped": skipped, "failed": failed, "success_count": len(imported), "skipped_count": len(skipped), "failed_count": len(failed)}
         try:
             if payload.get("type") == "git" or payload.get("url"):
                 records = await asyncio.to_thread(skill_loader.install_git, str(payload.get("url") or ""), scope, revision=payload.get("revision"), mode=mode)
@@ -1567,13 +1600,55 @@ def create_fastapi_app(
             return {"imported": imported, "skipped": [], "failed": [{"name": str(payload.get("name") or payload.get("url") or payload.get("path") or "skill"), "status": "failed", "reason": str(error)}]}
         return {"imported": imported, "skipped": [], "failed": []}
 
-    @app.post("/api/extensions/skills/discover")
-    def discover_skill_sources(workspace_id: str | None = Query(None)) -> dict[str, Any]:
+    def _discover_skill_sources(workspace_id: str | None = None) -> list[dict[str, Any]]:
         skill_loader = _skills_loader_for_request(workspace_id)
-        roots: list[dict[str, Any]] = [{"id": "project", "scope": "project", "path": str(skill_loader.skills_dir)}]
+        roots: list[tuple[str, str, Path]] = [("project", "project", skill_loader.skills_dir)]
         if application.core.skills.user_skills_dir is not None:
-            roots.append({"id": "user", "scope": "user", "path": str(application.core.skills.user_skills_dir)})
-        return {"sources": [{**root, "exists": Path(root["path"]).is_dir()} for root in roots]}
+            roots.append(("beanagent-user", "user", application.core.skills.user_skills_dir))
+        # 只读取常见 Agent 的 Skills 根目录摘要，不执行其中的脚本或读取其他配置。
+        roots.extend([
+            ("codex-user", "external", Path.home() / ".codex" / "skills"),
+            ("claude-user", "external", Path.home() / ".claude" / "skills"),
+            ("cursor-user", "external", Path.home() / ".cursor" / "skills"),
+        ])
+        seen: set[str] = set()
+        sources: list[dict[str, Any]] = []
+        for source_id, source_scope, root in roots:
+            resolved = root.expanduser().resolve()
+            key = str(resolved).casefold()
+            if key in seen or not resolved.is_dir():
+                continue
+            seen.add(key)
+            candidates: list[dict[str, Any]] = []
+            for directory in sorted(resolved.iterdir(), key=lambda item: item.name):
+                skill_file = directory / "SKILL.md"
+                if not directory.is_dir() or directory.is_symlink() or not skill_file.is_file() or skill_file.is_symlink():
+                    continue
+                try:
+                    parsed = SkillsLoader(resolved.parent, builtin_skills_dir=None).get_skill_record(directory.name, scope="workspace")
+                    candidates.append({
+                        "name": str(parsed.name if parsed else directory.name),
+                        "description": str(parsed.description if parsed else ""),
+                        "path": str(directory),
+                        "available": bool(parsed.available) if parsed else True,
+                    })
+                except (OSError, UnicodeError):
+                    continue
+            if candidates:
+                sources.append({
+                    "id": f"{source_id}:{key}",
+                    "agent": source_id,
+                    "scope": source_scope,
+                    "path": str(resolved),
+                    "candidates": candidates,
+                    "skill_count": len(candidates),
+                })
+        return sources
+
+    @app.get("/api/extensions/skills/discover")
+    def discover_skill_sources(workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        sources = _discover_skill_sources(workspace_id)
+        return {"sources": sources, "source_count": len(sources), "skill_count": sum(int(item["skill_count"]) for item in sources)}
 
     @app.delete("/api/extensions/skills/{skill_name}", status_code=204)
     async def delete_skill_extension(

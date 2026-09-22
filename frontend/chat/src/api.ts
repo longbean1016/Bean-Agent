@@ -377,6 +377,30 @@ export async function importSkillExtension(payload: { scope: ExtensionScope; typ
   if (!response.ok || result.failed?.length) throw new Error(result.failed?.[0]?.reason || "无法导入 Skill");
 }
 
+export interface DiscoveredSkillSource {
+  id: string;
+  agent: string;
+  scope: string;
+  path: string;
+  skill_count: number;
+  candidates: Array<{ name: string; description: string; path: string; available: boolean }>;
+}
+
+export async function discoverSkillSources(workspaceId?: string | null): Promise<DiscoveredSkillSource[]> {
+  const query = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/skills/discover${query}`);
+  const result = await response.json().catch(() => ({})) as { sources?: DiscoveredSkillSource[]; detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法发现外部技能");
+  return Array.isArray(result.sources) ? result.sources : [];
+}
+
+export async function importSkillSelections(scope: ExtensionScope, selections: Array<{ source_id: string; names: string[] }>, workspaceId?: string | null): Promise<{ imported: unknown[]; skipped: unknown[]; failed: Array<{ reason?: string }> }> {
+  const response = await fetch("/api/extensions/skills/import", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, selections, workspace_id: workspaceId }) });
+  const result = await response.json().catch(() => ({})) as { imported?: unknown[]; skipped?: unknown[]; failed?: Array<{ reason?: string }>; detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法批量导入 Skill");
+  return { imported: result.imported || [], skipped: result.skipped || [], failed: result.failed || [] };
+}
+
 export async function fetchSkillRevision(workspaceId?: string | null): Promise<string> {
   const query = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : "";
   const response = await fetch(`/api/extensions/skills/revision${query}`);

@@ -224,6 +224,11 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .skill-source-group-header strong { color: var(--text); }
 .skill-source-group-header span { margin-left: auto; }
 .extension-detail-meta { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 8px 0 12px; color: var(--text-muted); font-size: 12px; }
+.skill-import-source { display: grid; gap: 6px; max-height: 190px; overflow: auto; padding: 9px; border: 1px solid var(--border); border-radius: 8px; }
+.skill-import-source > header { display: flex; align-items: center; justify-content: space-between; }
+.skill-import-source > label { display: flex; align-items: flex-start; gap: 8px; }
+.skill-import-source > label span { display: grid; gap: 2px; }
+.skill-import-source > label small { color: var(--text-muted); }
 .extension-row-copy { min-width: 0; }
 .extension-row-actions { display: flex; align-items: center; gap: 3px; }
 .extension-row-copy strong { display: block; overflow: hidden; color: var(--text-strong); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
