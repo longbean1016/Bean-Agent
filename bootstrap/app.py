@@ -1437,7 +1437,7 @@ def create_fastapi_app(
             }
             for record in records
         ]
-        return {"items": items, "scope": "project" if normalized_scope == "workspace" else normalized_scope, "revision": skill_loader.directory_revision()}
+        return {"items": items, "scope": "project" if normalized_scope == "workspace" else normalized_scope, "revision": skill_loader.directory_revision(scope=normalized_scope)}
 
     @app.get("/api/extensions/skills/revision")
     def get_skill_revision(workspace_id: str | None = Query(None)) -> dict[str, str]:

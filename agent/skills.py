@@ -337,11 +337,11 @@ class SkillsLoader:
             plugin_skill_roots=self.plugin_skill_roots,
         )
 
-    def directory_revision(self) -> str:
+    def directory_revision(self, *, scope: str | None = None) -> str:
         """返回规范化目录 revision，文件遍历顺序不会造成无意义变化。"""
 
         digest = hashlib.sha256()
-        for record in self.list_skill_records(filter_unavailable=False):
+        for record in self.list_skill_records(filter_unavailable=False, scope=scope):
             digest.update(record.name.encode("utf-8"))
             digest.update(b"\0")
             digest.update(record.source.encode("utf-8"))
