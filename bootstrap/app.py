@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import mimetypes
 import logging
 from datetime import datetime
@@ -294,6 +295,7 @@ class CoreRuntime:
     memory: MemoryEngine | None
     tools: ToolRegistry
     mcp_registry: McpServerRegistry
+    skills: SkillsLoader
     message_bus: MessageBus
     event_bus: EventBus
     assembler: PromptAssembler
@@ -621,6 +623,7 @@ def build_core_runtime(
         memory=memory,
         tools=tools,
         mcp_registry=mcp_registry,
+        skills=skills,
         message_bus=messages,
         event_bus=events,
         assembler=assembler,
@@ -981,6 +984,97 @@ def create_fastapi_app(
     async def update_model_catalog() -> dict[str, Any]:
         return await settings.update_catalog()
 
+    @app.get("/api/extensions/plugins")
+    def list_plugin_extensions(scope: str = Query("workspace")) -> dict[str, Any]:
+        normalized_scope = scope if scope in {"user", "workspace"} else "workspace"
+        root = application.core.workspace / "plugins"
+        items: list[dict[str, Any]] = []
+        if normalized_scope == "workspace" and root.is_dir():
+            for directory in sorted(root.iterdir(), key=lambda item: item.name):
+                manifest_path = directory / "plugin.json"
+                if not directory.is_dir() or not manifest_path.is_file():
+                    continue
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    manifest = {}
+                if not isinstance(manifest, dict):
+                    manifest = {}
+                items.append({
+                    "id": directory.name,
+                    "name": str(manifest.get("name") or directory.name),
+                    "description": str(manifest.get("description") or "本地扩展插件"),
+                    "version": str(manifest.get("version") or "0.0.0"),
+                    "source": "workspace",
+                    "scope": normalized_scope,
+                    "status": "installed",
+                    "enabled": True,
+                    "skills_count": len(manifest.get("skills") or []) if isinstance(manifest.get("skills"), list) else 0,
+                    "mcp_count": len(manifest.get("mcp") or manifest.get("mcpServers") or []) if isinstance(manifest.get("mcp") or manifest.get("mcpServers"), list) else 0,
+                    "commands_count": len(manifest.get("commands") or []) if isinstance(manifest.get("commands"), list) else 0,
+                })
+        return {"items": items, "scope": normalized_scope}
+
+    @app.get("/api/extensions/mcp")
+    def list_mcp_extensions(scope: str = Query("workspace")) -> dict[str, Any]:
+        normalized_scope = scope if scope in {"user", "workspace"} else "workspace"
+        items = application.core.mcp_registry.list_server_records(scope=normalized_scope)
+        if normalized_scope == "user":
+            items = []
+        return {"items": items, "scope": normalized_scope}
+
+    @app.post("/api/extensions/mcp", status_code=201)
+    async def create_mcp_extension(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        name = str(payload.get("name") or "").strip()
+        command = payload.get("command")
+        if isinstance(command, str):
+            command = [part for part in command.split() if part]
+        env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
+        cwd = str(payload.get("cwd") or "").strip() or None
+        if not name or not isinstance(command, list):
+            raise HTTPException(status_code=400, detail="MCP 名称和启动命令不能为空")
+        message = await application.core.mcp_registry.add(name, command, env=env, cwd=cwd)
+        if not message.startswith("已连接 MCP server"):
+            raise HTTPException(status_code=400, detail=message)
+        record = next(
+            (item for item in application.core.mcp_registry.list_server_records() if item["id"] == name),
+            None,
+        )
+        if record is None:
+            raise HTTPException(status_code=500, detail="MCP 已连接但无法读取服务摘要")
+        return record
+
+    @app.delete("/api/extensions/mcp/{server_name}", status_code=204)
+    async def delete_mcp_extension(server_name: str) -> Response:
+        message = await application.core.mcp_registry.remove(server_name)
+        if "不存在" in message:
+            raise HTTPException(status_code=404, detail=message)
+        return Response(status_code=204)
+
+    @app.get("/api/extensions/skills")
+    def list_skill_extensions(scope: str = Query("workspace")) -> dict[str, Any]:
+        normalized_scope = scope if scope in {"user", "workspace"} else "workspace"
+        source = "workspace" if normalized_scope == "workspace" else "builtin"
+        records = application.core.skills.list_skill_records(filter_unavailable=False)
+        items = [
+            {
+                "id": f"{record.source}:{record.name}",
+                "name": record.name,
+                "description": record.description,
+                "source": record.source,
+                "scope": normalized_scope,
+                "available": record.available,
+                "enabled": record.available,
+                "always": record.always,
+                "missing": record.missing,
+                "plugin_name": None,
+                "version": None,
+            }
+            for record in records
+            if record.source == source
+        ]
+        return {"items": items, "scope": normalized_scope}
+
     @app.get("/", response_model=None)
     def chat_index() -> FileResponse | dict[str, str]:
         if index_file.is_file():
@@ -999,6 +1093,16 @@ def create_fastapi_app(
     def model_settings_index() -> FileResponse | dict[str, str]:
         """模型设置是独立前端路由，直接访问或刷新时返回 SPA 入口。"""
 
+        if index_file.is_file():
+            return FileResponse(index_file)
+        return {"status": "ok", "message": "聊天前端尚未构建，请运行 npm run build"}
+
+    @app.get("/extensions/{extension_kind}", response_model=None)
+    def extension_index(extension_kind: str) -> FileResponse | dict[str, str]:
+        """扩展管理页面使用同一 SPA 入口，支持直接访问和刷新。"""
+
+        if extension_kind not in {"plugins", "mcp", "skills"}:
+            raise HTTPException(status_code=404, detail="扩展页面不存在")
         if index_file.is_file():
             return FileResponse(index_file)
         return {"status": "ok", "message": "聊天前端尚未构建，请运行 npm run build"}

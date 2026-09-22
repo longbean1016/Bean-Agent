@@ -135,6 +135,36 @@ class McpServerRegistry:
     def connected_server_names(self) -> set[str]:
         return set(self._clients)
 
+    def list_server_records(self, *, scope: str = "workspace") -> list[dict[str, Any]]:
+        """返回扩展管理页使用的脱敏 MCP 摘要，不暴露环境变量值和完整命令。"""
+
+        records: list[dict[str, Any]] = []
+        configurations = self._load_raw_configs()
+        names = sorted(set(configurations) | set(self._clients))
+        for name in names:
+            config = configurations.get(name, {})
+            client = self._clients.get(name)
+            command = list(getattr(client, "command", None) or config.get("command") or [])
+            cwd = getattr(client, "cwd", None) or str(config.get("cwd") or "") or None
+            env = dict(getattr(client, "env", None) or config.get("env") or {})
+            connected = name in self._clients
+            records.append({
+                "id": name,
+                "name": name,
+                "description": "本地 MCP 工具服务",
+                "scope": scope,
+                "transport": "stdio",
+                "status": "connected" if connected else "disconnected",
+                "enabled": connected,
+                "tool_count": len(self._server_tools.get(name, [])),
+                "command": " ".join(command[:3]) if command else "",
+                "cwd": cwd,
+                "env_names": sorted(str(key) for key in env),
+                "tools": list(self._server_tools.get(name, [])),
+                "error": None,
+            })
+        return records
+
     async def shutdown(self) -> None:
         """幂等释放全部工具与子进程，配置保留供下次启动恢复。"""
 
