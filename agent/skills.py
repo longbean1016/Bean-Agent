@@ -185,7 +185,7 @@ class SkillsLoader:
         if mode not in {"copy", "symlink"}:
             raise ValueError("不支持的 Skill 安装模式")
         scope_root = self._scope_root(scope).resolve()
-        if source_path == scope_root or scope_root.is_relative_to(source_path):
+        if source_path == scope_root or source_path.is_relative_to(scope_root) or scope_root.is_relative_to(source_path):
             raise ValueError("Skill 来源目录不能位于安装目标目录内")
         candidates = [source_path] if (source_path / "SKILL.md").is_file() else [item for item in sorted(source_path.iterdir()) if item.is_dir() and (item / "SKILL.md").is_file()]
         if name and len(candidates) != 1:
@@ -198,6 +198,8 @@ class SkillsLoader:
                 raise ValueError(f"Skill 已存在: {skill_name}")
             if candidate.is_symlink() or (candidate / "SKILL.md").is_symlink():
                 raise ValueError("Skill 来源不能通过符号链接安装")
+            if any(item.is_symlink() for item in candidate.rglob("*")):
+                raise ValueError("Skill 来源包含未校验的符号链接")
             if mode == "symlink":
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.symlink_to(candidate, target_is_directory=True)
@@ -462,7 +464,7 @@ class SkillsLoader:
         if scope == "user" and self.user_skills_dir is None:
             raise ValueError("用户级 Skill 目录未配置")
         path = self._state_paths[1 if scope == "user" and len(self._state_paths) > 1 else 0]
-        state = self._read_state()
+        state = self._read_state_file(path)
         key = self._state_key(name, scope)
         if enabled is None:
             state.pop(key, None)
@@ -481,7 +483,7 @@ class SkillsLoader:
         if scope == "user" and self.user_skills_dir is None:
             raise ValueError("用户级 Skill 目录未配置")
         path = self._state_paths[1 if scope == "user" and len(self._state_paths) > 1 else 0]
-        state = self._read_state()
+        state = self._read_state_file(path)
         key = self._state_key(name, scope)
         current = state.get(key) if isinstance(state.get(key), dict) else {}
         state[key] = {
@@ -495,6 +497,14 @@ class SkillsLoader:
     @staticmethod
     def _state_key(name: str, scope: str) -> str:
         return f"{scope}:{name}"
+
+    @staticmethod
+    def _read_state_file(path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
     @staticmethod
     def _validate_name(name: str) -> str:
