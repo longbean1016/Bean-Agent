@@ -166,6 +166,19 @@ def test_invalid_skill_is_visible_with_diagnostics(tmp_path: Path) -> None:
     assert record.diagnostics
 
 
+def test_skill_diagnostics_expose_machine_readable_codes(tmp_path: Path) -> None:
+    directory = tmp_path / "skills" / "needs-diagnostics"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text("正文但没有 frontmatter", encoding="utf-8")
+
+    record = SkillsLoader(tmp_path, builtin_skills_dir=None).get_skill_record("needs-diagnostics")
+
+    assert record is not None
+    assert "missing_frontmatter" in record.diagnostics
+    assert "missing_description" in record.diagnostics
+    assert record.status == "invalid"
+
+
 def test_scope_priority_and_plugin_group(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     user = tmp_path / "user"
