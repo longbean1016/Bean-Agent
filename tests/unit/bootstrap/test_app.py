@@ -338,6 +338,35 @@ def test_default_skill_api_supports_diff_update_restore_and_conflict(tmp_path: P
         assert "正文二" in target.read_text(encoding="utf-8")
 
 
+def test_skill_update_api_rejects_builtin_and_plugin_sources(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    builtin_file = tmp_path / "builtin" / "readonly" / "SKILL.md"
+    plugin_file = workspace / "plugins" / "demo" / "skills" / "plugin-readonly" / "SKILL.md"
+    builtin_file.parent.mkdir(parents=True)
+    plugin_file.parent.mkdir(parents=True)
+    builtin_file.write_text("---\nname: readonly\ndescription: builtin\n---\nbody\n", encoding="utf-8")
+    plugin_file.write_text("---\nname: plugin-readonly\ndescription: plugin\n---\nbody\n", encoding="utf-8")
+    runtime = build_core_runtime(config, workspace, provider=Provider())
+    runtime.skills.builtin_skills_dir = (tmp_path / "builtin").resolve()
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        builtin = client.put(
+            "/api/extensions/skills/readonly",
+            json={"scope": "user", "content": "---\nname: readonly\ndescription: changed\n---\nbody"},
+        )
+        plugin = client.put(
+            "/api/extensions/skills/plugin-readonly",
+            json={"scope": "workspace", "content": "---\nname: plugin-readonly\ndescription: changed\n---\nbody"},
+        )
+
+    assert builtin.status_code == 400
+    assert plugin.status_code == 400
+    assert "changed" not in builtin_file.read_text(encoding="utf-8")
+    assert "changed" not in plugin_file.read_text(encoding="utf-8")
+
+
 def test_chat_session_route_returns_spa_index_or_build_hint(tmp_path: Path) -> None:
     config = Config()
     config.memory.enabled = False

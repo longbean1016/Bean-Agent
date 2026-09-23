@@ -566,6 +566,8 @@ class SkillsLoader:
         record = self.get_skill_record(name, scope=scope)
         if record is None:
             raise KeyError(f"Skill 不存在: {name}")
+        if record.source not in {"workspace", "user"}:
+            raise PermissionError("内置或插件 Skill 只能查看，不能直接编辑")
         if expected_revision is not None and expected_revision != record.revision:
             raise SkillRevisionConflict(expected_revision, record.revision)
         self._validate_content(content)
@@ -583,10 +585,19 @@ class SkillsLoader:
         if record.source in {"builtin", "plugin"}:
             raise PermissionError("只允许删除用户或工作区 Skill")
         scope_root = self._scope_root(scope).resolve()
-        target = record.root_dir.resolve()
-        if target.parent != scope_root:
+        target_path = self._scope_root(scope) / self._validate_name(name)
+        if target_path.parent.resolve() != scope_root:
             raise PermissionError("Skill 目录不在受管理的作用域内")
-        shutil.rmtree(record.root_dir)
+        if target_path.is_symlink():
+            if self._managed_symlink_target(target_path, scope) is None:
+                raise PermissionError("拒绝删除未登记的符号链接 Skill")
+            target_path.unlink()
+            self._unregister_managed_symlink(name, scope)
+        else:
+            target = record.root_dir.resolve()
+            if target.parent != scope_root:
+                raise PermissionError("Skill 目录不在受管理的作用域内")
+            shutil.rmtree(record.root_dir)
         self._set_enabled(name, scope, None)
 
     def set_skill_enabled(self, name: str, scope: str, enabled: bool) -> SkillRecord:
@@ -617,7 +628,7 @@ class SkillsLoader:
         for candidate in candidates:
             skill_name = self._validate_name(name if name else candidate.name)
             target = self._scope_root(scope) / skill_name
-            if target.exists():
+            if target.exists() or target.is_symlink():
                 raise ValueError(f"Skill 已存在: {skill_name}")
             if candidate.is_symlink() or (candidate / "SKILL.md").is_symlink():
                 raise ValueError("Skill 来源不能通过符号链接安装")
@@ -625,12 +636,24 @@ class SkillsLoader:
                 raise ValueError("Skill 来源包含未校验的符号链接")
             if mode == "symlink":
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.symlink_to(candidate, target_is_directory=True)
+                try:
+                    target.symlink_to(candidate, target_is_directory=True)
+                    self._register_managed_symlink(skill_name, scope, candidate)
+                except (OSError, ValueError):
+                    if target.is_symlink():
+                        target.unlink()
+                    raise
             else:
                 shutil.copytree(candidate, target, symlinks=False)
             record = self.get_skill_record(skill_name, scope=scope)
             if record is not None:
                 installed.append(record)
+            elif mode == "symlink":
+                # 注册后仍无法读取说明链接目标在安装窗口内发生变化，必须回滚，
+                # 不能留下页面不可见但占用目标名称的半成品。
+                if target.is_symlink():
+                    target.unlink()
+                self._unregister_managed_symlink(skill_name, scope)
         if not installed:
             raise ValueError("来源目录中未发现包含 SKILL.md 的 Skill")
         return installed
@@ -864,8 +887,14 @@ class SkillsLoader:
             return []
         records: list[SkillRecord] = []
         for skill_dir in sorted(skills_dir.iterdir(), key=lambda item: item.name):
-            # 符号链接即使当前目标仍在 workspace 内也不读取，避免目标后来被替换后越界。
-            if (reject_symlinks and skill_dir.is_symlink()) or not skill_dir.is_dir():
+            is_managed_link = (
+                skill_dir.is_symlink()
+                and source in {"workspace", "user"}
+                and self._managed_symlink_target(skill_dir, scope) is not None
+            )
+            # 只允许安装流程登记且目标仍完全匹配的链接。手工放入、目标被替换
+            # 或内部新增链接的目录全部 fail-closed，不跟随读取。
+            if (reject_symlinks and skill_dir.is_symlink() and not is_managed_link) or not skill_dir.is_dir():
                 continue
             skill_file = skill_dir / "SKILL.md"
             if not skill_file.is_file() or (reject_symlinks and skill_file.is_symlink()):
@@ -947,6 +976,65 @@ class SkillsLoader:
         if scope == "user" and self.user_skills_dir is not None:
             return self.user_skills_dir
         raise ValueError("不支持的 Skill 作用域")
+
+    def _link_manifest_path(self, scope: str) -> Path:
+        if scope == "workspace":
+            return self.workspace / ".beanagent" / "skills-links.json"
+        if scope == "user" and self.user_skills_dir is not None:
+            return self.user_skills_dir.parent / "skills-links.json"
+        raise ValueError("不支持的 Skill 作用域")
+
+    def _read_link_manifest(self, scope: str) -> dict[str, Any]:
+        payload = self._read_state_file(self._link_manifest_path(scope))
+        links = payload.get("links")
+        return links if isinstance(links, dict) else {}
+
+    def _write_link_manifest(self, scope: str, links: dict[str, Any]) -> None:
+        payload = {"schema": 1, "links": links}
+        _atomic_write_path(
+            self._link_manifest_path(scope),
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        )
+
+    def _register_managed_symlink(self, name: str, scope: str, source: Path) -> None:
+        normalized = self._validate_name(name)
+        link_path = self._scope_root(scope) / normalized
+        resolved_source = source.resolve(strict=True)
+        if not link_path.is_symlink() or link_path.resolve(strict=True) != resolved_source:
+            raise ValueError("软链接目标与安装来源不一致")
+        links = self._read_link_manifest(scope)
+        links[normalized] = {
+            "target": str(resolved_source),
+            "scope": scope,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        self._write_link_manifest(scope, links)
+
+    def _unregister_managed_symlink(self, name: str, scope: str) -> None:
+        links = self._read_link_manifest(scope)
+        if links.pop(self._validate_name(name), None) is not None:
+            self._write_link_manifest(scope, links)
+
+    def _managed_symlink_target(self, link_path: Path, scope: str) -> Path | None:
+        if not link_path.is_symlink():
+            return None
+        normalized = self._validate_name(link_path.name)
+        scope_root = self._scope_root(scope).resolve()
+        if link_path.parent.resolve() != scope_root:
+            return None
+        entry = self._read_link_manifest(scope).get(normalized)
+        if not isinstance(entry, dict) or str(entry.get("scope") or "") != scope:
+            return None
+        try:
+            expected = Path(str(entry.get("target") or "")).expanduser().resolve(strict=True)
+            actual = link_path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        if actual != expected or not actual.is_dir() or not (actual / "SKILL.md").is_file():
+            return None
+        if (actual / "SKILL.md").is_symlink() or any(item.is_symlink() for item in actual.rglob("*")):
+            return None
+        return actual
 
     def _read_state(self) -> dict[str, Any]:
         merged: dict[str, Any] = {}

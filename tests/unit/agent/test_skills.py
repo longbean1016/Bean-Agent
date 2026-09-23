@@ -193,6 +193,64 @@ def test_scope_priority_and_plugin_group(tmp_path: Path) -> None:
     assert plugin_record.source == "plugin"
 
 
+def test_builtin_and_plugin_skills_are_read_only_at_loader_boundary(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    builtin = tmp_path / "builtin"
+    plugin = tmp_path / "plugin"
+    _write_skill(builtin, "builtin-only")
+    _write_skill(plugin, "plugin-only")
+    loader = SkillsLoader(
+        workspace,
+        builtin_skills_dir=builtin,
+        plugin_skill_roots=[("demo", plugin)],
+    )
+
+    with pytest.raises(PermissionError):
+        loader.update_skill("builtin-only", "user", "---\nname: builtin-only\ndescription: changed\n---\nbody")
+    with pytest.raises(PermissionError):
+        loader.update_skill("plugin-only", "workspace", "---\nname: plugin-only\ndescription: changed\n---\nbody")
+    assert "changed" not in (builtin / "builtin-only" / "SKILL.md").read_text(encoding="utf-8")
+    assert "changed" not in (plugin / "plugin-only" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_managed_symlink_survives_restart_and_delete_keeps_source(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    source = _write_skill(tmp_path / "external", "linked", body="外部正文")
+    loader = SkillsLoader(workspace, builtin_skills_dir=None)
+    try:
+        installed = loader.install_directory(source, "workspace", mode="symlink")
+    except OSError as error:
+        pytest.skip(f"当前平台不允许创建目录软链接: {error}")
+
+    assert [record.name for record in installed] == ["linked"]
+    link = workspace / "skills" / "linked"
+    assert link.is_symlink()
+    restarted = SkillsLoader(workspace, builtin_skills_dir=None)
+    assert restarted.load_skill_body("linked") == "外部正文"
+
+    restarted.delete_skill("linked", "workspace")
+    assert not link.exists() and not link.is_symlink()
+    assert source.is_dir()
+    assert (source / "SKILL.md").is_file()
+
+
+def test_managed_symlink_target_replacement_is_rejected(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    source = _write_skill(tmp_path / "external", "linked")
+    replacement = _write_skill(tmp_path / "replacement", "linked", body="替换正文")
+    loader = SkillsLoader(workspace, builtin_skills_dir=None)
+    try:
+        loader.install_directory(source, "workspace", mode="symlink")
+    except OSError as error:
+        pytest.skip(f"当前平台不允许创建目录软链接: {error}")
+    link = workspace / "skills" / "linked"
+    link.unlink()
+    link.symlink_to(replacement, target_is_directory=True)
+
+    restarted = SkillsLoader(workspace, builtin_skills_dir=None)
+    assert restarted.get_skill_record("linked", scope="workspace") is None
+
+
 def test_skill_import_preflight_reports_ready_conflict_and_invalid(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     source_root = tmp_path / "external"

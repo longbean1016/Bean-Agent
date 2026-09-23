@@ -85,3 +85,22 @@ it("默认 Skill 更新失败时保留列表并展示服务端原因", async () 
   await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Skill 文件已变化，请刷新后重试"));
   expect(screen.getByText("有默认版本更新")).toBeInTheDocument();
 });
+
+it("查看 Skill 详情不会打开可保存编辑器", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.startsWith("/api/extensions/skills/revision")) return jsonResponse({ revision: "r1" });
+    if (url === "/api/extensions/skills?scope=workspace") return jsonResponse({ items: [weatherRecord] });
+    if (url === "/api/extensions/skills/weather?scope=workspace") return jsonResponse({ ...weatherRecord, content: "天气正文", file_path: "D:/skills/weather/SKILL.md" });
+    throw new Error(`未处理请求: ${url}`);
+  }));
+
+  render(<ExtensionsPage kind="skills" onBack={() => undefined} />);
+  await screen.findByText("天气查询");
+  fireEvent.click(screen.getByLabelText("查看技能 weather"));
+
+  expect(await screen.findByText("Skill 详情")).toBeInTheDocument();
+  expect(screen.getByText("天气正文")).toBeInTheDocument();
+  expect(screen.queryByLabelText("SKILL.md 内容")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "保存" })).not.toBeInTheDocument();
+});
