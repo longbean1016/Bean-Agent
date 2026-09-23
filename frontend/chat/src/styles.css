@@ -202,6 +202,8 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .extensions-search svg { position: absolute; left: 11px; color: var(--text-faint); pointer-events: none; }
 .extensions-search input { width: 100%; min-height: 36px; padding: 0 12px 0 34px; border: 1px solid var(--border-input); border-radius: 8px; outline: 0; background: var(--surface-2); color: var(--text); font-size: 12px; }
 .extensions-search input:focus { border-color: var(--primary-border); box-shadow: 0 0 0 3px var(--primary-tint); }
+.extensions-status-filter { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 6px; color: var(--text-muted); font-size: 10px; }
+.extensions-status-filter select { min-height: 34px; padding: 0 26px 0 9px; border: 1px solid var(--border-input); border-radius: 7px; background: var(--surface-2); color: var(--text); font-size: 10px; }
 .extensions-actions-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
 .extensions-actions-row h2 { display: inline; margin: 0; color: var(--text-strong); font-size: 15px; }
 .extensions-actions-row h2 small { margin-left: 4px; color: var(--text-muted); font-size: 11px; font-weight: 500; }
@@ -222,7 +224,9 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .skill-source-group + .skill-source-group { margin-top: 14px; }
 .skill-source-group-header { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text-muted); font-size: 12px; }
 .skill-source-group-header strong { color: var(--text); }
+.skill-source-group-header small { color: var(--text-faint); }
 .skill-source-group-header span { margin-left: auto; }
+.skill-source-group-header img, .plugin-skill-emoji { display: grid; width: 20px; height: 20px; place-items: center; border-radius: 5px; object-fit: cover; }
 .extension-detail-meta { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 8px 0 12px; color: var(--text-muted); font-size: 12px; }
 .skill-import-source { display: grid; gap: 6px; max-height: 190px; overflow: auto; padding: 9px; border: 1px solid var(--border); border-radius: 8px; }
 .skill-import-source > header { display: flex; align-items: center; justify-content: space-between; }

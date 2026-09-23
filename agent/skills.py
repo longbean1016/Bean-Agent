@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import uuid
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,7 @@ import yaml
 logger = logging.getLogger(__name__)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 _SKILL_NAME = re.compile(r"^[\w\u4e00-\u9fff][\w\u4e00-\u9fff.-]{0,63}$")
+_SOURCE_PRIORITY = {"workspace": 4, "user": 3, "plugin": 2, "builtin": 1}
 
 
 class SkillRevisionConflict(RuntimeError):
@@ -193,6 +194,14 @@ class SkillRecord:
     owner: str | None = None
     published_at: str | None = None
     file_size: int = 0
+    content_hash: str = ""
+    priority: int = 0
+    active: bool = True
+    overridden_by: str | None = None
+    override_reason: str | None = None
+    plugin_icon: str | None = None
+    plugin_source: str | None = None
+    plugin_enabled: bool = True
 
 
 class SkillSnapshotView:
@@ -240,6 +249,14 @@ class SkillSnapshotView:
                     owner=str(raw.get("owner") or "") or None,
                     published_at=str(raw.get("published_at") or "") or None,
                     file_size=int(raw.get("file_size", 0) or 0),
+                    content_hash=str(raw.get("content_hash") or hashlib.sha256(content.encode("utf-8")).hexdigest()),
+                    priority=int(raw.get("priority", _SOURCE_PRIORITY.get(str(raw.get("source") or ""), 0)) or 0),
+                    active=bool(raw.get("active", True)),
+                    overridden_by=str(raw.get("overridden_by") or "") or None,
+                    override_reason=str(raw.get("override_reason") or "") or None,
+                    plugin_icon=str(raw.get("plugin_icon") or "") or None,
+                    plugin_source=str(raw.get("plugin_source") or "") or None,
+                    plugin_enabled=bool(raw.get("plugin_enabled", True)),
                 )
             )
         self._records = tuple(sorted(records, key=lambda item: item.name))
@@ -331,6 +348,8 @@ class SkillsLoader:
         self._state_paths = [self.workspace / ".beanagent" / "skills-state.json"]
         if self.user_skills_dir is not None:
             self._state_paths.append(self.user_skills_dir.parent / "skills-state.json")
+        self._last_indexes: dict[str, tuple[SkillRecord, ...]] = {}
+        self._scan_diagnostics: tuple[str, ...] = ()
 
     def list_skill_records(
         self,
@@ -340,10 +359,23 @@ class SkillsLoader:
     ) -> list[SkillRecord]:
         """按 Skill 名称返回稳定排序的索引。"""
 
-        records = self._build_scope_index(scope) if scope in {"user", "workspace"} else self._build_index()
+        cache_key = str(scope or "effective")
+        try:
+            records = self._build_scope_index(scope) if scope in {"user", "workspace"} else self._build_index()
+        except OSError as error:
+            # 目录暂时不可读时沿用上一份不可变索引，避免页面和正在创建的快照
+            # 因一次磁盘抖动突然清空；诊断单独暴露给管理 API。
+            self._scan_diagnostics = (f"scan_failed:{type(error).__name__}",)
+            records = list(self._last_indexes.get(cache_key, ()))
+        else:
+            self._scan_diagnostics = ()
+            self._last_indexes[cache_key] = tuple(records)
         if filter_unavailable:
             return [record for record in records if record.available and record.enabled]
         return records
+
+    def last_scan_diagnostics(self) -> tuple[str, ...]:
+        return self._scan_diagnostics
 
     def for_workspace(self, workspace_path: str | Path) -> "SkillsLoader":
         """为已注册项目创建独立索引，复用全局来源配置但不共享项目路径状态。"""
@@ -376,7 +408,7 @@ class SkillsLoader:
 
         records = self.list_skill_records(filter_unavailable=False)
         return {
-            "schema": 1,
+            "schema": 2,
             "revision": self.directory_revision(),
             "skills": [
                 {
@@ -402,6 +434,14 @@ class SkillsLoader:
                     "owner": record.owner,
                     "published_at": record.published_at,
                     "file_size": record.file_size,
+                    "content_hash": record.content_hash or hashlib.sha256(record.content.encode("utf-8")).hexdigest(),
+                    "priority": record.priority or _SOURCE_PRIORITY.get(record.source, 0),
+                    "active": record.active,
+                    "overridden_by": record.overridden_by,
+                    "override_reason": record.override_reason,
+                    "plugin_icon": record.plugin_icon,
+                    "plugin_source": record.plugin_source,
+                    "plugin_enabled": record.plugin_enabled,
                 }
                 for record in records
             ],
@@ -799,6 +839,77 @@ class SkillsLoader:
         lines.append("</skills>")
         return "\n".join(lines)
 
+    def list_management_records(self, scope: str) -> list[SkillRecord]:
+        """返回管理页所需的全部来源，并由后端标记激活项和覆盖链。"""
+
+        normalized = "workspace" if scope in {"workspace", "project"} else "user"
+        cache_key = f"management:{normalized}"
+        try:
+            candidates = self._collect_management_sources(normalized)
+        except OSError as error:
+            self._scan_diagnostics = (f"scan_failed:{type(error).__name__}",)
+            return list(self._last_indexes.get(cache_key, ()))
+        winners: dict[str, SkillRecord] = {}
+        records: list[SkillRecord] = []
+        for record in candidates:
+            winner = winners.get(record.name)
+            if winner is None:
+                winners[record.name] = record
+                records.append(replace(record, active=True))
+                continue
+            records.append(replace(
+                record,
+                active=False,
+                overridden_by=f"{winner.source_id}:{winner.name}",
+                override_reason=f"被更高优先级来源 {winner.source} 覆盖",
+            ))
+        result = sorted(records, key=lambda item: (item.name, -item.priority, item.source_id))
+        self._scan_diagnostics = ()
+        self._last_indexes[cache_key] = tuple(result)
+        return result
+
+    def _collect_management_sources(self, scope: str) -> list[SkillRecord]:
+        records: list[SkillRecord] = []
+        if scope == "workspace":
+            records.extend(self._scan_skills_dir(self.skills_dir, source="workspace", source_id="workspace", reject_symlinks=True, scope="workspace"))
+        if self.user_skills_dir is not None:
+            records.extend(self._scan_skills_dir(self.user_skills_dir, source="user", source_id="user", reject_symlinks=True, scope="user"))
+        if scope == "workspace":
+            for source_id, plugin_name, plugin_root, icon, install_source, enabled in self._plugin_sources():
+                records.extend(self._scan_skills_dir(
+                    plugin_root,
+                    source="plugin",
+                    source_id=f"plugin:{source_id}",
+                    reject_symlinks=True,
+                    scope="workspace",
+                    plugin_name=plugin_name,
+                    plugin_icon=icon,
+                    plugin_source=install_source,
+                    plugin_enabled=enabled,
+                ))
+        if self.builtin_skills_dir is not None:
+            records.extend(self._scan_skills_dir(self.builtin_skills_dir, source="builtin", source_id="builtin", reject_symlinks=False, scope="builtin"))
+        return records
+
+    def _plugin_sources(self) -> list[tuple[str, str, Path, str | None, str, bool]]:
+        sources = [(name, name, root, None, "已配置插件", True) for name, root in self.plugin_skill_roots]
+        workspace_plugins = self.workspace / "plugins"
+        if not workspace_plugins.is_dir():
+            return sources
+        for directory in sorted(workspace_plugins.iterdir(), key=lambda item: item.name):
+            if not directory.is_dir():
+                continue
+            manifest = self._read_state_file(directory / "plugin.json")
+            sources.append((
+                directory.name,
+                str(manifest.get("name") or directory.name),
+                directory / "skills",
+                str(manifest.get("icon") or "") or None,
+                str(manifest.get("source") or "当前项目插件"),
+                bool(manifest.get("enabled", True)),
+            ))
+        return sources
+
     def _build_index(self) -> list[SkillRecord]:
         # workspace > user > plugin > builtin；显式按来源写入索引，不能依赖
         # 文件系统遍历顺序决定覆盖关系。
@@ -820,22 +931,17 @@ class SkillsLoader:
                 scope="user",
             ):
                 records.setdefault(record.name, record)
-        plugin_roots = list(self.plugin_skill_roots)
-        workspace_plugins = self.workspace / "plugins"
-        if workspace_plugins.is_dir():
-            plugin_roots.extend(
-                (directory.name, directory / "skills")
-                for directory in sorted(workspace_plugins.iterdir(), key=lambda item: item.name)
-                if directory.is_dir()
-            )
-        for plugin_name, plugin_root in plugin_roots:
+        for source_id, plugin_name, plugin_root, icon, install_source, enabled in self._plugin_sources():
             for record in self._scan_skills_dir(
                 plugin_root,
                 source="plugin",
-                source_id=f"plugin:{plugin_name}",
+                source_id=f"plugin:{source_id}",
                 reject_symlinks=True,
                 scope="workspace",
                 plugin_name=plugin_name,
+                plugin_icon=icon,
+                plugin_source=install_source,
+                plugin_enabled=enabled,
             ):
                 records.setdefault(record.name, record)
         if self.builtin_skills_dir is not None:
@@ -855,12 +961,8 @@ class SkillsLoader:
         if scope == "workspace":
             for record in self._scan_skills_dir(self.skills_dir, source="workspace", source_id="workspace", reject_symlinks=True, scope="workspace"):
                 records[record.name] = record
-            plugin_roots = list(self.plugin_skill_roots)
-            workspace_plugins = self.workspace / "plugins"
-            if workspace_plugins.is_dir():
-                plugin_roots.extend((directory.name, directory / "skills") for directory in sorted(workspace_plugins.iterdir(), key=lambda item: item.name) if directory.is_dir())
-            for plugin_name, plugin_root in plugin_roots:
-                for record in self._scan_skills_dir(plugin_root, source="plugin", source_id=f"plugin:{plugin_name}", reject_symlinks=True, scope="workspace", plugin_name=plugin_name):
+            for source_id, plugin_name, plugin_root, icon, install_source, enabled in self._plugin_sources():
+                for record in self._scan_skills_dir(plugin_root, source="plugin", source_id=f"plugin:{source_id}", reject_symlinks=True, scope="workspace", plugin_name=plugin_name, plugin_icon=icon, plugin_source=install_source, plugin_enabled=enabled):
                     records.setdefault(f"plugin:{plugin_name}:{record.name}", record)
         else:
             if self.user_skills_dir is not None:
@@ -880,6 +982,9 @@ class SkillsLoader:
         reject_symlinks: bool,
         scope: str,
         plugin_name: str | None = None,
+        plugin_icon: str | None = None,
+        plugin_source: str | None = None,
+        plugin_enabled: bool = True,
     ) -> list[SkillRecord]:
         """扫描一个 Skill 根目录；workspace 额外拒绝符号链接越界。"""
 
@@ -936,11 +1041,14 @@ class SkillsLoader:
             missing = self._missing_requirements(config)
             if missing:
                 diagnostic_items.append("missing_dependency")
+            if source == "plugin" and not plugin_enabled:
+                diagnostic_items.append("plugin_disabled")
             state = self._read_state().get(self._state_key(name, scope), {})
-            enabled = bool(state.get("enabled", True)) if isinstance(state, dict) else True
+            enabled = (bool(state.get("enabled", True)) if isinstance(state, dict) else True) and plugin_enabled
             diagnostics = tuple(dict.fromkeys(diagnostic_items))
-            invalid_diagnostics = tuple(item for item in diagnostics if item != "missing_dependency")
+            invalid_diagnostics = tuple(item for item in diagnostics if item not in {"missing_dependency", "plugin_disabled"})
             status = "invalid" if invalid_diagnostics else "missing_dependency" if missing else "disabled" if not enabled else "available"
+            display_missing = missing or ("插件已停用" if source == "plugin" and not plugin_enabled else "")
             records.append(
                 SkillRecord(
                     name=name,
@@ -953,8 +1061,8 @@ class SkillsLoader:
                     when_to_use=str(metadata.get("when_to_use") or ""),
                     always=self._as_bool(metadata.get("always"))
                     or self._as_bool(config.get("always")),
-                    available=not missing and not invalid_diagnostics,
-                    missing=missing,
+                    available=not display_missing and not invalid_diagnostics,
+                    missing=display_missing,
                     scope=scope,
                     version=str(metadata.get("version") or "") or None,
                     plugin_name=plugin_name,
@@ -966,6 +1074,11 @@ class SkillsLoader:
                     owner=str(metadata.get("owner") or "") or None,
                     published_at=str(metadata.get("published_at") or "") or None,
                     file_size=file_size,
+                    content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    priority=_SOURCE_PRIORITY.get(source, 0),
+                    plugin_icon=plugin_icon,
+                    plugin_source=plugin_source,
+                    plugin_enabled=plugin_enabled,
                 )
             )
         return records

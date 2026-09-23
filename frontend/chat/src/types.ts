@@ -66,12 +66,17 @@ export interface SkillExtensionRecord {
   name: string;
   description: string;
   source: "workspace" | "builtin" | "plugin" | string;
+  source_id?: string;
   scope: ExtensionScope;
   available: boolean;
   enabled: boolean;
   always: boolean;
   missing: string;
   plugin_name?: string | null;
+  plugin_icon?: string | null;
+  plugin_icon_url?: string | null;
+  plugin_source?: string | null;
+  plugin_enabled?: boolean;
   version?: string | null;
   slug?: string | null;
   owner?: string | null;
@@ -79,6 +84,9 @@ export interface SkillExtensionRecord {
   file_size?: number;
   file_path?: string;
   priority?: number;
+  active?: boolean;
+  overridden_by?: string | null;
+  override_reason?: string | null;
   status?: "available" | "missing_dependency" | "invalid" | "disabled" | "conflict" | "error" | "unknown" | string;
   diagnostics?: string[];
   revision?: number;

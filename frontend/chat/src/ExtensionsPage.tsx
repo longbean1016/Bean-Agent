@@ -47,6 +47,7 @@ export function ExtensionsPage({
 }) {
   const [scope, setScope] = useState<ExtensionScope>("workspace");
   const [query, setQuery] = useState("");
+  const [skillStatusFilter, setSkillStatusFilter] = useState("all");
   const [records, setRecords] = useState<ExtensionRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -103,12 +104,12 @@ export function ExtensionsPage({
   };
   const openEditSkill = async (record: SkillExtensionRecord) => {
     setError("");
-    try { const detail = await fetchSkillDetail(record.id, scope, workspaceId); setSkillDetail(null); setSkillEditing(record); setSkillName(record.name); setSkillContent(detail.content || ""); setSkillDialogOpen(true); }
+    try { const detail = await fetchSkillDetail(record.name, scope, workspaceId, record.source_id); setSkillDetail(null); setSkillEditing(record); setSkillName(record.name); setSkillContent(detail.content || ""); setSkillDialogOpen(true); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "无法加载 Skill 详情"); }
   };
   const openSkillDetail = async (record: SkillExtensionRecord) => {
     setError("");
-    try { setSkillDetail(await fetchSkillDetail(record.id, scope, workspaceId)); }
+    try { setSkillDetail(await fetchSkillDetail(record.name, scope, workspaceId, record.source_id)); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "无法加载 Skill 详情"); }
   };
 
@@ -164,12 +165,18 @@ export function ExtensionsPage({
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
-    if (!normalized) return records;
-    return records.filter((record) => {
+    const searched = !normalized ? records : records.filter((record) => {
       const source = "source" in record ? record.source : "transport" in record ? record.transport : "";
       return `${record.name} ${record.description} ${source}`.toLocaleLowerCase().includes(normalized);
     });
-  }, [query, records]);
+    if (kind !== "skills" || skillStatusFilter === "all") return searched;
+    return searched.filter((record) => {
+      const skill = record as SkillExtensionRecord;
+      if (skillStatusFilter === "overridden") return skill.active === false;
+      if (skillStatusFilter === "available") return skill.active !== false && skill.status === "available";
+      return skill.status === skillStatusFilter;
+    });
+  }, [kind, query, records, skillStatusFilter]);
   const defaultStatusByName = useMemo(
     () => new Map(defaultSkillStatuses.map((item) => [item.name, item])),
     [defaultSkillStatuses],
@@ -200,7 +207,7 @@ export function ExtensionsPage({
   const pluginSkillGroups = kind === "skills" ? filtered.reduce<Record<string, SkillExtensionRecord[]>>((groups, record) => {
     const skill = record as SkillExtensionRecord;
     if (!skill.plugin_name) return groups;
-    (groups[skill.plugin_name] ||= []).push(skill);
+    (groups[skill.source_id || skill.plugin_name] ||= []).push(skill);
     return groups;
   }, {}) : {};
   const ungroupedRecords = kind === "skills" ? filtered.filter((record) => !(record as SkillExtensionRecord).plugin_name) : filtered;
@@ -224,6 +231,7 @@ export function ExtensionsPage({
           </div>
           <div className="extensions-type-label"><Icon size={16} />{meta.title}<span>{filtered.length}</span></div>
           <label className="extensions-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`搜索${meta.title}…`} aria-label={`搜索${meta.title}`} /></label>
+          {kind === "skills" ? <label className="extensions-status-filter">状态<select value={skillStatusFilter} onChange={(event) => setSkillStatusFilter(event.target.value)} aria-label="Skill 状态筛选"><option value="all">全部</option><option value="available">可用</option><option value="disabled">已停用</option><option value="missing_dependency">缺少依赖</option><option value="invalid">无效</option><option value="overridden">已覆盖</option></select></label> : null}
         </div>
 
         <div className="extensions-actions-row">
@@ -242,7 +250,7 @@ export function ExtensionsPage({
           <div className="extensions-empty"><Icon size={30} /><strong>{meta.empty}</strong><span>{kind === "mcp" ? "可以通过导入 JSON 或新建服务开始配置。" : "可以通过导入或新建开始配置。"}</span></div>
         ) : (
           <div className={`extensions-list extensions-list-${kind}`}>
-            {kind !== "skills" ? filtered.map(renderExtensionRow) : <><div className="skill-source-group">{ungroupedRecords.map(renderExtensionRow)}</div>{Object.entries(pluginSkillGroups).map(([pluginName, group]) => <section className="skill-source-group" key={pluginName}><header className="skill-source-group-header"><Puzzle size={14} /><strong>{pluginName}</strong><span>插件提供 · {group.length} 个 Skill</span></header>{group.map(renderExtensionRow)}</section>)}</>}
+            {kind !== "skills" ? filtered.map(renderExtensionRow) : <><div className="skill-source-group">{ungroupedRecords.map(renderExtensionRow)}</div>{Object.entries(pluginSkillGroups).map(([pluginId, group]) => { const plugin = group[0]; return <section className="skill-source-group" key={pluginId}><header className="skill-source-group-header">{plugin.plugin_icon_url ? <img src={plugin.plugin_icon_url} alt="" /> : plugin.plugin_icon && plugin.plugin_icon.length <= 4 ? <span className="plugin-skill-emoji">{plugin.plugin_icon}</span> : <Puzzle size={14} />}<strong>{plugin.plugin_name}</strong><small>{plugin.plugin_source || "插件来源未声明"}</small><span>{plugin.plugin_enabled === false ? "插件已停用" : "插件已启用"} · {group.length} 个 Skill</span></header>{group.map(renderExtensionRow)}</section>; })}</>}
           </div>
         )}
       </main>
@@ -337,7 +345,7 @@ export function ExtensionsPage({
         }}
       />
       {defaultSkillDiff ? <DefaultSkillDiffDialog item={defaultSkillDiff} onClose={() => setDefaultSkillDiff(null)} /> : null}
-      {skillDetail && !skillDialogOpen ? <div className="extensions-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSkillDetail(null); }}><section className="extensions-dialog"><header><div><strong>{skillDetail.name}</strong><span>Skill 详情</span></div><button type="button" className="icon-button" onClick={() => setSkillDetail(null)} aria-label="关闭">×</button></header><p className="extension-detail-line">{skillDetail.description} · {skillDetail.status || "unknown"}</p><div className="extension-detail-meta"><span>版本：{skillDetail.version || "未声明"}</span><span>slug：{skillDetail.slug || "未声明"}</span><span>owner：{skillDetail.owner || "未声明"}</span><span>优先级：{skillDetail.priority ?? 0}</span><span>位置：{skillDetail.file_path || "未提供"}</span></div><button type="button" className="secondary-action" onClick={() => void openSkillDirectory(skillDetail.name, scope, workspaceId).catch((reason) => setError(reason instanceof Error ? reason.message : "无法打开目录"))}><FolderOpen size={14} />打开所在目录</button><pre className="skill-preview">{skillDetail.content || "暂无 SKILL.md 内容"}</pre></section></div> : null}
+      {skillDetail && !skillDialogOpen ? <div className="extensions-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSkillDetail(null); }}><section className="extensions-dialog"><header><div><strong>{skillDetail.name}</strong><span>Skill 详情</span></div><button type="button" className="icon-button" onClick={() => setSkillDetail(null)} aria-label="关闭">×</button></header><p className="extension-detail-line">{skillDetail.description} · {skillDetail.status || "unknown"}</p><div className="extension-detail-meta"><span>版本：{skillDetail.version || "未声明"}</span><span>slug：{skillDetail.slug || "未声明"}</span><span>owner：{skillDetail.owner || "未声明"}</span><span>优先级：{skillDetail.priority ?? 0}</span><span>位置：{skillDetail.file_path || "未提供"}</span></div><button type="button" className="secondary-action" onClick={() => void openSkillDirectory(skillDetail.name, scope, workspaceId, skillDetail.source_id).catch((reason) => setError(reason instanceof Error ? reason.message : "无法打开目录"))}><FolderOpen size={14} />打开所在目录</button><pre className="skill-preview">{skillDetail.content || "暂无 SKILL.md 内容"}</pre></section></div> : null}
     </div>
   );
 }
@@ -417,14 +425,15 @@ const defaultSkillStatusLabels: Record<DefaultSkillStatus["status"], string> = {
 };
 
 function SkillRow({ record, defaultStatus, defaultBusy, onDefaultDiff, onDefaultUpdate, onDefaultRestore, onRemove, onEdit, onToggle, onRefresh, onDetail }: { record: SkillExtensionRecord; defaultStatus?: DefaultSkillStatus; defaultBusy: boolean; onDefaultDiff: (item: DefaultSkillStatus) => Promise<void>; onDefaultUpdate: (item: DefaultSkillStatus) => Promise<void>; onDefaultRestore: (item: DefaultSkillStatus) => Promise<void>; onRemove: (record: SkillExtensionRecord) => Promise<void>; onEdit: (record: SkillExtensionRecord) => void; onToggle: (record: SkillExtensionRecord) => Promise<void>; onRefresh: (record: SkillExtensionRecord) => Promise<void>; onDetail: (record: SkillExtensionRecord) => void }) {
-  const ready = record.available && !record.missing;
+  if (record.active === false) defaultStatus = undefined;
+  const ready = record.active !== false && record.available && !record.missing;
   const [busy, setBusy] = useState(false);
-  const canMutate = record.source === "workspace" || record.source === "user";
+  const canMutate = record.active !== false && (record.source === "workspace" || record.source === "user");
   return (
     <article className="extension-row skill-row">
       <div className="extension-row-icon skill-icon"><Sparkles size={21} /></div>
-      <div className="extension-row-copy"><strong>{record.name}</strong><p>{record.description}</p><div className="extension-tags"><span>{record.source === "builtin" ? "内置" : record.source === "workspace" ? "工作区" : record.source === "user" ? "用户" : record.source}</span>{record.version ? <span>v{record.version}</span> : null}{record.always ? <span>始终启用</span> : null}{record.plugin_name ? <span>插件：{record.plugin_name}</span> : null}</div>{defaultStatus ? <div className={`default-skill-management ${defaultStatus.status}`}><span>{defaultSkillStatusLabels[defaultStatus.status]}</span><button type="button" disabled={defaultBusy || defaultStatus.status === "current"} onClick={() => void onDefaultDiff(defaultStatus)}><FileDiff size={12} />查看差异</button><button type="button" disabled={defaultBusy || !["update_available", "missing"].includes(defaultStatus.status)} onClick={() => void onDefaultUpdate(defaultStatus)}>更新默认版本</button><button type="button" disabled={defaultBusy || defaultStatus.status === "current"} onClick={() => void onDefaultRestore(defaultStatus)}>恢复默认</button></div> : null}{record.missing ? <div className="extension-warning"><AlertTriangle size={13} />缺少依赖：{record.missing}</div> : null}{record.diagnostics?.length ? <div className="extension-warning"><AlertTriangle size={13} />{record.diagnostics.join("；")}</div> : null}</div>
-      <span className={`extension-status ${ready ? "success" : "warning"}`}>{ready ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}{record.status === "disabled" ? "已停用" : ready ? "可用" : "需处理"}</span>
+      <div className="extension-row-copy"><strong>{record.name}</strong><p>{record.description}</p><div className="extension-tags"><span>{record.source === "builtin" ? "内置" : record.source === "workspace" ? "工作区" : record.source === "user" ? "用户" : record.source}</span>{record.version ? <span>v{record.version}</span> : null}{record.always ? <span>始终启用</span> : null}{record.plugin_name ? <span>插件：{record.plugin_name}</span> : null}{record.active === false ? <span>已覆盖</span> : null}</div>{record.active === false ? <div className="extension-warning"><AlertTriangle size={13} />{record.override_reason || `已被 ${record.overridden_by || "高优先级来源"} 覆盖`}</div> : null}{defaultStatus ? <div className={`default-skill-management ${defaultStatus.status}`}><span>{defaultSkillStatusLabels[defaultStatus.status]}</span><button type="button" disabled={defaultBusy || defaultStatus.status === "current"} onClick={() => void onDefaultDiff(defaultStatus)}><FileDiff size={12} />查看差异</button><button type="button" disabled={defaultBusy || !["update_available", "missing"].includes(defaultStatus.status)} onClick={() => void onDefaultUpdate(defaultStatus)}>更新默认版本</button><button type="button" disabled={defaultBusy || defaultStatus.status === "current"} onClick={() => void onDefaultRestore(defaultStatus)}>恢复默认</button></div> : null}{record.missing ? <div className="extension-warning"><AlertTriangle size={13} />{record.missing}</div> : null}{record.diagnostics?.length ? <div className="extension-warning"><AlertTriangle size={13} />{record.diagnostics.join("；")}</div> : null}</div>
+      <span className={`extension-status ${ready ? "success" : "warning"}`}>{ready ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}{record.active === false ? "已覆盖" : record.status === "disabled" ? "已停用" : ready ? "可用" : "需处理"}</span>
       <div className="extension-row-actions"><button className="icon-button" aria-label={`查看技能 ${record.name}`} title="查看详情" onClick={() => onDetail(record)}><Search size={15} /></button><button className="icon-button" aria-label={`刷新技能 ${record.name}`} title="刷新" disabled={busy} onClick={() => { setBusy(true); void onRefresh(record).finally(() => setBusy(false)); }}><RefreshCw size={15} className={busy ? "spin" : ""} /></button><button className="icon-button" aria-label={record.enabled ? `停用技能 ${record.name}` : `启用技能 ${record.name}`} title={record.enabled ? "停用" : "启用"} disabled={busy || !canMutate} onClick={() => { setBusy(true); void onToggle(record).finally(() => setBusy(false)); }}>{record.enabled ? <CheckCircle2 size={15} /> : <PlugZap size={15} />}</button><button className="icon-button" aria-label={`编辑技能 ${record.name}`} title="编辑" disabled={!canMutate} onClick={() => onEdit(record)}><Wrench size={15} /></button><button className="icon-button" aria-label={`删除技能 ${record.name}`} title="删除技能" disabled={!canMutate || busy} onClick={() => { setBusy(true); void onRemove(record).finally(() => setBusy(false)); }}><Trash2 size={16} /></button></div>
     </article>
   );

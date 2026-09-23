@@ -104,3 +104,26 @@ it("查看 Skill 详情不会打开可保存编辑器", async () => {
   expect(screen.queryByLabelText("SKILL.md 内容")).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "保存" })).not.toBeInTheDocument();
 });
+
+it("展示插件来源和覆盖原因并支持状态筛选", async () => {
+  const items = [
+    { ...weatherRecord, id: "workspace:same", name: "same", description: "项目版本", source: "workspace", source_id: "workspace", scope: "project", active: true, priority: 4 },
+    { ...weatherRecord, id: "user:same", name: "same", description: "用户版本", source: "user", source_id: "user", active: false, priority: 3, overridden_by: "workspace:same", override_reason: "被更高优先级来源 workspace 覆盖" },
+    { ...weatherRecord, id: "plugin:demo:plugin-skill", name: "plugin-skill", description: "插件版本", source: "plugin", source_id: "plugin:demo", active: true, plugin_name: "Demo", plugin_source: "local-catalog", plugin_enabled: false, plugin_icon_url: "/api/extensions/plugins/demo/icon", status: "disabled", available: false, missing: "插件已停用" },
+  ];
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.startsWith("/api/extensions/skills/revision")) return jsonResponse({ revision: "r1" });
+    if (url === "/api/extensions/skills?scope=workspace") return jsonResponse({ items });
+    throw new Error(`未处理请求: ${url}`);
+  }));
+
+  render(<ExtensionsPage kind="skills" onBack={() => undefined} />);
+
+  expect(await screen.findByText("Demo")).toBeInTheDocument();
+  expect(screen.getByText("local-catalog")).toBeInTheDocument();
+  expect(screen.getByText(/插件已停用 · 1 个 Skill/)).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Skill 状态筛选"), { target: { value: "overridden" } });
+  expect(await screen.findByText("被更高优先级来源 workspace 覆盖")).toBeInTheDocument();
+  expect(screen.queryByText("Demo")).not.toBeInTheDocument();
+});

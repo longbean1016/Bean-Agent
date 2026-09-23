@@ -367,6 +367,56 @@ def test_skill_update_api_rejects_builtin_and_plugin_sources(tmp_path: Path) -> 
     assert "changed" not in plugin_file.read_text(encoding="utf-8")
 
 
+def test_skill_management_api_exposes_overrides_and_project_external_sources(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    user_skills = tmp_path / "user-skills"
+    project_file = workspace / "skills" / "same" / "SKILL.md"
+    user_file = user_skills / "same" / "SKILL.md"
+    external_file = workspace / ".agents" / "skills" / "external" / "SKILL.md"
+    for path, description in ((project_file, "project"), (user_file, "user"), (external_file, "external")):
+        path.parent.mkdir(parents=True)
+        path.write_text(f"---\nname: {path.parent.name}\ndescription: {description}\n---\n{description}\n", encoding="utf-8")
+    runtime = build_core_runtime(config, workspace, provider=Provider())
+    runtime.skills.user_skills_dir = user_skills.resolve()
+    runtime.skills._state_paths = [workspace / ".beanagent" / "skills-state.json", user_skills.parent / "skills-state.json"]
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        items = client.get("/api/extensions/skills?scope=workspace").json()["items"]
+        same = [item for item in items if item["name"] == "same"]
+        assert [(item["source"], item["active"]) for item in same[:2]] == [("workspace", True), ("user", False)]
+        assert same[1]["overridden_by"] == "workspace:same"
+        detail = client.get("/api/extensions/skills/same?scope=workspace&source_id=user")
+        assert detail.status_code == 200
+        assert detail.json()["description"] == "user"
+        sources = client.get("/api/extensions/skills/discover").json()["sources"]
+        assert any(source["agent"] == "agents-project" and source["candidates"][0]["name"] == "external" for source in sources)
+
+
+def test_plugin_skill_metadata_and_icon_are_exposed_safely(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    plugin = workspace / "plugins" / "demo"
+    skill_file = plugin / "skills" / "plugin-skill" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text("---\nname: plugin-skill\ndescription: plugin\n---\nbody\n", encoding="utf-8")
+    (plugin / "icon.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'/>", encoding="utf-8")
+    (plugin / "plugin.json").write_text(json.dumps({"name": "Demo", "icon": "icon.svg", "source": "local", "enabled": False}), encoding="utf-8")
+    runtime = build_core_runtime(config, workspace, provider=Provider())
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        item = next(item for item in client.get("/api/extensions/skills?scope=workspace").json()["items"] if item["name"] == "plugin-skill")
+        assert item["plugin_name"] == "Demo"
+        assert item["plugin_source"] == "local"
+        assert item["plugin_enabled"] is False
+        assert item["plugin_icon_url"].endswith("/demo/icon")
+        icon = client.get(item["plugin_icon_url"])
+        assert icon.status_code == 200
+        assert "image/svg+xml" in icon.headers["content-type"]
+
+
 def test_chat_session_route_returns_spa_index_or_build_hint(tmp_path: Path) -> None:
     config = Config()
     config.memory.enabled = False

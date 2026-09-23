@@ -1066,6 +1066,21 @@ def create_fastapi_app(
                 })
         return {"items": items, "scope": normalized_scope}
 
+    @app.get("/api/extensions/plugins/{plugin_id}/icon")
+    def get_plugin_icon(plugin_id: str) -> FileResponse:
+        root = (application.core.workspace / "plugins").resolve()
+        directory = (root / plugin_id).resolve()
+        if directory.parent != root:
+            raise HTTPException(status_code=404, detail="插件不存在")
+        manifest = SkillsLoader._read_state_file(directory / "plugin.json")
+        icon_value = str(manifest.get("icon") or "").strip()
+        if not icon_value:
+            raise HTTPException(status_code=404, detail="插件未提供图标")
+        icon_path = (directory / icon_value).resolve()
+        if not icon_path.is_relative_to(directory) or not icon_path.is_file():
+            raise HTTPException(status_code=404, detail="插件图标不存在")
+        return FileResponse(icon_path)
+
     def _normalize_mcp_scope(scope: str | None) -> str:
         return scope if scope in {"user", "workspace"} else "workspace"
 
@@ -1417,10 +1432,11 @@ def create_fastapi_app(
     ) -> dict[str, Any]:
         normalized_scope = _normalize_skill_scope(scope)
         skill_loader = _skills_loader_for_request(workspace_id)
-        records = skill_loader.list_skill_records(filter_unavailable=False, scope=normalized_scope)
+        records = skill_loader.list_management_records(normalized_scope)
+        scan_diagnostics = list(skill_loader.last_scan_diagnostics())
         items = [
             {
-                "id": f"{record.source}:{record.name}",
+                "id": f"{record.source_id}:{record.name}",
                 "name": record.name,
                 "description": record.description,
                 "source": record.source,
@@ -1430,13 +1446,25 @@ def create_fastapi_app(
                 "always": record.always,
                 "missing": record.missing,
                 "plugin_name": record.plugin_name,
+                "plugin_icon": record.plugin_icon,
+                "plugin_icon_url": (
+                    f"/api/extensions/plugins/{quote(record.source_id.removeprefix('plugin:'), safe='')}/icon"
+                    if record.plugin_icon and record.source_id.startswith("plugin:")
+                    else None
+                ),
+                "plugin_source": record.plugin_source,
+                "plugin_enabled": record.plugin_enabled,
+                "source_id": record.source_id,
                 "version": record.version,
                 "slug": record.slug,
                 "owner": record.owner,
                 "published_at": record.published_at,
                 "file_size": record.file_size,
                 "file_path": str(record.skill_file),
-                "priority": {"workspace": 4, "user": 3, "plugin": 2, "builtin": 1}.get(record.source, 0),
+                "priority": record.priority,
+                "active": record.active,
+                "overridden_by": record.overridden_by,
+                "override_reason": record.override_reason,
                 "status": record.status,
                 "diagnostics": list(record.diagnostics),
                 "revision": record.revision,
@@ -1444,7 +1472,12 @@ def create_fastapi_app(
             }
             for record in records
         ]
-        return {"items": items, "scope": "project" if normalized_scope == "workspace" else normalized_scope, "revision": skill_loader.directory_revision(scope=normalized_scope)}
+        return {
+            "items": items,
+            "scope": "project" if normalized_scope == "workspace" else normalized_scope,
+            "revision": skill_loader.directory_revision(scope="user") if normalized_scope == "user" else skill_loader.directory_revision(),
+            "diagnostics": scan_diagnostics,
+        }
 
     @app.get("/api/extensions/skills/revision")
     def get_skill_revision(workspace_id: str | None = Query(None)) -> dict[str, str]:
@@ -1515,20 +1548,38 @@ def create_fastapi_app(
             raise HTTPException(status_code=404, detail="Skill 不存在")
         return record
 
+    def _management_skill_record_or_404(
+        skill_name: str,
+        scope: str,
+        skill_loader: SkillsLoader,
+        source_id: str | None,
+    ) -> Any:
+        records = skill_loader.list_management_records(scope)
+        record = next((
+            item for item in records
+            if item.name == skill_name
+            and (item.source_id == source_id if source_id else item.active)
+        ), None)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Skill 来源不存在")
+        return record
+
     @app.get("/api/extensions/skills/{skill_name}")
     def get_skill_extension(
         skill_name: str,
         scope: str = Query("workspace"),
         workspace_id: str | None = Query(None),
+        source_id: str | None = Query(None),
     ) -> dict[str, Any]:
         normalized_scope = _normalize_skill_scope(scope)
         skill_loader = _skills_loader_for_request(workspace_id)
-        record = _skill_record_or_404(skill_name, normalized_scope, skill_loader)
+        record = _management_skill_record_or_404(skill_name, normalized_scope, skill_loader, source_id)
         return {
-            "id": f"{record.source}:{record.name}",
+            "id": f"{record.source_id}:{record.name}",
             "name": record.name,
             "description": record.description,
             "source": record.source,
+            "source_id": record.source_id,
             "scope": "project" if record.scope == "workspace" else record.scope,
             "version": record.version,
             "slug": record.slug,
@@ -1536,7 +1587,13 @@ def create_fastapi_app(
             "published_at": record.published_at,
             "file_size": record.file_size,
             "file_path": str(record.skill_file),
-            "priority": {"workspace": 4, "user": 3, "plugin": 2, "builtin": 1}.get(record.source, 0),
+            "priority": record.priority,
+            "active": record.active,
+            "overridden_by": record.overridden_by,
+            "override_reason": record.override_reason,
+            "plugin_icon": record.plugin_icon,
+            "plugin_source": record.plugin_source,
+            "plugin_enabled": record.plugin_enabled,
             "status": record.status,
             "available": record.available,
             "enabled": record.enabled,
@@ -1605,7 +1662,11 @@ def create_fastapi_app(
             raise HTTPException(status_code=404, detail="Skill 操作不存在")
         try:
             if action in {"refresh", "open"}:
-                record = _skill_record_or_404(skill_name, scope, skill_loader)
+                record = (
+                    _management_skill_record_or_404(skill_name, scope, skill_loader, str(payload.get("source_id") or "") or None)
+                    if action == "open"
+                    else _skill_record_or_404(skill_name, scope, skill_loader)
+                )
             else:
                 record = await asyncio.to_thread(skill_loader.set_skill_enabled, skill_name, scope, action == "enable")
         except KeyError as error:
@@ -1726,6 +1787,12 @@ def create_fastapi_app(
     def _discover_skill_sources(workspace_id: str | None = None) -> list[dict[str, Any]]:
         skill_loader = _skills_loader_for_request(workspace_id)
         roots: list[tuple[str, str, Path]] = [("project", "project", skill_loader.skills_dir)]
+        roots.extend([
+            ("codex-project", "project-external", skill_loader.workspace / ".codex" / "skills"),
+            ("claude-project", "project-external", skill_loader.workspace / ".claude" / "skills"),
+            ("cursor-project", "project-external", skill_loader.workspace / ".cursor" / "skills"),
+            ("agents-project", "project-external", skill_loader.workspace / ".agents" / "skills"),
+        ])
         if application.core.skills.user_skills_dir is not None:
             roots.append(("beanagent-user", "user", application.core.skills.user_skills_dir))
         # 只读取常见 Agent 的 Skills 根目录摘要，不执行其中的脚本或读取其他配置。
