@@ -1,4 +1,4 @@
-import type { CapabilityRouteState, MessagePage, MessageRow, ModelCapability, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, TurnNavigationEntry, UploadedFile, Workspace } from "./types";
+import type { CapabilityRouteState, ExtensionScope, McpExtensionRecord, MessagePage, MessageRow, ModelCapability, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, PluginExtensionRecord, ProactiveNotificationRow, ProactiveSettings, ScheduledReminder, SessionSummary, SkillExtensionRecord, TurnNavigationEntry, UploadedFile, Workspace } from "./types";
 
 // 仅控制聊天页面的滚动分页，不参与模型上下文 token gate 或 checkpoint 边界。
 const MESSAGE_WINDOW_LIMIT = 60;
@@ -199,6 +199,310 @@ export async function fetchReminders(sessionId: string): Promise<ScheduledRemind
 export async function deleteReminder(sessionId: string, reminderId: string): Promise<void> {
   const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/reminders/${encodeURIComponent(reminderId)}`, { method: "DELETE" });
   if (!response.ok) throw new Error("无法删除提醒");
+}
+
+export async function fetchPluginExtensions(scope: ExtensionScope): Promise<PluginExtensionRecord[]> {
+  const response = await fetch(`/api/extensions/plugins?scope=${encodeURIComponent(scope)}`);
+  if (!response.ok) throw new Error("无法加载插件列表");
+  const payload = await response.json() as { items?: PluginExtensionRecord[] };
+  return payload.items ?? [];
+}
+
+export async function fetchMcpExtensions(scope: ExtensionScope, workspaceId?: string | null): Promise<McpExtensionRecord[]> {
+  const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/mcp?scope=${encodeURIComponent(scope)}${workspaceQuery}`);
+  if (!response.ok) throw new Error("无法加载 MCP 列表");
+  const payload = await response.json() as { items?: McpExtensionRecord[] };
+  return payload.items ?? [];
+}
+
+export interface ExternalMcpSource {
+  id: string;
+  agent: string;
+  path: string;
+  scope: "global" | "project";
+  server_count: number;
+  servers: Array<{ name: string; transport: string; summary: string; has_secrets: boolean }>;
+}
+
+export async function discoverMcpSources(workspaceId?: string | null): Promise<ExternalMcpSource[]> {
+  const workspaceQuery = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/mcp/discover${workspaceQuery}`);
+  if (!response.ok) throw new Error("无法发现外部 MCP 配置");
+  const payload = await response.json() as { sources?: ExternalMcpSource[] };
+  return payload.sources ?? [];
+}
+
+export interface McpExtensionConfigPayload {
+  name?: string;
+  revision?: number;
+  scope?: ExtensionScope;
+  type?: "stdio" | "http" | "sse";
+  command?: string[] | string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  oauth?: Record<string, unknown>;
+  timeoutMs?: number;
+  enabled?: boolean;
+  workspace_id?: string | null;
+}
+
+export async function createMcpExtension(payload: McpExtensionConfigPayload): Promise<McpExtensionRecord> {
+  const response = await fetch("/api/extensions/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json().catch(() => ({})) as McpExtensionRecord & { detail?: string };
+  if (!response.ok || !result.id) throw new Error(result.detail || "无法添加 MCP 服务");
+  return result;
+}
+
+export async function updateMcpExtension(id: string, scope: ExtensionScope, payload: McpExtensionConfigPayload & { revision?: number }, workspaceId?: string | null): Promise<McpExtensionRecord> {
+  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...payload, scope, workspace_id: workspaceId }),
+  });
+  const result = await response.json().catch(() => ({})) as McpExtensionRecord & { detail?: string };
+  if (!response.ok || !result.id) throw new Error(result.detail || "无法更新 MCP 服务");
+  return result;
+}
+
+export async function testMcpExtension(payload: McpExtensionConfigPayload): Promise<{ success: boolean; tool_count?: number; tools?: string[]; error?: string; code?: string }> {
+  const name = payload.name || "test-mcp";
+  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(name)}/test`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json().catch(() => ({})) as { success?: boolean; detail?: string; tool_count?: number; tools?: string[]; error?: string; code?: string };
+  if (!response.ok) throw new Error(result.detail || "MCP 连接测试失败");
+  return { success: Boolean(result.success), tool_count: result.tool_count, tools: result.tools, error: result.error, code: result.code };
+}
+
+export async function setMcpEnabled(id: string, scope: ExtensionScope, enabled: boolean, revision?: number, workspaceId?: string | null): Promise<McpExtensionRecord> {
+  const revisionQuery = revision ? `&revision=${encodeURIComponent(String(revision))}` : "";
+  const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}?scope=${encodeURIComponent(scope)}${revisionQuery}${workspaceQuery}`, { method: "POST" });
+  const result = await response.json().catch(() => ({})) as McpExtensionRecord & { detail?: string };
+  if (!response.ok || !result.id) throw new Error(result.detail || "无法更新 MCP 状态");
+  return result;
+}
+
+export async function refreshMcpExtension(id: string, scope: ExtensionScope, workspaceId?: string | null): Promise<McpExtensionRecord> {
+  const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(id)}/refresh?scope=${encodeURIComponent(scope)}${workspaceQuery}`, { method: "POST" });
+  const result = await response.json().catch(() => ({})) as { item?: McpExtensionRecord; detail?: string };
+  if (!response.ok || !result.item) throw new Error(result.detail || "无法刷新 MCP 工具");
+  return result.item;
+}
+
+export async function importMcpExtensions(config: unknown, scope: ExtensionScope, workspaceId?: string | null): Promise<{ imported: Array<{ name: string; status: string }>; skipped: Array<{ name: string; status: string; reason?: string }>; failed: Array<{ name: string; status: string; reason?: string }> }> {
+  const response = await fetch("/api/extensions/mcp/import", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ servers: config, scope, workspace_id: workspaceId }),
+  });
+  const result = await response.json().catch(() => ({})) as { imported?: Array<{ name: string; status: string }>; skipped?: Array<{ name: string; status: string; reason?: string }>; failed?: Array<{ name: string; status: string; reason?: string }>; detail?: string };
+  if (!response.ok) throw new Error(result.detail || "MCP 导入失败");
+  return { imported: result.imported ?? [], skipped: result.skipped ?? [], failed: result.failed ?? [] };
+}
+
+export async function importDiscoveredMcpExtensions(selections: Array<{ source_id: string; names: string[] }>, scope: ExtensionScope, workspaceId?: string | null): Promise<{ imported: Array<{ name: string; status: string }>; skipped: Array<{ name: string; status: string; reason?: string }>; failed: Array<{ name: string; status: string; reason?: string }> }> {
+  const response = await fetch("/api/extensions/mcp/import", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ selections, scope, workspace_id: workspaceId }),
+  });
+  const result = await response.json().catch(() => ({})) as { imported?: Array<{ name: string; status: string }>; skipped?: Array<{ name: string; status: string; reason?: string }>; failed?: Array<{ name: string; status: string; reason?: string }>; detail?: string };
+  if (!response.ok) throw new Error(result.detail || "外部 MCP 导入失败");
+  return { imported: result.imported ?? [], skipped: result.skipped ?? [], failed: result.failed ?? [] };
+}
+
+export async function removeMcpExtension(name: string, scope: ExtensionScope, revision?: number, workspaceId?: string | null): Promise<void> {
+  const revisionQuery = revision ? `&revision=${encodeURIComponent(String(revision))}` : "";
+  const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}${revisionQuery}${workspaceQuery}`, { method: "DELETE" });
+  const result = await response.json().catch(() => ({})) as { detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法移除 MCP 服务");
+}
+
+export async function fetchSkillExtensions(scope: ExtensionScope, workspaceId?: string | null): Promise<SkillExtensionRecord[]> {
+  const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/skills?scope=${encodeURIComponent(scope)}${workspaceQuery}`);
+  if (!response.ok) throw new Error("无法加载技能列表");
+  const payload = await response.json() as { items?: SkillExtensionRecord[] };
+  return payload.items ?? [];
+}
+
+export async function fetchSkillDetail(name: string, scope: ExtensionScope, workspaceId?: string | null, sourceId?: string): Promise<SkillExtensionRecord & { content?: string; diagnostics?: string[] }> {
+  const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const sourceQuery = sourceId ? `&source_id=${encodeURIComponent(sourceId)}` : "";
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}${workspaceQuery}${sourceQuery}`);
+  const result = await response.json().catch(() => ({})) as SkillExtensionRecord & { detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法加载 Skill 详情");
+  return result;
+}
+
+export async function createSkillExtension(payload: { name: string; scope: ExtensionScope; content: string; workspaceId?: string | null }): Promise<void> {
+  const { workspaceId, ...body } = payload;
+  const response = await fetch("/api/extensions/skills", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...body, workspace_id: workspaceId }) });
+  const result = await response.json().catch(() => ({})) as { detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法创建 Skill");
+}
+
+export async function updateSkillExtension(name: string, scope: ExtensionScope, content: string, revision?: number, workspaceId?: string | null): Promise<void> {
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, content, revision, workspace_id: workspaceId }) });
+  const result = await response.json().catch(() => ({})) as { detail?: string };
+  if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "无法更新 Skill");
+}
+
+export async function setSkillEnabled(name: string, scope: ExtensionScope, enabled: boolean, workspaceId?: string | null): Promise<void> {
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}/${enabled ? "enable" : "disable"}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, workspace_id: workspaceId }) });
+  if (!response.ok) throw new Error("无法更新 Skill 状态");
+}
+
+export async function refreshSkillExtension(name: string, scope: ExtensionScope, workspaceId?: string | null): Promise<void> {
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}/refresh`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, workspace_id: workspaceId }) });
+  if (!response.ok) throw new Error("无法刷新 Skill");
+}
+
+export async function openSkillDirectory(name: string, scope: ExtensionScope, workspaceId?: string | null, sourceId?: string): Promise<void> {
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}/open`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, workspace_id: workspaceId, source_id: sourceId }) });
+  const result = await response.json().catch(() => ({})) as { detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法打开 Skill 所在目录");
+}
+
+export async function removeSkillExtension(name: string, scope: ExtensionScope, workspaceId?: string | null): Promise<void> {
+  const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/skills/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}${workspaceQuery}`, { method: "DELETE" });
+  if (!response.ok) throw new Error("无法删除 Skill");
+}
+
+export async function importSkillExtension(payload: { scope: ExtensionScope; type: "directory" | "git"; path?: string; url?: string; revision?: string; mode?: "copy" | "symlink"; workspace_id?: string | null }): Promise<void> {
+  const response = await fetch("/api/extensions/skills/import", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+  const result = await response.json().catch(() => ({})) as { failed?: Array<{ reason?: string }> };
+  if (!response.ok || result.failed?.length) throw new Error(result.failed?.[0]?.reason || "无法导入 Skill");
+}
+
+export interface DiscoveredSkillSource {
+  id: string;
+  agent: string;
+  scope: string;
+  path: string;
+  skill_count: number;
+  candidates: Array<{ name: string; description: string; path: string; available: boolean }>;
+}
+
+export interface SkillImportPlanItem {
+  name: string;
+  source_id: string;
+  description?: string;
+  scope: string;
+  mode: "copy" | "symlink";
+  status: "ready" | "conflict" | "invalid" | "unsafe" | "unavailable";
+  reason: string;
+}
+
+export interface SkillImportPlan {
+  token: string;
+  scope: string;
+  mode: "copy" | "symlink";
+  target_revision: string;
+  items: SkillImportPlanItem[];
+  counts: Record<SkillImportPlanItem["status"], number>;
+}
+
+export interface SkillImportResultItem { name: string; status: "imported" | "skipped" | "failed"; reason?: string }
+export interface SkillImportResult { imported: SkillImportResultItem[]; skipped: SkillImportResultItem[]; failed: SkillImportResultItem[] }
+
+export interface DefaultSkillStatus {
+  name: string;
+  status: "current" | "update_available" | "user_modified" | "missing";
+  user_hash: string;
+  default_hash: string;
+  installed_hash: string;
+  managed: boolean;
+}
+
+export interface DefaultSkillDiff extends DefaultSkillStatus { diff: string }
+
+function skillApiErrorDetail(payload: { detail?: string | { detail?: string } }, fallback: string): string {
+  return typeof payload.detail === "string" ? payload.detail : payload.detail?.detail || fallback;
+}
+
+export async function fetchDefaultSkillStatuses(): Promise<DefaultSkillStatus[]> {
+  const response = await fetch("/api/extensions/skills/defaults");
+  const result = await response.json().catch(() => ({})) as { items?: DefaultSkillStatus[]; detail?: string | { detail?: string } };
+  if (!response.ok) throw new Error(skillApiErrorDetail(result, "无法加载默认 Skill 状态"));
+  return Array.isArray(result.items) ? result.items : [];
+}
+
+export async function fetchDefaultSkillDiff(name: string): Promise<DefaultSkillDiff> {
+  const response = await fetch(`/api/extensions/skills/defaults/${encodeURIComponent(name)}/diff`);
+  const result = await response.json().catch(() => ({})) as DefaultSkillDiff & { detail?: string | { detail?: string } };
+  if (!response.ok || typeof result.diff !== "string") throw new Error(skillApiErrorDetail(result, "无法加载默认 Skill 差异"));
+  return result;
+}
+
+async function replaceDefaultSkill(name: string, action: "restore" | "update", expectedHash: string): Promise<DefaultSkillStatus> {
+  const response = await fetch(`/api/extensions/skills/defaults/${encodeURIComponent(name)}/${action}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ expected_hash: expectedHash }),
+  });
+  const result = await response.json().catch(() => ({})) as { item?: DefaultSkillStatus; detail?: string | { detail?: string } };
+  if (!response.ok || !result.item) throw new Error(skillApiErrorDetail(result, action === "restore" ? "无法恢复默认 Skill" : "无法更新默认 Skill"));
+  return result.item;
+}
+
+export async function restoreDefaultSkill(name: string, expectedHash: string): Promise<DefaultSkillStatus> {
+  return replaceDefaultSkill(name, "restore", expectedHash);
+}
+
+export async function updateDefaultSkill(name: string, expectedHash: string): Promise<DefaultSkillStatus> {
+  return replaceDefaultSkill(name, "update", expectedHash);
+}
+
+export async function discoverSkillSources(workspaceId?: string | null): Promise<DiscoveredSkillSource[]> {
+  const query = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/skills/discover${query}`);
+  const result = await response.json().catch(() => ({})) as { sources?: DiscoveredSkillSource[]; detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法发现外部技能");
+  return Array.isArray(result.sources) ? result.sources : [];
+}
+
+export async function preflightSkillSelections(scope: ExtensionScope, mode: "copy" | "symlink", selections: Array<{ source_id: string; names: string[] }>, workspaceId?: string | null): Promise<SkillImportPlan> {
+  const response = await fetch("/api/extensions/skills/import/preflight", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, mode, selections, workspace_id: workspaceId }) });
+  const result = await response.json().catch(() => ({})) as SkillImportPlan & { detail?: string };
+  if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "无法预检批量导入");
+  return result;
+}
+
+export async function importSkillSelections(scope: ExtensionScope, mode: "copy" | "symlink", selections: Array<{ source_id: string; names: string[] }>, preflightToken: string, workspaceId?: string | null): Promise<SkillImportResult> {
+  const response = await fetch("/api/extensions/skills/import", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, mode, selections, preflight_token: preflightToken, workspace_id: workspaceId }) });
+  const result = await response.json().catch(() => ({})) as SkillImportResult & { detail?: string | { detail?: string } };
+  if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : result.detail?.detail || "无法批量导入 Skill");
+  return { imported: result.imported || [], skipped: result.skipped || [], failed: result.failed || [] };
+}
+
+export async function fetchSkillRevision(workspaceId?: string | null): Promise<string> {
+  const query = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/skills/revision${query}`);
+  const result = await response.json().catch(() => ({})) as { revision?: string };
+  if (!response.ok) throw new Error("无法读取技能目录版本");
+  return String(result.revision || "");
+}
+
+export async function refreshSessionSkills(sessionId: string): Promise<{ revision: string; skills_count: number }> {
+  const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/skills/refresh`, { method: "POST" });
+  const result = await response.json().catch(() => ({})) as { revision?: string; skills_count?: number; detail?: string };
+  if (!response.ok) throw new Error(result.detail || "无法刷新当前会话技能");
+  return { revision: String(result.revision || ""), skills_count: Number(result.skills_count || 0) };
 }
 
 class SettingsRequestError extends Error {

@@ -1480,7 +1480,7 @@ it("非连续正文窗口只插入已加载区间内的提醒", async () => {
   expect(screen.queryByText("中间未加载提醒")).not.toBeInTheDocument();
 });
 
-it("新建会话会清空其他会话中尚未发送的输入", async () => {
+it("新对话会清空其他会话中尚未发送的输入", async () => {
   render(<App />);
   await screen.findByText("已连接");
   const input = screen.getByPlaceholderText("输入消息，或附加文本与图片");
@@ -1490,7 +1490,7 @@ it("新建会话会清空其他会话中尚未发送的输入", async () => {
   fireEvent.change(fileInput, { target: { files: [attachment] } });
   expect(await screen.findByText("draft.txt")).toBeVisible();
 
-  fireEvent.click(screen.getByRole("button", { name: "新建会话" }));
+  fireEvent.click(screen.getByRole("button", { name: "新对话" }));
 
   expect(input).toHaveValue("");
   expect(screen.queryByText("draft.txt")).not.toBeInTheDocument();
@@ -1600,7 +1600,7 @@ it("切回后台运行会话时恢复用户问题流式内容和工具状态", a
     call_id: "call-1", tool_name: "list_dir", status: "ok", result_preview: "agent, tests",
   }) } as MessageEvent);
 
-  fireEvent.click(screen.getByRole("button", { name: "新对话" }));
+  fireEvent.click(screen.getByRole("button", { name: "打开会话“新对话”" }));
   expect(await screen.findByText("分析当前项目", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByText("阶段结果")).toBeVisible();
   const completedTools = screen.getByRole("button", { name: /工具调用 · 1 项完成/ });

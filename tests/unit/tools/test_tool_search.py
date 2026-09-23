@@ -65,3 +65,30 @@ async def test_tool_search_filters_risk_and_reports_missing_names() -> None:
     assert blocked["unlocked"] == []
     assert missing["unlocked"] == []
     assert "not_found" in missing["tip"]
+
+
+@pytest.mark.asyncio
+async def test_tool_search_hides_tools_outside_current_project_catalog() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        _HiddenTool(),
+        always_on=False,
+        risk="external-side-effect",
+        source_type="mcp",
+        source_name="project:other:demo",
+    )
+    tool = ToolSearchTool(registry)
+
+    keyword = json.loads(
+        await tool.execute(query="演示", allowed_tool_names={"tool_search"})
+    )
+    selected = json.loads(
+        await tool.execute(
+            query="select:mcp_demo__lookup",
+            allowed_tool_names={"tool_search"},
+        )
+    )
+
+    assert keyword["unlocked"] == []
+    assert selected["unlocked"] == []
+    assert "mcp_demo__lookup" in selected["tip"]

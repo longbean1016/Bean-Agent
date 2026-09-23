@@ -8,18 +8,156 @@ Skill 目录摘要会进入稳定 Prompt 前缀，因此扫描和输出顺序必
 
 from __future__ import annotations
 
+import difflib
+import hashlib
+import json
 import logging
-import os
 import re
 import shutil
+import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
+from agent.skill_services import (
+    PluginSkillSource,
+    SkillDependencyChecker,
+    SkillDiscovery,
+    SkillInstaller,
+    SkillParser,
+    SkillRuntimeIndex,
+    SkillSessionSnapshot,
+)
 
 logger = logging.getLogger(__name__)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+_SKILL_NAME = re.compile(r"^[\w\u4e00-\u9fff][\w\u4e00-\u9fff.-]{0,63}$")
+_SOURCE_PRIORITY = {"workspace": 4, "user": 3, "plugin": 2, "builtin": 1}
+
+
+class SkillRevisionConflict(RuntimeError):
+    """Skill 编辑基于旧摘要时的并发冲突。"""
+
+    def __init__(self, expected: int, actual: int) -> None:
+        super().__init__(f"Skill 配置已更新（期望 revision={expected}，当前 revision={actual}）")
+        self.expected = expected
+        self.actual = actual
+
+
+class SkillSeedConflict(RuntimeError):
+    """默认 Skill 操作期间用户副本发生变化。"""
+
+    def __init__(self, expected: str, actual: str) -> None:
+        super().__init__("Skill 文件已变化，请刷新后重试")
+        self.expected = expected
+        self.actual = actual
+
+
+def seed_builtin_skills(
+    user_skills_dir: str | Path,
+    *,
+    builtin_skills_dir: str | Path | None = BUILTIN_SKILLS_DIR,
+) -> dict[str, Any]:
+    """首启幂等复制内置 Skill；已有用户目录永远不被覆盖。"""
+
+    target_root = Path(user_skills_dir).expanduser().resolve()
+    source_root = (
+        Path(builtin_skills_dir).expanduser().resolve()
+        if builtin_skills_dir is not None
+        else None
+    )
+    if source_root is None or not source_root.is_dir():
+        return {"seeded": [], "skipped": [], "manifest": {}}
+    target_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = target_root.parent / "skills-seed-manifest.json"
+    seeded: list[str] = []
+    skipped: list[str] = []
+    manifest: dict[str, Any] = {}
+    try:
+        raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+        if isinstance(raw_manifest, dict):
+            manifest = raw_manifest
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        manifest = {}
+    for source in sorted(source_root.iterdir(), key=lambda item: item.name):
+        if not source.is_dir() or not (source / "SKILL.md").is_file():
+            continue
+        name = source.name
+        target = target_root / name
+        source_hash = _hash_skill_tree(source)
+        if target.exists():
+            skipped.append(name)
+            previous = manifest.get(name) if isinstance(manifest.get(name), dict) else {}
+            previous_seed_hash = str(previous.get("seed_hash") or "")
+            target_hash = _hash_skill_tree(target) if target.is_dir() else ""
+            # 只有目标仍等于上次种子版本时才允许升级；用户改过的副本永远
+            # 保留原内容，manifest 仅记录可供页面提示的最新内置哈希。
+            if (
+                previous_seed_hash
+                and previous_seed_hash == target_hash
+                and source_hash != target_hash
+                and bool(previous.get("managed", False))
+            ):
+                temporary = target_root / f".{name}.upgrade-{uuid.uuid4().hex}.tmp"
+                backup = target_root / f".{name}.upgrade-{uuid.uuid4().hex}.old"
+                try:
+                    shutil.copytree(source, temporary, symlinks=False)
+                    target.rename(backup)
+                    temporary.replace(target)
+                    shutil.rmtree(backup, ignore_errors=True)
+                    seeded.append(name)
+                    target_hash = source_hash
+                except (OSError, shutil.Error):
+                    shutil.rmtree(temporary, ignore_errors=True)
+                    if not target.exists() and backup.exists():
+                        backup.rename(target)
+                    logger.warning("内置 Skill 升级失败: name=%s", name)
+            manifest[name] = {
+                "source": "builtin",
+                "seed_hash": str(source_hash if target_hash == source_hash else (previous_seed_hash or target_hash)),
+                "current_builtin_hash": source_hash,
+                "managed": bool(previous.get("managed", False)) and target_hash == source_hash,
+                "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            continue
+        temporary = target_root / f".{name}.seed-{uuid.uuid4().hex}.tmp"
+        try:
+            shutil.copytree(source, temporary, symlinks=False)
+            temporary.replace(target)
+        except (OSError, shutil.Error):
+            shutil.rmtree(temporary, ignore_errors=True)
+            logger.warning("内置 Skill 首次复制失败: name=%s", name)
+            continue
+        seeded.append(name)
+        manifest[name] = {
+            "source": "builtin",
+            "seed_hash": source_hash,
+            "current_builtin_hash": source_hash,
+            "managed": True,
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+    if manifest:
+        _atomic_write_path(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2))
+    return {"seeded": seeded, "skipped": skipped, "manifest": manifest}
+
+
+def _hash_skill_tree(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(relative)
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _atomic_write_path(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
 
 
 def collect_skill_mentions(content: str, available_names: list[str]) -> list[str]:
@@ -50,6 +188,132 @@ class SkillRecord:
     always: bool
     available: bool
     missing: str
+    scope: str = "workspace"
+    version: str | None = None
+    plugin_name: str | None = None
+    status: str = "available"
+    diagnostics: tuple[str, ...] = ()
+    revision: int = 1
+    enabled: bool = True
+    slug: str | None = None
+    owner: str | None = None
+    published_at: str | None = None
+    file_size: int = 0
+    content_hash: str = ""
+    priority: int = 0
+    active: bool = True
+    overridden_by: str | None = None
+    override_reason: str | None = None
+    plugin_icon: str | None = None
+    plugin_source: str | None = None
+    plugin_enabled: bool = True
+
+
+class SkillSnapshotView:
+    """基于会话快照的只读 Skill 视图。
+
+    快照保存正文而不是只保存文件路径，确保磁盘上的文件被修改或删除后，
+    已有会话仍然能够重放创建快照时的内容。视图只实现 Prompt 所需的窄接口，
+    不把管理操作和运行时上下文耦合在一起。
+    """
+
+    def __init__(self, snapshot: dict[str, Any]) -> None:
+        self.revision, raw_records = SkillSessionSnapshot.restore(
+            snapshot,
+            _SOURCE_PRIORITY,
+        )
+        records: list[SkillRecord] = []
+        for raw in raw_records:
+            name = str(raw.get("name") or "").strip()
+            content = str(raw.get("content") or "")
+            records.append(
+                SkillRecord(
+                    name=name,
+                    source=str(raw.get("source") or "unknown"),
+                    source_id=str(raw.get("source_id") or ""),
+                    root_dir=Path(str(raw.get("root_dir") or "")),
+                    skill_file=Path(str(raw.get("skill_file") or "")),
+                    content=content,
+                    description=str(raw.get("description") or name),
+                    when_to_use=str(raw.get("when_to_use") or ""),
+                    always=bool(raw.get("always")),
+                    available=bool(raw.get("available", False)),
+                    missing=str(raw.get("missing") or ""),
+                    scope=str(raw.get("scope") or "project"),
+                    version=str(raw.get("version") or "") or None,
+                    plugin_name=str(raw.get("plugin_name") or "") or None,
+                    status=str(raw.get("status") or "unknown"),
+                    diagnostics=tuple(str(item) for item in raw.get("diagnostics", []) if str(item)),
+                    revision=int(raw.get("record_revision", 1) or 1),
+                    enabled=bool(raw.get("enabled", True)),
+                    slug=str(raw.get("slug") or "") or None,
+                    owner=str(raw.get("owner") or "") or None,
+                    published_at=str(raw.get("published_at") or "") or None,
+                    file_size=int(raw.get("file_size", 0) or 0),
+                    content_hash=str(raw.get("content_hash") or hashlib.sha256(content.encode("utf-8")).hexdigest()),
+                    priority=int(raw.get("priority", _SOURCE_PRIORITY.get(str(raw.get("source") or ""), 0)) or 0),
+                    active=bool(raw.get("active", True)),
+                    overridden_by=str(raw.get("overridden_by") or "") or None,
+                    override_reason=str(raw.get("override_reason") or "") or None,
+                    plugin_icon=str(raw.get("plugin_icon") or "") or None,
+                    plugin_source=str(raw.get("plugin_source") or "") or None,
+                    plugin_enabled=bool(raw.get("plugin_enabled", True)),
+                )
+            )
+        self._records = tuple(sorted(records, key=lambda item: item.name))
+
+    def list_skill_records(self, *, filter_unavailable: bool = True, scope: str | None = None) -> list[SkillRecord]:
+        records = list(self._records)
+        if scope in {"user", "workspace", "project"}:
+            wanted_scope = "project" if scope == "workspace" else scope
+            records = [record for record in records if record.scope == wanted_scope]
+        if filter_unavailable:
+            records = [record for record in records if record.available and record.enabled]
+        return records
+
+    def load_skill_record(self, name: str) -> SkillRecord | None:
+        return next((record for record in self._records if record.name == str(name).strip()), None)
+
+    def load_skill_body(self, name: str) -> str | None:
+        record = self.load_skill_record(name)
+        if record is None or not record.available or not record.enabled:
+            return None
+        return SkillsLoader._strip_frontmatter(record.content)
+
+    def get_always_skills(self) -> list[str]:
+        return [record.name for record in self.list_skill_records() if record.always]
+
+    def load_skills_for_context(self, names: list[str]) -> str:
+        parts: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            body = self.load_skill_body(name)
+            if body:
+                parts.append(f"### Skill: {name}\n\n{body}")
+        return "\n\n---\n\n".join(parts)
+
+    def build_skills_summary(self) -> str:
+        records = self.list_skill_records(filter_unavailable=False)
+        if not records:
+            return ""
+        lines = ["<skills>"]
+        for record in records:
+            lines.append(
+                f'  <skill name="{SkillsLoader._escape_xml(record.name)}" '
+                f'available="{str(record.available).lower()}" '
+                f'source="{SkillsLoader._escape_xml(record.source)}">'
+            )
+            lines.append(f"    <description>{SkillsLoader._escape_xml(record.description)}</description>")
+            if record.when_to_use:
+                lines.append(f"    <when_to_use>{SkillsLoader._escape_xml(record.when_to_use)}</when_to_use>")
+            if not record.available and record.missing:
+                lines.append(f"    <requires>{SkillsLoader._escape_xml(record.missing)}</requires>")
+            lines.append("  </skill>")
+        lines.append("</skills>")
+        return "\n".join(lines)
 
 
 class SkillsLoader:
@@ -63,6 +327,8 @@ class SkillsLoader:
         self,
         workspace: str | Path,
         builtin_skills_dir: str | Path | None = BUILTIN_SKILLS_DIR,
+        user_skills_dir: str | Path | None = None,
+        plugin_skill_roots: list[tuple[str, str | Path]] | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.skills_dir = self.workspace / "skills"
@@ -71,18 +337,369 @@ class SkillsLoader:
             if builtin_skills_dir is not None
             else None
         )
+        self.user_skills_dir = (
+            Path(user_skills_dir).expanduser().resolve()
+            if user_skills_dir is not None
+            else None
+        )
+        self.plugin_skill_roots = [
+            (str(name), Path(path).expanduser().resolve())
+            for name, path in (plugin_skill_roots or [])
+        ]
+        self._state_paths = [self.workspace / ".beanagent" / "skills-state.json"]
+        if self.user_skills_dir is not None:
+            self._state_paths.append(self.user_skills_dir.parent / "skills-state.json")
+        self.discovery = SkillDiscovery()
+        self.parser = SkillParser()
+        self.dependency_checker = SkillDependencyChecker()
+        self.installer = SkillInstaller()
+        self.runtime_index = SkillRuntimeIndex()
+        self.snapshot_service = SkillSessionSnapshot()
 
     def list_skill_records(
         self,
         *,
         filter_unavailable: bool = True,
+        scope: str | None = None,
     ) -> list[SkillRecord]:
         """按 Skill 名称返回稳定排序的索引。"""
 
-        records = self._build_index()
+        cache_key = str(scope or "effective")
+        records = self.runtime_index.build(
+            cache_key,
+            lambda: self._build_scope_index(scope) if scope in {"user", "workspace"} else self._build_index(),
+        )
         if filter_unavailable:
-            return [record for record in records if record.available]
+            return [record for record in records if record.available and record.enabled]
         return records
+
+    def last_scan_diagnostics(self) -> tuple[str, ...]:
+        return self.runtime_index.diagnostics
+
+    def for_workspace(self, workspace_path: str | Path) -> "SkillsLoader":
+        """为已注册项目创建独立索引，复用全局来源配置但不共享项目路径状态。"""
+
+        return SkillsLoader(
+            Path(workspace_path).expanduser().resolve(),
+            builtin_skills_dir=self.builtin_skills_dir,
+            user_skills_dir=self.user_skills_dir,
+            plugin_skill_roots=self.plugin_skill_roots,
+        )
+
+    def directory_revision(self, *, scope: str | None = None) -> str:
+        """返回规范化目录 revision，文件遍历顺序不会造成无意义变化。"""
+
+        return self.runtime_index.revision(self.list_skill_records(filter_unavailable=False, scope=scope))
+
+    def create_snapshot(self) -> dict[str, Any]:
+        """创建可持久化会话快照；正文随快照保存以隔离后续磁盘变化。"""
+
+        records = self.list_skill_records(filter_unavailable=False)
+        return self.snapshot_service.create(records, self.directory_revision())
+
+    def list_builtin_seed_statuses(self) -> list[dict[str, Any]]:
+        """返回内置种子的用户副本状态，不读取或修改其他 Skill。"""
+
+        if self.builtin_skills_dir is None or self.user_skills_dir is None or not self.builtin_skills_dir.is_dir():
+            return []
+        manifest = self._read_seed_manifest()
+        statuses: list[dict[str, Any]] = []
+        for source in sorted(self.builtin_skills_dir.iterdir(), key=lambda item: item.name):
+            if not source.is_dir() or not (source / "SKILL.md").is_file():
+                continue
+            name = source.name
+            target = self.user_skills_dir / name
+            default_hash = _hash_skill_tree(source)
+            user_hash = _hash_skill_tree(target) if target.is_dir() else ""
+            entry = manifest.get(name) if isinstance(manifest.get(name), dict) else {}
+            installed_hash = str(entry.get("seed_hash") or "")
+            if not target.is_dir():
+                status = "missing"
+            elif user_hash == default_hash:
+                status = "current"
+            elif installed_hash and user_hash == installed_hash and bool(entry.get("managed", False)):
+                status = "update_available"
+            else:
+                status = "user_modified"
+            statuses.append({
+                "name": name,
+                "status": status,
+                "user_hash": user_hash,
+                "default_hash": default_hash,
+                "installed_hash": installed_hash,
+                "managed": bool(entry.get("managed", False)),
+            })
+        return statuses
+
+    def builtin_seed_diff(self, name: str) -> dict[str, Any]:
+        """生成用户副本到当前默认版本的统一 diff，不调用外部程序。"""
+
+        status = self._builtin_seed_status(name)
+        source_file = self._builtin_seed_root(name) / "SKILL.md"
+        target_file = self._user_seed_root(name) / "SKILL.md"
+        user_content = target_file.read_text(encoding="utf-8") if target_file.is_file() else ""
+        default_content = source_file.read_text(encoding="utf-8")
+        diff = "".join(difflib.unified_diff(
+            user_content.splitlines(keepends=True),
+            default_content.splitlines(keepends=True),
+            fromfile=f"user/{name}/SKILL.md",
+            tofile=f"default/{name}/SKILL.md",
+        ))
+        return {**status, "diff": diff}
+
+    def restore_builtin_seed(self, name: str, *, expected_hash: str) -> dict[str, Any]:
+        """显式恢复当前默认版本；期望哈希阻止确认后发生的迟到覆盖。"""
+
+        return self._replace_builtin_seed(name, expected_hash=expected_hash, allow_modified=True)
+
+    def update_builtin_seed(self, name: str, *, expected_hash: str) -> dict[str, Any]:
+        """仅更新未被用户修改的旧默认副本，用户修改版本必须走恢复入口。"""
+
+        current = self._builtin_seed_status(name)
+        if current["status"] not in {"update_available", "missing", "current"}:
+            raise PermissionError("用户修改过该 Skill，请使用恢复默认并确认覆盖")
+        return self._replace_builtin_seed(name, expected_hash=expected_hash, allow_modified=False)
+
+    def _replace_builtin_seed(self, name: str, *, expected_hash: str, allow_modified: bool) -> dict[str, Any]:
+        source = self._builtin_seed_root(name)
+        target = self._user_seed_root(name)
+        actual_hash = _hash_skill_tree(target) if target.is_dir() else ""
+        if str(expected_hash or "") != actual_hash:
+            raise SkillSeedConflict(str(expected_hash or ""), actual_hash)
+        if not allow_modified and self._builtin_seed_status(name)["status"] == "user_modified":
+            raise PermissionError("用户修改过该 Skill，请使用恢复默认并确认覆盖")
+        existing = self.get_skill_record(name, scope="user")
+        enabled = existing.enabled if existing is not None and existing.source == "user" else True
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.parent / f".{name}.default-{uuid.uuid4().hex}.tmp"
+        backup = target.parent / f".{name}.default-{uuid.uuid4().hex}.old"
+        try:
+            shutil.copytree(source, temporary, symlinks=False)
+            if target.exists():
+                target.rename(backup)
+            temporary.replace(target)
+            shutil.rmtree(backup, ignore_errors=True)
+        except (OSError, shutil.Error):
+            shutil.rmtree(temporary, ignore_errors=True)
+            if not target.exists() and backup.exists():
+                backup.rename(target)
+            raise
+        source_hash = _hash_skill_tree(source)
+        manifest = self._read_seed_manifest()
+        manifest[name] = {
+            "source": "builtin",
+            "seed_hash": source_hash,
+            "current_builtin_hash": source_hash,
+            "managed": True,
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        self._write_seed_manifest(manifest)
+        # 默认版本替换同样属于用户文件变更，递增 revision 可阻止已打开的旧编辑器
+        # 在恢复完成后继续保存并覆盖新内容。
+        self._bump_revision(name, "user", enabled=enabled)
+        return self._builtin_seed_status(name)
+
+    def _builtin_seed_status(self, name: str) -> dict[str, Any]:
+        normalized = self._validate_name(name)
+        status = next((item for item in self.list_builtin_seed_statuses() if item["name"] == normalized), None)
+        if status is None:
+            raise KeyError(f"默认 Skill 不存在: {normalized}")
+        return status
+
+    def _builtin_seed_root(self, name: str) -> Path:
+        if self.builtin_skills_dir is None:
+            raise RuntimeError("内置 Skill 目录未配置")
+        source = self.builtin_skills_dir / self._validate_name(name)
+        if not source.is_dir() or not (source / "SKILL.md").is_file():
+            raise KeyError(f"默认 Skill 不存在: {name}")
+        return source
+
+    def _user_seed_root(self, name: str) -> Path:
+        if self.user_skills_dir is None:
+            raise RuntimeError("用户级 Skill 目录未配置")
+        return self.user_skills_dir / self._validate_name(name)
+
+    def _read_seed_manifest(self) -> dict[str, Any]:
+        if self.user_skills_dir is None:
+            return {}
+        return self._read_state_file(self.user_skills_dir.parent / "skills-seed-manifest.json")
+
+    def _write_seed_manifest(self, manifest: dict[str, Any]) -> None:
+        if self.user_skills_dir is None:
+            raise RuntimeError("用户级 Skill 目录未配置")
+        _atomic_write_path(self.user_skills_dir.parent / "skills-seed-manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+
+    @staticmethod
+    def from_snapshot(snapshot: dict[str, Any]) -> SkillSnapshotView:
+        return SkillSnapshotView(snapshot)
+
+    def get_skill_record(self, name: str, *, scope: str = "workspace") -> SkillRecord | None:
+        return next(
+            (record for record in self.list_skill_records(filter_unavailable=False, scope=scope) if record.name == name),
+            None,
+        )
+
+    def create_skill(self, name: str, scope: str, content: str) -> SkillRecord:
+        normalized = self._validate_name(name)
+        target = self._scope_root(scope) / normalized
+        if target.exists():
+            raise ValueError(f"Skill 已存在: {normalized}")
+        self._validate_content(content)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write(target / "SKILL.md", content)
+        record = self.get_skill_record(normalized, scope=scope)
+        if record is None:
+            raise RuntimeError("Skill 写入后无法解析")
+        return record
+
+    def update_skill(self, name: str, scope: str, content: str, *, expected_revision: int | None = None) -> SkillRecord:
+        record = self.get_skill_record(name, scope=scope)
+        if record is None:
+            raise KeyError(f"Skill 不存在: {name}")
+        if record.source not in {"workspace", "user"}:
+            raise PermissionError("内置或插件 Skill 只能查看，不能直接编辑")
+        if expected_revision is not None and expected_revision != record.revision:
+            raise SkillRevisionConflict(expected_revision, record.revision)
+        self._validate_content(content)
+        self._atomic_write(record.skill_file, content)
+        self._bump_revision(name, scope, enabled=record.enabled)
+        updated = self.get_skill_record(name, scope=scope)
+        if updated is None:
+            raise RuntimeError("Skill 更新后无法解析")
+        return updated
+
+    def delete_skill(self, name: str, scope: str) -> None:
+        record = self.get_skill_record(name, scope=scope)
+        if record is None:
+            raise KeyError(f"Skill 不存在: {name}")
+        if record.source in {"builtin", "plugin"}:
+            raise PermissionError("只允许删除用户或工作区 Skill")
+        scope_root = self._scope_root(scope).resolve()
+        target_path = self._scope_root(scope) / self._validate_name(name)
+        if target_path.parent.resolve() != scope_root:
+            raise PermissionError("Skill 目录不在受管理的作用域内")
+        if target_path.is_symlink():
+            if self._managed_symlink_target(target_path, scope) is None:
+                raise PermissionError("拒绝删除未登记的符号链接 Skill")
+            target_path.unlink()
+            self._unregister_managed_symlink(name, scope)
+        else:
+            target = record.root_dir.resolve()
+            if target.parent != scope_root:
+                raise PermissionError("Skill 目录不在受管理的作用域内")
+            shutil.rmtree(record.root_dir)
+        self._set_enabled(name, scope, None)
+
+    def set_skill_enabled(self, name: str, scope: str, enabled: bool) -> SkillRecord:
+        record = self.get_skill_record(name, scope=scope)
+        if record is None:
+            raise KeyError(f"Skill 不存在: {name}")
+        if record.source in {"builtin", "plugin"} and not enabled:
+            raise PermissionError("内置或插件 Skill 不能单独停用")
+        self._set_enabled(name, scope, enabled)
+        refreshed = self.get_skill_record(name, scope=scope)
+        if refreshed is None:
+            raise RuntimeError("Skill 状态更新后无法读取")
+        return refreshed
+
+    def install_directory(self, source: str | Path, scope: str, *, mode: str = "copy", name: str | None = None) -> list[SkillRecord]:
+        source_path = Path(source).expanduser().resolve()
+        if not source_path.is_dir():
+            raise ValueError("Skill 来源目录不存在")
+        if mode not in {"copy", "symlink"}:
+            raise ValueError("不支持的 Skill 安装模式")
+        scope_root = self._scope_root(scope).resolve()
+        if source_path == scope_root or source_path.is_relative_to(scope_root) or scope_root.is_relative_to(source_path):
+            raise ValueError("Skill 来源目录不能位于安装目标目录内")
+        candidates = self.installer.candidates(source_path)
+        if name and len(candidates) != 1:
+            raise ValueError("只有单个 Skill 来源时才能指定名称")
+        installed: list[SkillRecord] = []
+        for candidate in candidates:
+            skill_name = self._validate_name(name if name else candidate.name)
+            target = self._scope_root(scope) / skill_name
+            if target.exists() or target.is_symlink():
+                raise ValueError(f"Skill 已存在: {skill_name}")
+            self.installer.validate_source(candidate)
+            self.installer.place(
+                candidate,
+                target,
+                mode,
+                lambda: self._register_managed_symlink(skill_name, scope, candidate),
+            )
+            record = self.get_skill_record(skill_name, scope=scope)
+            if record is not None:
+                installed.append(record)
+            elif mode == "symlink":
+                # 注册后仍无法读取说明链接目标在安装窗口内发生变化，必须回滚，
+                # 不能留下页面不可见但占用目标名称的半成品。
+                if target.is_symlink():
+                    target.unlink()
+                self._unregister_managed_symlink(skill_name, scope)
+        if not installed:
+            raise ValueError("来源目录中未发现包含 SKILL.md 的 Skill")
+        return installed
+
+    def preflight_directory(
+        self,
+        source: str | Path,
+        scope: str,
+        *,
+        mode: str = "copy",
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        """只读校验单个导入候选，返回执行前可稳定展示的结果。"""
+
+        source_path = Path(source).expanduser().resolve()
+        candidate_name = str(name or source_path.name).strip()
+        result: dict[str, Any] = {
+            "name": candidate_name,
+            "source_path": str(source_path),
+            "scope": "project" if scope in {"workspace", "project"} else scope,
+            "mode": mode,
+            "status": "unavailable",
+            "reason": "Skill 来源目录不存在",
+            "source_hash": "",
+        }
+        if mode not in {"copy", "symlink"}:
+            return {**result, "status": "invalid", "reason": "不支持的 Skill 安装模式"}
+        if not source_path.is_dir() or not (source_path / "SKILL.md").is_file():
+            return result
+        try:
+            normalized_name = self._validate_name(candidate_name)
+            scope_root = self._scope_root("workspace" if scope == "project" else scope).resolve()
+        except ValueError as error:
+            return {**result, "status": "invalid", "reason": str(error)}
+        if source_path == scope_root or source_path.is_relative_to(scope_root) or scope_root.is_relative_to(source_path):
+            return {**result, "status": "unsafe", "reason": "Skill 来源目录不能位于安装目标目录内"}
+        if source_path.is_symlink() or (source_path / "SKILL.md").is_symlink() or any(item.is_symlink() for item in source_path.rglob("*")):
+            return {**result, "status": "unsafe", "reason": "Skill 来源包含未校验的符号链接"}
+        target = scope_root / normalized_name
+        source_hash = _hash_skill_tree(source_path)
+        if target.exists():
+            return {**result, "name": normalized_name, "source_hash": source_hash, "status": "conflict", "reason": "目标作用域已存在同名 Skill"}
+        records = self._scan_skills_dir(
+            source_path.parent,
+            source="external",
+            source_id="preflight",
+            reject_symlinks=True,
+            scope="workspace",
+        )
+        record = next((item for item in records if item.root_dir.resolve() == source_path), None)
+        if record is None:
+            return {**result, "name": normalized_name, "source_hash": source_hash, "status": "invalid", "reason": "无法解析 SKILL.md"}
+        if record.status == "invalid":
+            return {**result, "name": normalized_name, "source_hash": source_hash, "status": "invalid", "reason": "；".join(record.diagnostics) or "SKILL.md 无效"}
+        if record.status == "missing_dependency":
+            return {**result, "name": normalized_name, "source_hash": source_hash, "status": "unavailable", "reason": record.missing or "缺少依赖"}
+        return {**result, "name": normalized_name, "source_hash": source_hash, "status": "ready", "reason": ""}
+
+    def install_git(self, url: str, scope: str, *, revision: str | None = None, mode: str = "copy") -> list[SkillRecord]:
+        return self.installer.install_git(
+            url,
+            revision,
+            lambda directory: self.install_directory(directory, scope, mode=mode),
+        )
 
     def load_skill_record(self, name: str) -> SkillRecord | None:
         """按规范名称读取 Skill；名称不匹配时不猜测或模糊路由。"""
@@ -154,25 +771,100 @@ class SkillsLoader:
         lines.append("</skills>")
         return "\n".join(lines)
 
+    def list_management_records(self, scope: str) -> list[SkillRecord]:
+        """返回管理页所需的全部来源，并由后端标记激活项和覆盖链。"""
+
+        normalized = "workspace" if scope in {"workspace", "project"} else "user"
+        cache_key = f"management:{normalized}"
+        candidates = self.runtime_index.build(
+            cache_key,
+            lambda: self._collect_management_sources(normalized),
+        )
+        return self.runtime_index.mark_overrides(candidates)
+
+    def _collect_management_sources(self, scope: str) -> list[SkillRecord]:
+        records: list[SkillRecord] = []
+        if scope == "workspace":
+            records.extend(self._scan_skills_dir(self.skills_dir, source="workspace", source_id="workspace", reject_symlinks=True, scope="workspace"))
+        if self.user_skills_dir is not None:
+            records.extend(self._scan_skills_dir(self.user_skills_dir, source="user", source_id="user", reject_symlinks=True, scope="user"))
+        if scope == "workspace":
+            for plugin in self._plugin_sources():
+                records.extend(self._scan_skills_dir(
+                    plugin.skills_root,
+                    source="plugin",
+                    source_id=f"plugin:{plugin.source_id}",
+                    reject_symlinks=True,
+                    scope="workspace",
+                    plugin_name=plugin.name,
+                    plugin_icon=plugin.icon,
+                    plugin_source=plugin.install_source,
+                    plugin_enabled=plugin.enabled,
+                ))
+        if self.builtin_skills_dir is not None:
+            records.extend(self._scan_skills_dir(self.builtin_skills_dir, source="builtin", source_id="builtin", reject_symlinks=False, scope="builtin"))
+        return records
+
+    def _plugin_sources(self) -> list[PluginSkillSource]:
+        return self.discovery.plugin_sources(self.workspace, self.plugin_skill_roots)
+
     def _build_index(self) -> list[SkillRecord]:
-        # workspace 先写入索引，builtin 只补充缺失名称；这是用户自定义覆盖内置
-        # Skill 的唯一优先级规则，不能依赖文件系统遍历顺序。
-        records: dict[str, SkillRecord] = {}
-        for record in self._scan_skills_dir(
+        # workspace > user > plugin > builtin；显式按来源写入索引，不能依赖
+        # 文件系统遍历顺序决定覆盖关系。
+        candidates: list[SkillRecord] = []
+        candidates.extend(self._scan_skills_dir(
             self.skills_dir,
             source="workspace",
             source_id="workspace",
             reject_symlinks=True,
-        ):
-            records[record.name] = record
+            scope="workspace",
+        ))
+        if self.user_skills_dir is not None:
+            candidates.extend(self._scan_skills_dir(
+                self.user_skills_dir,
+                source="user",
+                source_id="user",
+                reject_symlinks=True,
+                scope="user",
+            ))
+        for plugin in self._plugin_sources():
+            candidates.extend(self._scan_skills_dir(
+                plugin.skills_root,
+                source="plugin",
+                source_id=f"plugin:{plugin.source_id}",
+                reject_symlinks=True,
+                scope="workspace",
+                plugin_name=plugin.name,
+                plugin_icon=plugin.icon,
+                plugin_source=plugin.install_source,
+                plugin_enabled=plugin.enabled,
+            ))
         if self.builtin_skills_dir is not None:
-            for record in self._scan_skills_dir(
+            candidates.extend(self._scan_skills_dir(
                 self.builtin_skills_dir,
                 source="builtin",
                 source_id="builtin",
                 reject_symlinks=False,
-            ):
-                records.setdefault(record.name, record)
+                scope="builtin",
+            ))
+        return self.runtime_index.select_effective(candidates)
+
+    def _build_scope_index(self, scope: str) -> list[SkillRecord]:
+        """构建管理页的来源列表，不因另一作用域同名而隐藏记录。"""
+        records: dict[str, SkillRecord] = {}
+        if scope == "workspace":
+            for record in self._scan_skills_dir(self.skills_dir, source="workspace", source_id="workspace", reject_symlinks=True, scope="workspace"):
+                records[record.name] = record
+            for plugin in self._plugin_sources():
+                for record in self._scan_skills_dir(plugin.skills_root, source="plugin", source_id=f"plugin:{plugin.source_id}", reject_symlinks=True, scope="workspace", plugin_name=plugin.name, plugin_icon=plugin.icon, plugin_source=plugin.install_source, plugin_enabled=plugin.enabled):
+                    records.setdefault(f"plugin:{plugin.name}:{record.name}", record)
+        else:
+            if self.user_skills_dir is not None:
+                for record in self._scan_skills_dir(self.user_skills_dir, source="user", source_id="user", reject_symlinks=True, scope="user"):
+                    records[record.name] = record
+            if self.builtin_skills_dir is not None:
+                for record in self._scan_skills_dir(self.builtin_skills_dir, source="builtin", source_id="builtin", reject_symlinks=False, scope="builtin"):
+                    records.setdefault(record.name, record)
         return sorted(records.values(), key=lambda record: record.name)
 
     def _scan_skills_dir(
@@ -182,6 +874,11 @@ class SkillsLoader:
         source: str,
         source_id: str,
         reject_symlinks: bool,
+        scope: str,
+        plugin_name: str | None = None,
+        plugin_icon: str | None = None,
+        plugin_source: str | None = None,
+        plugin_enabled: bool = True,
     ) -> list[SkillRecord]:
         """扫描一个 Skill 根目录；workspace 额外拒绝符号链接越界。"""
 
@@ -189,24 +886,51 @@ class SkillsLoader:
             return []
         records: list[SkillRecord] = []
         for skill_dir in sorted(skills_dir.iterdir(), key=lambda item: item.name):
-            # 符号链接即使当前目标仍在 workspace 内也不读取，避免目标后来被替换后越界。
-            if (reject_symlinks and skill_dir.is_symlink()) or not skill_dir.is_dir():
+            is_managed_link = (
+                skill_dir.is_symlink()
+                and source in {"workspace", "user"}
+                and self._managed_symlink_target(skill_dir, scope) is not None
+            )
+            # 只允许安装流程登记且目标仍完全匹配的链接。手工放入、目标被替换
+            # 或内部新增链接的目录全部 fail-closed，不跟随读取。
+            if (reject_symlinks and skill_dir.is_symlink() and not is_managed_link) or not skill_dir.is_dir():
                 continue
             skill_file = skill_dir / "SKILL.md"
             if not skill_file.is_file() or (reject_symlinks and skill_file.is_symlink()):
                 continue
-            try:
-                content = skill_file.read_text(encoding="utf-8")
-                metadata = self._parse_frontmatter(content)
-            except (OSError, UnicodeError, yaml.YAMLError) as error:
-                logger.warning("跳过无法解析的 Skill: path=%s error=%s", skill_file, error)
-                continue
+            parsed = self.parser.parse_file(skill_file)
+            diagnostic_items = list(parsed.diagnostics)
+            content = parsed.content
+            metadata = parsed.metadata
+            file_size = parsed.file_size
+            if "frontmatter_invalid" in diagnostic_items:
+                logger.warning("Skill 解析失败: path=%s diagnostics=%s", skill_file, diagnostic_items)
             name = str(metadata.get("name") or skill_dir.name).strip()
             if not name:
                 logger.warning("跳过名称为空的 Skill: path=%s", skill_file)
                 continue
-            config = self._skill_config(metadata.get("metadata"))
-            missing = self._missing_requirements(config)
+            if not _SKILL_NAME.fullmatch(name):
+                diagnostic_items.append("invalid_name")
+            if not str(metadata.get("description") or "").strip():
+                diagnostic_items.append("missing_description")
+            if len(str(metadata.get("description") or "")) > 500:
+                diagnostic_items.append("description_too_long")
+            unknown_fields = sorted(set(metadata) - {"name", "description", "when_to_use", "version", "slug", "owner", "published_at", "metadata", "always"})
+            diagnostic_items.extend(f"unknown_field:{field}" for field in unknown_fields)
+            if name in {item.name for item in records}:
+                diagnostic_items.append("duplicate_name")
+            config = self.dependency_checker.skill_config(metadata.get("metadata"))
+            missing = self.dependency_checker.missing_requirements(config)
+            if missing:
+                diagnostic_items.append("missing_dependency")
+            if source == "plugin" and not plugin_enabled:
+                diagnostic_items.append("plugin_disabled")
+            state = self._read_state().get(self._state_key(name, scope), {})
+            enabled = (bool(state.get("enabled", True)) if isinstance(state, dict) else True) and plugin_enabled
+            diagnostics = tuple(dict.fromkeys(diagnostic_items))
+            invalid_diagnostics = tuple(item for item in diagnostics if item not in {"missing_dependency", "plugin_disabled"})
+            status = "invalid" if invalid_diagnostics else "missing_dependency" if missing else "disabled" if not enabled else "available"
+            display_missing = missing or ("插件已停用" if source == "plugin" and not plugin_enabled else "")
             records.append(
                 SkillRecord(
                     name=name,
@@ -219,62 +943,186 @@ class SkillsLoader:
                     when_to_use=str(metadata.get("when_to_use") or ""),
                     always=self._as_bool(metadata.get("always"))
                     or self._as_bool(config.get("always")),
-                    available=not missing,
-                    missing=missing,
+                    available=not display_missing and not invalid_diagnostics,
+                    missing=display_missing,
+                    scope=scope,
+                    version=str(metadata.get("version") or "") or None,
+                    plugin_name=plugin_name,
+                    status=status,
+                    diagnostics=diagnostics,
+                    revision=int(state.get("revision", 1)) if isinstance(state, dict) and isinstance(state.get("revision", 1), int) else 1,
+                    enabled=enabled,
+                    slug=str(metadata.get("slug") or "") or None,
+                    owner=str(metadata.get("owner") or "") or None,
+                    published_at=str(metadata.get("published_at") or "") or None,
+                    file_size=file_size,
+                    content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    priority=_SOURCE_PRIORITY.get(source, 0),
+                    plugin_icon=plugin_icon,
+                    plugin_source=plugin_source,
+                    plugin_enabled=plugin_enabled,
                 )
             )
         return records
 
+    def _scope_root(self, scope: str) -> Path:
+        if scope == "workspace":
+            return self.skills_dir
+        if scope == "user" and self.user_skills_dir is not None:
+            return self.user_skills_dir
+        raise ValueError("不支持的 Skill 作用域")
+
+    def _link_manifest_path(self, scope: str) -> Path:
+        if scope == "workspace":
+            return self.workspace / ".beanagent" / "skills-links.json"
+        if scope == "user" and self.user_skills_dir is not None:
+            return self.user_skills_dir.parent / "skills-links.json"
+        raise ValueError("不支持的 Skill 作用域")
+
+    def _read_link_manifest(self, scope: str) -> dict[str, Any]:
+        payload = self._read_state_file(self._link_manifest_path(scope))
+        links = payload.get("links")
+        return links if isinstance(links, dict) else {}
+
+    def _write_link_manifest(self, scope: str, links: dict[str, Any]) -> None:
+        payload = {"schema": 1, "links": links}
+        _atomic_write_path(
+            self._link_manifest_path(scope),
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        )
+
+    def _register_managed_symlink(self, name: str, scope: str, source: Path) -> None:
+        normalized = self._validate_name(name)
+        link_path = self._scope_root(scope) / normalized
+        resolved_source = source.resolve(strict=True)
+        if not link_path.is_symlink() or link_path.resolve(strict=True) != resolved_source:
+            raise ValueError("软链接目标与安装来源不一致")
+        links = self._read_link_manifest(scope)
+        links[normalized] = {
+            "target": str(resolved_source),
+            "scope": scope,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        self._write_link_manifest(scope, links)
+
+    def _unregister_managed_symlink(self, name: str, scope: str) -> None:
+        links = self._read_link_manifest(scope)
+        if links.pop(self._validate_name(name), None) is not None:
+            self._write_link_manifest(scope, links)
+
+    def _managed_symlink_target(self, link_path: Path, scope: str) -> Path | None:
+        if not link_path.is_symlink():
+            return None
+        normalized = self._validate_name(link_path.name)
+        scope_root = self._scope_root(scope).resolve()
+        if link_path.parent.resolve() != scope_root:
+            return None
+        entry = self._read_link_manifest(scope).get(normalized)
+        if not isinstance(entry, dict) or str(entry.get("scope") or "") != scope:
+            return None
+        try:
+            expected = Path(str(entry.get("target") or "")).expanduser().resolve(strict=True)
+            actual = link_path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        if actual != expected or not actual.is_dir() or not (actual / "SKILL.md").is_file():
+            return None
+        if (actual / "SKILL.md").is_symlink() or any(item.is_symlink() for item in actual.rglob("*")):
+            return None
+        return actual
+
+    def _read_state(self) -> dict[str, Any]:
+        merged: dict[str, Any] = {}
+        for path in self._state_paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                merged.update(payload)
+        return merged
+
+    def _set_enabled(self, name: str, scope: str, enabled: bool | None) -> None:
+        if scope == "user" and self.user_skills_dir is None:
+            raise ValueError("用户级 Skill 目录未配置")
+        path = self._state_paths[1 if scope == "user" and len(self._state_paths) > 1 else 0]
+        state = self._read_state_file(path)
+        key = self._state_key(name, scope)
+        if enabled is None:
+            state.pop(key, None)
+        else:
+            current = state.get(key) if isinstance(state.get(key), dict) else {}
+            state[key] = {
+                "enabled": enabled,
+                "revision": int(current.get("revision", 0)) + 1,
+                "updatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write(path, json.dumps(state, ensure_ascii=False, indent=2))
+
+    def _bump_revision(self, name: str, scope: str, *, enabled: bool) -> None:
+        """内容变更也递增 revision，避免编辑器覆盖较新的文件。"""
+        if scope == "user" and self.user_skills_dir is None:
+            raise ValueError("用户级 Skill 目录未配置")
+        path = self._state_paths[1 if scope == "user" and len(self._state_paths) > 1 else 0]
+        state = self._read_state_file(path)
+        key = self._state_key(name, scope)
+        current = state.get(key) if isinstance(state.get(key), dict) else {}
+        state[key] = {
+            "enabled": enabled,
+            "revision": int(current.get("revision", 1)) + 1,
+            "updatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write(path, json.dumps(state, ensure_ascii=False, indent=2))
+
+    @staticmethod
+    def _state_key(name: str, scope: str) -> str:
+        return f"{scope}:{name}"
+
+    @staticmethod
+    def _read_state_file(path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _validate_name(name: str) -> str:
+        normalized = str(name or "").strip()
+        if not _SKILL_NAME.fullmatch(normalized):
+            raise ValueError("Skill 名称包含非法字符")
+        return normalized
+
+    @staticmethod
+    def _validate_content(content: str) -> None:
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("SKILL.md 内容不能为空")
+        if len(content.encode("utf-8")) > 1024 * 1024:
+            raise ValueError("SKILL.md 超过 1 MiB 限制")
+        if content.startswith("---"):
+            SkillParser.parse_frontmatter(content)
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        _atomic_write_path(path, content)
+
     @staticmethod
     def _parse_frontmatter(content: str) -> dict[str, Any]:
-        if not content.startswith("---"):
-            return {}
-        parts = content.split("---", 2)
-        if len(parts) < 3:
-            return {}
-        loaded = yaml.safe_load(parts[1]) or {}
-        if not isinstance(loaded, dict):
-            raise yaml.YAMLError("Skill frontmatter 必须是对象")
-        return {str(key): value for key, value in loaded.items()}
+        return SkillParser.parse_frontmatter(content)
 
     @staticmethod
     def _strip_frontmatter(content: str) -> str:
-        if not content.startswith("---"):
-            return content.strip()
-        parts = content.split("---", 2)
-        return parts[2].strip() if len(parts) == 3 else content.strip()
+        return SkillParser.strip_frontmatter(content)
 
     @staticmethod
     def _skill_config(raw: object) -> dict[str, Any]:
-        if not isinstance(raw, dict):
-            return {}
-        for key in ("skill", "beanagent"):
-            value = raw.get(key)
-            if isinstance(value, dict):
-                return {str(item_key): item for item_key, item in value.items()}
-        return {str(key): value for key, value in raw.items()}
+        return SkillDependencyChecker.skill_config(raw)
 
     @staticmethod
     def _missing_requirements(config: dict[str, Any]) -> str:
-        requires = config.get("requires")
-        if not isinstance(requires, dict):
-            return ""
-        missing: list[str] = []
-        bins = requires.get("bins")
-        if isinstance(bins, list):
-            missing.extend(
-                f"CLI: {name}"
-                for item in bins
-                if (name := str(item).strip()) and not shutil.which(name)
-            )
-        env_names = requires.get("env")
-        if isinstance(env_names, list):
-            missing.extend(
-                f"ENV: {name}"
-                for item in env_names
-                if (name := str(item).strip()) and not os.environ.get(name)
-            )
-        return ", ".join(missing)
+        return SkillDependencyChecker.missing_requirements(config)
 
     @staticmethod
     def _as_bool(value: object) -> bool:
@@ -292,4 +1140,4 @@ class SkillsLoader:
         )
 
 
-__all__ = ["SkillRecord", "SkillsLoader", "collect_skill_mentions"]
+__all__ = ["SkillRecord", "SkillRevisionConflict", "SkillSeedConflict", "SkillSnapshotView", "SkillsLoader", "collect_skill_mentions", "seed_builtin_skills"]
