@@ -39,11 +39,13 @@ export function ExtensionsPage({
   onBack,
   workspaceId = null,
   sessionId = "",
+  onCountChange,
 }: {
   kind: ExtensionKind;
   onBack: () => void;
   workspaceId?: string | null;
   sessionId?: string;
+  onCountChange?: (kind: ExtensionKind, count: number) => void;
 }) {
   const [scope, setScope] = useState<ExtensionScope>(() => (
     kind === "mcp" && !workspaceId ? "user" : "workspace"
@@ -132,6 +134,7 @@ export function ExtensionsPage({
       }
       if (requestVersion !== refreshVersionRef.current) return;
       setRecords(Array.isArray(next) ? next : []);
+      onCountChange?.(kind, Array.isArray(next) ? next.length : 0);
       setDefaultSkillStatuses(nextDefaultStatuses);
     } catch (reason) {
       if (requestVersion !== refreshVersionRef.current) return;
@@ -149,7 +152,7 @@ export function ExtensionsPage({
     }
     void refresh();
     return () => { refreshVersionRef.current += 1; };
-  }, [kind, scope, workspaceId]);
+  }, [kind, scope, workspaceId, onCountChange]);
 
   useEffect(() => {
     if (kind !== "skills") return;
@@ -224,18 +227,19 @@ export function ExtensionsPage({
         <div className="extensions-heading">
           <button className="icon-button extensions-back" aria-label="返回聊天" title="返回聊天" onClick={onBack}><ArrowLeft size={18} /></button>
           <div className="extensions-heading-icon"><Icon size={19} /></div>
-          <div><h1>扩展</h1><p>插件、MCP 与技能管理</p></div>
+          <div><h1>{meta.title}</h1><p>{meta.subtitle}</p></div>
         </div>
-        <div className="extensions-header-actions"><span className="extension-service-state"><span />服务已连接</span></div>
-      </header>
-
-      <main className="extensions-content">
-        <div className="extensions-toolbar">
+        <div className="extensions-header-actions">
           <div className="extension-scope" role="group" aria-label="扩展范围">
             <button className={scope === "user" ? "active" : ""} onClick={() => setScope("user")}><Monitor size={14} />用户级</button>
             <button className={scope === "workspace" ? "active" : ""} onClick={() => setScope("workspace")} disabled={kind === "mcp" && !workspaceId} title={kind === "mcp" && !workspaceId ? "请先选择工作目录" : undefined}><FolderOpen size={14} />{kind === "skills" || kind === "mcp" ? "当前项目级" : "工作区级"}</button>
           </div>
-          <div className="extensions-type-label"><Icon size={16} />{meta.title}<span>{filtered.length}</span></div>
+          <span className="extension-service-state"><span />服务已连接</span>
+        </div>
+      </header>
+
+      <main className="extensions-content">
+        <div className="extensions-toolbar">
           <label className="extensions-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`搜索${meta.title}…`} aria-label={`搜索${meta.title}`} /></label>
           {kind === "skills" ? <label className="extensions-status-filter">状态<select value={skillStatusFilter} onChange={(event) => setSkillStatusFilter(event.target.value)} aria-label="Skill 状态筛选"><option value="all">全部</option><option value="available">可用</option><option value="disabled">已停用</option><option value="missing_dependency">缺少依赖</option><option value="invalid">无效</option><option value="overridden">已覆盖</option></select></label> : null}
         </div>
@@ -253,7 +257,7 @@ export function ExtensionsPage({
         {error ? <div className="extensions-error" role="alert"><AlertTriangle size={16} />{error}<button onClick={() => void refresh()}>重试</button></div> : null}
         {notice ? <div className="extensions-notice" role="status"><CheckCircle2 size={16} />{notice}<button onClick={() => setNotice("")} aria-label="关闭提示">×</button></div> : null}
         {loading ? <div className="extensions-loading">正在加载扩展…</div> : filtered.length === 0 ? (
-          <div className="extensions-empty"><Icon size={30} /><strong>{meta.empty}</strong><span>{kind === "mcp" ? "可以通过导入 JSON 或新建服务开始配置。" : "可以通过导入或新建开始配置。"}</span></div>
+          <div className="extensions-empty"><Icon size={30} /><strong>{meta.empty}</strong><span>{kind === "plugins" ? "当前仅展示已安装插件，安装能力尚未开放。" : kind === "mcp" ? "可以通过导入 JSON 或新建服务开始配置。" : "可以通过导入或新建开始配置。"}</span></div>
         ) : (
           <div className={`extensions-list extensions-list-${kind}`}>
             {kind !== "skills" ? filtered.map(renderExtensionRow) : <><div className="skill-source-group">{ungroupedRecords.map(renderExtensionRow)}</div>{Object.entries(pluginSkillGroups).map(([pluginId, group]) => { const plugin = group[0]; return <section className="skill-source-group" key={pluginId}><header className="skill-source-group-header">{plugin.plugin_icon_url ? <img src={plugin.plugin_icon_url} alt="" /> : plugin.plugin_icon && plugin.plugin_icon.length <= 4 ? <span className="plugin-skill-emoji">{plugin.plugin_icon}</span> : <Puzzle size={14} />}<strong>{plugin.plugin_name}</strong><small>{plugin.plugin_source || "插件来源未声明"}</small><span>{plugin.plugin_enabled === false ? "插件已停用" : "插件已启用"} · {group.length} 个 Skill</span></header>{group.map(renderExtensionRow)}</section>; })}</>}

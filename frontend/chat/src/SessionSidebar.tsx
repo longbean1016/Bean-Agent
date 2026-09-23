@@ -2,6 +2,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import {
   AlertCircle,
   Bell,
+  Blocks,
   ChevronDown,
   ChevronRight,
   Folder,
@@ -54,6 +55,7 @@ export function SessionSidebar(props: {
   onSelect: (id: string) => void;
   onSettings: () => void;
   activeExtension?: ExtensionKind | null;
+  extensionCounts?: Partial<Record<ExtensionKind, number>>;
   onExtension?: (kind: ExtensionKind) => void;
 }) {
   const [menuSessionId, setMenuSessionId] = useState("");
@@ -76,6 +78,7 @@ export function SessionSidebar(props: {
   const [registeringWorkspace, setRegisteringWorkspace] = useState(false);
   const [scrollbarVisible, setScrollbarVisible] = useState(false);
   const [extensionsExpanded, setExtensionsExpanded] = useState(true);
+  const [activePrimaryAction, setActivePrimaryAction] = useState<"new-chat" | "add-workspace" | null>(null);
   const scrollbarHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionListRef = useRef<HTMLElement>(null);
 
@@ -96,7 +99,10 @@ export function SessionSidebar(props: {
   }, []);
 
   useEffect(() => {
-    if (props.activeExtension) setExtensionsExpanded(true);
+    if (props.activeExtension) {
+      setExtensionsExpanded(true);
+      setActivePrimaryAction(null);
+    }
   }, [props.activeExtension]);
 
   const showSessionScrollbar = () => {
@@ -176,7 +182,10 @@ export function SessionSidebar(props: {
         ) : (
           <button
             className="session-row-select"
-            onClick={() => props.onSelect(session.key)}
+            onClick={() => {
+              setActivePrimaryAction(null);
+              props.onSelect(session.key);
+            }}
             // 新对话既是默认会话标题，也是顶部操作按钮文案；补充动作语义避免读屏和自动化查询混淆。
             aria-label={title === "新对话" ? "打开会话“新对话”" : undefined}
           >
@@ -234,6 +243,7 @@ export function SessionSidebar(props: {
     try {
       await props.onRegisterWorkspace(path, workspaceTitle.trim());
       setWorkspaceDialogOpen(false);
+      setActivePrimaryAction(null);
       setWorkspacePath("");
       setWorkspaceTitle("");
     } catch (error) {
@@ -275,6 +285,10 @@ export function SessionSidebar(props: {
     });
   }
   const unavailableWorkspaceGroups = [...unavailableByWorkspace.values()];
+  const knownExtensionCounts = Object.values(props.extensionCounts ?? {});
+  const totalExtensionCount = knownExtensionCounts.length
+    ? knownExtensionCounts.reduce((total, count) => total + (count ?? 0), 0)
+    : null;
 
   const renderWorkspace = (workspace: Workspace) => (
     <section className="workspace-group" key={workspace.id} data-workspace-id={workspace.id}>
@@ -306,24 +320,37 @@ export function SessionSidebar(props: {
         <strong>BeanAgent</strong>
       </div>
       <div className="sidebar-primary-actions">
-        <button className="new-chat-button" onClick={() => props.onCreate(null)}><Plus size={15} />新对话</button>
-        <button className="add-workspace-button" onClick={() => {
-          setWorkspaceError("");
-          setWorkspacePath("");
-          setWorkspaceTitle("");
-          setWorkspaceDialogOpen(true);
-        }}><FolderPlus size={17} />添加工作目录</button>
+        <button
+          className={`new-chat-button${activePrimaryAction === "new-chat" ? " active" : ""}`}
+          aria-pressed={activePrimaryAction === "new-chat"}
+          onClick={() => {
+            setActivePrimaryAction("new-chat");
+            props.onCreate(null);
+          }}
+        ><Plus size={15} />新对话</button>
+        <button
+          className={`add-workspace-button${activePrimaryAction === "add-workspace" ? " active" : ""}`}
+          aria-pressed={activePrimaryAction === "add-workspace"}
+          onClick={() => {
+            setActivePrimaryAction("add-workspace");
+            setWorkspaceError("");
+            setWorkspacePath("");
+            setWorkspaceTitle("");
+            setWorkspaceDialogOpen(true);
+          }}
+        ><FolderPlus size={16} />添加工作目录</button>
       </div>
       <div className={`sidebar-extensions${extensionsExpanded ? " expanded" : " collapsed"}`} aria-label="扩展">
-        <button className="sidebar-extensions-title" onClick={() => setExtensionsExpanded((current) => !current)} aria-expanded={extensionsExpanded}>
-          <span className="sidebar-extensions-title-main">{extensionsExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}<strong>扩展</strong></span>
-          <small>插件、MCP 与技能</small>
+        <button className="sidebar-extensions-title" onClick={() => setExtensionsExpanded((current) => !current)} aria-expanded={extensionsExpanded} aria-controls="sidebar-extension-links" aria-label={totalExtensionCount === null ? "扩展" : `扩展，共 ${totalExtensionCount} 项`}>
+          <span className="sidebar-extensions-title-main"><Blocks size={15} /><strong>扩展</strong>{totalExtensionCount !== null ? <small>{totalExtensionCount}</small> : null}</span>
+          <span className="sidebar-extensions-chevron" aria-hidden="true">{extensionsExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</span>
         </button>
-        {extensionsExpanded ? <div className="sidebar-extension-links">
+        {extensionsExpanded ? <div className="sidebar-extension-links" id="sidebar-extension-links">
           {(["plugins", "mcp", "skills"] as ExtensionKind[]).map((kind) => {
             const labels: Record<ExtensionKind, string> = { plugins: "插件", mcp: "MCP", skills: "技能 Skills" };
             const icons: Record<ExtensionKind, ReactNode> = { plugins: <Puzzle size={15} />, mcp: <PlugZap size={15} />, skills: <Sparkles size={15} /> };
-            return <button key={kind} className={`sidebar-extension-link${props.activeExtension === kind ? " active" : ""}`} onClick={() => props.onExtension?.(kind)} disabled={!props.onExtension} aria-current={props.activeExtension === kind ? "page" : undefined}>{icons[kind]}<span>{labels[kind]}</span></button>;
+            const count = props.extensionCounts?.[kind];
+            return <button key={kind} className={`sidebar-extension-link${props.activeExtension === kind ? " active" : ""}`} onClick={() => { setActivePrimaryAction(null); props.onExtension?.(kind); }} disabled={!props.onExtension} aria-current={props.activeExtension === kind ? "page" : undefined} aria-label={typeof count === "number" ? `${labels[kind]}，${count} 项` : labels[kind]}>{icons[kind]}<span>{labels[kind]}</span>{typeof count === "number" ? <small>{count}</small> : null}</button>;
           })}
         </div> : null}
       </div>
@@ -356,7 +383,7 @@ export function SessionSidebar(props: {
         </div>
         <div className="recent-sessions" data-workspace-id="none">{renderSessions(unassignedSessions)}</div>
       </nav>
-      <button className="sidebar-settings-button" onClick={props.onSettings} title="模型与连接设置"><Settings size={17} />设置</button>
+      <button className="sidebar-settings-button" onClick={() => { setActivePrimaryAction(null); props.onSettings(); }} title="模型与连接设置"><Settings size={17} />设置</button>
       <Dialog.Root open={deleteTarget !== null} onOpenChange={(open) => { if (!open && !deleting) setDeleteTarget(null); }}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" onClick={() => { if (!deleting) setDeleteTarget(null); }} />
@@ -388,7 +415,10 @@ export function SessionSidebar(props: {
       <Dialog.Root open={workspaceDialogOpen} onOpenChange={(open) => {
         if (registeringWorkspace || pickingWorkspace) return;
         setWorkspaceDialogOpen(open);
-        if (!open) setWorkspaceError("");
+        if (!open) {
+          setWorkspaceError("");
+          setActivePrimaryAction(null);
+        }
       }}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />

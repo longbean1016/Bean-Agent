@@ -2197,7 +2197,8 @@ it("流式消息中的 Mermaid fence 闭合后允许立即查看大图", async (
 it("空会话不再提供 Mermaid 流程图示例", async () => {
   render(<App />);
 
-  await screen.findByText("从一个具体问题开始对话");
+  await screen.findByRole("heading", { name: "今天想让 BeanAgent 帮你做什么？" });
+  expect(screen.queryByText("从一个具体问题开始对话")).not.toBeInTheDocument();
   expect(screen.queryByText("画一张 Mermaid 流程图说明当前链路")).not.toBeInTheDocument();
 });
 

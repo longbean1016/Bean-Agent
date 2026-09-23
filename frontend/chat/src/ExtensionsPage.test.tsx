@@ -15,6 +15,8 @@ it("MCP 无项目时使用用户级，有项目时读取当前项目级", async 
 
   const first = render(<ExtensionsPage kind="mcp" onBack={() => undefined} />);
   await waitFor(() => expect(requested).toContain("/api/extensions/mcp?scope=user"));
+  expect(screen.getByRole("heading", { name: "MCP" })).toBeVisible();
+  expect(screen.getByText("连接外部工具服务，让 BeanAgent 获得更多可调用工具。")).toBeVisible();
   expect(screen.getByRole("button", { name: "当前项目级" })).toBeDisabled();
   first.unmount();
 
@@ -23,6 +25,23 @@ it("MCP 无项目时使用用户级，有项目时读取当前项目级", async 
     "/api/extensions/mcp?scope=workspace&workspace_id=workspace-1",
   ));
   expect(screen.getByText("当前项目")).toBeInTheDocument();
+});
+
+it("扩展页把真实数量同步给侧栏且不重复展示类型导航", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "/api/extensions/plugins?scope=workspace") {
+      return jsonResponse({ items: [{ id: "plugin:demo", name: "Demo", description: "演示插件", source: "local", scope: "workspace", enabled: true }] });
+    }
+    throw new Error(`未处理请求: ${url}`);
+  }));
+  const onCountChange = vi.fn();
+
+  const { container } = render(<ExtensionsPage kind="plugins" onBack={() => undefined} onCountChange={onCountChange} />);
+
+  expect(await screen.findByRole("heading", { name: "插件" })).toBeVisible();
+  await waitFor(() => expect(onCountChange).toHaveBeenCalledWith("plugins", 1));
+  expect(container.querySelector(".extensions-type-label")).toBeNull();
 });
 
 const weatherRecord = {
