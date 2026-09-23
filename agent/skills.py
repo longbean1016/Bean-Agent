@@ -493,6 +493,60 @@ class SkillsLoader:
             raise ValueError("来源目录中未发现包含 SKILL.md 的 Skill")
         return installed
 
+    def preflight_directory(
+        self,
+        source: str | Path,
+        scope: str,
+        *,
+        mode: str = "copy",
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        """只读校验单个导入候选，返回执行前可稳定展示的结果。"""
+
+        source_path = Path(source).expanduser().resolve()
+        candidate_name = str(name or source_path.name).strip()
+        result: dict[str, Any] = {
+            "name": candidate_name,
+            "source_path": str(source_path),
+            "scope": "project" if scope in {"workspace", "project"} else scope,
+            "mode": mode,
+            "status": "unavailable",
+            "reason": "Skill 来源目录不存在",
+            "source_hash": "",
+        }
+        if mode not in {"copy", "symlink"}:
+            return {**result, "status": "invalid", "reason": "不支持的 Skill 安装模式"}
+        if not source_path.is_dir() or not (source_path / "SKILL.md").is_file():
+            return result
+        try:
+            normalized_name = self._validate_name(candidate_name)
+            scope_root = self._scope_root("workspace" if scope == "project" else scope).resolve()
+        except ValueError as error:
+            return {**result, "status": "invalid", "reason": str(error)}
+        if source_path == scope_root or source_path.is_relative_to(scope_root) or scope_root.is_relative_to(source_path):
+            return {**result, "status": "unsafe", "reason": "Skill 来源目录不能位于安装目标目录内"}
+        if source_path.is_symlink() or (source_path / "SKILL.md").is_symlink() or any(item.is_symlink() for item in source_path.rglob("*")):
+            return {**result, "status": "unsafe", "reason": "Skill 来源包含未校验的符号链接"}
+        target = scope_root / normalized_name
+        source_hash = _hash_skill_tree(source_path)
+        if target.exists():
+            return {**result, "name": normalized_name, "source_hash": source_hash, "status": "conflict", "reason": "目标作用域已存在同名 Skill"}
+        records = self._scan_skills_dir(
+            source_path.parent,
+            source="external",
+            source_id="preflight",
+            reject_symlinks=True,
+            scope="workspace",
+        )
+        record = next((item for item in records if item.root_dir.resolve() == source_path), None)
+        if record is None:
+            return {**result, "name": normalized_name, "source_hash": source_hash, "status": "invalid", "reason": "无法解析 SKILL.md"}
+        if record.status == "invalid":
+            return {**result, "name": normalized_name, "source_hash": source_hash, "status": "invalid", "reason": "；".join(record.diagnostics) or "SKILL.md 无效"}
+        if record.status == "missing_dependency":
+            return {**result, "name": normalized_name, "source_hash": source_hash, "status": "unavailable", "reason": record.missing or "缺少依赖"}
+        return {**result, "name": normalized_name, "source_hash": source_hash, "status": "ready", "reason": ""}
+
     def install_git(self, url: str, scope: str, *, revision: str | None = None, mode: str = "copy") -> list[SkillRecord]:
         if not re.match(r"^(https://|ssh://|git@)[^\s]+$", url):
             raise ValueError("Git 来源必须使用 HTTPS、SSH 或 git@ 地址")

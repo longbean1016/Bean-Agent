@@ -193,6 +193,26 @@ def test_scope_priority_and_plugin_group(tmp_path: Path) -> None:
     assert plugin_record.source == "plugin"
 
 
+def test_skill_import_preflight_reports_ready_conflict_and_invalid(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    source_root = tmp_path / "external"
+    candidate = _write_skill(source_root, "importable", description="可导入")
+    invalid = source_root / "broken"
+    invalid.mkdir(parents=True)
+    (invalid / "SKILL.md").write_text("没有 frontmatter", encoding="utf-8")
+    loader = SkillsLoader(workspace, builtin_skills_dir=None, user_skills_dir=tmp_path / "user")
+
+    ready = loader.preflight_directory(candidate, "workspace", mode="copy", name="importable")
+    broken = loader.preflight_directory(invalid, "workspace", mode="copy", name="broken")
+    assert ready["status"] == "ready"
+    assert ready["source_hash"]
+    assert broken["status"] == "invalid"
+
+    _write_skill(workspace / "skills", "importable")
+    conflict = loader.preflight_directory(candidate, "workspace", mode="copy", name="importable")
+    assert conflict["status"] == "conflict"
+
+
 def test_seed_builtin_skills_is_idempotent_and_does_not_overwrite_user_file(tmp_path: Path) -> None:
     builtin = tmp_path / "builtin"
     user = tmp_path / "user"

@@ -240,6 +240,42 @@ def test_mcp_external_discovery_returns_safe_summary_and_imports_selected(tmp_pa
         assert record["env_names"] == ["TOKEN"]
 
 
+def test_skill_batch_import_requires_fresh_preflight_token(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    user_skills = tmp_path / "user-skills"
+    source = user_skills / "review" / "SKILL.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nname: review\ndescription: 审查\n---\n旧正文\n", encoding="utf-8")
+    runtime = build_core_runtime(config, workspace, provider=Provider())
+    runtime.skills.user_skills_dir = user_skills.resolve()
+    runtime.skills._state_paths = [workspace / ".beanagent" / "skills-state.json", user_skills.parent / "skills-state.json"]
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        discovered = client.get("/api/extensions/skills/discover").json()["sources"]
+        source_group = next(item for item in discovered if item["agent"] == "beanagent-user")
+        payload = {
+            "scope": "workspace",
+            "mode": "copy",
+            "selections": [{"source_id": source_group["id"], "names": ["review"]}],
+        }
+        preflight = client.post("/api/extensions/skills/import/preflight", json=payload)
+        assert preflight.status_code == 200
+        assert preflight.json()["items"][0]["status"] == "ready"
+
+        source.write_text("---\nname: review\ndescription: 审查\n---\n新正文\n", encoding="utf-8")
+        stale = client.post("/api/extensions/skills/import", json={**payload, "preflight_token": preflight.json()["token"]})
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "preflight_stale"
+
+        fresh = client.post("/api/extensions/skills/import/preflight", json=payload).json()
+        imported = client.post("/api/extensions/skills/import", json={**payload, "preflight_token": fresh["token"]})
+        assert imported.status_code == 200
+        assert imported.json()["success_count"] == 1
+        assert "新正文" in (workspace / "skills" / "review" / "SKILL.md").read_text(encoding="utf-8")
+
+
 def test_chat_session_route_returns_spa_index_or_build_hint(tmp_path: Path) -> None:
     config = Config()
     config.memory.enabled = False

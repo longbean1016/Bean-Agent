@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import mimetypes
 import logging
@@ -1450,6 +1451,11 @@ def create_fastapi_app(
         skill_loader = _skills_loader_for_request(workspace_id)
         return {"revision": skill_loader.directory_revision()}
 
+    @app.get("/api/extensions/skills/discover")
+    def discover_skill_sources(workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        sources = _discover_skill_sources(workspace_id)
+        return {"sources": sources, "source_count": len(sources), "skill_count": sum(int(item["skill_count"]) for item in sources)}
+
     def _skill_record_or_404(skill_name: str, scope: str, skill_loader: SkillsLoader | None = None) -> Any:
         record = (skill_loader or application.core.skills).get_skill_record(skill_name, scope=scope)
         if record is None:
@@ -1534,6 +1540,10 @@ def create_fastapi_app(
             raise HTTPException(status_code=400, detail=str(error)) from error
         return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": "project" if record.scope == "workspace" else record.scope, "status": record.status, "revision": record.revision}
 
+    @app.post("/api/extensions/skills/import/preflight")
+    def preflight_skill_import(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return _build_skill_import_plan(payload)
+
     @app.post("/api/extensions/skills/{skill_name}/{action}")
     async def skill_extension_action(skill_name: str, action: str, request: Request, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         scope = _skill_scope(payload)
@@ -1559,6 +1569,54 @@ def create_fastapi_app(
                 raise HTTPException(status_code=503, detail=str(error)) from error
         return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": "project" if record.scope == "workspace" else record.scope, "status": record.status, "enabled": record.enabled, "revision": record.revision}
 
+    def _build_skill_import_plan(payload: dict[str, Any]) -> dict[str, Any]:
+        scope = _skill_scope(payload)
+        mode = str(payload.get("mode") or "copy")
+        if mode not in {"copy", "symlink"}:
+            raise HTTPException(status_code=400, detail="导入模式必须是 copy 或 symlink")
+        selections = payload.get("selections")
+        if not isinstance(selections, list) or not selections:
+            raise HTTPException(status_code=400, detail="请至少选择一个 Skill")
+        skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
+        discovered = {
+            str(source.get("id")): source
+            for source in _discover_skill_sources(payload.get("workspace_id"))
+            if isinstance(source, dict)
+        }
+        items: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for selection in selections:
+            if not isinstance(selection, dict):
+                items.append({"name": "unknown", "source_id": "", "status": "invalid", "reason": "导入选择格式无效", "mode": mode, "scope": "project" if scope == "workspace" else scope, "source_hash": ""})
+                continue
+            source_id = str(selection.get("source_id") or "")
+            source = discovered.get(source_id)
+            names = selection.get("names") if isinstance(selection.get("names"), list) else []
+            candidates = {str(item.get("name")): item for item in (source or {}).get("candidates", []) if isinstance(item, dict)}
+            for raw_name in names:
+                name = str(raw_name or "").strip()
+                key = (source_id, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidate = candidates.get(name)
+                if candidate is None:
+                    items.append({"name": name or "unknown", "source_id": source_id, "status": "unavailable", "reason": "来源中不存在该 Skill", "mode": mode, "scope": "project" if scope == "workspace" else scope, "source_hash": ""})
+                    continue
+                checked = skill_loader.preflight_directory(str(candidate.get("path") or ""), scope, mode=mode, name=name)
+                items.append({**checked, "source_id": source_id, "description": str(candidate.get("description") or "")})
+        target_revision = skill_loader.directory_revision(scope=scope)
+        token_payload = {
+            "scope": scope,
+            "mode": mode,
+            "workspace_id": str(payload.get("workspace_id") or ""),
+            "target_revision": target_revision,
+            "items": [{key: item.get(key) for key in ("source_id", "name", "source_hash", "status")} for item in items],
+        }
+        token = hashlib.sha256(json.dumps(token_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        counts = {status: sum(1 for item in items if item.get("status") == status) for status in ("ready", "conflict", "invalid", "unsafe", "unavailable")}
+        return {"token": token, "scope": "project" if scope == "workspace" else scope, "mode": mode, "target_revision": target_revision, "items": items, "counts": counts}
+
     @app.post("/api/extensions/skills/import")
     async def import_skill_extensions(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         scope = _skill_scope(payload)
@@ -1567,36 +1625,40 @@ def create_fastapi_app(
         imported: list[dict[str, Any]] = []
         selections = payload.get("selections")
         if isinstance(selections, list):
-            discovered = {
-                str(source.get("id")): source
-                for source in _discover_skill_sources(payload.get("workspace_id"))
-                if isinstance(source, dict)
-            }
+            plan = _build_skill_import_plan(payload)
+            expected_token = str(payload.get("preflight_token") or "")
+            if not expected_token:
+                raise HTTPException(status_code=400, detail="批量导入必须先完成预检")
+            if expected_token != str(plan.get("token") or ""):
+                raise HTTPException(status_code=409, detail={"code": "preflight_stale", "detail": "Skill 来源或目标目录已变化，请重新预检", "retryable": True})
+            # 执行前再次核对所有 ready 项，避免预检完成到首个文件落盘之间来源被替换。
+            for item in plan["items"]:
+                if item.get("status") != "ready":
+                    continue
+                checked = skill_loader.preflight_directory(str(item.get("source_path") or ""), scope, mode=mode, name=str(item.get("name") or ""))
+                if checked.get("status") != "ready" or checked.get("source_hash") != item.get("source_hash"):
+                    raise HTTPException(status_code=409, detail={"code": "preflight_stale", "detail": "Skill 来源或目标目录已变化，请重新预检", "retryable": True})
             skipped: list[dict[str, Any]] = []
             failed: list[dict[str, Any]] = []
-            for selection in selections:
-                if not isinstance(selection, dict):
-                    failed.append({"name": "unknown", "status": "failed", "reason": "导入选择格式无效"})
+            for item in plan["items"]:
+                name = str(item.get("name") or "unknown")
+                status = str(item.get("status") or "invalid")
+                if status == "conflict":
+                    skipped.append({"name": name, "status": "skipped", "reason": str(item.get("reason") or "同名冲突")})
                     continue
-                source = discovered.get(str(selection.get("source_id") or ""))
-                names = selection.get("names") if isinstance(selection.get("names"), list) else []
-                candidates = {str(item.get("name")): item for item in (source or {}).get("candidates", []) if isinstance(item, dict)}
-                for raw_name in names:
-                    name = str(raw_name or "").strip()
-                    candidate = candidates.get(name)
-                    if candidate is None:
-                        failed.append({"name": name or "unknown", "status": "failed", "reason": "来源中不存在该 Skill"})
-                        continue
-                    try:
-                        records = await asyncio.to_thread(skill_loader.install_directory, str(candidate.get("path") or ""), scope, mode=mode, name=name)
-                        imported.extend({"name": record.name, "status": "imported", "scope": "project" if record.scope == "workspace" else record.scope} for record in records)
-                    except ValueError as error:
-                        if "已存在" in str(error):
-                            skipped.append({"name": name, "status": "skipped", "reason": str(error)})
-                        else:
-                            failed.append({"name": name, "status": "failed", "reason": str(error)})
-                    except (RuntimeError, OSError) as error:
+                if status != "ready":
+                    failed.append({"name": name, "status": "failed", "reason": str(item.get("reason") or "预检未通过")})
+                    continue
+                try:
+                    records = await asyncio.to_thread(skill_loader.install_directory, str(item.get("source_path") or ""), scope, mode=mode, name=name)
+                    imported.extend({"name": record.name, "status": "imported", "scope": "project" if record.scope == "workspace" else record.scope} for record in records)
+                except ValueError as error:
+                    if "已存在" in str(error):
+                        skipped.append({"name": name, "status": "skipped", "reason": str(error)})
+                    else:
                         failed.append({"name": name, "status": "failed", "reason": str(error)})
+                except (RuntimeError, OSError) as error:
+                    failed.append({"name": name, "status": "failed", "reason": str(error)})
             return {"imported": imported, "skipped": skipped, "failed": failed, "success_count": len(imported), "skipped_count": len(skipped), "failed_count": len(failed)}
         try:
             if payload.get("type") == "git" or payload.get("url"):
@@ -1652,11 +1714,6 @@ def create_fastapi_app(
                     "skill_count": len(candidates),
                 })
         return sources
-
-    @app.get("/api/extensions/skills/discover")
-    def discover_skill_sources(workspace_id: str | None = Query(None)) -> dict[str, Any]:
-        sources = _discover_skill_sources(workspace_id)
-        return {"sources": sources, "source_count": len(sources), "skill_count": sum(int(item["skill_count"]) for item in sources)}
 
     @app.delete("/api/extensions/skills/{skill_name}", status_code=204)
     async def delete_skill_extension(

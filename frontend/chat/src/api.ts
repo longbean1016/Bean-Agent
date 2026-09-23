@@ -392,6 +392,28 @@ export interface DiscoveredSkillSource {
   candidates: Array<{ name: string; description: string; path: string; available: boolean }>;
 }
 
+export interface SkillImportPlanItem {
+  name: string;
+  source_id: string;
+  description?: string;
+  scope: string;
+  mode: "copy" | "symlink";
+  status: "ready" | "conflict" | "invalid" | "unsafe" | "unavailable";
+  reason: string;
+}
+
+export interface SkillImportPlan {
+  token: string;
+  scope: string;
+  mode: "copy" | "symlink";
+  target_revision: string;
+  items: SkillImportPlanItem[];
+  counts: Record<SkillImportPlanItem["status"], number>;
+}
+
+export interface SkillImportResultItem { name: string; status: "imported" | "skipped" | "failed"; reason?: string }
+export interface SkillImportResult { imported: SkillImportResultItem[]; skipped: SkillImportResultItem[]; failed: SkillImportResultItem[] }
+
 export async function discoverSkillSources(workspaceId?: string | null): Promise<DiscoveredSkillSource[]> {
   const query = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : "";
   const response = await fetch(`/api/extensions/skills/discover${query}`);
@@ -400,10 +422,17 @@ export async function discoverSkillSources(workspaceId?: string | null): Promise
   return Array.isArray(result.sources) ? result.sources : [];
 }
 
-export async function importSkillSelections(scope: ExtensionScope, selections: Array<{ source_id: string; names: string[] }>, workspaceId?: string | null): Promise<{ imported: unknown[]; skipped: unknown[]; failed: Array<{ reason?: string }> }> {
-  const response = await fetch("/api/extensions/skills/import", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, selections, workspace_id: workspaceId }) });
-  const result = await response.json().catch(() => ({})) as { imported?: unknown[]; skipped?: unknown[]; failed?: Array<{ reason?: string }>; detail?: string };
-  if (!response.ok) throw new Error(result.detail || "无法批量导入 Skill");
+export async function preflightSkillSelections(scope: ExtensionScope, mode: "copy" | "symlink", selections: Array<{ source_id: string; names: string[] }>, workspaceId?: string | null): Promise<SkillImportPlan> {
+  const response = await fetch("/api/extensions/skills/import/preflight", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, mode, selections, workspace_id: workspaceId }) });
+  const result = await response.json().catch(() => ({})) as SkillImportPlan & { detail?: string };
+  if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "无法预检批量导入");
+  return result;
+}
+
+export async function importSkillSelections(scope: ExtensionScope, mode: "copy" | "symlink", selections: Array<{ source_id: string; names: string[] }>, preflightToken: string, workspaceId?: string | null): Promise<SkillImportResult> {
+  const response = await fetch("/api/extensions/skills/import", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ scope, mode, selections, preflight_token: preflightToken, workspace_id: workspaceId }) });
+  const result = await response.json().catch(() => ({})) as SkillImportResult & { detail?: string | { detail?: string } };
+  if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : result.detail?.detail || "无法批量导入 Skill");
   return { imported: result.imported || [], skipped: result.skipped || [], failed: result.failed || [] };
 }
 
