@@ -12,18 +12,23 @@ import difflib
 import hashlib
 import json
 import logging
-import os
 import re
 import shutil
-import subprocess
-import tempfile
 import uuid
 from datetime import datetime, timezone
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
+from agent.skill_services import (
+    PluginSkillSource,
+    SkillDependencyChecker,
+    SkillDiscovery,
+    SkillInstaller,
+    SkillParser,
+    SkillRuntimeIndex,
+    SkillSessionSnapshot,
+)
 
 logger = logging.getLogger(__name__)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
@@ -213,18 +218,14 @@ class SkillSnapshotView:
     """
 
     def __init__(self, snapshot: dict[str, Any]) -> None:
-        self.revision = str(snapshot.get("revision") or "")
+        self.revision, raw_records = SkillSessionSnapshot.restore(
+            snapshot,
+            _SOURCE_PRIORITY,
+        )
         records: list[SkillRecord] = []
-        raw_records = snapshot.get("skills")
-        if not isinstance(raw_records, list):
-            raw_records = []
         for raw in raw_records:
-            if not isinstance(raw, dict):
-                continue
             name = str(raw.get("name") or "").strip()
             content = str(raw.get("content") or "")
-            if not name:
-                continue
             records.append(
                 SkillRecord(
                     name=name,
@@ -348,8 +349,12 @@ class SkillsLoader:
         self._state_paths = [self.workspace / ".beanagent" / "skills-state.json"]
         if self.user_skills_dir is not None:
             self._state_paths.append(self.user_skills_dir.parent / "skills-state.json")
-        self._last_indexes: dict[str, tuple[SkillRecord, ...]] = {}
-        self._scan_diagnostics: tuple[str, ...] = ()
+        self.discovery = SkillDiscovery()
+        self.parser = SkillParser()
+        self.dependency_checker = SkillDependencyChecker()
+        self.installer = SkillInstaller()
+        self.runtime_index = SkillRuntimeIndex()
+        self.snapshot_service = SkillSessionSnapshot()
 
     def list_skill_records(
         self,
@@ -360,22 +365,16 @@ class SkillsLoader:
         """按 Skill 名称返回稳定排序的索引。"""
 
         cache_key = str(scope or "effective")
-        try:
-            records = self._build_scope_index(scope) if scope in {"user", "workspace"} else self._build_index()
-        except OSError as error:
-            # 目录暂时不可读时沿用上一份不可变索引，避免页面和正在创建的快照
-            # 因一次磁盘抖动突然清空；诊断单独暴露给管理 API。
-            self._scan_diagnostics = (f"scan_failed:{type(error).__name__}",)
-            records = list(self._last_indexes.get(cache_key, ()))
-        else:
-            self._scan_diagnostics = ()
-            self._last_indexes[cache_key] = tuple(records)
+        records = self.runtime_index.build(
+            cache_key,
+            lambda: self._build_scope_index(scope) if scope in {"user", "workspace"} else self._build_index(),
+        )
         if filter_unavailable:
             return [record for record in records if record.available and record.enabled]
         return records
 
     def last_scan_diagnostics(self) -> tuple[str, ...]:
-        return self._scan_diagnostics
+        return self.runtime_index.diagnostics
 
     def for_workspace(self, workspace_path: str | Path) -> "SkillsLoader":
         """为已注册项目创建独立索引，复用全局来源配置但不共享项目路径状态。"""
@@ -390,62 +389,13 @@ class SkillsLoader:
     def directory_revision(self, *, scope: str | None = None) -> str:
         """返回规范化目录 revision，文件遍历顺序不会造成无意义变化。"""
 
-        digest = hashlib.sha256()
-        for record in self.list_skill_records(filter_unavailable=False, scope=scope):
-            digest.update(record.name.encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(record.source.encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(hashlib.sha256(record.content.encode("utf-8")).digest())
-            digest.update(str(record.enabled).encode("ascii"))
-            digest.update(b"\0")
-            digest.update("|".join(record.diagnostics).encode("utf-8"))
-            digest.update(b"\n")
-        return digest.hexdigest()
+        return self.runtime_index.revision(self.list_skill_records(filter_unavailable=False, scope=scope))
 
     def create_snapshot(self) -> dict[str, Any]:
         """创建可持久化会话快照；正文随快照保存以隔离后续磁盘变化。"""
 
         records = self.list_skill_records(filter_unavailable=False)
-        return {
-            "schema": 2,
-            "revision": self.directory_revision(),
-            "skills": [
-                {
-                    "name": record.name,
-                    "source": record.source,
-                    "source_id": record.source_id,
-                    "scope": "project" if record.scope == "workspace" and record.source == "workspace" else record.scope,
-                    "root_dir": str(record.root_dir),
-                    "skill_file": str(record.skill_file),
-                    "content": record.content,
-                    "description": record.description,
-                    "when_to_use": record.when_to_use,
-                    "always": record.always,
-                    "available": record.available,
-                    "missing": record.missing,
-                    "version": record.version,
-                    "plugin_name": record.plugin_name,
-                    "status": record.status,
-                    "diagnostics": list(record.diagnostics),
-                    "record_revision": record.revision,
-                    "enabled": record.enabled,
-                    "slug": record.slug,
-                    "owner": record.owner,
-                    "published_at": record.published_at,
-                    "file_size": record.file_size,
-                    "content_hash": record.content_hash or hashlib.sha256(record.content.encode("utf-8")).hexdigest(),
-                    "priority": record.priority or _SOURCE_PRIORITY.get(record.source, 0),
-                    "active": record.active,
-                    "overridden_by": record.overridden_by,
-                    "override_reason": record.override_reason,
-                    "plugin_icon": record.plugin_icon,
-                    "plugin_source": record.plugin_source,
-                    "plugin_enabled": record.plugin_enabled,
-                }
-                for record in records
-            ],
-        }
+        return self.snapshot_service.create(records, self.directory_revision())
 
     def list_builtin_seed_statuses(self) -> list[dict[str, Any]]:
         """返回内置种子的用户副本状态，不读取或修改其他 Skill。"""
@@ -661,7 +611,7 @@ class SkillsLoader:
         scope_root = self._scope_root(scope).resolve()
         if source_path == scope_root or source_path.is_relative_to(scope_root) or scope_root.is_relative_to(source_path):
             raise ValueError("Skill 来源目录不能位于安装目标目录内")
-        candidates = [source_path] if (source_path / "SKILL.md").is_file() else [item for item in sorted(source_path.iterdir()) if item.is_dir() and (item / "SKILL.md").is_file()]
+        candidates = self.installer.candidates(source_path)
         if name and len(candidates) != 1:
             raise ValueError("只有单个 Skill 来源时才能指定名称")
         installed: list[SkillRecord] = []
@@ -670,21 +620,13 @@ class SkillsLoader:
             target = self._scope_root(scope) / skill_name
             if target.exists() or target.is_symlink():
                 raise ValueError(f"Skill 已存在: {skill_name}")
-            if candidate.is_symlink() or (candidate / "SKILL.md").is_symlink():
-                raise ValueError("Skill 来源不能通过符号链接安装")
-            if any(item.is_symlink() for item in candidate.rglob("*")):
-                raise ValueError("Skill 来源包含未校验的符号链接")
-            if mode == "symlink":
-                target.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    target.symlink_to(candidate, target_is_directory=True)
-                    self._register_managed_symlink(skill_name, scope, candidate)
-                except (OSError, ValueError):
-                    if target.is_symlink():
-                        target.unlink()
-                    raise
-            else:
-                shutil.copytree(candidate, target, symlinks=False)
+            self.installer.validate_source(candidate)
+            self.installer.place(
+                candidate,
+                target,
+                mode,
+                lambda: self._register_managed_symlink(skill_name, scope, candidate),
+            )
             record = self.get_skill_record(skill_name, scope=scope)
             if record is not None:
                 installed.append(record)
@@ -753,21 +695,11 @@ class SkillsLoader:
         return {**result, "name": normalized_name, "source_hash": source_hash, "status": "ready", "reason": ""}
 
     def install_git(self, url: str, scope: str, *, revision: str | None = None, mode: str = "copy") -> list[SkillRecord]:
-        if not re.match(r"^(https://|ssh://|git@)[^\s]+$", url):
-            raise ValueError("Git 来源必须使用 HTTPS、SSH 或 git@ 地址")
-        with tempfile.TemporaryDirectory(prefix="beanagent-skill-") as directory:
-            command = ["git", "clone"]
-            if not revision:
-                command.extend(["--depth", "1"])
-            command.extend([url, directory])
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
-            if completed.returncode != 0:
-                raise RuntimeError("Git 仓库获取失败")
-            if revision:
-                checkout = subprocess.run(["git", "-C", directory, "checkout", revision], capture_output=True, text=True, timeout=60, check=False)
-                if checkout.returncode != 0:
-                    raise RuntimeError("Git revision 不存在")
-            return self.install_directory(directory, scope, mode=mode)
+        return self.installer.install_git(
+            url,
+            revision,
+            lambda directory: self.install_directory(directory, scope, mode=mode),
+        )
 
     def load_skill_record(self, name: str) -> SkillRecord | None:
         """按规范名称读取 Skill；名称不匹配时不猜测或模糊路由。"""
@@ -844,29 +776,11 @@ class SkillsLoader:
 
         normalized = "workspace" if scope in {"workspace", "project"} else "user"
         cache_key = f"management:{normalized}"
-        try:
-            candidates = self._collect_management_sources(normalized)
-        except OSError as error:
-            self._scan_diagnostics = (f"scan_failed:{type(error).__name__}",)
-            return list(self._last_indexes.get(cache_key, ()))
-        winners: dict[str, SkillRecord] = {}
-        records: list[SkillRecord] = []
-        for record in candidates:
-            winner = winners.get(record.name)
-            if winner is None:
-                winners[record.name] = record
-                records.append(replace(record, active=True))
-                continue
-            records.append(replace(
-                record,
-                active=False,
-                overridden_by=f"{winner.source_id}:{winner.name}",
-                override_reason=f"被更高优先级来源 {winner.source} 覆盖",
-            ))
-        result = sorted(records, key=lambda item: (item.name, -item.priority, item.source_id))
-        self._scan_diagnostics = ()
-        self._last_indexes[cache_key] = tuple(result)
-        return result
+        candidates = self.runtime_index.build(
+            cache_key,
+            lambda: self._collect_management_sources(normalized),
+        )
+        return self.runtime_index.mark_overrides(candidates)
 
     def _collect_management_sources(self, scope: str) -> list[SkillRecord]:
         records: list[SkillRecord] = []
@@ -875,85 +789,65 @@ class SkillsLoader:
         if self.user_skills_dir is not None:
             records.extend(self._scan_skills_dir(self.user_skills_dir, source="user", source_id="user", reject_symlinks=True, scope="user"))
         if scope == "workspace":
-            for source_id, plugin_name, plugin_root, icon, install_source, enabled in self._plugin_sources():
+            for plugin in self._plugin_sources():
                 records.extend(self._scan_skills_dir(
-                    plugin_root,
+                    plugin.skills_root,
                     source="plugin",
-                    source_id=f"plugin:{source_id}",
+                    source_id=f"plugin:{plugin.source_id}",
                     reject_symlinks=True,
                     scope="workspace",
-                    plugin_name=plugin_name,
-                    plugin_icon=icon,
-                    plugin_source=install_source,
-                    plugin_enabled=enabled,
+                    plugin_name=plugin.name,
+                    plugin_icon=plugin.icon,
+                    plugin_source=plugin.install_source,
+                    plugin_enabled=plugin.enabled,
                 ))
         if self.builtin_skills_dir is not None:
             records.extend(self._scan_skills_dir(self.builtin_skills_dir, source="builtin", source_id="builtin", reject_symlinks=False, scope="builtin"))
         return records
 
-    def _plugin_sources(self) -> list[tuple[str, str, Path, str | None, str, bool]]:
-        sources = [(name, name, root, None, "已配置插件", True) for name, root in self.plugin_skill_roots]
-        workspace_plugins = self.workspace / "plugins"
-        if not workspace_plugins.is_dir():
-            return sources
-        for directory in sorted(workspace_plugins.iterdir(), key=lambda item: item.name):
-            if not directory.is_dir():
-                continue
-            manifest = self._read_state_file(directory / "plugin.json")
-            sources.append((
-                directory.name,
-                str(manifest.get("name") or directory.name),
-                directory / "skills",
-                str(manifest.get("icon") or "") or None,
-                str(manifest.get("source") or "当前项目插件"),
-                bool(manifest.get("enabled", True)),
-            ))
-        return sources
+    def _plugin_sources(self) -> list[PluginSkillSource]:
+        return self.discovery.plugin_sources(self.workspace, self.plugin_skill_roots)
 
     def _build_index(self) -> list[SkillRecord]:
         # workspace > user > plugin > builtin；显式按来源写入索引，不能依赖
         # 文件系统遍历顺序决定覆盖关系。
-        records: dict[str, SkillRecord] = {}
-        for record in self._scan_skills_dir(
+        candidates: list[SkillRecord] = []
+        candidates.extend(self._scan_skills_dir(
             self.skills_dir,
             source="workspace",
             source_id="workspace",
             reject_symlinks=True,
             scope="workspace",
-        ):
-            records[record.name] = record
+        ))
         if self.user_skills_dir is not None:
-            for record in self._scan_skills_dir(
+            candidates.extend(self._scan_skills_dir(
                 self.user_skills_dir,
                 source="user",
                 source_id="user",
                 reject_symlinks=True,
                 scope="user",
-            ):
-                records.setdefault(record.name, record)
-        for source_id, plugin_name, plugin_root, icon, install_source, enabled in self._plugin_sources():
-            for record in self._scan_skills_dir(
-                plugin_root,
+            ))
+        for plugin in self._plugin_sources():
+            candidates.extend(self._scan_skills_dir(
+                plugin.skills_root,
                 source="plugin",
-                source_id=f"plugin:{source_id}",
+                source_id=f"plugin:{plugin.source_id}",
                 reject_symlinks=True,
                 scope="workspace",
-                plugin_name=plugin_name,
-                plugin_icon=icon,
-                plugin_source=install_source,
-                plugin_enabled=enabled,
-            ):
-                records.setdefault(record.name, record)
+                plugin_name=plugin.name,
+                plugin_icon=plugin.icon,
+                plugin_source=plugin.install_source,
+                plugin_enabled=plugin.enabled,
+            ))
         if self.builtin_skills_dir is not None:
-            for record in self._scan_skills_dir(
+            candidates.extend(self._scan_skills_dir(
                 self.builtin_skills_dir,
                 source="builtin",
                 source_id="builtin",
                 reject_symlinks=False,
                 scope="builtin",
-            ):
-                records.setdefault(record.name, record)
-        return sorted(records.values(), key=lambda record: record.name)
+            ))
+        return self.runtime_index.select_effective(candidates)
 
     def _build_scope_index(self, scope: str) -> list[SkillRecord]:
         """构建管理页的来源列表，不因另一作用域同名而隐藏记录。"""
@@ -961,9 +855,9 @@ class SkillsLoader:
         if scope == "workspace":
             for record in self._scan_skills_dir(self.skills_dir, source="workspace", source_id="workspace", reject_symlinks=True, scope="workspace"):
                 records[record.name] = record
-            for source_id, plugin_name, plugin_root, icon, install_source, enabled in self._plugin_sources():
-                for record in self._scan_skills_dir(plugin_root, source="plugin", source_id=f"plugin:{source_id}", reject_symlinks=True, scope="workspace", plugin_name=plugin_name, plugin_icon=icon, plugin_source=install_source, plugin_enabled=enabled):
-                    records.setdefault(f"plugin:{plugin_name}:{record.name}", record)
+            for plugin in self._plugin_sources():
+                for record in self._scan_skills_dir(plugin.skills_root, source="plugin", source_id=f"plugin:{plugin.source_id}", reject_symlinks=True, scope="workspace", plugin_name=plugin.name, plugin_icon=plugin.icon, plugin_source=plugin.install_source, plugin_enabled=plugin.enabled):
+                    records.setdefault(f"plugin:{plugin.name}:{record.name}", record)
         else:
             if self.user_skills_dir is not None:
                 for record in self._scan_skills_dir(self.user_skills_dir, source="user", source_id="user", reject_symlinks=True, scope="user"):
@@ -1004,25 +898,13 @@ class SkillsLoader:
             skill_file = skill_dir / "SKILL.md"
             if not skill_file.is_file() or (reject_symlinks and skill_file.is_symlink()):
                 continue
-            diagnostic_items: list[str] = []
-            content = ""
-            metadata: dict[str, Any] = {}
-            file_size = 0
-            try:
-                file_size = skill_file.stat().st_size
-                if file_size > 1024 * 1024:
-                    raise ValueError("file_too_large")
-                content = skill_file.read_text(encoding="utf-8")
-                if not content.startswith("---"):
-                    diagnostic_items.append("missing_frontmatter")
-                metadata = self._parse_frontmatter(content)
-            except (OSError, UnicodeError, yaml.YAMLError) as error:
-                diagnostic_items.extend(("frontmatter_invalid", str(error)))
-                logger.warning("Skill 解析失败: path=%s error=%s", skill_file, error)
-            except ValueError as error:
-                content = ""
-                metadata = {}
-                diagnostic_items.append(str(error))
+            parsed = self.parser.parse_file(skill_file)
+            diagnostic_items = list(parsed.diagnostics)
+            content = parsed.content
+            metadata = parsed.metadata
+            file_size = parsed.file_size
+            if "frontmatter_invalid" in diagnostic_items:
+                logger.warning("Skill 解析失败: path=%s diagnostics=%s", skill_file, diagnostic_items)
             name = str(metadata.get("name") or skill_dir.name).strip()
             if not name:
                 logger.warning("跳过名称为空的 Skill: path=%s", skill_file)
@@ -1037,8 +919,8 @@ class SkillsLoader:
             diagnostic_items.extend(f"unknown_field:{field}" for field in unknown_fields)
             if name in {item.name for item in records}:
                 diagnostic_items.append("duplicate_name")
-            config = self._skill_config(metadata.get("metadata"))
-            missing = self._missing_requirements(config)
+            config = self.dependency_checker.skill_config(metadata.get("metadata"))
+            missing = self.dependency_checker.missing_requirements(config)
             if missing:
                 diagnostic_items.append("missing_dependency")
             if source == "plugin" and not plugin_enabled:
@@ -1220,7 +1102,7 @@ class SkillsLoader:
         if len(content.encode("utf-8")) > 1024 * 1024:
             raise ValueError("SKILL.md 超过 1 MiB 限制")
         if content.startswith("---"):
-            SkillsLoader._parse_frontmatter(content)
+            SkillParser.parse_frontmatter(content)
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
@@ -1228,54 +1110,19 @@ class SkillsLoader:
 
     @staticmethod
     def _parse_frontmatter(content: str) -> dict[str, Any]:
-        if not content.startswith("---"):
-            return {}
-        parts = content.split("---", 2)
-        if len(parts) < 3:
-            return {}
-        loaded = yaml.safe_load(parts[1]) or {}
-        if not isinstance(loaded, dict):
-            raise yaml.YAMLError("Skill frontmatter 必须是对象")
-        return {str(key): value for key, value in loaded.items()}
+        return SkillParser.parse_frontmatter(content)
 
     @staticmethod
     def _strip_frontmatter(content: str) -> str:
-        if not content.startswith("---"):
-            return content.strip()
-        parts = content.split("---", 2)
-        return parts[2].strip() if len(parts) == 3 else content.strip()
+        return SkillParser.strip_frontmatter(content)
 
     @staticmethod
     def _skill_config(raw: object) -> dict[str, Any]:
-        if not isinstance(raw, dict):
-            return {}
-        for key in ("skill", "beanagent"):
-            value = raw.get(key)
-            if isinstance(value, dict):
-                return {str(item_key): item for item_key, item in value.items()}
-        return {str(key): value for key, value in raw.items()}
+        return SkillDependencyChecker.skill_config(raw)
 
     @staticmethod
     def _missing_requirements(config: dict[str, Any]) -> str:
-        requires = config.get("requires")
-        if not isinstance(requires, dict):
-            return ""
-        missing: list[str] = []
-        bins = requires.get("bins")
-        if isinstance(bins, list):
-            missing.extend(
-                f"CLI: {name}"
-                for item in bins
-                if (name := str(item).strip()) and not shutil.which(name)
-            )
-        env_names = requires.get("env")
-        if isinstance(env_names, list):
-            missing.extend(
-                f"ENV: {name}"
-                for item in env_names
-                if (name := str(item).strip()) and not os.environ.get(name)
-            )
-        return ", ".join(missing)
+        return SkillDependencyChecker.missing_requirements(config)
 
     @staticmethod
     def _as_bool(value: object) -> bool:
