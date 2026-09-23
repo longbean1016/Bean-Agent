@@ -15,9 +15,9 @@ export function reasoningStatusForModel(model: {
   capability_confidence?: string;
 }): string {
   if (model.supports_reasoning === false) return "思考关闭";
-  if (model.supports_reasoning == null) return "思考待验证";
+  if (model.supports_reasoning == null) return "思考能力待验证";
   if (model.capability_confidence === "high") return "思考已验证";
-  return "思考待验证";
+  return "思考能力待验证";
 }
 
 export function updateReasoningOptions(

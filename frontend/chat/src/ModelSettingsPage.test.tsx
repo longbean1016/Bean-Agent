@@ -49,6 +49,10 @@ afterEach(() => {
 it("明确显示密钥状态并反馈模型列表和所选模型测试结果", async () => {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.endsWith("/api-key")) return {
+      ok: true,
+      json: async () => ({ api_key: "sk-company-complete-key" }),
+    } as Response;
     if (url.endsWith("/models/model-a/test")) return {
       ok: true,
       json: async () => ({
@@ -84,8 +88,11 @@ it("明确显示密钥状态并反馈模型列表和所选模型测试结果", a
   expect(screen.queryByRole("dialog", { name: "模型连接" })).not.toBeInTheDocument();
   expect(screen.getByText("sk-t...5678")).toBeVisible();
   expect(screen.getByText("仅显示掩码")).toBeVisible();
-  expect(screen.queryByRole("button", { name: "明文查看 API Key" })).not.toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: "复制 API Key" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "显示完整 API Key" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "显示完整 API Key" }));
+  expect(await screen.findByText("sk-company-complete-key")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "隐藏完整 API Key" }));
+  expect(screen.queryByText("sk-company-complete-key")).not.toBeInTheDocument();
   expect(screen.getByText("上下文 128K")).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "测试模型列表" }));
@@ -141,6 +148,43 @@ it("Embedding 与视觉入口默认跟随主模型，独立模式隐藏手动适
   await waitFor(() => expect(screen.getByText(/Embedding 调用成功.*1024/)).toBeVisible());
 });
 
+it("独立模式保存主连接草稿时新增连接，不更新主连接", async () => {
+  const capabilitySettings: ModelSettingsPayload = {
+    ...settings,
+    capability_routes: {
+      embedding: { capability: "embedding", mode: "follow", follows_primary: true, route: settings.default_route },
+    },
+  };
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === "/api/settings/connections" && init?.method === "POST") {
+      return { ok: true, json: async () => ({ ...settings.connections[0], id: "embedding-copy", name: "Embedding 独立连接" }) } as Response;
+    }
+    return { ok: true, json: async () => ({}) } as Response;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<ModelSettingsPage
+    settings={capabilitySettings}
+    onBack={vi.fn()}
+    onRefresh={vi.fn(async () => capabilitySettings)}
+    onDefaultRoute={vi.fn()}
+  />);
+
+  fireEvent.click(screen.getByRole("button", { name: /Embedding 模型/ }));
+  fireEvent.click(screen.getByRole("radio", { name: "独立连接" }));
+  fireEvent.change(screen.getByPlaceholderText("例如：DeepSeek 官方"), { target: { value: "Embedding 独立连接" } });
+  fireEvent.click(screen.getByRole("button", { name: "保存连接" }));
+
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    "/api/settings/connections",
+    expect.objectContaining({ method: "POST" }),
+  ));
+  expect(fetchMock).not.toHaveBeenCalledWith(
+    "/api/settings/connections/company",
+    expect.objectContaining({ method: "PUT" }),
+  );
+  expect(await screen.findByText("新增连接成功")).toBeVisible();
+});
+
 it("即使后端返回未掩码预览，前端也只展示首尾片段", async () => {
   const unsafeSettings: ModelSettingsPayload = {
     ...settings,
@@ -183,6 +227,31 @@ it("按名称或 ID 搜索当前连接已获取的模型", async () => {
   fireEvent.change(search, { target: { value: "不存在" } });
   expect(screen.queryByRole("button", { name: /Model Amodel-a/ })).not.toBeInTheDocument();
   expect(screen.getByText("没有匹配的模型。")).toBeVisible();
+});
+
+it("设置页三个能力入口显示当前模型，当前模型在列表中置顶", async () => {
+  const modelB = {
+    ...settings.connections[0].models[0],
+    model_id: "model-b",
+    display_name: "Model B",
+  };
+  const orderedSettings: ModelSettingsPayload = {
+    ...settings,
+    default_route: { connection_id: "company", model_id: "model-b" },
+    connections: [{ ...settings.connections[0], models: [settings.connections[0].models[0], modelB] }],
+  };
+  render(<ModelSettingsPage
+    settings={orderedSettings}
+    onBack={vi.fn()}
+    onRefresh={vi.fn(async () => orderedSettings)}
+    onDefaultRoute={vi.fn()}
+  />);
+
+  expect(screen.getByRole("button", { name: /主模型当前：Model B/ })).toBeVisible();
+  expect(screen.getByRole("button", { name: /Embedding 模型.*跟随主模型.*Model B/ })).toBeVisible();
+  expect(screen.getByRole("button", { name: /视觉模型.*跟随主模型.*Model B/ })).toBeVisible();
+  const rows = screen.getAllByRole("button", { name: /Model [AB]model-/ });
+  expect(rows[0]).toHaveAccessibleName("Model Bmodel-b");
 });
 
 it("删除连接前展示影响范围并要求确认", async () => {

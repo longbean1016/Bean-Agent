@@ -213,6 +213,7 @@ export function App() {
   });
   const [activePage, setActivePage] = useState<"chat" | "model-settings" | "extensions">(initialPage);
   const [activeExtension, setActiveExtension] = useState<ExtensionKind>(initialExtension ?? "plugins");
+  const [extensionCounts, setExtensionCounts] = useState<Partial<Record<ExtensionKind, number>>>({});
   const [routeSession, setRouteSession] = useState(initialSession);
   const [connection, setConnection] = useState<ConnectionStatus>("connecting");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -1380,6 +1381,10 @@ export function App() {
     setSidebarOpen(false);
   };
 
+  const updateExtensionCount = useCallback((kind: ExtensionKind, count: number) => {
+    setExtensionCounts((current) => current[kind] === count ? current : { ...current, [kind]: count });
+  }, []);
+
   const closeModelSettings = () => {
     window.history.replaceState({}, "", pathForSession(routeSessionRef.current));
     activePageRef.current = "chat";
@@ -1408,6 +1413,7 @@ export function App() {
       onSelect={selectSession}
       onSettings={openModelSettings}
       activeExtension={activeExtension}
+      extensionCounts={extensionCounts}
       onExtension={openExtensions}
     />
   );
@@ -1417,7 +1423,7 @@ export function App() {
       <div className="app-shell extensions-app-shell">
         <aside className="desktop-sidebar">{extensionSidebar}</aside>
         <main className="chat-workspace extensions-workspace">
-          <ExtensionsPage kind={activeExtension} onBack={closeExtensions} workspaceId={currentWorkspaceId} sessionId={chat.sessionId} />
+          <ExtensionsPage kind={activeExtension} onBack={closeExtensions} workspaceId={currentWorkspaceId} sessionId={chat.sessionId} onCountChange={updateExtensionCount} />
         </main>
       </div>
     );
@@ -1461,6 +1467,7 @@ export function App() {
       onSelect={selectSession}
       onSettings={openModelSettings}
       activeExtension={null}
+      extensionCounts={extensionCounts}
       onExtension={openExtensions}
     />
   );
@@ -3063,7 +3070,7 @@ function EmptyConversation() {
   return (
     <div className="empty-conversation">
       <span className="empty-mark">B</span>
-      <h1>从一个具体问题开始对话</h1>
+      <h1>今天想让 BeanAgent 帮你做什么？</h1>
     </div>
   );
 }

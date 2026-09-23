@@ -1,10 +1,11 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { ArrowLeft, Bot, BrainCircuit, Check, CircleCheck, Database, Image, KeyRound, ListChecks, Play, Plus, RefreshCw, Search, Settings, Trash2, TriangleAlert } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { ArrowLeft, Bot, BrainCircuit, Check, CircleCheck, Database, Eye, EyeOff, Image, KeyRound, ListChecks, Play, Plus, RefreshCw, Search, Settings, Trash2, TriangleAlert } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   createModelConnection,
   deleteModelConnection,
+  fetchModelConnectionApiKey,
   refreshConnectionModels,
   saveCapabilityRoute,
   saveDefaultModelRoute,
@@ -28,6 +29,11 @@ const ADAPTERS: Array<{ id: ModelAdapterId; label: string }> = [
 type ConnectionDraft = {
   name: string; provider: string; base_url: string; api_key: string;
   enabled: boolean; default_adapter: ModelAdapterId;
+};
+
+type SettingsToast = {
+  kind: "success" | "error";
+  message: string;
 };
 
 const EMPTY_DRAFT: ConnectionDraft = {
@@ -81,7 +87,10 @@ export function ModelSettingsPage(props: {
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [toast, setToast] = useState<SettingsToast | null>(null);
+  const [revealedApiKey, setRevealedApiKey] = useState<{ connectionId: string; value: string } | null>(null);
   const [deleteConfirmationOpen, setDeleteConfirmationOpen] = useState(false);
+  const selectionInitialized = useRef(false);
   const selected = props.settings.connections.find((item) => item.id === selectedId) ?? null;
 
   const capabilityState = (capability: ConfigurableCapability) => (
@@ -102,13 +111,20 @@ export function ModelSettingsPage(props: {
     ? props.settings.connections.find((item) => item.id === effectiveCapabilityRoute.connection_id) ?? null
     : null;
   const connectionEditable = activeCapability === "primary" || activeMode === "independent";
+  const configuredIndependentRoute = activeCapabilityState?.route ?? activeCapabilityState?.override_route ?? null;
+  const independentRoute = activeCapability === "primary" || activeMode !== "independent" || activeCapabilityState?.mode !== "independent"
+    || configuredIndependentRoute?.connection_id === props.settings.default_route?.connection_id
+    ? null
+    : configuredIndependentRoute;
   const capabilityStateSignature = useMemo(
     () => JSON.stringify(props.settings.capability_routes ?? props.settings.capabilities ?? {}),
     [props.settings.capability_routes, props.settings.capabilities],
   );
 
   useEffect(() => {
-    if (creating) return;
+    // 初次设置数据可能异步到达；空列表阶段不要把页面锁在“新增连接”空态。
+    if (!props.settings.connections.length) return;
+    if (selectionInitialized.current && creating) return;
     if (selectedId && props.settings.connections.some((item) => item.id === selectedId)) return;
     const preferred = effectiveCapabilityRoute?.connection_id
       ? props.settings.connections.find((item) => item.id === effectiveCapabilityRoute?.connection_id)
@@ -121,6 +137,14 @@ export function ModelSettingsPage(props: {
   useEffect(() => {
     setCapabilityModeOverrides({});
   }, [capabilityStateSignature]);
+
+  // 提示只在设置页短暂显示；清理定时器避免切换页面后留下悬挂回调。
+  useEffect(() => {
+    if (!notice && !error) return;
+    setToast({ kind: error ? "error" : "success", message: error || notice });
+    const timer = window.setTimeout(() => setToast(null), 4200);
+    return () => window.clearTimeout(timer);
+  }, [notice, error]);
 
   const availableModels = useMemo(
     () => selected?.models.filter((model) => model.available) ?? [],
@@ -138,6 +162,15 @@ export function ModelSettingsPage(props: {
     ? props.settings.default_route
     : (activeCapabilityState?.route ?? activeCapabilityState?.override_route
       ?? (activeMode === "follow" ? props.settings.default_route : null));
+  const orderedModels = useMemo(() => {
+    const pinnedModelId = capabilityRouteForSelection?.connection_id === selected?.id
+      ? capabilityRouteForSelection?.model_id ?? ""
+      : "";
+    if (!pinnedModelId) return filteredModels;
+    return [...filteredModels].sort((left, right) => (
+      Number(right.model_id === pinnedModelId) - Number(left.model_id === pinnedModelId)
+    ));
+  }, [capabilityRouteForSelection?.connection_id, capabilityRouteForSelection?.model_id, filteredModels, selected?.id]);
   const testModel = availableModels.find((model) => model.model_id === testModelId)
     ?? availableModels.find((model) => capabilityRouteForSelection?.connection_id === selected?.id && capabilityRouteForSelection?.model_id === model.model_id)
     ?? availableModels[0];
@@ -145,7 +178,20 @@ export function ModelSettingsPage(props: {
     ? (testModel.capabilities_json?.reasoning?.native?.at(-1) ?? testModel.reasoning_options.at(-1) ?? null)
     : null;
 
+  const currentModelLabel = (capability: ModelCapability): string => {
+    const state = capability === "primary" ? null : capabilityState(capability);
+    const route = capability === "primary"
+      ? props.settings.default_route
+      : (state?.route ?? state?.override_route ?? props.settings.default_route);
+    if (!route) return "未选择模型";
+    const connection = props.settings.connections.find((item) => item.id === route.connection_id);
+    return connection?.models.find((model) => model.model_id === route.model_id)?.display_name
+      ?? route.model_id
+      ?? "未选择模型";
+  };
+
   const selectConnection = (connection: ModelConnection | null, preferredModelId?: string) => {
+    selectionInitialized.current = true;
     setCreating(connection === null);
     setSelectedId(connection?.id ?? "");
     setDraft(connection ? {
@@ -165,6 +211,7 @@ export function ModelSettingsPage(props: {
     ))?.model_id ?? connection?.models.find((model) => model.available)?.model_id ?? "");
     setModelQuery("");
     setDeleteConfirmationOpen(false);
+    setRevealedApiKey(null);
     setError("");
     setNotice("");
   };
@@ -198,11 +245,18 @@ export function ModelSettingsPage(props: {
     if (activeCapability === "primary") return;
     const capability = activeCapability;
     if (mode === "independent") {
-      // 独立模式先只打开编辑态；等用户明确点击“设为当前”后再写入路由，
-      // 避免把当前聊天模型误保存成 Embedding/视觉模型。
       setCapabilityModeOverrides((current) => ({ ...current, [capability]: mode }));
+      const primaryConnectionId = props.settings.default_route?.connection_id;
+      const existingIndependent = activeCapabilityState?.mode === "independent"
+        ? (activeCapabilityState.route ?? activeCapabilityState.override_route)
+        : null;
+      // 历史配置可能把独立路由指向主连接；此时必须新建草稿，不能再覆盖主连接。
+      const reusable = existingIndependent && existingIndependent.connection_id !== primaryConnectionId
+        ? props.settings.connections.find((item) => item.id === existingIndependent.connection_id)
+        : null;
+      if (reusable) selectConnection(reusable, existingIndependent?.model_id);
       setError("");
-      setNotice("已进入独立连接配置，请选择连接并设为当前模型");
+      setNotice(reusable ? "已切换到独立连接，可编辑后保存" : "已进入独立连接配置，保存时会新增连接，不会修改主模型连接");
       return;
     }
     void run(`capability-${capability}`, async () => {
@@ -242,13 +296,31 @@ export function ModelSettingsPage(props: {
     }
     const payload = { ...draft };
     if (selected && !payload.api_key) delete (payload as Partial<ConnectionDraft>).api_key;
-    const saved = selected
-      ? await updateModelConnection(selected.id, payload)
+    const isIndependent = activeCapability !== "primary" && activeMode === "independent";
+    const canUpdateSelected = Boolean(selected) && (!isIndependent || selected?.id === independentRoute?.connection_id);
+    const creatingConnection = !canUpdateSelected;
+    // 独立能力只允许更新自己已绑定的连接；主连接或其他连接一律复制为新配置。
+    const saved = canUpdateSelected
+      ? await updateModelConnection(selected!.id, payload)
       : await createModelConnection(payload);
     const settings = await props.onRefresh();
     selectConnection(settings.connections.find((item) => item.id === saved.id) ?? null);
-    setNotice("连接已保存");
+    setNotice(creatingConnection ? "新增连接成功" : "连接保存成功");
   });
+
+  const toggleApiKeyVisibility = () => {
+    if (!selected) return;
+    if (revealedApiKey?.connectionId === selected.id) {
+      setRevealedApiKey(null);
+      return;
+    }
+    const connectionId = selected.id;
+    void run("api-key", async () => {
+      const value = await fetchModelConnectionApiKey(connectionId);
+      setRevealedApiKey({ connectionId, value });
+      setNotice("完整密钥已显示，切换连接后会自动隐藏");
+    });
+  };
 
   const runCapabilityTest = () => {
     if (activeCapability === "primary") return;
@@ -284,6 +356,7 @@ export function ModelSettingsPage(props: {
         {CAPABILITY_TABS.map((tab) => {
           const state = tab.id === "primary" ? null : capabilityState(tab.id);
           const mode = tab.id === "primary" ? "primary" : (capabilityModeOverrides[tab.id] ?? capabilityMode(state));
+          const currentModel = currentModelLabel(tab.id);
           return <button
             key={tab.id}
             type="button"
@@ -292,7 +365,7 @@ export function ModelSettingsPage(props: {
             onClick={() => selectCapability(tab.id)}
           >
             <span className="model-capability-icon">{capabilityIcon(tab.id)}</span>
-            <span><strong>{tab.label}</strong><small>{tab.id === "primary" ? tab.description : mode === "follow" ? "跟随主模型" : tab.description}</small></span>
+            <span><strong>{tab.label}</strong><small title={currentModel}>{tab.id === "primary" ? `当前：${currentModel}` : mode === "follow" ? `跟随主模型 · ${currentModel}` : `当前：${currentModel}`}</small></span>
             {tab.id !== "primary" ? <span className={`model-capability-state ${mode === "follow" ? "follow" : "independent"}`}>{mode === "follow" ? "跟随" : "独立"}</span> : null}
           </button>;
         })}
@@ -335,7 +408,14 @@ export function ModelSettingsPage(props: {
                 <label><span>目录供应商</span><input disabled={!connectionEditable} maxLength={80} value={draft.provider} onChange={(e) => setDraft({ ...draft, provider: e.target.value })} placeholder="models.dev provider id，可留空" /></label>
                 <label className="wide"><span>Base URL</span><input disabled={!connectionEditable} value={draft.base_url} onChange={(e) => setDraft({ ...draft, base_url: e.target.value })} placeholder="https://api.example.com/v1" /></label>
                 <label className="wide api-key-field"><span className="field-label"><span>API Key</span>{selected ? <span className={`api-key-state ${selected.has_api_key ? "configured" : "missing"}`}>{selected.has_api_key ? <CircleCheck size={13} /> : <KeyRound size={13} />}{selected.has_api_key ? "已配置" : "未配置"}</span> : null}</span>
-                  {selected?.has_api_key ? <span className="stored-api-key"><code aria-label="API Key 掩码">{maskedApiKeyPreview(selected.api_key_preview)}</code><small>仅显示掩码</small></span> : null}
+                  {selected?.has_api_key ? <span className="stored-api-key">
+                    <code aria-label={revealedApiKey?.connectionId === selected.id ? "API Key 完整值" : "API Key 掩码"}>{revealedApiKey?.connectionId === selected.id ? revealedApiKey.value : maskedApiKeyPreview(selected.api_key_preview)}</code>
+                    <small>{revealedApiKey?.connectionId === selected.id ? "已显示完整值" : "仅显示掩码"}</small>
+                    <button type="button" className="api-key-visibility" disabled={Boolean(busy)} onClick={toggleApiKeyVisibility} aria-label={revealedApiKey?.connectionId === selected.id ? "隐藏完整 API Key" : "显示完整 API Key"} title={revealedApiKey?.connectionId === selected.id ? "隐藏完整 API Key" : "显示完整 API Key"}>
+                      {revealedApiKey?.connectionId === selected.id ? <EyeOff size={14} /> : <Eye size={14} />}
+                      {revealedApiKey?.connectionId === selected.id ? "隐藏" : "显示"}
+                    </button>
+                  </span> : null}
                   <input disabled={!connectionEditable} type="password" autoComplete="new-password" value={draft.api_key} onChange={(e) => setDraft({ ...draft, api_key: e.target.value })} placeholder={selected?.has_api_key ? "输入新值可替换当前密钥" : "输入 API Key"} />
                 </label>
                 {activeCapability === "primary" ? <label><span>默认适配器</span><select value={draft.default_adapter} onChange={(e) => setDraft({ ...draft, default_adapter: e.target.value as ModelAdapterId })}>{ADAPTERS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label> : <div className="capability-auto-adapter"><span>调用方式</span><strong>直接调用对应接口</strong><small>{activeCapability === "embedding" ? "使用 /embeddings 验证向量维度" : "使用图片输入验证视觉响应"}，无需手动配置适配器</small></div>}
@@ -363,15 +443,13 @@ export function ModelSettingsPage(props: {
                     setNotice(`“${result.connection_name} / ${result.model_display_name}”调用成功${result.thinking_received ? `，思考模式 ${result.effective_effort || testEffort || "已验证"}` : ""}，耗时 ${result.duration_ms} ms`);
                   })}><Play size={15} />{busy === "test-model" ? "调用中" : "测试所选模型"}</button> : <button disabled={Boolean(busy) || !testModel || (activeMode === "follow" && !effectiveCapabilityRoute)} onClick={runCapabilityTest}><Play size={15} />{busy === `test-${activeCapability}` ? "验证中" : "测试所选模型"}</button>}
                 </div>
-                {error ? <p className="model-test-message error" role="alert">{error}</p> : null}
-                {notice ? <p className="model-test-message" role="status">{notice}</p> : null}
                 <div className="model-search-row">
                   <Search size={16} aria-hidden="true" />
                   <input type="search" aria-label="搜索当前连接的模型" value={modelQuery} onChange={(event) => setModelQuery(event.target.value)} placeholder="搜索模型名称或模型 ID" />
                   <span>{filteredModels.length}/{availableModels.length}</span>
                 </div>
                 <div className="model-profile-list">
-                  {filteredModels.length ? filteredModels.map((model) => {
+                  {orderedModels.length ? orderedModels.map((model) => {
                     const isDefault = effectiveCapabilityRoute?.connection_id === selected.id && effectiveCapabilityRoute?.model_id === model.model_id;
                     return <div className={`model-profile-row ${testModel?.model_id === model.model_id ? "selected" : ""}`} key={model.model_id}>
                       <button className="model-profile-main" onClick={() => {
@@ -386,7 +464,9 @@ export function ModelSettingsPage(props: {
                         <strong>{model.display_name}</strong><small>{model.model_id}</small>
                       </button>
                       <span className="model-capacity">上下文 {formatCapacity(model.context_window)}</span>
-                      <span className="model-source">{model.supports_reasoning
+                      <span className="model-source" title={model.supports_reasoning == null || (model.supports_reasoning && model.capability_confidence !== "high")
+                        ? "模型资料标记支持思考，但尚未通过实际调用验证"
+                        : undefined}>{model.supports_reasoning
                         ? reasoningStatusForModel(model)
                         : Object.prototype.hasOwnProperty.call(model.user_overrides, "context_window") ? "手动设置" : "思考关闭"}</span>
                       <button className={isDefault ? "default-model active" : "default-model"} disabled={Boolean(busy) || !selected.enabled || (activeCapability !== "primary" && activeMode !== "independent")} title={!selected.enabled ? "连接已停用，请先启用并保存" : activeCapability !== "primary" && activeMode !== "independent" ? "跟随主模型时不能单独选择" : ""} onClick={() => void saveCapabilityModel(model)}>{isDefault ? (activeCapability === "primary" ? "默认" : "当前") : activeCapability === "primary" ? "设为默认" : "设为当前"}</button>
@@ -423,10 +503,12 @@ export function ModelSettingsPage(props: {
                   })}>保存能力</button>
                 </div> : null}
               </> : <div className="new-connection-empty"><Settings size={28} /><strong>新增模型连接</strong><span>保存后即可测试地址并获取模型。</span></div>}
-              {!selected && error ? <p className="settings-message error" role="alert">{error}</p> : null}
-              {!selected && notice ? <p className="settings-message" role="status">{notice}</p> : null}
             </section>
       </div>
+      {toast ? <div className={`settings-toast ${toast.kind}`} role={toast.kind === "error" ? "alert" : "status"} aria-live={toast.kind === "error" ? "assertive" : "polite"}>
+        <span aria-hidden="true">{toast.kind === "error" ? "!" : "✓"}</span><p>{toast.message}</p>
+        <button type="button" aria-label="关闭提示" onClick={() => setToast(null)}>×</button>
+      </div> : null}
       {selected ? <DeleteConnectionDialog
         open={deleteConfirmationOpen}
         connectionName={selected.name}
@@ -438,6 +520,7 @@ export function ModelSettingsPage(props: {
             await deleteModelConnection(selected.id);
             const settings = await props.onRefresh();
             selectConnection(settings.connections[0] ?? null);
+            setNotice("连接删除成功");
           });
         }}
       /> : null}
