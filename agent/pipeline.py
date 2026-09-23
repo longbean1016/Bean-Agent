@@ -79,6 +79,7 @@ SessionUsageWriter = Callable[[str, str, int, dict[str, Any]], Awaitable[dict[st
 WorkspaceLoader = Callable[[str], Awaitable[str | None]]
 SkillSnapshotLoader = Callable[[str], Awaitable[dict[str, Any] | None]]
 SkillSnapshotWriter = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] | None]]
+McpToolNamesLoader = Callable[[str], Awaitable[set[str]]]
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,7 @@ class Pipeline:
         workspace_loader: WorkspaceLoader | None = None,
         skill_snapshot_loader: SkillSnapshotLoader | None = None,
         skill_snapshot_writer: SkillSnapshotWriter | None = None,
+        mcp_tool_names_loader: McpToolNamesLoader | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -253,6 +255,7 @@ class Pipeline:
         self._workspace_loader = workspace_loader
         self._skill_snapshot_loader = skill_snapshot_loader
         self._skill_snapshot_writer = skill_snapshot_writer
+        self._mcp_tool_names_loader = mcp_tool_names_loader
         # 中断快照只服务于当前进程内的停止/续跑语义，不进入 Session 或长期记忆。
         self._interrupt_snapshots: dict[str, dict[str, Any]] = {}
         # 工具起点的单调时钟只保存在进程内，用于取消/异常时补算终态耗时；
@@ -347,15 +350,29 @@ class Pipeline:
                 operation_key=f"{turn_id}:turn-start",
             ))
         raw_allowed_tools = message.metadata.get("allowed_tools")
+        allowed_tool_catalog: set[str] | None = None
+        project_mcp_tools: set[str] = set()
+        if self._mcp_tool_names_loader is not None:
+            project_mcp_tools = await self._mcp_tool_names_loader(message.session_key)
+            allowed_tool_catalog = _allowed_tool_names(self._tools, project_mcp_tools)
         allowed_tools = (
             [str(name) for name in raw_allowed_tools if str(name).strip()]
             if isinstance(raw_allowed_tools, (list, tuple, set))
             else None
         )
         initial_tool_names = (
-            [name for name in allowed_tools if self._tools.has_tool(name)]
+            [
+                name
+                for name in allowed_tools
+                if self._tools.has_tool(name)
+                and (allowed_tool_catalog is None or name in allowed_tool_catalog)
+            ]
             if allowed_tools is not None
-            else self._tools.get_always_on_order()
+            else [
+                name
+                for name in self._tools.get_always_on_order()
+                if allowed_tool_catalog is None or name in allowed_tool_catalog
+            ]
         )
         tool_view = ToolRuntimeView.create(
             channel=message.channel,
@@ -391,7 +408,11 @@ class Pipeline:
             else []
         )
         active_skills = collect_skill_mentions(message.content, available_skills)
-        deferred_hint = _build_deferred_tools_hint(self._tools, tool_view.visible_names)
+        deferred_hint = _build_deferred_tools_hint(
+            self._tools,
+            tool_view.visible_names,
+            allowed_names=allowed_tool_catalog,
+        )
         checkpoint_summary = ""
         if self._memory and not skip_memory and self._surface_loader is None:
             read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
@@ -1372,6 +1393,12 @@ class Pipeline:
                     # 搜索工具需要知道哪些 Schema 已在当前 Turn 可见，但不能
                     # 持有 View 本身，否则状态会重新泄漏到全局工具实例。
                     execution_context["excluded_names"] = set(tool_view.visible_names)
+                    if allowed_tool_catalog is not None:
+                        allowed_tool_catalog = _allowed_tool_names(
+                            self._tools,
+                            project_mcp_tools,
+                        )
+                        execution_context["allowed_tool_names"] = set(allowed_tool_catalog)
                 tool_meta = self._tools.get_metadata(call.name)
                 mcp_restricted = (
                     self._sandbox_guard is not None
@@ -1382,7 +1409,13 @@ class Pipeline:
                     and self._sandbox_guard.policy(message.session_key).mode
                     != "danger-full-access"
                 )
-                if mcp_restricted:
+                tool_scope_restricted = (
+                    allowed_tool_catalog is not None
+                    and call.name not in allowed_tool_catalog
+                )
+                if tool_scope_restricted:
+                    raw_result = "错误：当前项目不能使用此工具"
+                elif mcp_restricted:
                     raw_result = (
                         "错误：MCP 子进程属于受信任扩展，当前仅在经过风险确认的"
                         "完全访问会话中可用"
@@ -1392,6 +1425,13 @@ class Pipeline:
                         call.name,
                         call.arguments,
                         context=execution_context,
+                    )
+                if allowed_tool_catalog is not None and call.name in {"mcp_add", "mcp_remove"}:
+                    # MCP 管理工具会在当前 Turn 内增删用户级工具，后续搜索必须
+                    # 基于最新目录重新过滤，同时继续排除其他项目来源。
+                    allowed_tool_catalog = _allowed_tool_names(
+                        self._tools,
+                        project_mcp_tools,
                     )
                 result = normalize_tool_result(raw_result)
                 if call.name == "tool_search":
@@ -1407,7 +1447,7 @@ class Pipeline:
                         logger.warning("tool_search 返回了无法解析的结果")
                 status, error_code, exit_code = _classify_tool_result(
                     result,
-                    restricted=mcp_restricted,
+                    restricted=mcp_restricted or tool_scope_restricted,
                 )
                 tool_ended_at = datetime.now(_LOCAL_TZ).isoformat()
                 tool_duration_ms = _elapsed_monotonic_ms(tool_started_monotonic)
@@ -1930,7 +1970,12 @@ def _context_as_of_seq(message: InboundMessage) -> int | None:
         return None
 
 
-def _build_deferred_tools_hint(tools: Any, visible: set[str] | None = None) -> str:
+def _build_deferred_tools_hint(
+    tools: Any,
+    visible: set[str] | None = None,
+    *,
+    allowed_names: set[str] | None = None,
+) -> str:
     """构建未加载工具目录，让模型在调用 tool_search 前知道有哪些工具可用。
 
     对齐 Akashic 的 build_deferred_tools_hint() 行为：列出当前 Turn 不可见
@@ -1949,6 +1994,8 @@ def _build_deferred_tools_hint(tools: Any, visible: set[str] | None = None) -> s
         return ""
     if not all_names:
         return ""
+    if allowed_names is not None:
+        all_names.intersection_update(allowed_names)
     visible_set = visible or set()
     deferred = [name for name in sorted(all_names) if name not in visible_set]
     if not deferred:
@@ -1963,6 +2010,21 @@ def _build_deferred_tools_hint(tools: Any, visible: set[str] | None = None) -> s
         "- 描述功能   → tool_search(query=\"关键词\") 搜索匹配"
     )
     return "\n".join(lines) + "\n\n"
+
+
+def _allowed_tool_names(tools: ToolRegistry, project_mcp_tools: set[str]) -> set[str]:
+    """保留全局工具和当前项目 MCP，排除其他已加载项目的 MCP。"""
+
+    return {
+        name
+        for name in tools.get_registered_names()
+        if (
+            (meta := tools.get_metadata(name)) is None
+            or meta.source_type != "mcp"
+            or not meta.source_name.startswith("project:")
+            or name in project_mcp_tools
+        )
+    }
 
 
 __all__ = ["Pipeline"]

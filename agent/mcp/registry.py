@@ -57,12 +57,19 @@ class McpServerRegistry:
         client_factory: McpClientFactory = McpClient,
         default_scope: str = "workspace",
         secret_store: Any | None = None,
+        tool_namespace: str = "",
+        source_id: str = "",
     ) -> None:
         self._config_path = Path(config_path)
         self._tools = tool_registry
         self._client_factory = client_factory
         self._default_scope = default_scope if default_scope in {"user", "workspace"} else "workspace"
         self._secret_store = secret_store
+        namespace = str(tool_namespace or "").strip()
+        if namespace and not _TOOL_NAME.fullmatch(namespace.rstrip("_")):
+            raise ValueError("MCP 工具命名空间只能包含字母、数字、下划线和连字符")
+        self._tool_namespace = f"{namespace.rstrip('_')}_" if namespace else ""
+        self._source_id = str(source_id or "").strip()
         self._clients: dict[str, McpClientApi] = {}
         self._server_tools: dict[str, list[str]] = {}
         self._configs: dict[str, dict[str, Any]] = {}
@@ -386,7 +393,12 @@ class McpServerRegistry:
             for info in infos:
                 if not _TOOL_NAME.fullmatch(info.name):
                     raise RuntimeError(f"远端工具名称无效: {info.name!r}")
-                wrapper = McpToolWrapper(client, info, server_name=name)
+                wrapper = McpToolWrapper(
+                    client,
+                    info,
+                    server_name=name,
+                    tool_namespace=self._tool_namespace,
+                )
                 if wrapper.name in generated or self._tools.has_tool(wrapper.name):
                     raise RuntimeError(f"工具名称冲突: {wrapper.name}")
                 generated.add(wrapper.name)
@@ -397,7 +409,7 @@ class McpServerRegistry:
                     risk="external-side-effect",
                     always_on=False,
                     source_type="mcp",
-                    source_name=name,
+                    source_name=f"{self._source_id}:{name}" if self._source_id else name,
                 )
             names = [wrapper.name for wrapper in wrappers]
             self._clients[name] = client

@@ -208,8 +208,9 @@ export async function fetchPluginExtensions(scope: ExtensionScope): Promise<Plug
   return payload.items ?? [];
 }
 
-export async function fetchMcpExtensions(scope: ExtensionScope): Promise<McpExtensionRecord[]> {
-  const response = await fetch(`/api/extensions/mcp?scope=${encodeURIComponent(scope)}`);
+export async function fetchMcpExtensions(scope: ExtensionScope, workspaceId?: string | null): Promise<McpExtensionRecord[]> {
+  const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/mcp?scope=${encodeURIComponent(scope)}${workspaceQuery}`);
   if (!response.ok) throw new Error("无法加载 MCP 列表");
   const payload = await response.json() as { items?: McpExtensionRecord[] };
   return payload.items ?? [];
@@ -224,8 +225,9 @@ export interface ExternalMcpSource {
   servers: Array<{ name: string; transport: string; summary: string; has_secrets: boolean }>;
 }
 
-export async function discoverMcpSources(): Promise<ExternalMcpSource[]> {
-  const response = await fetch("/api/extensions/mcp/discover");
+export async function discoverMcpSources(workspaceId?: string | null): Promise<ExternalMcpSource[]> {
+  const workspaceQuery = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/mcp/discover${workspaceQuery}`);
   if (!response.ok) throw new Error("无法发现外部 MCP 配置");
   const payload = await response.json() as { sources?: ExternalMcpSource[] };
   return payload.sources ?? [];
@@ -245,6 +247,7 @@ export interface McpExtensionConfigPayload {
   oauth?: Record<string, unknown>;
   timeoutMs?: number;
   enabled?: boolean;
+  workspace_id?: string | null;
 }
 
 export async function createMcpExtension(payload: McpExtensionConfigPayload): Promise<McpExtensionRecord> {
@@ -258,11 +261,11 @@ export async function createMcpExtension(payload: McpExtensionConfigPayload): Pr
   return result;
 }
 
-export async function updateMcpExtension(id: string, scope: ExtensionScope, payload: McpExtensionConfigPayload & { revision?: number }): Promise<McpExtensionRecord> {
+export async function updateMcpExtension(id: string, scope: ExtensionScope, payload: McpExtensionConfigPayload & { revision?: number }, workspaceId?: string | null): Promise<McpExtensionRecord> {
   const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(id)}`, {
     method: "PUT",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...payload, scope }),
+    body: JSON.stringify({ ...payload, scope, workspace_id: workspaceId }),
   });
   const result = await response.json().catch(() => ({})) as McpExtensionRecord & { detail?: string };
   if (!response.ok || !result.id) throw new Error(result.detail || "无法更新 MCP 服务");
@@ -281,46 +284,49 @@ export async function testMcpExtension(payload: McpExtensionConfigPayload): Prom
   return { success: Boolean(result.success), tool_count: result.tool_count, tools: result.tools, error: result.error, code: result.code };
 }
 
-export async function setMcpEnabled(id: string, scope: ExtensionScope, enabled: boolean, revision?: number): Promise<McpExtensionRecord> {
+export async function setMcpEnabled(id: string, scope: ExtensionScope, enabled: boolean, revision?: number, workspaceId?: string | null): Promise<McpExtensionRecord> {
   const revisionQuery = revision ? `&revision=${encodeURIComponent(String(revision))}` : "";
-  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}?scope=${encodeURIComponent(scope)}${revisionQuery}`, { method: "POST" });
+  const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}?scope=${encodeURIComponent(scope)}${revisionQuery}${workspaceQuery}`, { method: "POST" });
   const result = await response.json().catch(() => ({})) as McpExtensionRecord & { detail?: string };
   if (!response.ok || !result.id) throw new Error(result.detail || "无法更新 MCP 状态");
   return result;
 }
 
-export async function refreshMcpExtension(id: string, scope: ExtensionScope): Promise<McpExtensionRecord> {
-  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(id)}/refresh?scope=${encodeURIComponent(scope)}`, { method: "POST" });
+export async function refreshMcpExtension(id: string, scope: ExtensionScope, workspaceId?: string | null): Promise<McpExtensionRecord> {
+  const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(id)}/refresh?scope=${encodeURIComponent(scope)}${workspaceQuery}`, { method: "POST" });
   const result = await response.json().catch(() => ({})) as { item?: McpExtensionRecord; detail?: string };
   if (!response.ok || !result.item) throw new Error(result.detail || "无法刷新 MCP 工具");
   return result.item;
 }
 
-export async function importMcpExtensions(config: unknown, scope: ExtensionScope): Promise<{ imported: Array<{ name: string; status: string }>; skipped: Array<{ name: string; status: string; reason?: string }>; failed: Array<{ name: string; status: string; reason?: string }> }> {
+export async function importMcpExtensions(config: unknown, scope: ExtensionScope, workspaceId?: string | null): Promise<{ imported: Array<{ name: string; status: string }>; skipped: Array<{ name: string; status: string; reason?: string }>; failed: Array<{ name: string; status: string; reason?: string }> }> {
   const response = await fetch("/api/extensions/mcp/import", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ servers: config, scope }),
+    body: JSON.stringify({ servers: config, scope, workspace_id: workspaceId }),
   });
   const result = await response.json().catch(() => ({})) as { imported?: Array<{ name: string; status: string }>; skipped?: Array<{ name: string; status: string; reason?: string }>; failed?: Array<{ name: string; status: string; reason?: string }>; detail?: string };
   if (!response.ok) throw new Error(result.detail || "MCP 导入失败");
   return { imported: result.imported ?? [], skipped: result.skipped ?? [], failed: result.failed ?? [] };
 }
 
-export async function importDiscoveredMcpExtensions(selections: Array<{ source_id: string; names: string[] }>, scope: ExtensionScope): Promise<{ imported: Array<{ name: string; status: string }>; skipped: Array<{ name: string; status: string; reason?: string }>; failed: Array<{ name: string; status: string; reason?: string }> }> {
+export async function importDiscoveredMcpExtensions(selections: Array<{ source_id: string; names: string[] }>, scope: ExtensionScope, workspaceId?: string | null): Promise<{ imported: Array<{ name: string; status: string }>; skipped: Array<{ name: string; status: string; reason?: string }>; failed: Array<{ name: string; status: string; reason?: string }> }> {
   const response = await fetch("/api/extensions/mcp/import", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ selections, scope }),
+    body: JSON.stringify({ selections, scope, workspace_id: workspaceId }),
   });
   const result = await response.json().catch(() => ({})) as { imported?: Array<{ name: string; status: string }>; skipped?: Array<{ name: string; status: string; reason?: string }>; failed?: Array<{ name: string; status: string; reason?: string }>; detail?: string };
   if (!response.ok) throw new Error(result.detail || "外部 MCP 导入失败");
   return { imported: result.imported ?? [], skipped: result.skipped ?? [], failed: result.failed ?? [] };
 }
 
-export async function removeMcpExtension(name: string, scope: ExtensionScope, revision?: number): Promise<void> {
+export async function removeMcpExtension(name: string, scope: ExtensionScope, revision?: number, workspaceId?: string | null): Promise<void> {
   const revisionQuery = revision ? `&revision=${encodeURIComponent(String(revision))}` : "";
-  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}${revisionQuery}`, { method: "DELETE" });
+  const workspaceQuery = workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : "";
+  const response = await fetch(`/api/extensions/mcp/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}${revisionQuery}${workspaceQuery}`, { method: "DELETE" });
   const result = await response.json().catch(() => ({})) as { detail?: string };
   if (!response.ok) throw new Error(result.detail || "无法移除 MCP 服务");
 }

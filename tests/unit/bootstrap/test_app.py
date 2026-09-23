@@ -164,10 +164,15 @@ def test_mcp_api_keeps_user_and_workspace_scopes_isolated(tmp_path: Path) -> Non
         provider=Provider(),
         user_mcp_path=user_path,
     )
+    project = tmp_path / "project"
+    project.mkdir()
+    registered = runtime.sessions.store.create_workspace(str(project))
     # 停用配置用于验证列表隔离，不会在测试启动时创建外部进程。
     import json
 
-    (workspace / "mcp_servers.json").write_text(
+    project_config = project / ".beanagent" / "mcp_servers.json"
+    project_config.parent.mkdir()
+    project_config.write_text(
         json.dumps({"servers": {"workspace_server": {"type": "stdio", "command": ["x"], "enabled": False}}}),
         encoding="utf-8",
     )
@@ -177,13 +182,52 @@ def test_mcp_api_keeps_user_and_workspace_scopes_isolated(tmp_path: Path) -> Non
         encoding="utf-8",
     )
     with TestClient(create_fastapi_app(runtime)) as client:
-        workspace_items = client.get("/api/extensions/mcp?scope=workspace").json()["items"]
+        workspace_items = client.get(
+            f"/api/extensions/mcp?scope=workspace&workspace_id={registered['id']}"
+        ).json()["items"]
         user_items = client.get("/api/extensions/mcp?scope=user").json()["items"]
+        missing_project = client.get("/api/extensions/mcp?scope=workspace")
 
     assert [item["id"] for item in workspace_items] == ["workspace_server"]
     assert [item["scope"] for item in workspace_items] == ["workspace"]
     assert [item["id"] for item in user_items] == ["user_server"]
     assert [item["scope"] for item in user_items] == ["user"]
+    assert missing_project.status_code == 400
+
+
+def test_mcp_project_create_writes_registered_project_directory(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    data_workspace = tmp_path / "runtime-data"
+    project = tmp_path / "project"
+    project.mkdir()
+    runtime = build_core_runtime(
+        config,
+        data_workspace,
+        provider=Provider(),
+        user_mcp_path=tmp_path / "user" / "mcp_servers.json",
+    )
+    registered = runtime.sessions.store.create_workspace(str(project))
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        created = client.post(
+            "/api/extensions/mcp",
+            json={
+                "name": "project_server",
+                "scope": "workspace",
+                "workspace_id": registered["id"],
+                "type": "stdio",
+                "command": ["x"],
+                "enabled": False,
+            },
+        )
+
+    assert created.status_code == 201
+    project_payload = json.loads(
+        (project / ".beanagent" / "mcp_servers.json").read_text(encoding="utf-8")
+    )
+    assert "project_server" in project_payload["servers"]
+    assert not (data_workspace / "mcp_servers.json").exists()
 
 
 def test_mcp_api_rejects_stale_revision_without_mutating_config(tmp_path: Path) -> None:
@@ -191,26 +235,31 @@ def test_mcp_api_rejects_stale_revision_without_mutating_config(tmp_path: Path) 
     config.memory.enabled = False
     workspace = tmp_path / "workspace"
     runtime = build_core_runtime(config, workspace, provider=Provider(), user_mcp_path=tmp_path / "user.json")
-    (workspace / "mcp_servers.json").write_text(
+    project = tmp_path / "project"
+    project.mkdir()
+    registered = runtime.sessions.store.create_workspace(str(project))
+    project_config = project / ".beanagent" / "mcp_servers.json"
+    project_config.parent.mkdir()
+    project_config.write_text(
         json.dumps({"servers": {"demo": {"type": "stdio", "command": ["x"], "enabled": False}}}),
         encoding="utf-8",
     )
     with TestClient(create_fastapi_app(runtime)) as client:
-        first = client.get("/api/extensions/mcp/demo?scope=workspace")
+        first = client.get(f"/api/extensions/mcp/demo?scope=workspace&workspace_id={registered['id']}")
         assert first.status_code == 200
         revision = first.json()["revision"]
         updated = client.put(
             "/api/extensions/mcp/demo",
-            json={"scope": "workspace", "revision": revision, "type": "stdio", "command": ["x"], "enabled": False},
+            json={"scope": "workspace", "workspace_id": registered["id"], "revision": revision, "type": "stdio", "command": ["x"], "enabled": False},
         )
         assert updated.status_code == 200
         stale = client.put(
             "/api/extensions/mcp/demo",
-            json={"scope": "workspace", "revision": revision, "type": "stdio", "command": ["y"], "enabled": False},
+            json={"scope": "workspace", "workspace_id": registered["id"], "revision": revision, "type": "stdio", "command": ["y"], "enabled": False},
         )
         assert stale.status_code == 409
         assert stale.json()["detail"]["code"] == "revision_conflict"
-        current = client.get("/api/extensions/mcp/demo?scope=workspace").json()
+        current = client.get(f"/api/extensions/mcp/demo?scope=workspace&workspace_id={registered['id']}").json()
         assert current["command"] == "x"
 
 
@@ -218,26 +267,29 @@ def test_mcp_external_discovery_returns_safe_summary_and_imports_selected(tmp_pa
     config = Config()
     config.memory.enabled = False
     workspace = tmp_path / "workspace"
-    source_path = workspace / ".vscode" / "mcp.json"
+    project = tmp_path / "project"
+    project.mkdir()
+    source_path = project / ".vscode" / "mcp.json"
     source_path.parent.mkdir(parents=True)
     source_path.write_text(
         json.dumps({"mcpServers": {"external": {"type": "stdio", "command": ["x"], "env": {"TOKEN": "secret"}, "enabled": False}}}),
         encoding="utf-8",
     )
     runtime = build_core_runtime(config, workspace, provider=Provider(), user_mcp_path=tmp_path / "user.json")
+    registered = runtime.sessions.store.create_workspace(str(project))
     with TestClient(create_fastapi_app(runtime)) as client:
-        discovered = client.get("/api/extensions/mcp/discover")
+        discovered = client.get(f"/api/extensions/mcp/discover?workspace_id={registered['id']}")
         assert discovered.status_code == 200
         source = next(item for item in discovered.json()["sources"] if item["scope"] == "project")
         discovery_text = json.dumps(discovered.json())
         assert "TOKEN" not in discovery_text and '"secret"' not in discovery_text
         imported = client.post(
             "/api/extensions/mcp/import",
-            json={"scope": "workspace", "selections": [{"source_id": source["id"], "names": ["external"]}]},
+            json={"scope": "workspace", "workspace_id": registered["id"], "selections": [{"source_id": source["id"], "names": ["external"]}]},
         )
         assert imported.status_code == 200
         assert imported.json()["success_count"] == 1
-        record = client.get("/api/extensions/mcp/external?scope=workspace").json()
+        record = client.get(f"/api/extensions/mcp/external?scope=workspace&workspace_id={registered['id']}").json()
         assert record["env_names"] == ["TOKEN"]
 
 

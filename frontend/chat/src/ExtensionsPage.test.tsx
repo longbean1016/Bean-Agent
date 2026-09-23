@@ -3,6 +3,28 @@ import { afterEach, expect, it, vi } from "vitest";
 
 import { ExtensionsPage } from "./ExtensionsPage";
 
+it("MCP 无项目时使用用户级，有项目时读取当前项目级", async () => {
+  const requested: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    requested.push(url);
+    if (url === "/api/extensions/mcp?scope=user") return jsonResponse({ items: [] });
+    if (url === "/api/extensions/mcp?scope=workspace&workspace_id=workspace-1") return jsonResponse({ items: [] });
+    throw new Error(`未处理请求: ${url}`);
+  }));
+
+  const first = render(<ExtensionsPage kind="mcp" onBack={() => undefined} />);
+  await waitFor(() => expect(requested).toContain("/api/extensions/mcp?scope=user"));
+  expect(screen.getByRole("button", { name: "当前项目级" })).toBeDisabled();
+  first.unmount();
+
+  render(<ExtensionsPage kind="mcp" onBack={() => undefined} workspaceId="workspace-1" />);
+  await waitFor(() => expect(requested).toContain(
+    "/api/extensions/mcp?scope=workspace&workspace_id=workspace-1",
+  ));
+  expect(screen.getByText("当前项目")).toBeInTheDocument();
+});
+
 const weatherRecord = {
   id: "user:weather",
   name: "weather",

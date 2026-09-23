@@ -333,6 +333,75 @@ async def test_tool_search_unlocks_only_the_current_turn_schema() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pipeline_only_exposes_current_project_mcp_tools() -> None:
+    class ProjectATool(Tool):
+        name = "mcp_project_a__lookup"
+        description = "查询项目记录"
+        parameters = {"type": "object", "properties": {}}
+
+        async def execute(self, **kwargs):
+            return "a"
+
+    class ProjectBTool(ProjectATool):
+        name = "mcp_project_b__lookup"
+
+    class SearchProvider:
+        def __init__(self) -> None:
+            self.schema_names: list[list[str]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            names = [item["function"]["name"] for item in tools or []]
+            self.schema_names.append(names)
+            if len(self.schema_names) == 1:
+                return LLMResponse(
+                    None,
+                    [ToolCall("search", "tool_search", {"query": "项目记录"})],
+                )
+            return LLMResponse("完成")
+
+    registry = ToolRegistry()
+    registry.register(ToolSearchTool(registry), always_on=True)
+    registry.register(
+        ProjectATool(),
+        always_on=False,
+        source_type="mcp",
+        source_name="project:a:demo",
+    )
+    registry.register(
+        ProjectBTool(),
+        always_on=False,
+        source_type="mcp",
+        source_name="project:b:demo",
+    )
+    provider = SearchProvider()
+    pipeline = Pipeline(
+        provider,
+        registry,
+        EventBus(),
+        PromptAssembler(
+            SystemPromptBuilder(default_prompt_blocks(), SectionCache()),
+            MessageEnvelopeBuilder(),
+        ),
+        workspace="D:/workspace",
+        mcp_tool_names_loader=lambda _session_key: asyncio.sleep(
+            0,
+            result={"mcp_project_a__lookup"},
+        ),
+    )
+
+    result = await pipeline.process(
+        InboundMessage("web", "u", "a", "查询项目记录"),
+        turn_id="turn-project-a",
+    )
+
+    assert result.content == "完成"
+    assert provider.schema_names == [
+        ["tool_search"],
+        ["tool_search", "mcp_project_a__lookup"],
+    ]
+
+
+@pytest.mark.asyncio
 async def test_allowed_tools_do_not_change_system_prompt(tmp_path: Path) -> None:
     class CapturingProvider:
         def __init__(self) -> None:

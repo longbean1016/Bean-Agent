@@ -74,7 +74,12 @@ def test_websocket_mcp_turn_commits_and_next_turn_loads_history(tmp_path: Path) 
         [sys.executable, "-u", str(server)],
         {"BEANAGENT_MCP_TEST_LOG": str(tmp_path / "mcp.jsonl")},
     )
-    core = build_core_runtime(config, workspace, provider=provider)
+    core = build_core_runtime(
+        config,
+        workspace,
+        provider=provider,
+        user_mcp_path=tmp_path / "user" / "mcp_servers.json",
+    )
     # MCP stdio 子进程不经过 Windows ACL 边界，只允许已确认的完全访问会话调用。
     core.sessions.store.create_session(
         "web:mcp",

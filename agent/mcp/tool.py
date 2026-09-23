@@ -17,14 +17,16 @@ class McpToolWrapper(Tool):
         info: McpToolInfo,
         *,
         server_name: str | None = None,
+        tool_namespace: str = "",
     ) -> None:
         self._client = client
         self._info = info
         self._server_name = server_name or client.name
+        self._tool_namespace = str(tool_namespace or "")
 
     @property
     def name(self) -> str:
-        return f"mcp_{self._server_name}__{self._info.name}"
+        return f"mcp_{self._tool_namespace}{self._server_name}__{self._info.name}"
 
     @property
     def description(self) -> str:

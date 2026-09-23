@@ -28,6 +28,7 @@ from agent.config_models import Config, EmbeddingConfig, VisionConfig
 from agent.event_bus import EventBus, SandboxApprovalRequested, SandboxApprovalResolved
 from agent.message_bus import MessageBus
 from agent.mcp.manage_tools import McpAddTool, McpListTool, McpRemoveTool
+from agent.mcp.project_registry import ProjectMcpRegistryPool, migrate_legacy_workspace_mcp
 from agent.mcp.registry import McpRevisionConflict, McpServerRegistry
 from agent.pipeline import Pipeline
 from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
@@ -240,7 +241,8 @@ class AppRuntime:
             # 窗口内同一配置在不同 Turn 中呈现不同能力。
             if self.core.user_mcp_registry is not None:
                 await self.core.user_mcp_registry.load_and_connect_all()
-            await self.core.mcp_registry.load_and_connect_all()
+            if self.core.mcp_registry is not self.core.user_mcp_registry:
+                await self.core.mcp_registry.load_and_connect_all()
             # 恢复旧 outbox 必须先于 AgentLoop 接受新消息，保持事件顺序可审计。
             if self.maintenance is not None:
                 await self.maintenance.start()
@@ -265,8 +267,9 @@ class AppRuntime:
             if self.agent_task is not None and not self.agent_task.done():
                 self.agent_task.cancel()
                 await asyncio.gather(self.agent_task, return_exceptions=True)
+            await _cleanup_step("project_mcp_registries.shutdown", self.core.project_mcp_registries.shutdown)
             await _cleanup_step("mcp_registry.shutdown", self.core.mcp_registry.shutdown)
-            if self.core.user_mcp_registry is not None:
+            if self.core.user_mcp_registry is not None and self.core.user_mcp_registry is not self.core.mcp_registry:
                 await _cleanup_step("user_mcp_registry.shutdown", self.core.user_mcp_registry.shutdown)
             await _cleanup_step("sandbox_runtime.close", self.core.sandbox_runtime.close)
             if self.maintenance is not None:
@@ -301,6 +304,7 @@ class CoreRuntime:
     memory: MemoryEngine | None
     tools: ToolRegistry
     mcp_registry: McpServerRegistry
+    project_mcp_registries: ProjectMcpRegistryPool
     skills: SkillsLoader
     message_bus: MessageBus
     event_bus: EventBus
@@ -543,6 +547,14 @@ def build_core_runtime(
         workspace_path = str(sandbox.get("workspace_path") or "").strip()
         return workspace_path or str(root)
 
+    async def resolve_session_project_workspace(session_key: str) -> str | None:
+        """无绑定项目时返回空，不能把运行数据目录冒充项目 MCP 目录。"""
+
+        sandbox = await asyncio.to_thread(sessions.store.get_session_sandbox, session_key)
+        if not isinstance(sandbox, dict):
+            return None
+        return str(sandbox.get("workspace_path") or "").strip() or None
+
     prompt_cache_log = PromptCacheLogWriter(root)
     tools = ToolRegistry()
     register_all(
@@ -564,27 +576,37 @@ def build_core_runtime(
     tools.register(ScheduleTaskTool(proactive_store), risk="write", always_on=True)
     tools.register(ListSchedulesTool(proactive_store), risk="read-only", always_on=True)
     tools.register(CancelScheduleTool(proactive_store), risk="write", always_on=True)
-    mcp_registry = McpServerRegistry(
+    resolved_user_mcp_path = user_mcp_path or (Path.home() / ".beanagent" / "mcp_servers.json")
+    migrate_legacy_workspace_mcp(
         root / "mcp_servers.json",
-        tools,
-        default_scope="workspace",
-        secret_store=secrets,
+        resolved_user_mcp_path,
+        root / ".beanagent" / "mcp-user-migration-v1.json",
     )
     user_mcp_registry = McpServerRegistry(
-        user_mcp_path or (Path.home() / ".beanagent" / "mcp_servers.json"),
+        resolved_user_mcp_path,
         tools,
         default_scope="user",
         secret_store=secrets,
+        source_id="user",
     )
+    # 兼容现有调用方保留 mcp_registry；Agent 内管理工具默认操作用户级配置。
+    mcp_registry = user_mcp_registry
+    project_mcp_registries = ProjectMcpRegistryPool(tools, secret_store=secrets)
+
+    async def load_session_project_mcp_tools(session_key: str) -> set[str]:
+        project_path = await resolve_session_project_workspace(session_key)
+        if not project_path:
+            return set()
+        return await project_mcp_registries.tool_names(project_path)
     # 管理工具必须与运行时持有的 Registry 共享同一实例，动态添加和关闭才能
     # 作用于同一批 Client；三者常驻可见，远端工具本身仍需搜索解锁。
     tools.register(
-        McpAddTool(mcp_registry),
+        McpAddTool(user_mcp_registry),
         risk="external-side-effect",
         always_on=True,
     )
-    tools.register(McpRemoveTool(mcp_registry), risk="write", always_on=True)
-    tools.register(McpListTool(mcp_registry), risk="read-only", always_on=True)
+    tools.register(McpRemoveTool(user_mcp_registry), risk="write", always_on=True)
+    tools.register(McpListTool(user_mcp_registry), risk="read-only", always_on=True)
     assembler = PromptAssembler(
         SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
         MessageEnvelopeBuilder(),
@@ -622,6 +644,7 @@ def build_core_runtime(
         workspace_loader=resolve_session_workspace,
         skill_snapshot_loader=sessions.load_skill_snapshot,
         skill_snapshot_writer=sessions.save_skill_snapshot,
+        mcp_tool_names_loader=load_session_project_mcp_tools,
     )
     agent_loop = AgentLoop(
         messages,
@@ -657,6 +680,7 @@ def build_core_runtime(
         memory=memory,
         tools=tools,
         mcp_registry=mcp_registry,
+        project_mcp_registries=project_mcp_registries,
         user_mcp_registry=user_mcp_registry,
         skills=skills,
         message_bus=messages,
@@ -1107,27 +1131,42 @@ def create_fastapi_app(
             },
         ) from error
 
-    def _mcp_registry_for_scope(scope: str | None) -> tuple[str, McpServerRegistry]:
+    def _mcp_project_path(workspace_id: str | None) -> Path:
+        clean_id = str(workspace_id or "").strip()
+        if not clean_id:
+            raise HTTPException(status_code=400, detail="请选择当前项目")
+        workspace = application.core.sessions.store.get_workspace(clean_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        if not workspace.get("valid", False):
+            raise HTTPException(status_code=409, detail="工作区目录当前不可用")
+        return Path(str(workspace["canonical_path"])).expanduser().resolve()
+
+    async def _mcp_registry_for_scope(
+        scope: str | None,
+        workspace_id: str | None = None,
+    ) -> tuple[str, McpServerRegistry]:
         normalized_scope = _normalize_mcp_scope(scope)
-        registry = (
-            application.core.user_mcp_registry
-            if normalized_scope == "user"
-            else application.core.mcp_registry
-        )
+        registry = application.core.user_mcp_registry
+        if normalized_scope == "workspace":
+            registry = await application.core.project_mcp_registries.get(
+                _mcp_project_path(workspace_id)
+            )
         # 老的 CoreRuntime 构造方式可能没有用户注册表；此时用户级请求仍然
         # 返回明确的空结果，而不会错误地读写工作区配置。
         if registry is None:
             raise HTTPException(status_code=503, detail="用户级 MCP 注册表未初始化")
         return normalized_scope, registry
 
-    def _find_mcp_record(
+    async def _find_mcp_record(
         server_name: str,
         scope: str | None = None,
+        workspace_id: str | None = None,
     ) -> tuple[str, McpServerRegistry, dict[str, Any]] | None:
         scopes = [_normalize_mcp_scope(scope)] if scope in {"user", "workspace"} else ["workspace", "user"]
         for candidate_scope in scopes:
             try:
-                normalized_scope, registry = _mcp_registry_for_scope(candidate_scope)
+                normalized_scope, registry = await _mcp_registry_for_scope(candidate_scope, workspace_id)
             except HTTPException:
                 continue
             record = next(
@@ -1138,17 +1177,18 @@ def create_fastapi_app(
                 return normalized_scope, registry, record
         return None
 
-    def _discover_external_mcp_sources() -> list[dict[str, Any]]:
+    def _discover_external_mcp_sources(workspace_id: str | None = None) -> list[dict[str, Any]]:
         """只返回外部配置的安全摘要；导入时由后端重新读取原文件。"""
 
         appdata = Path(os.environ.get("APPDATA", "")) if os.environ.get("APPDATA") else None
+        project_path = _mcp_project_path(workspace_id) if workspace_id else None
         candidates: list[tuple[str, Path | None, str]] = [
             ("claude-desktop", appdata / "Claude" / "claude_desktop_config.json" if appdata else None, "global"),
             ("cursor", appdata / "Cursor" / "User" / "mcp.json" if appdata else None, "global"),
             ("windsurf", Path.home() / ".codeium" / "windsurf" / "mcp_config.json", "global"),
             ("generic-user", Path.home() / ".mcp.json", "global"),
-            ("workspace", application.core.workspace / ".vscode" / "mcp.json", "project"),
-            ("workspace-mcp", application.core.workspace / "mcp.json", "project"),
+            ("workspace", project_path / ".vscode" / "mcp.json" if project_path else None, "project"),
+            ("workspace-mcp", project_path / "mcp.json" if project_path else None, "project"),
         ]
         seen: set[str] = set()
         sources: list[dict[str, Any]] = []
@@ -1196,8 +1236,8 @@ def create_fastapi_app(
         return sources
 
     @app.get("/api/extensions/mcp/discover")
-    def discover_mcp_sources() -> dict[str, Any]:
-        sources = _discover_external_mcp_sources()
+    def discover_mcp_sources(workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        sources = _discover_external_mcp_sources(workspace_id)
         return {
             "sources": sources,
             "source_count": len(sources),
@@ -1205,8 +1245,11 @@ def create_fastapi_app(
         }
 
     @app.get("/api/extensions/mcp")
-    def list_mcp_extensions(scope: str = Query("workspace")) -> dict[str, Any]:
-        normalized_scope, registry = _mcp_registry_for_scope(scope)
+    async def list_mcp_extensions(
+        scope: str = Query("workspace"),
+        workspace_id: str | None = Query(None),
+    ) -> dict[str, Any]:
+        normalized_scope, registry = await _mcp_registry_for_scope(scope, workspace_id)
         items = [
             item
             for item in registry.list_server_records(scope=normalized_scope)
@@ -1220,9 +1263,10 @@ def create_fastapi_app(
         config = dict(payload)
         config.pop("name", None)
         config.pop("revision", None)
+        workspace_id = str(config.pop("workspace_id", "") or "") or None
         if isinstance(config.get("command"), str):
             config["command"] = [part for part in str(config["command"]).split() if part]
-        normalized_scope, registry = _mcp_registry_for_scope(payload.get("scope"))
+        normalized_scope, registry = await _mcp_registry_for_scope(payload.get("scope"), workspace_id)
         config["scope"] = normalized_scope
         if not name:
             raise HTTPException(status_code=400, detail="MCP 名称不能为空")
@@ -1239,8 +1283,12 @@ def create_fastapi_app(
         return record
 
     @app.get("/api/extensions/mcp/{server_name}")
-    def get_mcp_extension(server_name: str, scope: str = Query("workspace")) -> dict[str, Any]:
-        found = _find_mcp_record(server_name, scope)
+    async def get_mcp_extension(
+        server_name: str,
+        scope: str = Query("workspace"),
+        workspace_id: str | None = Query(None),
+    ) -> dict[str, Any]:
+        found = await _find_mcp_record(server_name, scope, workspace_id)
         if found is None:
             raise HTTPException(status_code=404, detail="MCP 服务不存在")
         return found[2]
@@ -1250,9 +1298,10 @@ def create_fastapi_app(
         config = dict(payload)
         expected_revision = _parse_revision(config.get("revision"))
         config.pop("name", None)
+        workspace_id = str(config.pop("workspace_id", "") or "") or None
         if isinstance(config.get("command"), str):
             config["command"] = [part for part in str(config["command"]).split() if part]
-        found = _find_mcp_record(server_name, payload.get("scope"))
+        found = await _find_mcp_record(server_name, payload.get("scope"), workspace_id)
         if found is None:
             raise HTTPException(status_code=404, detail="MCP 服务不存在")
         normalized_scope, registry, _old_record = found
@@ -1277,17 +1326,18 @@ def create_fastapi_app(
     async def test_mcp_extension(server_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         config = dict(payload)
         config.pop("name", None)
+        workspace_id = str(config.pop("workspace_id", "") or "") or None
         if isinstance(config.get("command"), str):
             config["command"] = [part for part in str(config["command"]).split() if part]
-        _normalized_scope, registry = _mcp_registry_for_scope(payload.get("scope"))
+        _normalized_scope, registry = await _mcp_registry_for_scope(payload.get("scope"), workspace_id)
         try:
             return await registry.test(server_name, config)
         except (ValueError, KeyError, RuntimeError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/api/extensions/mcp/{server_name}/enable")
-    async def enable_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None)) -> dict[str, Any]:
-        found = _find_mcp_record(server_name, scope)
+    async def enable_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None), workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        found = await _find_mcp_record(server_name, scope, workspace_id)
         if found is None:
             raise HTTPException(status_code=404, detail="MCP 服务不存在")
         normalized_scope, registry, _old_record = found
@@ -1302,8 +1352,8 @@ def create_fastapi_app(
         return next(item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name)
 
     @app.post("/api/extensions/mcp/{server_name}/disable")
-    async def disable_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None)) -> dict[str, Any]:
-        found = _find_mcp_record(server_name, scope)
+    async def disable_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None), workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        found = await _find_mcp_record(server_name, scope, workspace_id)
         if found is None:
             raise HTTPException(status_code=404, detail="MCP 服务不存在")
         normalized_scope, registry, _old_record = found
@@ -1316,8 +1366,8 @@ def create_fastapi_app(
         return next(item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name)
 
     @app.post("/api/extensions/mcp/{server_name}/refresh")
-    async def refresh_mcp_extension(server_name: str, scope: str = Query("workspace")) -> dict[str, Any]:
-        found = _find_mcp_record(server_name, scope)
+    async def refresh_mcp_extension(server_name: str, scope: str = Query("workspace"), workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        found = await _find_mcp_record(server_name, scope, workspace_id)
         if found is None:
             raise HTTPException(status_code=404, detail="MCP 服务不存在")
         normalized_scope, registry, _old_record = found
@@ -1335,7 +1385,7 @@ def create_fastapi_app(
         raw_servers: Any = payload.get("servers", payload)
         selections = payload.get("selections")
         if isinstance(selections, list):
-            discovered = {str(source["id"]): source for source in _discover_external_mcp_sources()}
+            discovered = {str(source["id"]): source for source in _discover_external_mcp_sources(payload.get("workspace_id"))}
             selected_servers: dict[str, dict[str, Any]] = {}
             for selection in selections:
                 if not isinstance(selection, dict):
@@ -1374,7 +1424,7 @@ def create_fastapi_app(
                 continue
             try:
                 config = dict(raw_config)
-                normalized_scope, registry = _mcp_registry_for_scope(payload.get("scope"))
+                normalized_scope, registry = await _mcp_registry_for_scope(payload.get("scope"), payload.get("workspace_id"))
                 config["scope"] = normalized_scope
                 await registry.create(str(name), config)
                 imported.append({"name": str(name), "status": "imported"})
@@ -1395,8 +1445,8 @@ def create_fastapi_app(
         }
 
     @app.delete("/api/extensions/mcp/{server_name}", status_code=204)
-    async def delete_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None)) -> Response:
-        found = _find_mcp_record(server_name, scope)
+    async def delete_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None), workspace_id: str | None = Query(None)) -> Response:
+        found = await _find_mcp_record(server_name, scope, workspace_id)
         if found is None:
             raise HTTPException(status_code=404, detail="MCP 服务不存在")
         _normalized_scope, registry, _old_record = found
@@ -1983,6 +2033,9 @@ def create_fastapi_app(
 
     @app.delete("/api/chat/workspaces/{workspace_id}", status_code=204)
     async def unregister_workspace(workspace_id: str) -> Response:
+        workspace = application.core.sessions.store.get_workspace(workspace_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="工作区不存在")
         session_keys = application.core.sessions.store.list_workspace_session_keys(
             workspace_id
         )
@@ -1996,6 +2049,9 @@ def create_fastapi_app(
             )
         if not application.core.sessions.store.delete_workspace(workspace_id):
             raise HTTPException(status_code=404, detail="工作区不存在")
+        await application.core.project_mcp_registries.discard(
+            str(workspace["canonical_path"])
+        )
         # 删除关系可能让多个缓存策略失效；Policy 每次回源，不需要全局缓存失效。
         return Response(status_code=204)
 
