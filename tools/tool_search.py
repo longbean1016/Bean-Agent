@@ -49,22 +49,29 @@ class ToolSearchTool(Tool):
         top_k: int = 5,
         allowed_risk: list[str] | None = None,
         excluded_names: Iterable[str] | None = None,
+        allowed_tool_names: Iterable[str] | None = None,
         **_: Any,
     ) -> str:
         """返回稳定 JSON，避免工具自身持有任何会话或 Turn 状态。"""
 
         text = str(query or "").strip()
         excluded = {str(name) for name in excluded_names or ()}
+        allowed_names = (
+            {str(name) for name in allowed_tool_names}
+            if allowed_tool_names is not None
+            else None
+        )
         if not text:
             return self._render(tip="query 不能为空")
         if text.casefold().startswith("select:"):
-            return self._select(text[7:], excluded, allowed_risk)
+            return self._select(text[7:], excluded, allowed_risk, allowed_names)
 
         matched = self._registry.search(
             text,
             top_k=top_k,
             allowed_risk=set(allowed_risk) if allowed_risk else None,
             excluded_names=excluded,
+            allowed_names=allowed_names,
         )
         unlocked = [item["name"] for item in matched]
         return self._render(matched=matched, unlocked=unlocked)
@@ -74,6 +81,7 @@ class ToolSearchTool(Tool):
         names_text: str,
         excluded: set[str],
         allowed_risk: list[str] | None,
+        allowed_names: set[str] | None,
     ) -> str:
         requested = [name.strip() for name in names_text.split(",") if name.strip()]
         already_loaded: list[str] = []
@@ -85,6 +93,9 @@ class ToolSearchTool(Tool):
         for name in requested:
             if name in excluded:
                 already_loaded.append(name)
+                continue
+            if allowed_names is not None and name not in allowed_names:
+                missing.append(name)
                 continue
             tool = self._registry.get_tool(name)
             meta = self._registry.get_metadata(name)

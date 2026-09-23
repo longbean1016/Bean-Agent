@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import mimetypes
 import logging
+import os
 from datetime import datetime
 from io import BytesIO
 from contextlib import asynccontextmanager
@@ -25,13 +28,14 @@ from agent.config_models import Config, EmbeddingConfig, VisionConfig
 from agent.event_bus import EventBus, SandboxApprovalRequested, SandboxApprovalResolved
 from agent.message_bus import MessageBus
 from agent.mcp.manage_tools import McpAddTool, McpListTool, McpRemoveTool
-from agent.mcp.registry import McpServerRegistry
+from agent.mcp.project_registry import ProjectMcpRegistryPool, migrate_legacy_workspace_mcp
+from agent.mcp.registry import McpRevisionConflict, McpServerRegistry
 from agent.pipeline import Pipeline
 from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
 from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import LLMProvider, create_vision_provider
-from agent.skills import SkillsLoader
+from agent.skills import SkillRevisionConflict, SkillSeedConflict, SkillsLoader, seed_builtin_skills
 from agent.tool_projection import project_tool_call, project_tool_chain
 from bootstrap.native_folder_picker import (
     DirectoryPicker,
@@ -235,7 +239,10 @@ class AppRuntime:
                 raise RuntimeError("AppRuntime 已关闭")
             # MCP 工具目录必须在第一条消息进入 AgentLoop 前恢复完成，避免启动
             # 窗口内同一配置在不同 Turn 中呈现不同能力。
-            await self.core.mcp_registry.load_and_connect_all()
+            if self.core.user_mcp_registry is not None:
+                await self.core.user_mcp_registry.load_and_connect_all()
+            if self.core.mcp_registry is not self.core.user_mcp_registry:
+                await self.core.mcp_registry.load_and_connect_all()
             # 恢复旧 outbox 必须先于 AgentLoop 接受新消息，保持事件顺序可审计。
             if self.maintenance is not None:
                 await self.maintenance.start()
@@ -260,7 +267,10 @@ class AppRuntime:
             if self.agent_task is not None and not self.agent_task.done():
                 self.agent_task.cancel()
                 await asyncio.gather(self.agent_task, return_exceptions=True)
+            await _cleanup_step("project_mcp_registries.shutdown", self.core.project_mcp_registries.shutdown)
             await _cleanup_step("mcp_registry.shutdown", self.core.mcp_registry.shutdown)
+            if self.core.user_mcp_registry is not None and self.core.user_mcp_registry is not self.core.mcp_registry:
+                await _cleanup_step("user_mcp_registry.shutdown", self.core.user_mcp_registry.shutdown)
             await _cleanup_step("sandbox_runtime.close", self.core.sandbox_runtime.close)
             if self.maintenance is not None:
                 await _cleanup_step("memory_maintenance.close", self.maintenance.close)
@@ -294,6 +304,8 @@ class CoreRuntime:
     memory: MemoryEngine | None
     tools: ToolRegistry
     mcp_registry: McpServerRegistry
+    project_mcp_registries: ProjectMcpRegistryPool
+    skills: SkillsLoader
     message_bus: MessageBus
     event_bus: EventBus
     assembler: PromptAssembler
@@ -314,6 +326,7 @@ class CoreRuntime:
     provider_manager: ProviderManager
     legacy_model_available: bool
     vision_provider: Any | None = None
+    user_mcp_registry: McpServerRegistry | None = None
 
 
 def _saved_route_parts(
@@ -436,6 +449,7 @@ def build_core_runtime(
     provider: Any | None = None,
     embedder: Any | None = None,
     model_secret_store: SecretStore | None = None,
+    user_mcp_path: Path | None = None,
 ) -> CoreRuntime:
     """按依赖方向构造核心组件，不启动任务或监听端口。"""
 
@@ -520,7 +534,27 @@ def build_core_runtime(
         multimodal=effective_multimodal,
     )
     vision_provider = create_vision_provider(vision_config)
-    skills = SkillsLoader(root)
+    user_skills_dir = Path.home() / ".beanagent" / "skills"
+    seed_builtin_skills(user_skills_dir)
+    skills = SkillsLoader(root, user_skills_dir=user_skills_dir)
+
+    async def resolve_session_workspace(session_key: str) -> str | None:
+        """只从 SessionStore 读取已注册项目，避免前端路径直接进入 SkillsLoader。"""
+
+        sandbox = await asyncio.to_thread(sessions.store.get_session_sandbox, session_key)
+        if not isinstance(sandbox, dict):
+            return str(root)
+        workspace_path = str(sandbox.get("workspace_path") or "").strip()
+        return workspace_path or str(root)
+
+    async def resolve_session_project_workspace(session_key: str) -> str | None:
+        """无绑定项目时返回空，不能把运行数据目录冒充项目 MCP 目录。"""
+
+        sandbox = await asyncio.to_thread(sessions.store.get_session_sandbox, session_key)
+        if not isinstance(sandbox, dict):
+            return None
+        return str(sandbox.get("workspace_path") or "").strip() or None
+
     prompt_cache_log = PromptCacheLogWriter(root)
     tools = ToolRegistry()
     register_all(
@@ -542,16 +576,37 @@ def build_core_runtime(
     tools.register(ScheduleTaskTool(proactive_store), risk="write", always_on=True)
     tools.register(ListSchedulesTool(proactive_store), risk="read-only", always_on=True)
     tools.register(CancelScheduleTool(proactive_store), risk="write", always_on=True)
-    mcp_registry = McpServerRegistry(root / "mcp_servers.json", tools)
+    resolved_user_mcp_path = user_mcp_path or (Path.home() / ".beanagent" / "mcp_servers.json")
+    migrate_legacy_workspace_mcp(
+        root / "mcp_servers.json",
+        resolved_user_mcp_path,
+        root / ".beanagent" / "mcp-user-migration-v1.json",
+    )
+    user_mcp_registry = McpServerRegistry(
+        resolved_user_mcp_path,
+        tools,
+        default_scope="user",
+        secret_store=secrets,
+        source_id="user",
+    )
+    # 兼容现有调用方保留 mcp_registry；Agent 内管理工具默认操作用户级配置。
+    mcp_registry = user_mcp_registry
+    project_mcp_registries = ProjectMcpRegistryPool(tools, secret_store=secrets)
+
+    async def load_session_project_mcp_tools(session_key: str) -> set[str]:
+        project_path = await resolve_session_project_workspace(session_key)
+        if not project_path:
+            return set()
+        return await project_mcp_registries.tool_names(project_path)
     # 管理工具必须与运行时持有的 Registry 共享同一实例，动态添加和关闭才能
     # 作用于同一批 Client；三者常驻可见，远端工具本身仍需搜索解锁。
     tools.register(
-        McpAddTool(mcp_registry),
+        McpAddTool(user_mcp_registry),
         risk="external-side-effect",
         always_on=True,
     )
-    tools.register(McpRemoveTool(mcp_registry), risk="write", always_on=True)
-    tools.register(McpListTool(mcp_registry), risk="read-only", always_on=True)
+    tools.register(McpRemoveTool(user_mcp_registry), risk="write", always_on=True)
+    tools.register(McpListTool(user_mcp_registry), risk="read-only", always_on=True)
     assembler = PromptAssembler(
         SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
         MessageEnvelopeBuilder(),
@@ -586,6 +641,10 @@ def build_core_runtime(
         vl_available=vision_provider is not None,
         sandbox_guard=sandbox_guard,
         provider_manager=provider_manager,
+        workspace_loader=resolve_session_workspace,
+        skill_snapshot_loader=sessions.load_skill_snapshot,
+        skill_snapshot_writer=sessions.save_skill_snapshot,
+        mcp_tool_names_loader=load_session_project_mcp_tools,
     )
     agent_loop = AgentLoop(
         messages,
@@ -621,6 +680,9 @@ def build_core_runtime(
         memory=memory,
         tools=tools,
         mcp_registry=mcp_registry,
+        project_mcp_registries=project_mcp_registries,
+        user_mcp_registry=user_mcp_registry,
+        skills=skills,
         message_bus=messages,
         event_bus=events,
         assembler=assembler,
@@ -981,6 +1043,864 @@ def create_fastapi_app(
     async def update_model_catalog() -> dict[str, Any]:
         return await settings.update_catalog()
 
+    @app.get("/api/extensions/plugins")
+    def list_plugin_extensions(scope: str = Query("workspace")) -> dict[str, Any]:
+        normalized_scope = scope if scope in {"user", "workspace"} else "workspace"
+        root = application.core.workspace / "plugins"
+        items: list[dict[str, Any]] = []
+        if normalized_scope == "workspace" and root.is_dir():
+            for directory in sorted(root.iterdir(), key=lambda item: item.name):
+                manifest_path = directory / "plugin.json"
+                if not directory.is_dir() or not manifest_path.is_file():
+                    continue
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    manifest = {}
+                if not isinstance(manifest, dict):
+                    manifest = {}
+                raw_plugin_mcp = manifest.get("mcp") or manifest.get("mcpServers") or {}
+                plugin_mcp = raw_plugin_mcp if isinstance(raw_plugin_mcp, dict) else {
+                    str(index): item for index, item in enumerate(raw_plugin_mcp) if isinstance(item, dict)
+                } if isinstance(raw_plugin_mcp, list) else {}
+                mcp_groups = [
+                    {
+                        "id": str(mcp_name),
+                        "name": str(mcp_name),
+                        "transport": str(mcp_config.get("type") or ("stdio" if mcp_config.get("command") else "http")),
+                        "status": "disabled" if not bool(manifest.get("enabled", True)) else "not_loaded",
+                        "enabled": bool(manifest.get("enabled", True)),
+                    }
+                    for mcp_name, mcp_config in plugin_mcp.items()
+                    if isinstance(mcp_config, dict)
+                ]
+                items.append({
+                    "id": directory.name,
+                    "name": str(manifest.get("name") or directory.name),
+                    "description": str(manifest.get("description") or "本地扩展插件"),
+                    "version": str(manifest.get("version") or "0.0.0"),
+                    "source": "workspace",
+                    "scope": normalized_scope,
+                    "status": "installed",
+                    "enabled": True,
+                    "skills_count": len(manifest.get("skills") or []) if isinstance(manifest.get("skills"), list) else 0,
+                    "mcp_count": len(mcp_groups),
+                    "mcp_groups": mcp_groups,
+                    "commands_count": len(manifest.get("commands") or []) if isinstance(manifest.get("commands"), list) else 0,
+                })
+        return {"items": items, "scope": normalized_scope}
+
+    @app.get("/api/extensions/plugins/{plugin_id}/icon")
+    def get_plugin_icon(plugin_id: str) -> FileResponse:
+        root = (application.core.workspace / "plugins").resolve()
+        directory = (root / plugin_id).resolve()
+        if directory.parent != root:
+            raise HTTPException(status_code=404, detail="插件不存在")
+        manifest = SkillsLoader._read_state_file(directory / "plugin.json")
+        icon_value = str(manifest.get("icon") or "").strip()
+        if not icon_value:
+            raise HTTPException(status_code=404, detail="插件未提供图标")
+        icon_path = (directory / icon_value).resolve()
+        if not icon_path.is_relative_to(directory) or not icon_path.is_file():
+            raise HTTPException(status_code=404, detail="插件图标不存在")
+        return FileResponse(icon_path)
+
+    def _normalize_mcp_scope(scope: str | None) -> str:
+        return scope if scope in {"user", "workspace"} else "workspace"
+
+    def _parse_revision(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        try:
+            revision = int(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="revision 必须是正整数") from None
+        if revision <= 0:
+            raise HTTPException(status_code=400, detail="revision 必须是正整数")
+        return revision
+
+    def _raise_mcp_conflict(error: McpRevisionConflict) -> None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "revision_conflict",
+                "detail": str(error),
+                "expected_revision": error.expected,
+                "actual_revision": error.actual,
+                "retryable": True,
+            },
+        ) from error
+
+    def _mcp_project_path(workspace_id: str | None) -> Path:
+        clean_id = str(workspace_id or "").strip()
+        if not clean_id:
+            raise HTTPException(status_code=400, detail="请选择当前项目")
+        workspace = application.core.sessions.store.get_workspace(clean_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        if not workspace.get("valid", False):
+            raise HTTPException(status_code=409, detail="工作区目录当前不可用")
+        return Path(str(workspace["canonical_path"])).expanduser().resolve()
+
+    async def _mcp_registry_for_scope(
+        scope: str | None,
+        workspace_id: str | None = None,
+    ) -> tuple[str, McpServerRegistry]:
+        normalized_scope = _normalize_mcp_scope(scope)
+        registry = application.core.user_mcp_registry
+        if normalized_scope == "workspace":
+            registry = await application.core.project_mcp_registries.get(
+                _mcp_project_path(workspace_id)
+            )
+        # 老的 CoreRuntime 构造方式可能没有用户注册表；此时用户级请求仍然
+        # 返回明确的空结果，而不会错误地读写工作区配置。
+        if registry is None:
+            raise HTTPException(status_code=503, detail="用户级 MCP 注册表未初始化")
+        return normalized_scope, registry
+
+    async def _find_mcp_record(
+        server_name: str,
+        scope: str | None = None,
+        workspace_id: str | None = None,
+    ) -> tuple[str, McpServerRegistry, dict[str, Any]] | None:
+        scopes = [_normalize_mcp_scope(scope)] if scope in {"user", "workspace"} else ["workspace", "user"]
+        for candidate_scope in scopes:
+            try:
+                normalized_scope, registry = await _mcp_registry_for_scope(candidate_scope, workspace_id)
+            except HTTPException:
+                continue
+            record = next(
+                (item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name),
+                None,
+            )
+            if record is not None and str(record.get("scope") or normalized_scope) == normalized_scope:
+                return normalized_scope, registry, record
+        return None
+
+    def _discover_external_mcp_sources(workspace_id: str | None = None) -> list[dict[str, Any]]:
+        """只返回外部配置的安全摘要；导入时由后端重新读取原文件。"""
+
+        appdata = Path(os.environ.get("APPDATA", "")) if os.environ.get("APPDATA") else None
+        project_path = _mcp_project_path(workspace_id) if workspace_id else None
+        candidates: list[tuple[str, Path | None, str]] = [
+            ("claude-desktop", appdata / "Claude" / "claude_desktop_config.json" if appdata else None, "global"),
+            ("cursor", appdata / "Cursor" / "User" / "mcp.json" if appdata else None, "global"),
+            ("windsurf", Path.home() / ".codeium" / "windsurf" / "mcp_config.json", "global"),
+            ("generic-user", Path.home() / ".mcp.json", "global"),
+            ("workspace", project_path / ".vscode" / "mcp.json" if project_path else None, "project"),
+            ("workspace-mcp", project_path / "mcp.json" if project_path else None, "project"),
+        ]
+        seen: set[str] = set()
+        sources: list[dict[str, Any]] = []
+        for agent, path, source_scope in candidates:
+            if path is None:
+                continue
+            resolved = path.expanduser().resolve()
+            key = str(resolved).lower()
+            if key in seen or not resolved.is_file():
+                continue
+            seen.add(key)
+            try:
+                payload = json.loads(resolved.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            servers: Any = payload.get("mcpServers") or payload.get("servers")
+            if not isinstance(servers, dict) and isinstance(payload.get("mcp"), dict):
+                servers = payload["mcp"].get("servers")
+            if not isinstance(servers, dict):
+                continue
+            summaries: list[dict[str, Any]] = []
+            for name, raw_config in servers.items():
+                if not isinstance(raw_config, dict):
+                    continue
+                transport = str(raw_config.get("type") or ("stdio" if raw_config.get("command") else "http"))
+                command = raw_config.get("command")
+                summary = " ".join(command[:3]) if isinstance(command, list) else str(raw_config.get("url") or "")
+                summaries.append({
+                    "name": str(name),
+                    "transport": transport,
+                    "summary": summary[:180],
+                    "has_secrets": bool(raw_config.get("env") or raw_config.get("headers") or raw_config.get("oauth")),
+                })
+            if summaries:
+                sources.append({
+                    "id": f"{agent}:{key}",
+                    "agent": agent,
+                    "path": str(resolved),
+                    "scope": source_scope,
+                    "server_count": len(summaries),
+                    "servers": summaries,
+                })
+        return sources
+
+    @app.get("/api/extensions/mcp/discover")
+    def discover_mcp_sources(workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        sources = _discover_external_mcp_sources(workspace_id)
+        return {
+            "sources": sources,
+            "source_count": len(sources),
+            "server_count": sum(int(source["server_count"]) for source in sources),
+        }
+
+    @app.get("/api/extensions/mcp")
+    async def list_mcp_extensions(
+        scope: str = Query("workspace"),
+        workspace_id: str | None = Query(None),
+    ) -> dict[str, Any]:
+        normalized_scope, registry = await _mcp_registry_for_scope(scope, workspace_id)
+        items = [
+            item
+            for item in registry.list_server_records(scope=normalized_scope)
+            if str(item.get("scope") or normalized_scope) == normalized_scope
+        ]
+        return {"items": items, "scope": normalized_scope}
+
+    @app.post("/api/extensions/mcp", status_code=201)
+    async def create_mcp_extension(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        name = str(payload.get("name") or "").strip()
+        config = dict(payload)
+        config.pop("name", None)
+        config.pop("revision", None)
+        workspace_id = str(config.pop("workspace_id", "") or "") or None
+        if isinstance(config.get("command"), str):
+            config["command"] = [part for part in str(config["command"]).split() if part]
+        normalized_scope, registry = await _mcp_registry_for_scope(payload.get("scope"), workspace_id)
+        config["scope"] = normalized_scope
+        if not name:
+            raise HTTPException(status_code=400, detail="MCP 名称不能为空")
+        try:
+            await registry.create(name, config)
+        except (ValueError, KeyError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        record = next(
+            (item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == name),
+            None,
+        )
+        if record is None:
+            raise HTTPException(status_code=500, detail="MCP 已连接但无法读取服务摘要")
+        return record
+
+    @app.get("/api/extensions/mcp/{server_name}")
+    async def get_mcp_extension(
+        server_name: str,
+        scope: str = Query("workspace"),
+        workspace_id: str | None = Query(None),
+    ) -> dict[str, Any]:
+        found = await _find_mcp_record(server_name, scope, workspace_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        return found[2]
+
+    @app.put("/api/extensions/mcp/{server_name}")
+    async def update_mcp_extension(server_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        config = dict(payload)
+        expected_revision = _parse_revision(config.get("revision"))
+        config.pop("name", None)
+        workspace_id = str(config.pop("workspace_id", "") or "") or None
+        if isinstance(config.get("command"), str):
+            config["command"] = [part for part in str(config["command"]).split() if part]
+        found = await _find_mcp_record(server_name, payload.get("scope"), workspace_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        normalized_scope, registry, _old_record = found
+        config["scope"] = normalized_scope
+        try:
+            await registry.update(server_name, config, expected_revision=expected_revision)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except McpRevisionConflict as error:
+            _raise_mcp_conflict(error)
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        record = next(
+            (item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name),
+            None,
+        )
+        if record is None:
+            raise HTTPException(status_code=500, detail="MCP 更新后无法读取服务摘要")
+        return record
+
+    @app.post("/api/extensions/mcp/{server_name}/test")
+    async def test_mcp_extension(server_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        config = dict(payload)
+        config.pop("name", None)
+        workspace_id = str(config.pop("workspace_id", "") or "") or None
+        if isinstance(config.get("command"), str):
+            config["command"] = [part for part in str(config["command"]).split() if part]
+        _normalized_scope, registry = await _mcp_registry_for_scope(payload.get("scope"), workspace_id)
+        try:
+            return await registry.test(server_name, config)
+        except (ValueError, KeyError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/extensions/mcp/{server_name}/enable")
+    async def enable_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None), workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        found = await _find_mcp_record(server_name, scope, workspace_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        normalized_scope, registry, _old_record = found
+        try:
+            await registry.enable(server_name, expected_revision=_parse_revision(revision))
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except McpRevisionConflict as error:
+            _raise_mcp_conflict(error)
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return next(item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name)
+
+    @app.post("/api/extensions/mcp/{server_name}/disable")
+    async def disable_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None), workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        found = await _find_mcp_record(server_name, scope, workspace_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        normalized_scope, registry, _old_record = found
+        try:
+            await registry.disable(server_name, expected_revision=_parse_revision(revision))
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except McpRevisionConflict as error:
+            _raise_mcp_conflict(error)
+        return next(item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name)
+
+    @app.post("/api/extensions/mcp/{server_name}/refresh")
+    async def refresh_mcp_extension(server_name: str, scope: str = Query("workspace"), workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        found = await _find_mcp_record(server_name, scope, workspace_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        normalized_scope, registry, _old_record = found
+        try:
+            result = await registry.refresh(server_name)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        record = next(item for item in registry.list_server_records(scope=normalized_scope) if item["id"] == server_name)
+        return {"item": record, "changes": result}
+
+    @app.post("/api/extensions/mcp/import")
+    async def import_mcp_extensions(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        raw_servers: Any = payload.get("servers", payload)
+        selections = payload.get("selections")
+        if isinstance(selections, list):
+            discovered = {str(source["id"]): source for source in _discover_external_mcp_sources(payload.get("workspace_id"))}
+            selected_servers: dict[str, dict[str, Any]] = {}
+            for selection in selections:
+                if not isinstance(selection, dict):
+                    continue
+                source = discovered.get(str(selection.get("source_id") or selection.get("sourceId") or ""))
+                if source is None:
+                    continue
+                selected_names = selection.get("names")
+                if not isinstance(selected_names, list):
+                    selected_names = [item.get("name") for item in source.get("servers", [])]
+                try:
+                    source_payload = json.loads(Path(str(source["path"])).read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(source_payload, dict):
+                    continue
+                source_servers: Any = source_payload.get("mcpServers") or source_payload.get("servers")
+                if not isinstance(source_servers, dict) and isinstance(source_payload.get("mcp"), dict):
+                    source_servers = source_payload["mcp"].get("servers")
+                if not isinstance(source_servers, dict):
+                    continue
+                for selected_name in selected_names:
+                    if isinstance(selected_name, str) and isinstance(source_servers.get(selected_name), dict):
+                        selected_servers[selected_name] = dict(source_servers[selected_name])
+            raw_servers = selected_servers
+        if isinstance(raw_servers, dict) and isinstance(raw_servers.get("mcpServers"), dict):
+            raw_servers = raw_servers["mcpServers"]
+        if not isinstance(raw_servers, dict):
+            raise HTTPException(status_code=400, detail="MCP 导入内容必须是服务对象")
+        imported: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for name, raw_config in raw_servers.items():
+            if not isinstance(raw_config, dict):
+                failed.append({"name": str(name), "status": "failed", "reason": "配置必须是对象"})
+                continue
+            try:
+                config = dict(raw_config)
+                normalized_scope, registry = await _mcp_registry_for_scope(payload.get("scope"), payload.get("workspace_id"))
+                config["scope"] = normalized_scope
+                await registry.create(str(name), config)
+                imported.append({"name": str(name), "status": "imported"})
+            except ValueError as error:
+                if "已存在" in str(error):
+                    skipped.append({"name": str(name), "status": "skipped", "reason": "same_name_exists"})
+                else:
+                    failed.append({"name": str(name), "status": "failed", "reason": str(error)})
+            except Exception as error:
+                failed.append({"name": str(name), "status": "failed", "reason": str(error)})
+        return {
+            "imported": imported,
+            "skipped": skipped,
+            "failed": failed,
+            "success_count": len(imported),
+            "skipped_count": len(skipped),
+            "failed_count": len(failed),
+        }
+
+    @app.delete("/api/extensions/mcp/{server_name}", status_code=204)
+    async def delete_mcp_extension(server_name: str, scope: str = Query("workspace"), revision: str | None = Query(None), workspace_id: str | None = Query(None)) -> Response:
+        found = await _find_mcp_record(server_name, scope, workspace_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="MCP 服务不存在")
+        _normalized_scope, registry, _old_record = found
+        try:
+            message = await registry.remove(server_name, expected_revision=_parse_revision(revision))
+        except McpRevisionConflict as error:
+            _raise_mcp_conflict(error)
+        if "不存在" in message:
+            raise HTTPException(status_code=404, detail=message)
+        return Response(status_code=204)
+
+    def _skills_loader_for_request(workspace_id: str | None = None) -> SkillsLoader:
+        """把 Skills 管理请求绑定到已注册工作区，不接受前端任意磁盘路径。"""
+
+        clean_id = str(workspace_id or "").strip()
+        if not clean_id:
+            return application.core.skills
+        workspace = application.core.sessions.store.get_workspace(clean_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        return application.core.skills.for_workspace(str(workspace["canonical_path"]))
+
+    def _normalize_skill_scope(scope: str) -> str:
+        # 保留旧客户端传入的 workspace 别名；新的管理语义统一称为 project。
+        if scope in {"workspace", "project"}:
+            return "workspace"
+        return "user" if scope == "user" else "workspace"
+
+    @app.get("/api/extensions/skills")
+    def list_skill_extensions(
+        scope: str = Query("workspace"),
+        workspace_id: str | None = Query(None),
+    ) -> dict[str, Any]:
+        normalized_scope = _normalize_skill_scope(scope)
+        skill_loader = _skills_loader_for_request(workspace_id)
+        records = skill_loader.list_management_records(normalized_scope)
+        scan_diagnostics = list(skill_loader.last_scan_diagnostics())
+        items = [
+            {
+                "id": f"{record.source_id}:{record.name}",
+                "name": record.name,
+                "description": record.description,
+                "source": record.source,
+                "scope": "project" if record.scope == "workspace" else record.scope,
+                "available": record.available,
+                "enabled": record.enabled,
+                "always": record.always,
+                "missing": record.missing,
+                "plugin_name": record.plugin_name,
+                "plugin_icon": record.plugin_icon,
+                "plugin_icon_url": (
+                    f"/api/extensions/plugins/{quote(record.source_id.removeprefix('plugin:'), safe='')}/icon"
+                    if record.plugin_icon and record.source_id.startswith("plugin:")
+                    else None
+                ),
+                "plugin_source": record.plugin_source,
+                "plugin_enabled": record.plugin_enabled,
+                "source_id": record.source_id,
+                "version": record.version,
+                "slug": record.slug,
+                "owner": record.owner,
+                "published_at": record.published_at,
+                "file_size": record.file_size,
+                "file_path": str(record.skill_file),
+                "priority": record.priority,
+                "active": record.active,
+                "overridden_by": record.overridden_by,
+                "override_reason": record.override_reason,
+                "status": record.status,
+                "diagnostics": list(record.diagnostics),
+                "revision": record.revision,
+                "updated_at": None,
+            }
+            for record in records
+        ]
+        return {
+            "items": items,
+            "scope": "project" if normalized_scope == "workspace" else normalized_scope,
+            "revision": skill_loader.directory_revision(scope="user") if normalized_scope == "user" else skill_loader.directory_revision(),
+            "diagnostics": scan_diagnostics,
+        }
+
+    @app.get("/api/extensions/skills/revision")
+    def get_skill_revision(workspace_id: str | None = Query(None)) -> dict[str, str]:
+        skill_loader = _skills_loader_for_request(workspace_id)
+        return {"revision": skill_loader.directory_revision()}
+
+    @app.get("/api/extensions/skills/discover")
+    def discover_skill_sources(workspace_id: str | None = Query(None)) -> dict[str, Any]:
+        sources = _discover_skill_sources(workspace_id)
+        return {"sources": sources, "source_count": len(sources), "skill_count": sum(int(item["skill_count"]) for item in sources)}
+
+    @app.get("/api/extensions/skills/defaults")
+    def list_default_skill_statuses() -> dict[str, Any]:
+        """默认版本管理只面向应用内置种子及其用户级副本。"""
+
+        skill_loader = application.core.skills
+        return {
+            "items": skill_loader.list_builtin_seed_statuses(),
+            "revision": skill_loader.directory_revision(scope="user"),
+        }
+
+    @app.get("/api/extensions/skills/defaults/{skill_name}/diff")
+    def get_default_skill_diff(skill_name: str) -> dict[str, Any]:
+        try:
+            return application.core.skills.builtin_seed_diff(skill_name)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    async def _replace_default_skill(skill_name: str, payload: dict[str, Any], *, restore: bool) -> dict[str, Any]:
+        if "expected_hash" not in payload:
+            raise HTTPException(status_code=400, detail="expected_hash 不能为空")
+        expected_hash = str(payload.get("expected_hash") or "")
+        operation = application.core.skills.restore_builtin_seed if restore else application.core.skills.update_builtin_seed
+        try:
+            item = await asyncio.to_thread(operation, skill_name, expected_hash=expected_hash)
+        except SkillSeedConflict as error:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "seed_conflict", "detail": str(error), "retryable": True},
+            ) from error
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except PermissionError as error:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "user_modified", "detail": str(error), "retryable": False},
+            ) from error
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "item": item,
+            "revision": application.core.skills.directory_revision(scope="user"),
+        }
+
+    @app.post("/api/extensions/skills/defaults/{skill_name}/restore")
+    async def restore_default_skill(skill_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return await _replace_default_skill(skill_name, payload, restore=True)
+
+    @app.post("/api/extensions/skills/defaults/{skill_name}/update")
+    async def update_default_skill(skill_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return await _replace_default_skill(skill_name, payload, restore=False)
+
+    def _skill_record_or_404(skill_name: str, scope: str, skill_loader: SkillsLoader | None = None) -> Any:
+        record = (skill_loader or application.core.skills).get_skill_record(skill_name, scope=scope)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Skill 不存在")
+        return record
+
+    def _management_skill_record_or_404(
+        skill_name: str,
+        scope: str,
+        skill_loader: SkillsLoader,
+        source_id: str | None,
+    ) -> Any:
+        records = skill_loader.list_management_records(scope)
+        record = next((
+            item for item in records
+            if item.name == skill_name
+            and (item.source_id == source_id if source_id else item.active)
+        ), None)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Skill 来源不存在")
+        return record
+
+    @app.get("/api/extensions/skills/{skill_name}")
+    def get_skill_extension(
+        skill_name: str,
+        scope: str = Query("workspace"),
+        workspace_id: str | None = Query(None),
+        source_id: str | None = Query(None),
+    ) -> dict[str, Any]:
+        normalized_scope = _normalize_skill_scope(scope)
+        skill_loader = _skills_loader_for_request(workspace_id)
+        record = _management_skill_record_or_404(skill_name, normalized_scope, skill_loader, source_id)
+        return {
+            "id": f"{record.source_id}:{record.name}",
+            "name": record.name,
+            "description": record.description,
+            "source": record.source,
+            "source_id": record.source_id,
+            "scope": "project" if record.scope == "workspace" else record.scope,
+            "version": record.version,
+            "slug": record.slug,
+            "owner": record.owner,
+            "published_at": record.published_at,
+            "file_size": record.file_size,
+            "file_path": str(record.skill_file),
+            "priority": record.priority,
+            "active": record.active,
+            "overridden_by": record.overridden_by,
+            "override_reason": record.override_reason,
+            "plugin_icon": record.plugin_icon,
+            "plugin_source": record.plugin_source,
+            "plugin_enabled": record.plugin_enabled,
+            "status": record.status,
+            "available": record.available,
+            "enabled": record.enabled,
+            "always": record.always,
+            "missing": record.missing,
+            "diagnostics": list(record.diagnostics),
+            "revision": record.revision,
+            "content": record.content,
+        }
+
+    def _skill_scope(payload: dict[str, Any]) -> str:
+        scope = payload.get("scope")
+        if scope not in {"user", "workspace", "project"}:
+            raise HTTPException(status_code=400, detail="Skill scope 必须是 user 或 project")
+        return _normalize_skill_scope(str(scope))
+
+    @app.post("/api/extensions/skills", status_code=201)
+    async def create_skill_extension(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        scope = _skill_scope(payload)
+        skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
+        try:
+            record = await asyncio.to_thread(
+                skill_loader.create_skill,
+                str(payload.get("name") or ""),
+                scope,
+                str(payload.get("content") or ""),
+            )
+        except (ValueError, KeyError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": "project" if record.scope == "workspace" else record.scope, "status": record.status, "revision": record.revision}
+
+    @app.put("/api/extensions/skills/{skill_name}")
+    async def update_skill_extension(skill_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        scope = _skill_scope(payload)
+        skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
+        expected = payload.get("revision")
+        try:
+            expected_revision = int(expected) if expected is not None else None
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail="revision 必须是整数") from error
+        try:
+            record = await asyncio.to_thread(
+                skill_loader.update_skill,
+                skill_name,
+                scope,
+                str(payload.get("content") or ""),
+                expected_revision=expected_revision,
+            )
+        except SkillRevisionConflict as error:
+            raise HTTPException(status_code=409, detail={"code": "revision_conflict", "detail": str(error), "retryable": True}) from error
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except (ValueError, PermissionError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": "project" if record.scope == "workspace" else record.scope, "status": record.status, "revision": record.revision}
+
+    @app.post("/api/extensions/skills/import/preflight")
+    def preflight_skill_import(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return _build_skill_import_plan(payload)
+
+    @app.post("/api/extensions/skills/{skill_name}/{action}")
+    async def skill_extension_action(skill_name: str, action: str, request: Request, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        scope = _skill_scope(payload)
+        skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
+        if action not in {"enable", "disable", "refresh", "open"}:
+            raise HTTPException(status_code=404, detail="Skill 操作不存在")
+        try:
+            if action in {"refresh", "open"}:
+                record = (
+                    _management_skill_record_or_404(skill_name, scope, skill_loader, str(payload.get("source_id") or "") or None)
+                    if action == "open"
+                    else _skill_record_or_404(skill_name, scope, skill_loader)
+                )
+            else:
+                record = await asyncio.to_thread(skill_loader.set_skill_enabled, skill_name, scope, action == "enable")
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except PermissionError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        if action == "open":
+            require_local_host(request)
+            try:
+                host_directories.open_directory(record.root_dir.resolve())
+            except NativeHostUnavailable as error:
+                raise HTTPException(status_code=501, detail=str(error)) from error
+            except NativeHostError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
+        return {"id": f"{record.source}:{record.name}", "name": record.name, "scope": "project" if record.scope == "workspace" else record.scope, "status": record.status, "enabled": record.enabled, "revision": record.revision}
+
+    def _build_skill_import_plan(payload: dict[str, Any]) -> dict[str, Any]:
+        scope = _skill_scope(payload)
+        mode = str(payload.get("mode") or "copy")
+        if mode not in {"copy", "symlink"}:
+            raise HTTPException(status_code=400, detail="导入模式必须是 copy 或 symlink")
+        selections = payload.get("selections")
+        if not isinstance(selections, list) or not selections:
+            raise HTTPException(status_code=400, detail="请至少选择一个 Skill")
+        skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
+        discovered = {
+            str(source.get("id")): source
+            for source in _discover_skill_sources(payload.get("workspace_id"))
+            if isinstance(source, dict)
+        }
+        items: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for selection in selections:
+            if not isinstance(selection, dict):
+                items.append({"name": "unknown", "source_id": "", "status": "invalid", "reason": "导入选择格式无效", "mode": mode, "scope": "project" if scope == "workspace" else scope, "source_hash": ""})
+                continue
+            source_id = str(selection.get("source_id") or "")
+            source = discovered.get(source_id)
+            names = selection.get("names") if isinstance(selection.get("names"), list) else []
+            candidates = {str(item.get("name")): item for item in (source or {}).get("candidates", []) if isinstance(item, dict)}
+            for raw_name in names:
+                name = str(raw_name or "").strip()
+                key = (source_id, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidate = candidates.get(name)
+                if candidate is None:
+                    items.append({"name": name or "unknown", "source_id": source_id, "status": "unavailable", "reason": "来源中不存在该 Skill", "mode": mode, "scope": "project" if scope == "workspace" else scope, "source_hash": ""})
+                    continue
+                checked = skill_loader.preflight_directory(str(candidate.get("path") or ""), scope, mode=mode, name=name)
+                items.append({**checked, "source_id": source_id, "description": str(candidate.get("description") or "")})
+        target_revision = skill_loader.directory_revision(scope=scope)
+        token_payload = {
+            "scope": scope,
+            "mode": mode,
+            "workspace_id": str(payload.get("workspace_id") or ""),
+            "target_revision": target_revision,
+            "items": [{key: item.get(key) for key in ("source_id", "name", "source_hash", "status")} for item in items],
+        }
+        token = hashlib.sha256(json.dumps(token_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        counts = {status: sum(1 for item in items if item.get("status") == status) for status in ("ready", "conflict", "invalid", "unsafe", "unavailable")}
+        return {"token": token, "scope": "project" if scope == "workspace" else scope, "mode": mode, "target_revision": target_revision, "items": items, "counts": counts}
+
+    @app.post("/api/extensions/skills/import")
+    async def import_skill_extensions(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        scope = _skill_scope(payload)
+        skill_loader = _skills_loader_for_request(payload.get("workspace_id"))
+        mode = str(payload.get("mode") or "copy")
+        imported: list[dict[str, Any]] = []
+        selections = payload.get("selections")
+        if isinstance(selections, list):
+            plan = _build_skill_import_plan(payload)
+            expected_token = str(payload.get("preflight_token") or "")
+            if not expected_token:
+                raise HTTPException(status_code=400, detail="批量导入必须先完成预检")
+            if expected_token != str(plan.get("token") or ""):
+                raise HTTPException(status_code=409, detail={"code": "preflight_stale", "detail": "Skill 来源或目标目录已变化，请重新预检", "retryable": True})
+            # 执行前再次核对所有 ready 项，避免预检完成到首个文件落盘之间来源被替换。
+            for item in plan["items"]:
+                if item.get("status") != "ready":
+                    continue
+                checked = skill_loader.preflight_directory(str(item.get("source_path") or ""), scope, mode=mode, name=str(item.get("name") or ""))
+                if checked.get("status") != "ready" or checked.get("source_hash") != item.get("source_hash"):
+                    raise HTTPException(status_code=409, detail={"code": "preflight_stale", "detail": "Skill 来源或目标目录已变化，请重新预检", "retryable": True})
+            skipped: list[dict[str, Any]] = []
+            failed: list[dict[str, Any]] = []
+            for item in plan["items"]:
+                name = str(item.get("name") or "unknown")
+                status = str(item.get("status") or "invalid")
+                if status == "conflict":
+                    skipped.append({"name": name, "status": "skipped", "reason": str(item.get("reason") or "同名冲突")})
+                    continue
+                if status != "ready":
+                    failed.append({"name": name, "status": "failed", "reason": str(item.get("reason") or "预检未通过")})
+                    continue
+                try:
+                    records = await asyncio.to_thread(skill_loader.install_directory, str(item.get("source_path") or ""), scope, mode=mode, name=name)
+                    imported.extend({"name": record.name, "status": "imported", "scope": "project" if record.scope == "workspace" else record.scope} for record in records)
+                except ValueError as error:
+                    if "已存在" in str(error):
+                        skipped.append({"name": name, "status": "skipped", "reason": str(error)})
+                    else:
+                        failed.append({"name": name, "status": "failed", "reason": str(error)})
+                except (RuntimeError, OSError) as error:
+                    failed.append({"name": name, "status": "failed", "reason": str(error)})
+            return {"imported": imported, "skipped": skipped, "failed": failed, "success_count": len(imported), "skipped_count": len(skipped), "failed_count": len(failed)}
+        try:
+            if payload.get("type") == "git" or payload.get("url"):
+                records = await asyncio.to_thread(skill_loader.install_git, str(payload.get("url") or ""), scope, revision=payload.get("revision"), mode=mode)
+            else:
+                records = await asyncio.to_thread(skill_loader.install_directory, str(payload.get("path") or ""), scope, mode=mode, name=payload.get("name"))
+            imported = [{"name": record.name, "status": "imported", "scope": "project" if record.scope == "workspace" else record.scope} for record in records]
+        except (ValueError, RuntimeError, OSError) as error:
+            return {"imported": imported, "skipped": [], "failed": [{"name": str(payload.get("name") or payload.get("url") or payload.get("path") or "skill"), "status": "failed", "reason": str(error)}]}
+        return {"imported": imported, "skipped": [], "failed": []}
+
+    def _discover_skill_sources(workspace_id: str | None = None) -> list[dict[str, Any]]:
+        skill_loader = _skills_loader_for_request(workspace_id)
+        roots: list[tuple[str, str, Path]] = [("project", "project", skill_loader.skills_dir)]
+        roots.extend([
+            ("codex-project", "project-external", skill_loader.workspace / ".codex" / "skills"),
+            ("claude-project", "project-external", skill_loader.workspace / ".claude" / "skills"),
+            ("cursor-project", "project-external", skill_loader.workspace / ".cursor" / "skills"),
+            ("agents-project", "project-external", skill_loader.workspace / ".agents" / "skills"),
+        ])
+        if application.core.skills.user_skills_dir is not None:
+            roots.append(("beanagent-user", "user", application.core.skills.user_skills_dir))
+        # 只读取常见 Agent 的 Skills 根目录摘要，不执行其中的脚本或读取其他配置。
+        roots.extend([
+            ("codex-user", "external", Path.home() / ".codex" / "skills"),
+            ("claude-user", "external", Path.home() / ".claude" / "skills"),
+            ("cursor-user", "external", Path.home() / ".cursor" / "skills"),
+        ])
+        seen: set[str] = set()
+        sources: list[dict[str, Any]] = []
+        for source_id, source_scope, root in roots:
+            resolved = root.expanduser().resolve()
+            key = str(resolved).casefold()
+            if key in seen or not resolved.is_dir():
+                continue
+            seen.add(key)
+            candidates: list[dict[str, Any]] = []
+            for directory in sorted(resolved.iterdir(), key=lambda item: item.name):
+                skill_file = directory / "SKILL.md"
+                if not directory.is_dir() or directory.is_symlink() or not skill_file.is_file() or skill_file.is_symlink():
+                    continue
+                try:
+                    parsed = SkillsLoader(resolved.parent, builtin_skills_dir=None).get_skill_record(directory.name, scope="workspace")
+                    candidates.append({
+                        "name": str(parsed.name if parsed else directory.name),
+                        "description": str(parsed.description if parsed else ""),
+                        "path": str(directory),
+                        "available": bool(parsed.available) if parsed else True,
+                    })
+                except (OSError, UnicodeError):
+                    continue
+            if candidates:
+                sources.append({
+                    "id": f"{source_id}:{key}",
+                    "agent": source_id,
+                    "scope": source_scope,
+                    "path": str(resolved),
+                    "candidates": candidates,
+                    "skill_count": len(candidates),
+                })
+        return sources
+
+    @app.delete("/api/extensions/skills/{skill_name}", status_code=204)
+    async def delete_skill_extension(
+        skill_name: str,
+        scope: str = Query("workspace"),
+        workspace_id: str | None = Query(None),
+    ) -> Response:
+        normalized_scope = _normalize_skill_scope(scope)
+        skill_loader = _skills_loader_for_request(workspace_id)
+        try:
+            await asyncio.to_thread(skill_loader.delete_skill, skill_name, normalized_scope)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except PermissionError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return Response(status_code=204)
+
     @app.get("/", response_model=None)
     def chat_index() -> FileResponse | dict[str, str]:
         if index_file.is_file():
@@ -999,6 +1919,16 @@ def create_fastapi_app(
     def model_settings_index() -> FileResponse | dict[str, str]:
         """模型设置是独立前端路由，直接访问或刷新时返回 SPA 入口。"""
 
+        if index_file.is_file():
+            return FileResponse(index_file)
+        return {"status": "ok", "message": "聊天前端尚未构建，请运行 npm run build"}
+
+    @app.get("/extensions/{extension_kind}", response_model=None)
+    def extension_index(extension_kind: str) -> FileResponse | dict[str, str]:
+        """扩展管理页面使用同一 SPA 入口，支持直接访问和刷新。"""
+
+        if extension_kind not in {"plugins", "mcp", "skills"}:
+            raise HTTPException(status_code=404, detail="扩展页面不存在")
         if index_file.is_file():
             return FileResponse(index_file)
         return {"status": "ok", "message": "聊天前端尚未构建，请运行 npm run build"}
@@ -1103,6 +2033,9 @@ def create_fastapi_app(
 
     @app.delete("/api/chat/workspaces/{workspace_id}", status_code=204)
     async def unregister_workspace(workspace_id: str) -> Response:
+        workspace = application.core.sessions.store.get_workspace(workspace_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="工作区不存在")
         session_keys = application.core.sessions.store.list_workspace_session_keys(
             workspace_id
         )
@@ -1116,6 +2049,9 @@ def create_fastapi_app(
             )
         if not application.core.sessions.store.delete_workspace(workspace_id):
             raise HTTPException(status_code=404, detail="工作区不存在")
+        await application.core.project_mcp_registries.discard(
+            str(workspace["canonical_path"])
+        )
         # 删除关系可能让多个缓存策略失效；Policy 每次回源，不需要全局缓存失效。
         return Response(status_code=204)
 
@@ -1183,6 +2119,19 @@ def create_fastapi_app(
         if snapshot is None:
             raise HTTPException(status_code=404, detail="会话不存在")
         return snapshot
+
+    @app.post("/api/chat/sessions/{session_key:path}/skills/refresh")
+    async def refresh_session_skills(session_key: str) -> dict[str, Any]:
+        """主动替换当前会话快照；不会改写历史消息或 workspace 数据。"""
+
+        require_web_session(session_key)
+        snapshot = await application.core.pipeline.refresh_skill_snapshot(session_key)
+        if snapshot is None:
+            raise HTTPException(status_code=409, detail="当前运行时未启用 Skills 快照")
+        return {
+            "revision": str(snapshot.get("revision") or ""),
+            "skills_count": len(snapshot.get("skills") or []),
+        }
 
     def require_web_session(session_key: str) -> None:
         """主动设置只属于当前 Web channel，禁止借 path 参数访问其他渠道。"""

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from agent.config_models import Config, VisionConfig
+from agent.skills import seed_builtin_skills
 from bootstrap.app import AppRuntime, MemoryMaintenanceLoop, build_core_runtime, create_fastapi_app
 from fastapi.testclient import TestClient
 
@@ -149,6 +151,322 @@ def test_fastapi_exposes_real_websocket_route(tmp_path: Path) -> None:
             assert notifications.status_code == 200
             assert notifications.json()["items"] == []
             assert runtime.sessions.store.get_session_meta(session_key)["next_seq"] == 0
+
+
+def test_mcp_api_keeps_user_and_workspace_scopes_isolated(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    user_path = tmp_path / "user" / "mcp_servers.json"
+    runtime = build_core_runtime(
+        config,
+        workspace,
+        provider=Provider(),
+        user_mcp_path=user_path,
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    registered = runtime.sessions.store.create_workspace(str(project))
+    # 停用配置用于验证列表隔离，不会在测试启动时创建外部进程。
+    import json
+
+    project_config = project / ".beanagent" / "mcp_servers.json"
+    project_config.parent.mkdir()
+    project_config.write_text(
+        json.dumps({"servers": {"workspace_server": {"type": "stdio", "command": ["x"], "enabled": False}}}),
+        encoding="utf-8",
+    )
+    user_path.parent.mkdir(parents=True, exist_ok=True)
+    user_path.write_text(
+        json.dumps({"servers": {"user_server": {"type": "stdio", "command": ["x"], "enabled": False}}}),
+        encoding="utf-8",
+    )
+    with TestClient(create_fastapi_app(runtime)) as client:
+        workspace_items = client.get(
+            f"/api/extensions/mcp?scope=workspace&workspace_id={registered['id']}"
+        ).json()["items"]
+        user_items = client.get("/api/extensions/mcp?scope=user").json()["items"]
+        missing_project = client.get("/api/extensions/mcp?scope=workspace")
+
+    assert [item["id"] for item in workspace_items] == ["workspace_server"]
+    assert [item["scope"] for item in workspace_items] == ["workspace"]
+    assert [item["id"] for item in user_items] == ["user_server"]
+    assert [item["scope"] for item in user_items] == ["user"]
+    assert missing_project.status_code == 400
+
+
+def test_mcp_project_create_writes_registered_project_directory(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    data_workspace = tmp_path / "runtime-data"
+    project = tmp_path / "project"
+    project.mkdir()
+    runtime = build_core_runtime(
+        config,
+        data_workspace,
+        provider=Provider(),
+        user_mcp_path=tmp_path / "user" / "mcp_servers.json",
+    )
+    registered = runtime.sessions.store.create_workspace(str(project))
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        created = client.post(
+            "/api/extensions/mcp",
+            json={
+                "name": "project_server",
+                "scope": "workspace",
+                "workspace_id": registered["id"],
+                "type": "stdio",
+                "command": ["x"],
+                "enabled": False,
+            },
+        )
+
+    assert created.status_code == 201
+    project_payload = json.loads(
+        (project / ".beanagent" / "mcp_servers.json").read_text(encoding="utf-8")
+    )
+    assert "project_server" in project_payload["servers"]
+    assert not (data_workspace / "mcp_servers.json").exists()
+
+
+def test_mcp_api_rejects_stale_revision_without_mutating_config(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    runtime = build_core_runtime(config, workspace, provider=Provider(), user_mcp_path=tmp_path / "user.json")
+    project = tmp_path / "project"
+    project.mkdir()
+    registered = runtime.sessions.store.create_workspace(str(project))
+    project_config = project / ".beanagent" / "mcp_servers.json"
+    project_config.parent.mkdir()
+    project_config.write_text(
+        json.dumps({"servers": {"demo": {"type": "stdio", "command": ["x"], "enabled": False}}}),
+        encoding="utf-8",
+    )
+    with TestClient(create_fastapi_app(runtime)) as client:
+        first = client.get(f"/api/extensions/mcp/demo?scope=workspace&workspace_id={registered['id']}")
+        assert first.status_code == 200
+        revision = first.json()["revision"]
+        updated = client.put(
+            "/api/extensions/mcp/demo",
+            json={"scope": "workspace", "workspace_id": registered["id"], "revision": revision, "type": "stdio", "command": ["x"], "enabled": False},
+        )
+        assert updated.status_code == 200
+        stale = client.put(
+            "/api/extensions/mcp/demo",
+            json={"scope": "workspace", "workspace_id": registered["id"], "revision": revision, "type": "stdio", "command": ["y"], "enabled": False},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "revision_conflict"
+        current = client.get(f"/api/extensions/mcp/demo?scope=workspace&workspace_id={registered['id']}").json()
+        assert current["command"] == "x"
+
+
+def test_mcp_external_discovery_returns_safe_summary_and_imports_selected(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    project = tmp_path / "project"
+    project.mkdir()
+    source_path = project / ".vscode" / "mcp.json"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(
+        json.dumps({"mcpServers": {"external": {"type": "stdio", "command": ["x"], "env": {"TOKEN": "secret"}, "enabled": False}}}),
+        encoding="utf-8",
+    )
+    runtime = build_core_runtime(config, workspace, provider=Provider(), user_mcp_path=tmp_path / "user.json")
+    registered = runtime.sessions.store.create_workspace(str(project))
+    with TestClient(create_fastapi_app(runtime)) as client:
+        discovered = client.get(f"/api/extensions/mcp/discover?workspace_id={registered['id']}")
+        assert discovered.status_code == 200
+        source = next(item for item in discovered.json()["sources"] if item["scope"] == "project")
+        discovery_text = json.dumps(discovered.json())
+        assert "TOKEN" not in discovery_text and '"secret"' not in discovery_text
+        imported = client.post(
+            "/api/extensions/mcp/import",
+            json={"scope": "workspace", "workspace_id": registered["id"], "selections": [{"source_id": source["id"], "names": ["external"]}]},
+        )
+        assert imported.status_code == 200
+        assert imported.json()["success_count"] == 1
+        record = client.get(f"/api/extensions/mcp/external?scope=workspace&workspace_id={registered['id']}").json()
+        assert record["env_names"] == ["TOKEN"]
+
+
+def test_skill_batch_import_requires_fresh_preflight_token(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    user_skills = tmp_path / "user-skills"
+    source = user_skills / "review" / "SKILL.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nname: review\ndescription: 审查\n---\n旧正文\n", encoding="utf-8")
+    runtime = build_core_runtime(config, workspace, provider=Provider())
+    runtime.skills.user_skills_dir = user_skills.resolve()
+    runtime.skills._state_paths = [workspace / ".beanagent" / "skills-state.json", user_skills.parent / "skills-state.json"]
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        discovered = client.get("/api/extensions/skills/discover").json()["sources"]
+        source_group = next(item for item in discovered if item["agent"] == "beanagent-user")
+        payload = {
+            "scope": "workspace",
+            "mode": "copy",
+            "selections": [{"source_id": source_group["id"], "names": ["review"]}],
+        }
+        preflight = client.post("/api/extensions/skills/import/preflight", json=payload)
+        assert preflight.status_code == 200
+        assert preflight.json()["items"][0]["status"] == "ready"
+
+        source.write_text("---\nname: review\ndescription: 审查\n---\n新正文\n", encoding="utf-8")
+        stale = client.post("/api/extensions/skills/import", json={**payload, "preflight_token": preflight.json()["token"]})
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "preflight_stale"
+
+        fresh = client.post("/api/extensions/skills/import/preflight", json=payload).json()
+        imported = client.post("/api/extensions/skills/import", json={**payload, "preflight_token": fresh["token"]})
+        assert imported.status_code == 200
+        assert imported.json()["success_count"] == 1
+        assert "新正文" in (workspace / "skills" / "review" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_default_skill_api_supports_diff_update_restore_and_conflict(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    builtin = tmp_path / "builtin"
+    user_skills = tmp_path / "user-skills"
+    source = builtin / "weather" / "SKILL.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nname: weather\ndescription: 版本一\n---\n正文一\n", encoding="utf-8")
+    seed_builtin_skills(user_skills, builtin_skills_dir=builtin)
+    runtime = build_core_runtime(config, workspace, provider=Provider())
+    runtime.skills.builtin_skills_dir = builtin.resolve()
+    runtime.skills.user_skills_dir = user_skills.resolve()
+    runtime.skills._state_paths = [workspace / ".beanagent" / "skills-state.json", user_skills.parent / "skills-state.json"]
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        current = client.get("/api/extensions/skills/defaults")
+        assert current.status_code == 200
+        assert current.json()["items"][0]["status"] == "current"
+
+        source.write_text("---\nname: weather\ndescription: 版本二\n---\n正文二\n", encoding="utf-8")
+        available = client.get("/api/extensions/skills/defaults").json()["items"][0]
+        assert available["status"] == "update_available"
+        diff = client.get("/api/extensions/skills/defaults/weather/diff")
+        assert diff.status_code == 200
+        assert "+description: 版本二" in diff.json()["diff"]
+        updated = client.post(
+            "/api/extensions/skills/defaults/weather/update",
+            json={"expected_hash": available["user_hash"]},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["item"]["status"] == "current"
+
+        target = user_skills / "weather" / "SKILL.md"
+        target.write_text("---\nname: weather\ndescription: 用户版本\n---\n用户正文\n", encoding="utf-8")
+        modified = client.get("/api/extensions/skills/defaults").json()["items"][0]
+        protected = client.post(
+            "/api/extensions/skills/defaults/weather/update",
+            json={"expected_hash": modified["user_hash"]},
+        )
+        assert protected.status_code == 409
+        assert protected.json()["detail"]["code"] == "user_modified"
+
+        target.write_text("---\nname: weather\ndescription: 又一次修改\n---\n正文\n", encoding="utf-8")
+        stale = client.post(
+            "/api/extensions/skills/defaults/weather/restore",
+            json={"expected_hash": modified["user_hash"]},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "seed_conflict"
+
+        latest = client.get("/api/extensions/skills/defaults").json()["items"][0]
+        restored = client.post(
+            "/api/extensions/skills/defaults/weather/restore",
+            json={"expected_hash": latest["user_hash"]},
+        )
+        assert restored.status_code == 200
+        assert restored.json()["item"]["status"] == "current"
+        assert "正文二" in target.read_text(encoding="utf-8")
+
+
+def test_skill_update_api_rejects_builtin_and_plugin_sources(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    builtin_file = tmp_path / "builtin" / "readonly" / "SKILL.md"
+    plugin_file = workspace / "plugins" / "demo" / "skills" / "plugin-readonly" / "SKILL.md"
+    builtin_file.parent.mkdir(parents=True)
+    plugin_file.parent.mkdir(parents=True)
+    builtin_file.write_text("---\nname: readonly\ndescription: builtin\n---\nbody\n", encoding="utf-8")
+    plugin_file.write_text("---\nname: plugin-readonly\ndescription: plugin\n---\nbody\n", encoding="utf-8")
+    runtime = build_core_runtime(config, workspace, provider=Provider())
+    runtime.skills.builtin_skills_dir = (tmp_path / "builtin").resolve()
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        builtin = client.put(
+            "/api/extensions/skills/readonly",
+            json={"scope": "user", "content": "---\nname: readonly\ndescription: changed\n---\nbody"},
+        )
+        plugin = client.put(
+            "/api/extensions/skills/plugin-readonly",
+            json={"scope": "workspace", "content": "---\nname: plugin-readonly\ndescription: changed\n---\nbody"},
+        )
+
+    assert builtin.status_code == 400
+    assert plugin.status_code == 400
+    assert "changed" not in builtin_file.read_text(encoding="utf-8")
+    assert "changed" not in plugin_file.read_text(encoding="utf-8")
+
+
+def test_skill_management_api_exposes_overrides_and_project_external_sources(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    user_skills = tmp_path / "user-skills"
+    project_file = workspace / "skills" / "same" / "SKILL.md"
+    user_file = user_skills / "same" / "SKILL.md"
+    external_file = workspace / ".agents" / "skills" / "external" / "SKILL.md"
+    for path, description in ((project_file, "project"), (user_file, "user"), (external_file, "external")):
+        path.parent.mkdir(parents=True)
+        path.write_text(f"---\nname: {path.parent.name}\ndescription: {description}\n---\n{description}\n", encoding="utf-8")
+    runtime = build_core_runtime(config, workspace, provider=Provider())
+    runtime.skills.user_skills_dir = user_skills.resolve()
+    runtime.skills._state_paths = [workspace / ".beanagent" / "skills-state.json", user_skills.parent / "skills-state.json"]
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        items = client.get("/api/extensions/skills?scope=workspace").json()["items"]
+        same = [item for item in items if item["name"] == "same"]
+        assert [(item["source"], item["active"]) for item in same[:2]] == [("workspace", True), ("user", False)]
+        assert same[1]["overridden_by"] == "workspace:same"
+        detail = client.get("/api/extensions/skills/same?scope=workspace&source_id=user")
+        assert detail.status_code == 200
+        assert detail.json()["description"] == "user"
+        sources = client.get("/api/extensions/skills/discover").json()["sources"]
+        assert any(source["agent"] == "agents-project" and source["candidates"][0]["name"] == "external" for source in sources)
+
+
+def test_plugin_skill_metadata_and_icon_are_exposed_safely(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    plugin = workspace / "plugins" / "demo"
+    skill_file = plugin / "skills" / "plugin-skill" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text("---\nname: plugin-skill\ndescription: plugin\n---\nbody\n", encoding="utf-8")
+    (plugin / "icon.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'/>", encoding="utf-8")
+    (plugin / "plugin.json").write_text(json.dumps({"name": "Demo", "icon": "icon.svg", "source": "local", "enabled": False}), encoding="utf-8")
+    runtime = build_core_runtime(config, workspace, provider=Provider())
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        item = next(item for item in client.get("/api/extensions/skills?scope=workspace").json()["items"] if item["name"] == "plugin-skill")
+        assert item["plugin_name"] == "Demo"
+        assert item["plugin_source"] == "local"
+        assert item["plugin_enabled"] is False
+        assert item["plugin_icon_url"].endswith("/demo/icon")
+        icon = client.get(item["plugin_icon_url"])
+        assert icon.status_code == 200
+        assert "image/svg+xml" in icon.headers["content-type"]
 
 
 def test_chat_session_route_returns_spa_index_or_build_hint(tmp_path: Path) -> None:

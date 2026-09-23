@@ -14,6 +14,85 @@ export type ApprovalState = "none" | "pending" | "submitting" | "allowed-once" |
 export type ThinkingStatus = "running" | "completed" | "interrupted";
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 
+export type ExtensionScope = "user" | "workspace";
+
+export interface PluginExtensionRecord {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  source: string;
+  scope: ExtensionScope;
+  status: "installed" | "available" | "disabled" | "invalid";
+  enabled: boolean;
+  skills_count: number;
+  mcp_count: number;
+  commands_count: number;
+  mcp_groups?: Array<{
+    id: string;
+    name: string;
+    transport: string;
+    status: "disabled" | "not_loaded" | "connecting" | "connected" | "error" | string;
+    enabled: boolean;
+  }>;
+}
+
+export interface McpExtensionRecord {
+  id: string;
+  name: string;
+  description: string;
+  scope: ExtensionScope;
+  transport: "stdio" | "http" | "sse" | "unknown";
+  status: "connected" | "connecting" | "disconnected" | "disabled" | "error" | "unknown" | "unsupported";
+  enabled: boolean;
+  tool_count: number;
+  command?: string;
+  url?: string;
+  cwd?: string | null;
+  env_names?: string[];
+  header_names?: string[];
+  tools?: string[];
+  error?: string | null;
+  timeout_ms?: number | null;
+  revision: number;
+  created_at?: string | null;
+  updated_at?: string | null;
+  oauth_configured?: boolean;
+  authorization_required?: boolean;
+}
+
+export interface SkillExtensionRecord {
+  id: string;
+  name: string;
+  description: string;
+  source: "workspace" | "builtin" | "plugin" | string;
+  source_id?: string;
+  scope: ExtensionScope;
+  available: boolean;
+  enabled: boolean;
+  always: boolean;
+  missing: string;
+  plugin_name?: string | null;
+  plugin_icon?: string | null;
+  plugin_icon_url?: string | null;
+  plugin_source?: string | null;
+  plugin_enabled?: boolean;
+  version?: string | null;
+  slug?: string | null;
+  owner?: string | null;
+  published_at?: string | null;
+  file_size?: number;
+  file_path?: string;
+  priority?: number;
+  active?: boolean;
+  overridden_by?: string | null;
+  override_reason?: string | null;
+  status?: "available" | "missing_dependency" | "invalid" | "disabled" | "conflict" | "error" | "unknown" | string;
+  diagnostics?: string[];
+  revision?: number;
+  updated_at?: string | null;
+}
+
 export interface Workspace {
   id: string;
   canonical_path: string;

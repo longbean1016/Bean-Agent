@@ -25,7 +25,12 @@ async def test_runtime_add_search_call_remove_mcp_tool(tmp_path: Path) -> None:
     config = Config()
     config.memory.enabled = False
     config.agent.workdir = str(tmp_path / "workdir")
-    core = build_core_runtime(config, tmp_path / "workspace", provider=_Provider())
+    core = build_core_runtime(
+        config,
+        tmp_path / "workspace",
+        provider=_Provider(),
+        user_mcp_path=tmp_path / "user" / "mcp_servers.json",
+    )
     runtime = AppRuntime(core)
     server = Path(__file__).parents[1] / "fixtures" / "stdio_mcp_server.py"
     log_path = tmp_path / "mcp.jsonl"

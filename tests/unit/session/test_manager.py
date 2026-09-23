@@ -586,3 +586,18 @@ async def test_delete_removes_cached_session_without_recreating_it(
     with pytest.raises(RuntimeError, match="已删除"):
         await manager.append_messages(session, [stale_message])
     assert manager.store.get_session_meta("web:delete") is None
+
+
+@pytest.mark.asyncio
+async def test_skill_snapshot_round_trips_through_session_metadata(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    snapshot = {"schema": 1, "revision": "abc", "skills": []}
+
+    await manager.save_skill_snapshot("web:skills", snapshot)
+    loaded = await manager.load_skill_snapshot("web:skills")
+    assert loaded == snapshot
+    assert manager.store.get_session_meta("web:skills")["metadata"]["skill_snapshot_revision"] == "abc"
+
+    await manager.clear_skill_snapshot("web:skills")
+    assert await manager.load_skill_snapshot("web:skills") is None
+    await manager.close()

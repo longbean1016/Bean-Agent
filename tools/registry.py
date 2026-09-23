@@ -180,6 +180,7 @@ class ToolRegistry:
         top_k: int = 5,
         allowed_risk: set[str] | None = None,
         excluded_names: set[str] | None = None,
+        allowed_names: set[str] | None = None,
     ) -> list[dict[str, str]]:
         """在全局工具目录中执行无依赖、可复现的文本搜索。"""
 
@@ -190,6 +191,8 @@ class ToolRegistry:
         ranked: list[tuple[int, int, ToolDocument]] = []
         for document in self._documents.values():
             if document.name in excluded or document.name not in self._tools:
+                continue
+            if allowed_names is not None and document.name not in allowed_names:
                 continue
             if allowed_risk is not None and document.risk not in allowed_risk:
                 continue
@@ -235,6 +238,9 @@ class ToolRegistry:
                 merged["current_user_source_ref"] = context[
                     "current_user_source_ref"
                 ]
+            if context and "_skills_view" in context:
+                # 会话快照是运行时身份，不能被模型参数覆盖后退回实时磁盘读取。
+                merged["_skills_view"] = context["_skills_view"]
             return await tool.execute(**merged)
         except Exception as error:
             logger.error("工具 %s 执行出错: %s", name, error, exc_info=True)
