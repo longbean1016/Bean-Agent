@@ -414,6 +414,54 @@ export interface SkillImportPlan {
 export interface SkillImportResultItem { name: string; status: "imported" | "skipped" | "failed"; reason?: string }
 export interface SkillImportResult { imported: SkillImportResultItem[]; skipped: SkillImportResultItem[]; failed: SkillImportResultItem[] }
 
+export interface DefaultSkillStatus {
+  name: string;
+  status: "current" | "update_available" | "user_modified" | "missing";
+  user_hash: string;
+  default_hash: string;
+  installed_hash: string;
+  managed: boolean;
+}
+
+export interface DefaultSkillDiff extends DefaultSkillStatus { diff: string }
+
+function skillApiErrorDetail(payload: { detail?: string | { detail?: string } }, fallback: string): string {
+  return typeof payload.detail === "string" ? payload.detail : payload.detail?.detail || fallback;
+}
+
+export async function fetchDefaultSkillStatuses(): Promise<DefaultSkillStatus[]> {
+  const response = await fetch("/api/extensions/skills/defaults");
+  const result = await response.json().catch(() => ({})) as { items?: DefaultSkillStatus[]; detail?: string | { detail?: string } };
+  if (!response.ok) throw new Error(skillApiErrorDetail(result, "无法加载默认 Skill 状态"));
+  return Array.isArray(result.items) ? result.items : [];
+}
+
+export async function fetchDefaultSkillDiff(name: string): Promise<DefaultSkillDiff> {
+  const response = await fetch(`/api/extensions/skills/defaults/${encodeURIComponent(name)}/diff`);
+  const result = await response.json().catch(() => ({})) as DefaultSkillDiff & { detail?: string | { detail?: string } };
+  if (!response.ok || typeof result.diff !== "string") throw new Error(skillApiErrorDetail(result, "无法加载默认 Skill 差异"));
+  return result;
+}
+
+async function replaceDefaultSkill(name: string, action: "restore" | "update", expectedHash: string): Promise<DefaultSkillStatus> {
+  const response = await fetch(`/api/extensions/skills/defaults/${encodeURIComponent(name)}/${action}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ expected_hash: expectedHash }),
+  });
+  const result = await response.json().catch(() => ({})) as { item?: DefaultSkillStatus; detail?: string | { detail?: string } };
+  if (!response.ok || !result.item) throw new Error(skillApiErrorDetail(result, action === "restore" ? "无法恢复默认 Skill" : "无法更新默认 Skill"));
+  return result.item;
+}
+
+export async function restoreDefaultSkill(name: string, expectedHash: string): Promise<DefaultSkillStatus> {
+  return replaceDefaultSkill(name, "restore", expectedHash);
+}
+
+export async function updateDefaultSkill(name: string, expectedHash: string): Promise<DefaultSkillStatus> {
+  return replaceDefaultSkill(name, "update", expectedHash);
+}
+
 export async function discoverSkillSources(workspaceId?: string | null): Promise<DiscoveredSkillSource[]> {
   const query = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : "";
   const response = await fetch(`/api/extensions/skills/discover${query}`);

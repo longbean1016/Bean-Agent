@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.skills import SkillRevisionConflict, SkillsLoader, seed_builtin_skills
+from agent.skills import SkillRevisionConflict, SkillSeedConflict, SkillsLoader, seed_builtin_skills
 
 
 def _write_skill(
@@ -254,6 +254,79 @@ def test_seed_builtin_skills_upgrades_unmodified_copy_but_preserves_user_edit(tm
     assert "weather" not in preserved["seeded"]
     assert "用户正文" in (user / "weather" / "SKILL.md").read_text(encoding="utf-8")
     assert preserved["manifest"]["weather"]["managed"] is False
+
+
+def test_builtin_seed_statuses_and_diff_cover_all_lifecycle_states(tmp_path: Path) -> None:
+    builtin = tmp_path / "builtin"
+    user = tmp_path / "user"
+    _write_skill(builtin, "weather", description="版本一", body="正文一")
+    seed_builtin_skills(user, builtin_skills_dir=builtin)
+    loader = SkillsLoader(tmp_path / "workspace", builtin_skills_dir=builtin, user_skills_dir=user)
+
+    assert loader.list_builtin_seed_statuses()[0]["status"] == "current"
+    (builtin / "weather" / "SKILL.md").write_text(
+        "---\nname: weather\ndescription: 版本二\n---\n正文二\n",
+        encoding="utf-8",
+    )
+    update_status = loader.list_builtin_seed_statuses()[0]
+    assert update_status["status"] == "update_available"
+    assert "-description: 版本一" in loader.builtin_seed_diff("weather")["diff"]
+    assert "+description: 版本二" in loader.builtin_seed_diff("weather")["diff"]
+
+    (user / "weather" / "SKILL.md").write_text(
+        "---\nname: weather\ndescription: 用户版本\n---\n用户正文\n",
+        encoding="utf-8",
+    )
+    assert loader.list_builtin_seed_statuses()[0]["status"] == "user_modified"
+    (user / "weather" / "SKILL.md").unlink()
+    (user / "weather").rmdir()
+    assert loader.list_builtin_seed_statuses()[0]["status"] == "missing"
+
+
+def test_builtin_seed_update_and_restore_refresh_manifest_and_revision(tmp_path: Path) -> None:
+    builtin = tmp_path / "builtin"
+    user = tmp_path / "user"
+    _write_skill(builtin, "weather", description="版本一", body="正文一")
+    seed_builtin_skills(user, builtin_skills_dir=builtin)
+    loader = SkillsLoader(tmp_path / "workspace", builtin_skills_dir=builtin, user_skills_dir=user)
+    (builtin / "weather" / "SKILL.md").write_text(
+        "---\nname: weather\ndescription: 版本二\n---\n正文二\n",
+        encoding="utf-8",
+    )
+
+    before = loader.list_builtin_seed_statuses()[0]
+    updated = loader.update_builtin_seed("weather", expected_hash=before["user_hash"])
+    assert updated["status"] == "current"
+    assert "正文二" in (user / "weather" / "SKILL.md").read_text(encoding="utf-8")
+    assert loader.get_skill_record("weather", scope="user").revision == 2
+
+    (user / "weather" / "SKILL.md").write_text(
+        "---\nname: weather\ndescription: 用户版本\n---\n用户正文\n",
+        encoding="utf-8",
+    )
+    modified = loader.list_builtin_seed_statuses()[0]
+    with pytest.raises(PermissionError):
+        loader.update_builtin_seed("weather", expected_hash=modified["user_hash"])
+    restored = loader.restore_builtin_seed("weather", expected_hash=modified["user_hash"])
+    assert restored["status"] == "current"
+    assert restored["managed"] is True
+    assert restored["installed_hash"] == restored["default_hash"]
+
+
+def test_builtin_seed_restore_rejects_stale_expected_hash(tmp_path: Path) -> None:
+    builtin = tmp_path / "builtin"
+    user = tmp_path / "user"
+    _write_skill(builtin, "weather")
+    seed_builtin_skills(user, builtin_skills_dir=builtin)
+    loader = SkillsLoader(tmp_path / "workspace", builtin_skills_dir=builtin, user_skills_dir=user)
+    expected_hash = loader.list_builtin_seed_statuses()[0]["user_hash"]
+    (user / "weather" / "SKILL.md").write_text(
+        "---\nname: weather\ndescription: 新改动\n---\n正文\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillSeedConflict):
+        loader.restore_builtin_seed("weather", expected_hash=expected_hash)
 
 
 def test_loader_can_switch_registered_project_and_create_immutable_snapshot(tmp_path: Path) -> None:

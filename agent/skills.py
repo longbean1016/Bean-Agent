@@ -8,9 +8,10 @@ Skill 目录摘要会进入稳定 Prompt 前缀，因此扫描和输出顺序必
 
 from __future__ import annotations
 
-import logging
+import difflib
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -34,6 +35,15 @@ class SkillRevisionConflict(RuntimeError):
 
     def __init__(self, expected: int, actual: int) -> None:
         super().__init__(f"Skill 配置已更新（期望 revision={expected}，当前 revision={actual}）")
+        self.expected = expected
+        self.actual = actual
+
+
+class SkillSeedConflict(RuntimeError):
+    """默认 Skill 操作期间用户副本发生变化。"""
+
+    def __init__(self, expected: str, actual: str) -> None:
+        super().__init__("Skill 文件已变化，请刷新后重试")
         self.expected = expected
         self.actual = actual
 
@@ -396,6 +406,138 @@ class SkillsLoader:
                 for record in records
             ],
         }
+
+    def list_builtin_seed_statuses(self) -> list[dict[str, Any]]:
+        """返回内置种子的用户副本状态，不读取或修改其他 Skill。"""
+
+        if self.builtin_skills_dir is None or self.user_skills_dir is None or not self.builtin_skills_dir.is_dir():
+            return []
+        manifest = self._read_seed_manifest()
+        statuses: list[dict[str, Any]] = []
+        for source in sorted(self.builtin_skills_dir.iterdir(), key=lambda item: item.name):
+            if not source.is_dir() or not (source / "SKILL.md").is_file():
+                continue
+            name = source.name
+            target = self.user_skills_dir / name
+            default_hash = _hash_skill_tree(source)
+            user_hash = _hash_skill_tree(target) if target.is_dir() else ""
+            entry = manifest.get(name) if isinstance(manifest.get(name), dict) else {}
+            installed_hash = str(entry.get("seed_hash") or "")
+            if not target.is_dir():
+                status = "missing"
+            elif user_hash == default_hash:
+                status = "current"
+            elif installed_hash and user_hash == installed_hash and bool(entry.get("managed", False)):
+                status = "update_available"
+            else:
+                status = "user_modified"
+            statuses.append({
+                "name": name,
+                "status": status,
+                "user_hash": user_hash,
+                "default_hash": default_hash,
+                "installed_hash": installed_hash,
+                "managed": bool(entry.get("managed", False)),
+            })
+        return statuses
+
+    def builtin_seed_diff(self, name: str) -> dict[str, Any]:
+        """生成用户副本到当前默认版本的统一 diff，不调用外部程序。"""
+
+        status = self._builtin_seed_status(name)
+        source_file = self._builtin_seed_root(name) / "SKILL.md"
+        target_file = self._user_seed_root(name) / "SKILL.md"
+        user_content = target_file.read_text(encoding="utf-8") if target_file.is_file() else ""
+        default_content = source_file.read_text(encoding="utf-8")
+        diff = "".join(difflib.unified_diff(
+            user_content.splitlines(keepends=True),
+            default_content.splitlines(keepends=True),
+            fromfile=f"user/{name}/SKILL.md",
+            tofile=f"default/{name}/SKILL.md",
+        ))
+        return {**status, "diff": diff}
+
+    def restore_builtin_seed(self, name: str, *, expected_hash: str) -> dict[str, Any]:
+        """显式恢复当前默认版本；期望哈希阻止确认后发生的迟到覆盖。"""
+
+        return self._replace_builtin_seed(name, expected_hash=expected_hash, allow_modified=True)
+
+    def update_builtin_seed(self, name: str, *, expected_hash: str) -> dict[str, Any]:
+        """仅更新未被用户修改的旧默认副本，用户修改版本必须走恢复入口。"""
+
+        current = self._builtin_seed_status(name)
+        if current["status"] not in {"update_available", "missing", "current"}:
+            raise PermissionError("用户修改过该 Skill，请使用恢复默认并确认覆盖")
+        return self._replace_builtin_seed(name, expected_hash=expected_hash, allow_modified=False)
+
+    def _replace_builtin_seed(self, name: str, *, expected_hash: str, allow_modified: bool) -> dict[str, Any]:
+        source = self._builtin_seed_root(name)
+        target = self._user_seed_root(name)
+        actual_hash = _hash_skill_tree(target) if target.is_dir() else ""
+        if str(expected_hash or "") != actual_hash:
+            raise SkillSeedConflict(str(expected_hash or ""), actual_hash)
+        if not allow_modified and self._builtin_seed_status(name)["status"] == "user_modified":
+            raise PermissionError("用户修改过该 Skill，请使用恢复默认并确认覆盖")
+        existing = self.get_skill_record(name, scope="user")
+        enabled = existing.enabled if existing is not None and existing.source == "user" else True
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.parent / f".{name}.default-{uuid.uuid4().hex}.tmp"
+        backup = target.parent / f".{name}.default-{uuid.uuid4().hex}.old"
+        try:
+            shutil.copytree(source, temporary, symlinks=False)
+            if target.exists():
+                target.rename(backup)
+            temporary.replace(target)
+            shutil.rmtree(backup, ignore_errors=True)
+        except (OSError, shutil.Error):
+            shutil.rmtree(temporary, ignore_errors=True)
+            if not target.exists() and backup.exists():
+                backup.rename(target)
+            raise
+        source_hash = _hash_skill_tree(source)
+        manifest = self._read_seed_manifest()
+        manifest[name] = {
+            "source": "builtin",
+            "seed_hash": source_hash,
+            "current_builtin_hash": source_hash,
+            "managed": True,
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        self._write_seed_manifest(manifest)
+        # 默认版本替换同样属于用户文件变更，递增 revision 可阻止已打开的旧编辑器
+        # 在恢复完成后继续保存并覆盖新内容。
+        self._bump_revision(name, "user", enabled=enabled)
+        return self._builtin_seed_status(name)
+
+    def _builtin_seed_status(self, name: str) -> dict[str, Any]:
+        normalized = self._validate_name(name)
+        status = next((item for item in self.list_builtin_seed_statuses() if item["name"] == normalized), None)
+        if status is None:
+            raise KeyError(f"默认 Skill 不存在: {normalized}")
+        return status
+
+    def _builtin_seed_root(self, name: str) -> Path:
+        if self.builtin_skills_dir is None:
+            raise RuntimeError("内置 Skill 目录未配置")
+        source = self.builtin_skills_dir / self._validate_name(name)
+        if not source.is_dir() or not (source / "SKILL.md").is_file():
+            raise KeyError(f"默认 Skill 不存在: {name}")
+        return source
+
+    def _user_seed_root(self, name: str) -> Path:
+        if self.user_skills_dir is None:
+            raise RuntimeError("用户级 Skill 目录未配置")
+        return self.user_skills_dir / self._validate_name(name)
+
+    def _read_seed_manifest(self) -> dict[str, Any]:
+        if self.user_skills_dir is None:
+            return {}
+        return self._read_state_file(self.user_skills_dir.parent / "skills-seed-manifest.json")
+
+    def _write_seed_manifest(self, manifest: dict[str, Any]) -> None:
+        if self.user_skills_dir is None:
+            raise RuntimeError("用户级 Skill 目录未配置")
+        _atomic_write_path(self.user_skills_dir.parent / "skills-seed-manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
     @staticmethod
     def from_snapshot(snapshot: dict[str, Any]) -> SkillSnapshotView:
@@ -950,4 +1092,4 @@ class SkillsLoader:
         )
 
 
-__all__ = ["SkillRecord", "SkillRevisionConflict", "SkillSnapshotView", "SkillsLoader", "collect_skill_mentions", "seed_builtin_skills"]
+__all__ = ["SkillRecord", "SkillRevisionConflict", "SkillSeedConflict", "SkillSnapshotView", "SkillsLoader", "collect_skill_mentions", "seed_builtin_skills"]

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from agent.config_models import Config, VisionConfig
+from agent.skills import seed_builtin_skills
 from bootstrap.app import AppRuntime, MemoryMaintenanceLoop, build_core_runtime, create_fastapi_app
 from fastapi.testclient import TestClient
 
@@ -274,6 +275,67 @@ def test_skill_batch_import_requires_fresh_preflight_token(tmp_path: Path) -> No
         assert imported.status_code == 200
         assert imported.json()["success_count"] == 1
         assert "新正文" in (workspace / "skills" / "review" / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_default_skill_api_supports_diff_update_restore_and_conflict(tmp_path: Path) -> None:
+    config = Config()
+    config.memory.enabled = False
+    workspace = tmp_path / "workspace"
+    builtin = tmp_path / "builtin"
+    user_skills = tmp_path / "user-skills"
+    source = builtin / "weather" / "SKILL.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nname: weather\ndescription: 版本一\n---\n正文一\n", encoding="utf-8")
+    seed_builtin_skills(user_skills, builtin_skills_dir=builtin)
+    runtime = build_core_runtime(config, workspace, provider=Provider())
+    runtime.skills.builtin_skills_dir = builtin.resolve()
+    runtime.skills.user_skills_dir = user_skills.resolve()
+    runtime.skills._state_paths = [workspace / ".beanagent" / "skills-state.json", user_skills.parent / "skills-state.json"]
+
+    with TestClient(create_fastapi_app(runtime)) as client:
+        current = client.get("/api/extensions/skills/defaults")
+        assert current.status_code == 200
+        assert current.json()["items"][0]["status"] == "current"
+
+        source.write_text("---\nname: weather\ndescription: 版本二\n---\n正文二\n", encoding="utf-8")
+        available = client.get("/api/extensions/skills/defaults").json()["items"][0]
+        assert available["status"] == "update_available"
+        diff = client.get("/api/extensions/skills/defaults/weather/diff")
+        assert diff.status_code == 200
+        assert "+description: 版本二" in diff.json()["diff"]
+        updated = client.post(
+            "/api/extensions/skills/defaults/weather/update",
+            json={"expected_hash": available["user_hash"]},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["item"]["status"] == "current"
+
+        target = user_skills / "weather" / "SKILL.md"
+        target.write_text("---\nname: weather\ndescription: 用户版本\n---\n用户正文\n", encoding="utf-8")
+        modified = client.get("/api/extensions/skills/defaults").json()["items"][0]
+        protected = client.post(
+            "/api/extensions/skills/defaults/weather/update",
+            json={"expected_hash": modified["user_hash"]},
+        )
+        assert protected.status_code == 409
+        assert protected.json()["detail"]["code"] == "user_modified"
+
+        target.write_text("---\nname: weather\ndescription: 又一次修改\n---\n正文\n", encoding="utf-8")
+        stale = client.post(
+            "/api/extensions/skills/defaults/weather/restore",
+            json={"expected_hash": modified["user_hash"]},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "seed_conflict"
+
+        latest = client.get("/api/extensions/skills/defaults").json()["items"][0]
+        restored = client.post(
+            "/api/extensions/skills/defaults/weather/restore",
+            json={"expected_hash": latest["user_hash"]},
+        )
+        assert restored.status_code == 200
+        assert restored.json()["item"]["status"] == "current"
+        assert "正文二" in target.read_text(encoding="utf-8")
 
 
 def test_chat_session_route_returns_spa_index_or_build_hint(tmp_path: Path) -> None:

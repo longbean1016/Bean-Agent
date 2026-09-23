@@ -255,12 +255,20 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .extension-status .status-dot { box-shadow: none; }
 .extension-status.muted .status-dot { background: var(--text-faint); }
 .extension-warning { display: inline-flex; align-items: center; gap: 5px; color: var(--warning-text); font-size: 10px; }
+.default-skill-management { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 7px; }
+.default-skill-management > span { margin-right: 2px; color: var(--text-muted); font-size: 10px; }
+.default-skill-management.update_available > span, .default-skill-management.user_modified > span, .default-skill-management.missing > span { color: var(--warning-text); }
+.default-skill-management button { display: inline-flex; align-items: center; gap: 3px; min-height: 24px; padding: 0 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text-muted); cursor: pointer; font-size: 9px; }
+.default-skill-management button:hover:not(:disabled) { border-color: var(--primary-border); color: var(--primary-active); background: var(--primary-soft); }
+.default-skill-management button:disabled { cursor: not-allowed; opacity: .45; }
 .extensions-empty, .extensions-loading { display: grid; min-height: 260px; place-items: center; align-content: center; gap: 8px; border: 1px dashed var(--border-strong); border-radius: 10px; color: var(--text-muted); text-align: center; }
 .extensions-empty svg { color: var(--primary-active); }
 .extensions-empty strong { color: var(--text-strong); font-size: 14px; }
 .extensions-empty span, .extensions-loading { font-size: 11px; }
 .extensions-error { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; padding: 9px 11px; border: 1px solid var(--danger-border); border-radius: 7px; background: var(--danger-soft); color: var(--danger-text); font-size: 11px; }
 .extensions-error button { margin-left: auto; border: 0; background: transparent; color: inherit; cursor: pointer; text-decoration: underline; }
+.extensions-notice { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; padding: 9px 11px; border: 1px solid var(--primary-border); border-radius: 7px; background: var(--primary-soft); color: var(--primary-active); font-size: 11px; }
+.extensions-notice button { margin-left: auto; border: 0; background: transparent; color: inherit; cursor: pointer; }
 .extensions-dialog-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 18px; background: var(--overlay-color); }
 .extensions-dialog { display: grid; gap: 13px; width: min(480px, 100%); padding: 20px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); box-shadow: var(--shadow-lg); }
 .extensions-dialog header, .extensions-dialog footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -286,6 +294,8 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .extensions-dialog footer .primary-action { border: 1px solid var(--primary); background: var(--primary); color: var(--primary-foreground); }
 .skill-editor-dialog { width: min(760px, 100%); }
 .skill-preview { max-height: 52vh; overflow: auto; margin: 0; padding: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--text); font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
+.default-skill-diff-dialog { width: min(760px, 100%); }
+.default-skill-diff { max-height: 55vh; overflow: auto; margin: 0; padding: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--text); font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre; }
 .spin { animation: extension-spin .9s linear infinite; }
 @keyframes extension-spin { to { transform: rotate(360deg); } }
 .sidebar-section-label:first-child { margin-top: 2px; }

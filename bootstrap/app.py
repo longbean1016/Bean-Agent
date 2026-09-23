@@ -34,7 +34,7 @@ from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
 from agent.prompt_cache_log import PromptCacheLogWriter
 from agent.provider import LLMProvider, create_vision_provider
-from agent.skills import SkillRevisionConflict, SkillsLoader, seed_builtin_skills
+from agent.skills import SkillRevisionConflict, SkillSeedConflict, SkillsLoader, seed_builtin_skills
 from agent.tool_projection import project_tool_call, project_tool_chain
 from bootstrap.native_folder_picker import (
     DirectoryPicker,
@@ -1455,6 +1455,59 @@ def create_fastapi_app(
     def discover_skill_sources(workspace_id: str | None = Query(None)) -> dict[str, Any]:
         sources = _discover_skill_sources(workspace_id)
         return {"sources": sources, "source_count": len(sources), "skill_count": sum(int(item["skill_count"]) for item in sources)}
+
+    @app.get("/api/extensions/skills/defaults")
+    def list_default_skill_statuses() -> dict[str, Any]:
+        """默认版本管理只面向应用内置种子及其用户级副本。"""
+
+        skill_loader = application.core.skills
+        return {
+            "items": skill_loader.list_builtin_seed_statuses(),
+            "revision": skill_loader.directory_revision(scope="user"),
+        }
+
+    @app.get("/api/extensions/skills/defaults/{skill_name}/diff")
+    def get_default_skill_diff(skill_name: str) -> dict[str, Any]:
+        try:
+            return application.core.skills.builtin_seed_diff(skill_name)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    async def _replace_default_skill(skill_name: str, payload: dict[str, Any], *, restore: bool) -> dict[str, Any]:
+        if "expected_hash" not in payload:
+            raise HTTPException(status_code=400, detail="expected_hash 不能为空")
+        expected_hash = str(payload.get("expected_hash") or "")
+        operation = application.core.skills.restore_builtin_seed if restore else application.core.skills.update_builtin_seed
+        try:
+            item = await asyncio.to_thread(operation, skill_name, expected_hash=expected_hash)
+        except SkillSeedConflict as error:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "seed_conflict", "detail": str(error), "retryable": True},
+            ) from error
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except PermissionError as error:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "user_modified", "detail": str(error), "retryable": False},
+            ) from error
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "item": item,
+            "revision": application.core.skills.directory_revision(scope="user"),
+        }
+
+    @app.post("/api/extensions/skills/defaults/{skill_name}/restore")
+    async def restore_default_skill(skill_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return await _replace_default_skill(skill_name, payload, restore=True)
+
+    @app.post("/api/extensions/skills/defaults/{skill_name}/update")
+    async def update_default_skill(skill_name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return await _replace_default_skill(skill_name, payload, restore=False)
 
     def _skill_record_or_404(skill_name: str, scope: str, skill_loader: SkillsLoader | None = None) -> Any:
         record = (skill_loader or application.core.skills).get_skill_record(skill_name, scope=scope)
