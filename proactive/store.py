@@ -290,7 +290,7 @@ class ProactiveStore:
         with self._lock:
             self._ensure_open()
             rows = self._conn.execute(
-                f"SELECT * FROM proactive_notifications WHERE session_key=?{status_clause} ORDER BY generated_at DESC, id DESC LIMIT ?",
+                f"SELECT * FROM proactive_notifications WHERE session_key=?{status_clause} ORDER BY generated_at DESC, scheduled_at DESC, id DESC LIMIT ?",
                 (key, safe_limit),
             ).fetchall()
         return [_notification_from_row(row) for row in reversed(rows)]
