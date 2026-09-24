@@ -16,15 +16,9 @@ import {
   updateModelConnection,
   updateModelProfile,
 } from "./api";
+import { ModelAdapterSelect } from "./ModelAdapterSelect";
 import type { CapabilityRouteMode, ModelAdapterId, ModelCapability, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload } from "./types";
 import { REASONING_CHOICES, reasoningStatusForModel, updateReasoningOptions } from "./reasoning";
-
-const ADAPTERS: Array<{ id: ModelAdapterId; label: string }> = [
-  { id: "generic_openai", label: "通用 OpenAI" },
-  { id: "deepseek", label: "DeepSeek" },
-  { id: "qwen_dashscope", label: "Qwen / DashScope" },
-  { id: "openai_reasoning", label: "OpenAI Reasoning" },
-];
 
 type ConnectionDraft = {
   name: string; provider: string; base_url: string; api_key: string;
@@ -372,24 +366,40 @@ export function ModelSettingsPage(props: {
       </nav>
       <div className="model-settings-layout">
             <aside className="connection-list">
-              <button className={`connection-item ${creating ? "active" : ""}`} onClick={() => {
-                if (activeCapability !== "primary") {
-                  setCapabilityModeOverrides((current) => ({ ...current, [activeCapability]: "independent" }));
-                }
-                selectConnection(null);
-              }}><Plus size={15} />新增连接</button>
+              <div className="connection-list-heading">
+                <strong>连接</strong>
+                <button type="button" aria-label="新增连接" title="新增连接" onClick={() => {
+                  if (activeCapability !== "primary") {
+                    setCapabilityModeOverrides((current) => ({ ...current, [activeCapability]: "independent" }));
+                  }
+                  selectConnection(null);
+                }}><Plus size={15} /></button>
+              </div>
               {props.settings.connections.map((connection) => (
-                <button key={connection.id} className={`connection-item ${selectedId === connection.id ? "active" : ""}`} onClick={() => selectConnection(connection)}>
+                <button type="button" key={connection.id} className={`connection-item ${selectedId === connection.id ? "active" : ""}`} onClick={() => selectConnection(connection)}>
                   <span className={`connection-dot ${connection.enabled ? "online" : ""}`} />
                   <span><strong>{connection.name}</strong><small>{connection.models.filter((model) => model.available).length} 个模型 · {connection.has_api_key ? "Key 已配置" : "Key 未配置"}</small></span>
                 </button>
               ))}
-              <button className="catalog-update" disabled={Boolean(busy)} onClick={() => run("catalog", async () => {
+              <button type="button" className="catalog-update" disabled={Boolean(busy)} onClick={() => run("catalog", async () => {
                 const result = await updateModelCatalog(); await props.onRefresh();
                 setNotice(`资料库已更新，共 ${result.models} 个模型`);
               })}><Database size={15} />{busy === "catalog" ? "更新中" : "更新模型资料库"}</button>
             </aside>
             <section className="connection-editor">
+              <header className="connection-editor-header">
+                <div>
+                  <span className="connection-editor-title">
+                    <strong>{selected?.name || "新增连接"}</strong>
+                    {selected ? <small className={selected.enabled ? "enabled" : "disabled"}><i />{selected.enabled ? "连接已启用" : "连接已停用"}</small> : null}
+                  </span>
+                  <p>{selected ? `${selected.provider || "OpenAI-compatible"} · ${availableModels.length} 个可用模型` : "配置地址、密钥和默认适配器"}</p>
+                </div>
+                <div className="connection-editor-actions">
+                  {selected && connectionEditable ? <button type="button" className="danger-text" disabled={Boolean(busy)} onClick={() => setDeleteConfirmationOpen(true)}><Trash2 size={15} />删除</button> : null}
+                  <button type="button" className="primary-action" disabled={Boolean(busy) || !connectionEditable} title={!connectionEditable ? "跟随主模型时请切换到独立连接" : ""} onClick={() => void saveConnection()}><Check size={15} />{busy === "save" ? "保存中" : "保存连接"}</button>
+                </div>
+              </header>
               {activeCapability !== "primary" ? <section className="capability-routing-panel" aria-label={`${activeCapability === "vision" ? "视觉" : "Embedding"} 模型连接方式`}>
                 <div className="capability-routing-copy">
                   <strong>{activeCapability === "vision" ? "视觉模型" : "Embedding 模型"}连接方式</strong>
@@ -403,6 +413,11 @@ export function ModelSettingsPage(props: {
                   当前使用：<strong>{activeCapabilityConnection?.name || "主模型默认连接"}</strong>{effectiveCapabilityRoute?.model_id ? ` / ${effectiveCapabilityRoute.model_id}` : ""}。需要更换 URL、密钥或模型时，请切换到独立连接。
                 </p> : <p className="capability-follow-summary">独立模式复用连接列表中的连接；需要不同 URL 或密钥时，请先在左侧新增连接。</p>}
               </section> : null}
+              <section className="connection-form-section" aria-labelledby="connection-form-title">
+                <div className="connection-section-heading">
+                  <div><h2 id="connection-form-title">连接信息</h2><p>地址和凭据仅用于访问当前服务。</p></div>
+                  {selected?.has_api_key ? <span><CircleCheck size={14} aria-hidden="true" />密钥已安全保存</span> : null}
+                </div>
               <div className="connection-form-grid">
                 <label><span>连接名称</span><input disabled={!connectionEditable} maxLength={80} value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} placeholder="例如：DeepSeek 官方" /></label>
                 <label><span>目录供应商</span><input disabled={!connectionEditable} maxLength={80} value={draft.provider} onChange={(e) => setDraft({ ...draft, provider: e.target.value })} placeholder="models.dev provider id，可留空" /></label>
@@ -418,13 +433,10 @@ export function ModelSettingsPage(props: {
                   </span> : null}
                   <input disabled={!connectionEditable} type="password" autoComplete="new-password" value={draft.api_key} onChange={(e) => setDraft({ ...draft, api_key: e.target.value })} placeholder={selected?.has_api_key ? "输入新值可替换当前密钥" : "输入 API Key"} />
                 </label>
-                {activeCapability === "primary" ? <label><span>默认适配器</span><select value={draft.default_adapter} onChange={(e) => setDraft({ ...draft, default_adapter: e.target.value as ModelAdapterId })}>{ADAPTERS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label> : <div className="capability-auto-adapter"><span>调用方式</span><strong>直接调用对应接口</strong><small>{activeCapability === "embedding" ? "使用 /embeddings 验证向量维度" : "使用图片输入验证视觉响应"}，无需手动配置适配器</small></div>}
+                {activeCapability === "primary" ? <div className="model-adapter-field"><span>默认适配器</span><ModelAdapterSelect value={draft.default_adapter} disabled={!connectionEditable} ariaLabel="默认适配器" onChange={(defaultAdapter) => setDraft({ ...draft, default_adapter: defaultAdapter })} /></div> : <div className="capability-auto-adapter"><span>调用方式</span><strong>直接调用对应接口</strong><small>{activeCapability === "embedding" ? "使用 /embeddings 验证向量维度" : "使用图片输入验证视觉响应"}，无需手动配置适配器</small></div>}
                 <label className="connection-enabled"><input disabled={!connectionEditable} type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} /><span>启用连接</span></label>
               </div>
-              <div className="connection-toolbar">
-                {selected && connectionEditable ? <button className="danger-text" disabled={Boolean(busy)} onClick={() => setDeleteConfirmationOpen(true)}><Trash2 size={15} />删除</button> : null}
-                <button className="primary-action" disabled={Boolean(busy) || !connectionEditable} title={!connectionEditable ? "跟随主模型时请切换到独立连接" : ""} onClick={() => void saveConnection()}><Check size={15} />{busy === "save" ? "保存中" : "保存连接"}</button>
-              </div>
+              </section>
               {selected ? <>
                 {!selected.enabled ? <p className="connection-disabled-message">连接已停用。启用并保存后，才能设为默认或调用模型。</p> : null}
                 <div className="model-list-heading">
@@ -476,7 +488,7 @@ export function ModelSettingsPage(props: {
                 {editingModel && activeCapability === "primary" ? <div className="model-override-editor">
                   <div><strong>{editingModel.display_name}</strong><span>覆盖模型容量、推理能力与适配器</span></div>
                   <label><span>上下文 token</span><input type="number" min="1" value={contextDraft} onChange={(e) => setContextDraft(e.target.value)} placeholder="未知" /></label>
-                  <label><span>适配器</span><select value={editingModel.adapter} onChange={(e) => setEditingModel({ ...editingModel, adapter: e.target.value as ModelAdapterId })}>{ADAPTERS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+                  <div className="model-adapter-field"><span>适配器</span><ModelAdapterSelect value={editingModel.adapter} ariaLabel="模型适配器" onChange={(adapter) => setEditingModel({ ...editingModel, adapter })} /></div>
                   <fieldset className="model-reasoning-editor">
                     <legend>推理能力</legend>
                     <label className="model-reasoning-support"><input type="checkbox" checked={Boolean(editingModel.supports_reasoning)} onChange={(event) => setEditingModel({
