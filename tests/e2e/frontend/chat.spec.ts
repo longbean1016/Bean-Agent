@@ -208,6 +208,67 @@ test("工作目录与会话权限可以在输入框切换", async ({ page }) => 
   await expect(page.getByRole("button", { name: "权限：工作区可写" })).toBeVisible();
 });
 
+test("侧栏分组和目录独立折叠且不关闭当前会话", async ({ page }, testInfo) => {
+  const mobile = testInfo.project.name === "mobile";
+  const historySession = page.getByRole("navigation", { name: "会话列表" })
+    .getByRole("button", { name: "历史问题", exact: true });
+  if (mobile) await page.getByRole("button", { name: "打开会话列表" }).click();
+  await historySession.click();
+  await expect(page.getByText("历史回答")).toBeVisible();
+  if (mobile) await page.getByRole("button", { name: "打开会话列表" }).click();
+  const directory = page.getByRole("button", { name: "工作目录“Bean Demo”的会话", exact: true });
+  const projects = page.getByRole("button", { name: "项目", exact: true });
+  await directory.click();
+  await expect(directory).toHaveAttribute("aria-expanded", "false");
+  await expect(historySession).toBeHidden();
+  await projects.focus();
+  await page.keyboard.press("Enter");
+  await expect(directory).toBeHidden();
+  await page.keyboard.press("Space");
+  await expect(directory).toBeVisible();
+  await expect(directory).toHaveAttribute("aria-expanded", "false");
+  await page.getByRole("button", { name: "打开工作目录“Bean Demo”的菜单" }).click();
+  await expect(page.getByRole("menuitem", { name: "修改名称" })).toBeVisible();
+  await expect(directory).toHaveAttribute("aria-expanded", "false");
+  await directory.click();
+  await expect(historySession).toBeVisible();
+  await expect(page.getByText("历史回答")).toBeVisible();
+  await expect(page).toHaveURL(/\/chat\/history$/);
+  const recent = page.getByRole("button", { name: "最近", exact: true });
+  await recent.click();
+  await expect(recent).toHaveAttribute("aria-expanded", "false");
+  await page.screenshot({ path: `.pytest_artifacts/sidebar-fold-${testInfo.project.name}.png` });
+  await page.getByRole("button", { name: "在最近中新建会话" }).click();
+  if (mobile) await page.getByRole("button", { name: "打开会话列表" }).click();
+  await expect(recent).toHaveAttribute("aria-expanded", "true");
+});
+
+test("侧栏折叠刷新后保留并在收起时显示数量", async ({ page }, testInfo) => {
+  const mobile = testInfo.project.name === "mobile";
+  if (mobile) await page.getByRole("button", { name: "打开会话列表" }).click();
+  const directory = page.getByRole("button", { name: "工作目录“Bean Demo”的会话", exact: true });
+  const projects = page.getByRole("button", { name: "项目", exact: true });
+  const recent = page.getByRole("button", { name: "最近", exact: true });
+  await directory.click();
+  await expect(directory).toHaveAccessibleDescription("1 个会话");
+  await recent.click();
+  await projects.click();
+  await expect(projects).toHaveAccessibleDescription("1 个目录");
+  await page.reload();
+  await expect(page.getByRole("button", { name: "已连接" })).toBeVisible();
+  if (mobile) await page.getByRole("button", { name: "打开会话列表" }).click();
+  await expect(projects).toHaveAttribute("aria-expanded", "false");
+  await expect(recent).toHaveAttribute("aria-expanded", "false");
+  await expect(projects).toHaveAccessibleDescription("1 个目录");
+  await projects.click();
+  await expect(directory).toHaveAttribute("aria-expanded", "false");
+  await expect(directory.getByText("1 个会话", { exact: true })).toBeVisible();
+  await expect(projects.locator(".sidebar-fold-count")).toHaveCount(0);
+  await page.screenshot({ path: `.pytest_artifacts/sidebar-fold-persist-${testInfo.project.name}.png` });
+  await directory.click();
+  await expect(directory.locator(".sidebar-fold-count")).toHaveCount(0);
+});
+
 test("添加工作目录使用本机选择器返回路径", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "桌面侧栏覆盖即可");
   await page.getByRole("button", { name: "添加工作目录" }).click();

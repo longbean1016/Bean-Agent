@@ -339,6 +339,14 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .workspace-group + .workspace-group { margin-top: 14px; }
 .workspace-group-header { position: relative; display: grid; grid-template-columns: 24px minmax(0, 1fr) 26px 26px; min-height: 40px; align-items: center; gap: 2px; padding: 3px 2px 5px; }
 .workspace-group-header.unavailable-header { grid-template-columns: 24px minmax(0, 1fr); }
+/* 折叠入口沿用标题和目录原有视觉，只添加箭头；新建与菜单仍是独立按钮。 */
+.sidebar-fold-toggle { display: flex; min-width: 0; align-items: center; gap: 4px; width: 100%; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.sidebar-fold-toggle > svg { flex: 0 0 12px; color: var(--text-subtle); }
+.sidebar-fold-toggle:focus-visible { outline: 2px solid var(--primary-border); outline-offset: 2px; border-radius: 3px; }
+.sidebar-fold-count { flex: 0 0 auto; margin-left: auto; padding-left: 4px; color: var(--text-subtle); font-size: 11px; font-weight: 400; white-space: nowrap; }
+.workspace-fold-toggle { grid-column: span 2; gap: 2px; }
+.workspace-fold-toggle .workspace-group-copy { flex: 1; }
+.session-list [hidden] { display: none; }
 .workspace-group-icon { display: grid; width: 24px; height: 24px; place-items: center; color: var(--primary-icon); }
 .workspace-group-icon.invalid { color: var(--warning); }
 .workspace-group-copy { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
