@@ -12,13 +12,9 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleStop,
-  CircleHelp,
-  Clock3,
   Copy,
   FileText,
-  FilePenLine,
   FolderOpen,
-  Globe2,
   Image as ImageIcon,
   Menu,
   MessageCircle,
@@ -32,12 +28,11 @@ import {
   Search,
   SendHorizontal,
   Settings,
-  SquareTerminal,
   Sun,
   Wrench,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { ComponentPropsWithoutRef, CSSProperties } from "react";
 import { Streamdown } from "streamdown";
@@ -50,7 +45,9 @@ import { composeTimeline, reconcileMessages } from "./timeline";
 import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
-import { ApprovalCard, ApprovalPanel, PermissionSelector, WorkspaceSelector } from "./SandboxControls";
+import { ApprovalPanel, PermissionSelector, WorkspaceSelector } from "./SandboxControls";
+import { ToolTimeline } from "./ToolTimeline";
+import type { ToolDisclosureState } from "./ToolTimeline";
 import { SessionSidebar } from "./SessionSidebar";
 import { ResizableSidebarLayout } from "./ResizableSidebarLayout";
 import type { ApprovalRequest, ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, SandboxMode, SandboxSnapshot, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry, Workspace } from "./types";
@@ -1803,16 +1800,19 @@ function isApprovalTerminalToolStatus(status: ToolActivity["status"]): boolean {
     || status === "rejected";
 }
 
-function MessageView({ message, navigationTurnId, turnDurationMs, approvals = [], approvalDecisionRequests = {}, onApprovalDecision }: {
+export const MessageView = memo(function MessageView({ message, navigationTurnId, turnDurationMs, approvals = [], approvalDecisionRequests = {}, onApprovalDecision, toolDisclosure, sessionId }: {
   message: ChatMessage;
   navigationTurnId: string;
   turnDurationMs?: number;
+  toolDisclosure: ToolDisclosureState;
+  sessionId: string;
   approvals?: ApprovalRequest[];
   approvalDecisionRequests?: Record<string, string>;
   onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
 }) {
   const isUser = message.role === "user";
   const parsed = useMemo(() => parseMemoryCitations(message.content), [message.content]);
+  const markdown = useMemo(() => prepareMessageMarkdown(parsed.markdown), [parsed.markdown]);
   const messageApprovals = approvals.filter((approval) => approval.turn_id === message.turnId);
   const [copied, setCopied] = useState(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1868,6 +1868,9 @@ function MessageView({ message, navigationTurnId, turnDurationMs, approvals = []
         {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} status={message.thinkingStatus} /> : null}
         {!isUser && (message.tools.length || messageApprovals.length) ? (
           <ToolTimeline
+            key={JSON.stringify([sessionId, message.turnId, message.tools[0]?.callId ?? message.id])}
+            disclosure={toolDisclosure}
+            disclosureKey={JSON.stringify([sessionId, message.turnId, message.tools[0]?.callId ?? message.id])}
             tools={message.tools}
             approvals={messageApprovals}
             approvalDecisionRequests={approvalDecisionRequests}
@@ -1877,7 +1880,6 @@ function MessageView({ message, navigationTurnId, turnDurationMs, approvals = []
         {isUser ? <p className="user-text">{message.content}</p> : message.content && message.content !== "[用户已停止生成]" ? (
           <div className="beanagent-markdown">
             <Streamdown
-              key={`${message.id}-${message.streaming ? "stream" : "final"}`}
               plugins={markdownPlugins}
               components={markdownComponents}
               controls={markdownControls}
@@ -1886,7 +1888,7 @@ function MessageView({ message, navigationTurnId, turnDurationMs, approvals = []
               linkSafety={markdownLinkSafety}
               translations={markdownTranslations}
             >
-              {prepareMessageMarkdown(parsed.markdown)}
+              {markdown}
             </Streamdown>
           </div>
         ) : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
@@ -1927,7 +1929,16 @@ function MessageView({ message, navigationTurnId, turnDurationMs, approvals = []
       </div>
     </article>
   );
-}
+}, (previous, next) => {
+  if (previous.message !== next.message || previous.navigationTurnId !== next.navigationTurnId
+    || previous.turnDurationMs !== next.turnDurationMs || previous.sessionId !== next.sessionId
+    || previous.toolDisclosure !== next.toolDisclosure || previous.onApprovalDecision !== next.onApprovalDecision) return false;
+  const relevant = (items: ApprovalRequest[] = []) => items.filter((item) => item.turn_id === next.message.turnId);
+  const before = relevant(previous.approvals);
+  const after = relevant(next.approvals);
+  return before.length === after.length && before.every((approval, index) => approval === after[index]
+    && previous.approvalDecisionRequests?.[approval.id] === next.approvalDecisionRequests?.[approval.id]);
+});
 
 function formatMessageTime(timestamp?: string): string | null {
   if (!timestamp) return null;
@@ -2034,7 +2045,7 @@ function MemoryCitationList({ citations }: { citations: MemoryCitation[] }) {
   );
 }
 
-function Thinking({ content, streaming, status }: { content: string; streaming: boolean; status?: "running" | "completed" | "interrupted" }) {
+const Thinking = memo(function Thinking({ content, streaming, status }: { content: string; streaming: boolean; status?: "running" | "completed" | "interrupted" }) {
   const visibleStatus = status ?? (streaming ? "running" : "completed");
   return (
     <Collapsible.Root className={`thinking ${visibleStatus}`} defaultOpen={streaming}>
@@ -2050,351 +2061,8 @@ function Thinking({ content, streaming, status }: { content: string; streaming: 
       </Collapsible.Content>
     </Collapsible.Root>
   );
-}
+});
 
-/**
- * 工具活动行使用“动作图标 + 语义文案”表达调用类型，状态图标只在
- * 等待授权、失败或中断等异常状态下接管。这样完成态不会把所有工具
- * 都压成同一个勾，而是能直接看出这是命令、浏览器、文件还是消息活动。
- */
-type ToolVisualKind = "terminal" | "browser" | "tool-loader" | "file-read" | "file-write" | "file-edit" | "directory" | "message" | "mcp" | "generic";
-
-function toolVisualKind(name: string): ToolVisualKind {
-  const normalized = name.trim().toLowerCase().replace(/[\s.:-]+/gu, "_");
-  if (/^(shell|exec|run|terminal|command)(?:_|$)/u.test(normalized)) return "terminal";
-  if (normalized === "web_search" || normalized === "web_fetch" || normalized === "browser" || normalized.startsWith("browser_") || normalized.startsWith("web_")) return "browser";
-  if (normalized === "tool_search" || normalized === "load_skill" || normalized.includes("skill")) return "tool-loader";
-  if (normalized === "read_file" || normalized.includes("read_file") || normalized.includes("get_file") || normalized.includes("fetch_file")) return "file-read";
-  if (normalized === "write_file" || normalized.includes("write_file") || normalized.includes("create_file") || normalized.includes("upload_file")) return "file-write";
-  if (normalized === "edit_file" || normalized.includes("edit_file") || normalized.includes("patch_file") || normalized.includes("update_file")) return "file-edit";
-  if (normalized === "list_dir" || normalized.includes("list_dir") || normalized.includes("list_directory") || normalized.includes("directory")) return "directory";
-  if (normalized === "send_message" || normalized === "notify" || normalized.startsWith("message_") || normalized.startsWith("send_")) return "message";
-  if (normalized.startsWith("mcp_") || normalized.startsWith("plugin_") || normalized.includes("connector")) return "mcp";
-  return "generic";
-}
-
-function toolIcon(kind: ToolVisualKind, size = 16) {
-  if (kind === "terminal") return <SquareTerminal size={size} />;
-  if (kind === "browser") return <Globe2 size={size} />;
-  if (kind === "file-read") return <FileText size={size} />;
-  if (kind === "file-write" || kind === "file-edit") return <FilePenLine size={size} />;
-  if (kind === "directory") return <FolderOpen size={size} />;
-  if (kind === "message") return <MessageCircle size={size} />;
-  if (kind === "mcp") return <PlugZap size={size} />;
-  return <Wrench size={size} />;
-}
-
-function summarizeMessageRecipient(tool: ToolActivity): string {
-  if (!tool.arguments || typeof tool.arguments !== "object" || Array.isArray(tool.arguments)) return "";
-  const args = tool.arguments as Record<string, unknown>;
-  for (const key of ["to", "recipient", "channel", "thread", "target", "name"]) {
-    const value = args[key];
-    if (typeof value === "string" && value.trim()) return truncateToolText(value.trim(), 72);
-  }
-  return "";
-}
-
-function toolActionLabel(tool: ToolActivity, kind: ToolVisualKind): string {
-  if (kind === "terminal") return "运行了命令";
-  if (kind === "browser") return "已使用浏览器运行了命令";
-  if (kind === "tool-loader") return "加载了工具";
-  if (kind === "file-read") return "读取了文件";
-  if (kind === "file-write") return "写入了文件";
-  if (kind === "file-edit") return "编辑了文件";
-  if (kind === "directory") return "查看了目录";
-  if (kind === "message") {
-    const recipient = summarizeMessageRecipient(tool);
-    return recipient ? `已向 ${recipient} 发送消息` : "发送了消息";
-  }
-  if (kind === "mcp") return "调用了 MCP 工具";
-  return "运行了工具";
-}
-
-function ToolTimeline({
-  tools,
-  approvals,
-  approvalDecisionRequests,
-  onApprovalDecision,
-}: {
-  tools: ToolActivity[];
-  approvals: ApprovalRequest[];
-  approvalDecisionRequests: Record<string, string>;
-  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
-}) {
-  const [now, setNow] = useState(() => Date.now());
-  const hasRunningTimer = tools.some((tool) => tool.status === "running" && tool.startedAt);
-  useEffect(() => {
-    if (!hasRunningTimer) return undefined;
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [hasRunningTimer]);
-
-  const pendingByCall = new Map(approvals.map((approval) => [approval.call_id, approval]));
-  const approvalOrder = new Map(approvals.map((approval, index) => [approval.id, index + 1]));
-  const matchedCallIds = new Set<string>();
-  const runningCount = tools.filter((tool) => tool.status === "running").length;
-  const failedCount = tools.filter((tool) => (
-    tool.status === "error" || tool.status === "rejected" || tool.status === "interrupted"
-      || tool.status === "cancelled" || tool.status === "expired" || tool.status === "unavailable"
-  )).length;
-  const unknownCount = tools.filter((tool) => tool.status === "unknown").length;
-  const pendingCount = approvals.length;
-  const groupDuration = deriveToolGroupDuration(tools, now);
-  const groupState = pendingCount
-    ? `${pendingCount} 项等待授权`
-    : runningCount
-      ? `${runningCount}/${tools.length} 项执行中`
-      : failedCount
-        ? `${tools.length} 项中 ${failedCount} 项失败`
-        : unknownCount
-          ? `${tools.length} 项中 ${unknownCount} 项状态未知`
-          : `${tools.length} 项完成`;
-  const summary = `工具调用 · ${groupState}`;
-  const groupStatus = pendingCount ? "pending" : runningCount ? "running" : failedCount ? "error" : unknownCount ? "unknown" : "completed";
-  const [groupOpen, setGroupOpen] = useState(Boolean(pendingCount || runningCount || failedCount || unknownCount));
-  const previousGroupStatusRef = useRef(groupStatus);
-  useEffect(() => {
-    const previous = previousGroupStatusRef.current;
-    if (pendingCount > 0) {
-      // 等待授权是必须完成的交互；即使用户之前收起了执行组，审批到达后
-      // 也要立即展开，避免把唯一的操作入口藏起来。
-      setGroupOpen(true);
-    } else if (previous !== groupStatus) {
-      // 完成组默认收起；执行重新开始或出现审批/异常时自动展开，用户手动
-      // 展开的完成组不在每次计时刷新时被强制关闭。
-      if (groupStatus === "completed") setGroupOpen(false);
-      else if (previous === "completed") setGroupOpen(true);
-      previousGroupStatusRef.current = groupStatus;
-    }
-  }, [groupStatus, pendingCount]);
-
-  return (
-    <Collapsible.Root
-      className={`tool-timeline tool-group ${groupStatus}`}
-      open={groupOpen || pendingCount > 0}
-      onOpenChange={(nextOpen) => {
-        if (pendingCount > 0 && !nextOpen) return;
-        setGroupOpen(nextOpen);
-      }}
-    >
-      <Collapsible.Trigger className="tool-group-trigger" aria-disabled={pendingCount > 0} aria-label={`${summary}，${groupOpen || pendingCount > 0 ? "收起" : "展开"}工具详情`}>
-        <span className="tool-group-icon" aria-hidden="true">
-          {pendingCount ? <Clock3 size={15} /> : failedCount ? <AlertCircle size={15} /> : unknownCount ? <CircleHelp size={15} /> : <Wrench size={15} />}
-        </span>
-        <span className="tool-group-summary">
-          <strong>工具调用</strong>
-          <span className="tool-group-separator" aria-hidden="true">·</span>
-          <span className="tool-group-state" aria-live="polite" aria-atomic="true">{groupState}</span>
-        </span>
-        {groupDuration !== null ? <time className="tool-group-duration">{formatCompactDuration(groupDuration)}</time> : null}
-        <ChevronDown size={14} aria-hidden="true" />
-      </Collapsible.Trigger>
-      <Collapsible.Content className="tool-group-content">
-        {tools.map((tool) => {
-          const approval = pendingByCall.get(tool.callId);
-          if (approval) matchedCallIds.add(approval.id);
-          return (
-            <ToolStep
-              key={tool.callId}
-              tool={tool}
-              now={now}
-              approval={approval}
-              queuePosition={approval ? approvalOrder.get(approval.id) : undefined}
-              queueTotal={approvals.length}
-              submitting={Boolean(approval && approvalDecisionRequests[approval.id])}
-              onApprovalDecision={onApprovalDecision}
-            />
-          );
-        })}
-        {approvals.filter((approval) => !matchedCallIds.has(approval.id)).map((approval) => (
-          <div className="tool-orphan-approval" key={approval.id}>
-            <ApprovalCard
-              approval={approval}
-              queuePosition={approvalOrder.get(approval.id)}
-              queueTotal={approvals.length}
-              submitting={Boolean(approvalDecisionRequests[approval.id])}
-              onDecide={(decision) => onApprovalDecision?.(approval, decision)}
-              inline
-            />
-          </div>
-        ))}
-      </Collapsible.Content>
-    </Collapsible.Root>
-  );
-}
-
-function ToolStep({
-  tool,
-  now,
-  approval,
-  queuePosition,
-  queueTotal,
-  submitting,
-  onApprovalDecision,
-}: {
-  tool: ToolActivity;
-  now: number;
-  approval?: ApprovalRequest;
-  queuePosition?: number;
-  queueTotal: number;
-  submitting: boolean;
-  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
-}) {
-  const [stepOpen, setStepOpen] = useState(Boolean(approval || tool.status === "running" || tool.status === "error" || tool.status === "unknown"));
-  useLayoutEffect(() => {
-    if (approval) {
-      // 待授权是工具行唯一的继续入口；审批到达后即使用户此前收起了该行，
-      // 也要强制展开，避免把“允许/拒绝”按钮藏在不可见详情里。
-      setStepOpen(true);
-    }
-  }, [approval]);
-  const kind = toolVisualKind(tool.name);
-  const actionLabel = toolActionLabel(tool, kind);
-  const icon = approval
-    ? <Clock3 size={14} />
-    : tool.status === "completed" || tool.status === "running"
-      ? toolIcon(kind, 16)
-      : tool.status === "error" || tool.status === "rejected"
-        ? <AlertCircle size={14} />
-        : tool.status === "interrupted" || tool.status === "cancelled"
-          ? <CircleStop size={14} />
-          : tool.status === "unknown" || tool.status === "unavailable" || tool.status === "expired"
-            ? <CircleHelp size={14} />
-            : toolIcon(kind, 16);
-  const statusLabel = approval
-    ? "等待授权"
-    : tool.approvalState === "allowed-once" && tool.status === "running" ? "已允许本次"
-      : tool.approvalState === "rejected" ? "已拒绝"
-        : tool.approvalState === "cancelled" ? "已取消"
-          : tool.approvalState === "expired" ? "授权超时"
-            : tool.approvalState === "unavailable" ? "授权不可用"
-    : tool.status === "running" ? "执行中"
-      : tool.status === "error" || tool.status === "rejected" ? "失败"
-        : tool.status === "interrupted" || tool.status === "cancelled" ? "已中断"
-          : tool.status === "expired" ? "已超时"
-            : tool.status === "unavailable" ? "不可用"
-              : tool.status === "unknown" ? "状态未知" : "完成";
-  const duration = toolDurationForDisplay(tool, now);
-  const target = summarizeToolTarget(tool);
-  return (
-    <Collapsible.Root
-      className={`tool-step ${tool.status}${approval ? " approval-pending" : ""}`}
-      open={stepOpen || Boolean(approval)}
-      onOpenChange={(nextOpen) => {
-        if (approval && !nextOpen) return;
-        setStepOpen(nextOpen);
-      }}
-    >
-      <Collapsible.Trigger className="tool-trigger" aria-disabled={Boolean(approval)} aria-label={`${tool.name}${target ? ` ${target}` : ""}，${actionLabel}，${statusLabel}`}>
-        <span className="tool-icon" aria-hidden="true">{icon}</span>
-        <span className="tool-action">{actionLabel}</span>
-        <strong className="tool-name">{tool.name}</strong>
-        {target && kind !== "message" ? <span className="tool-target">{target}</span> : null}
-        <span className="tool-status-label">{statusLabel}</span>
-        {duration ? <time className="tool-duration">{duration}</time> : null}
-        <ChevronDown size={14} aria-hidden="true" />
-      </Collapsible.Trigger>
-      <Collapsible.Content className="tool-detail">
-        {approval ? (
-          <ApprovalCard
-            approval={approval}
-            queuePosition={queuePosition}
-            queueTotal={queueTotal}
-            submitting={submitting}
-            onDecide={(decision) => onApprovalDecision?.(approval, decision)}
-            inline
-          />
-        ) : null}
-        <dl className="tool-detail-grid">
-          {target ? <div><dt>目标</dt><dd>{target}</dd></div> : null}
-          {tool.startedAt ? <div><dt>开始</dt><dd>{formatToolTimestamp(tool.startedAt)}</dd></div> : null}
-          {tool.endedAt ? <div><dt>结束</dt><dd>{formatToolTimestamp(tool.endedAt)}</dd></div> : null}
-          <div><dt>耗时</dt><dd>{duration || "耗时未知"}</dd></div>
-          {tool.approvalWaitMs !== undefined ? <div><dt>授权等待</dt><dd>{formatCompactDuration(tool.approvalWaitMs)}</dd></div> : null}
-          {tool.executionMs !== undefined ? <div><dt>执行</dt><dd>{formatCompactDuration(tool.executionMs)}</dd></div> : null}
-          {tool.approvalState && tool.approvalState !== "none" && !approval ? <div><dt>授权</dt><dd>{approvalStateLabel(tool.approvalState)}</dd></div> : null}
-          {tool.resultKind ? <div><dt>结果类型</dt><dd>{tool.resultKind}</dd></div> : null}
-          {tool.isTruncated ? <div><dt>输出</dt><dd>已截断</dd></div> : null}
-          {tool.exitCode !== undefined ? <div><dt>退出码</dt><dd>{String(tool.exitCode)}</dd></div> : null}
-          {tool.errorCode ? <div><dt>错误</dt><dd>{tool.errorCode}</dd></div> : null}
-        </dl>
-        {tool.resultPreview ? <p className="tool-result-preview">{truncateToolText(tool.resultPreview)}</p> : null}
-        {tool.status === "unknown" ? <p className="tool-unknown-note" role="status">服务端返回了未识别的工具状态，已按保守状态展示。</p> : null}
-      </Collapsible.Content>
-    </Collapsible.Root>
-  );
-}
-
-function approvalStateLabel(state: NonNullable<ToolActivity["approvalState"]>): string {
-  if (state === "pending") return "等待确认";
-  if (state === "submitting") return "提交中";
-  if (state === "allowed-once") return "已允许本次";
-  if (state === "rejected") return "已拒绝";
-  if (state === "cancelled") return "已取消";
-  if (state === "expired") return "已超时";
-  if (state === "unavailable") return "不可用";
-  return "无";
-}
-
-function deriveToolGroupDuration(tools: ToolActivity[], now: number): number | null {
-  const explicit = tools
-    .map((tool) => tool.groupDurationMs)
-    .filter((value): value is number => value !== undefined && Number.isFinite(value) && value >= 0);
-  const starts = tools.map((tool) => Date.parse(tool.startedAt || "")).filter((value) => Number.isFinite(value));
-  if (!starts.length) return null;
-  const ends = tools.map((tool) => {
-    if (tool.endedAt) return Date.parse(tool.endedAt);
-    if (tool.status === "running") return now;
-    return NaN;
-  }).filter((value) => Number.isFinite(value));
-  if (ends.length) return Math.max(0, Math.max(...ends) - Math.min(...starts));
-  // 历史快照可能只有分组显式耗时，没有完整时间戳；多个 iteration 时取
-  // 最大墙钟值，避免标题误用第一组的耗时。
-  return explicit.length ? Math.max(...explicit) : null;
-}
-
-function toolDurationForDisplay(tool: ToolActivity, now: number): string | null {
-  if (tool.durationMs !== undefined && Number.isFinite(tool.durationMs) && tool.durationMs >= 0) return formatCompactDuration(tool.durationMs);
-  if (tool.status === "running" && tool.startedAt) {
-    const start = Date.parse(tool.startedAt);
-    if (Number.isFinite(start)) return `运行中 · ${formatCompactDuration(Math.max(0, now - start))}`;
-  }
-  return tool.status === "running" ? "耗时未知" : null;
-}
-
-function formatCompactDuration(durationMs: number): string {
-  const milliseconds = Math.max(0, durationMs);
-  const seconds = milliseconds / 1000;
-  if (seconds < 1) return `${seconds.toFixed(1)} 秒`;
-  if (seconds < 60) return `${seconds.toFixed(1).replace(/\.0$/, "")} 秒`;
-  // 先把整秒四舍五入，再拆分分钟，避免 59.6 秒显示成“0 分 60 秒”。
-  const totalSeconds = Math.max(60, Math.round(seconds));
-  const minutes = Math.floor(totalSeconds / 60);
-  const remainder = totalSeconds % 60;
-  return remainder ? `${minutes} 分 ${remainder} 秒` : `${minutes} 分钟`;
-}
-
-function formatToolTimestamp(value: string): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "时间未知";
-  return date.toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
-function summarizeToolTarget(tool: ToolActivity): string {
-  if (!tool.arguments || typeof tool.arguments !== "object" || Array.isArray(tool.arguments)) return "";
-  const args = tool.arguments as Record<string, unknown>;
-  for (const key of ["path", "file_path", "source", "destination", "cwd", "pattern", "query", "skill", "command", "to", "recipient", "channel", "thread", "target", "name"]) {
-    const value = args[key];
-    if (typeof value !== "string" || !value.trim()) continue;
-    return truncateToolText(value.trim(), key === "command" ? 72 : 96);
-  }
-  return "";
-}
-
-function truncateToolText(value: string, max = 500): string {
-  const normalized = value.replace(/\s+/gu, " ").trim();
-  return normalized.length > max ? `${normalized.slice(0, max)}…` : normalized;
-}
 
 function AttachmentGallery({ paths }: { paths: string[] }) {
   return <div className="attachment-gallery">{paths.map((path) => {
@@ -3006,6 +2674,7 @@ function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositio
   onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const toolDisclosure = useRef<ToolDisclosureState>(new Map());
   const [scrollElement, setScrollElement] = useState<HTMLElement | null>(null);
   const virtualizer = useVirtualizer({
     count: groups.length,
@@ -3087,6 +2756,8 @@ function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositio
             {group.messages.map((message) => (
               <MessageView
                 key={message.id}
+                sessionId={sessionId}
+                toolDisclosure={toolDisclosure.current}
                 message={message}
                 navigationTurnId={group.navigationTurnId}
                 turnDurationMs={turnDurationMs}

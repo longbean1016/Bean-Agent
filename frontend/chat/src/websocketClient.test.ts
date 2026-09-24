@@ -58,4 +58,27 @@ describe("BeanWebSocketClient", () => {
     expect(frames).toEqual([expect.objectContaining({ type: "error", code: "invalid_server_frame" })]);
     client.close();
   });
+
+  it("断线前补齐缓冲，重连后忽略旧连接迟到帧", () => {
+    vi.useFakeTimers();
+    const frames: unknown[] = [];
+    const client = new BeanWebSocketClient({ onFrame: (frame) => frames.push(frame), onStatus: vi.fn(),
+      socketFactory: () => new FakeSocket() as unknown as WebSocket });
+    client.connect();
+    const first = FakeSocket.instances[0];
+    first.open();
+    const delta = { type: "answer.delta", session_id: "web:test", turn_id: "turn", delta: "尾字" };
+    first.receive(JSON.stringify(delta));
+    expect(frames).toHaveLength(0);
+    first.close();
+    expect(frames).toEqual([delta]);
+    vi.advanceTimersByTime(750);
+    FakeSocket.instances[1].open();
+    first.receive(JSON.stringify({ ...delta, delta: "旧连接" }));
+    expect(frames).toHaveLength(1);
+    FakeSocket.instances[1].receive(JSON.stringify({ ...delta, delta: "替换连接前的尾字" }));
+    client.close();
+    vi.advanceTimersByTime(1000);
+    expect(frames).toEqual([delta, { ...delta, delta: "替换连接前的尾字" }]);
+  });
 });

@@ -1,4 +1,5 @@
 import type { ChatFrame, ConnectionStatus } from "./types";
+import { StreamFrameBatcher } from "./streamFrameBatcher";
 
 type WebSocketFactory = (url: string) => WebSocket;
 
@@ -14,9 +15,11 @@ export class BeanWebSocketClient {
   private reconnectAttempt = 0;
   private closed = false;
   private readonly socketFactory: WebSocketFactory;
+  private readonly frames: StreamFrameBatcher;
 
   constructor(private readonly options: ClientOptions) {
     this.socketFactory = options.socketFactory ?? ((url) => new WebSocket(url));
+    this.frames = new StreamFrameBatcher(options.onFrame);
   }
 
   connect(): void {
@@ -27,19 +30,23 @@ export class BeanWebSocketClient {
     const socket = this.socketFactory(`${protocol}://${window.location.host}/ws`);
     this.socket = socket;
     socket.onopen = () => {
+      if (this.socket !== socket || this.closed) return;
       this.reconnectAttempt = 0;
       this.options.onStatus("connected");
     };
     socket.onmessage = (event) => {
+      if (this.socket !== socket || this.closed) return;
       try {
-        this.options.onFrame(JSON.parse(String(event.data)) as ChatFrame);
+        this.frames.push(JSON.parse(String(event.data)) as ChatFrame);
       } catch {
-        this.options.onFrame({ type: "error", request_id: "", code: "invalid_server_frame", message: "服务端返回了无法解析的消息" });
+        this.frames.push({ type: "error", request_id: "", code: "invalid_server_frame", message: "服务端返回了无法解析的消息" });
       }
     };
     socket.onerror = () => socket.close();
     socket.onclose = () => {
-      if (this.socket === socket) this.socket = null;
+      if (this.socket !== socket) return;
+      this.frames.flush();
+      this.socket = null;
       if (this.closed) {
         this.options.onStatus("offline");
         return;
@@ -57,8 +64,10 @@ export class BeanWebSocketClient {
   reconnectNow(): void {
     if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
-    this.socket?.close();
+    this.frames.flush();
+    const previous = this.socket;
     this.socket = null;
+    previous?.close();
     this.reconnectAttempt = 0;
     this.connect();
   }
@@ -67,8 +76,12 @@ export class BeanWebSocketClient {
     this.closed = true;
     if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
-    this.socket?.close();
+    // 连接实例替换时先交付已接收文本，取消的仅是后续调度，不能丢弃尾部内容。
+    this.frames.flush();
+    const previous = this.socket;
     this.socket = null;
+    previous?.close();
+    this.options.onStatus("offline");
   }
 
   private scheduleReconnect(): void {
