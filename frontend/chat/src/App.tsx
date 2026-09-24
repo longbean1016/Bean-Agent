@@ -1529,7 +1529,7 @@ export function App() {
             </Dialog.Portal>
           </Dialog.Root>
           <div className="brand-compact">
-            <span className="brand-mark">B</span>
+            <span className="brand-mark" aria-hidden="true" />
             <div><strong>BeanAgent</strong><span>{shortSession(chat.sessionId)}</span></div>
           </div>
           {(() => {
@@ -3105,7 +3105,7 @@ function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositio
 function EmptyConversation() {
   return (
     <div className="empty-conversation">
-      <span className="empty-mark">B</span>
+      <span className="empty-mark" aria-hidden="true" />
       <h1>今天想让 BeanAgent 帮你做什么？</h1>
     </div>
   );

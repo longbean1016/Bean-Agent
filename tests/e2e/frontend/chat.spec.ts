@@ -124,6 +124,41 @@ test("移动端布局没有横向溢出", async ({ page }, testInfo) => {
   await page.screenshot({ path: ".pytest_artifacts/frontend-mobile.png", fullPage: true });
 });
 
+test("品牌 SVG 在网站图标与新对话页正确加载且保留原尺寸", async ({ page }, testInfo) => {
+  const mobile = testInfo.project.name === "mobile";
+  const welcomeLogo = page.locator(".empty-mark");
+  const headerLogo = page.locator(mobile ? ".brand-compact .brand-mark" : ".brand-lockup .brand-mark");
+  await expect(welcomeLogo).toBeVisible();
+  await expect(welcomeLogo).toHaveCSS("width", "42px");
+  await expect(welcomeLogo).toHaveCSS("height", "42px");
+  await expect(headerLogo).toBeVisible();
+  await expect(headerLogo).toHaveCSS("width", mobile ? "30px" : "32px");
+  await expect(headerLogo).toHaveCSS("height", mobile ? "30px" : "32px");
+  await expect(welcomeLogo).toHaveCSS("box-shadow", "none");
+  const mask = await welcomeLogo.evaluate((element) => getComputedStyle(element).maskImage);
+  expect(mask).toContain("svg");
+  const favicon = page.locator('link[rel="icon"]');
+  await expect(favicon).toHaveAttribute("type", "image/svg+xml");
+  // 验证构建后的资源确实可解码，避免只替换入口却遗漏静态文件。
+  const faviconLoaded = await favicon.evaluate((element) => new Promise<boolean>((resolve) => {
+    const image = new Image();
+    image.onload = () => resolve(image.naturalWidth > 0 && image.naturalHeight > 0);
+    image.onerror = () => resolve(false);
+    image.src = (element as HTMLLinkElement).href;
+  }));
+  expect(faviconLoaded).toBe(true);
+  await page.getByRole("button", { name: "浅色", exact: true }).click();
+  await expect(welcomeLogo).toHaveCSS("background-color", "rgb(11, 118, 110)");
+  await page.screenshot({ path: `.pytest_artifacts/beanagent-logo-light-${testInfo.project.name}.png` });
+  await page.getByRole("button", { name: "深色", exact: true }).click();
+  await expect(welcomeLogo).toHaveCSS("background-color", "rgb(98, 184, 170)");
+  await page.screenshot({ path: `.pytest_artifacts/beanagent-logo-dark-${testInfo.project.name}.png` });
+  if (mobile) {
+    await page.getByRole("button", { name: "打开会话列表" }).click();
+    await expect(page.locator(".brand-lockup .brand-mark:visible")).toHaveCSS("width", "32px");
+  }
+});
+
 test("消息阅读排版、过程键盘折叠与长代码复制在窄屏仍可用", async ({ page }, testInfo) => {
   const source = "const message = '" + "正文与代码分别控制滚动范围".repeat(14) + "';";
   const content = [

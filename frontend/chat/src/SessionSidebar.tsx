@@ -352,7 +352,7 @@ export function SessionSidebar(props: {
   return (
     <div className="session-panel">
       <div className="brand-lockup">
-        <span className="brand-mark">B</span>
+        <span className="brand-mark" aria-hidden="true" />
         <strong>BeanAgent</strong>
       </div>
       <div className="sidebar-primary-actions">
