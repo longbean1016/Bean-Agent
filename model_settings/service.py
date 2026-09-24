@@ -133,6 +133,8 @@ class ModelSettingsService:
                     self._secrets.delete(current.secret_ref)
             raise
         saved_key = self._secrets.get(saved.secret_ref)
+        if (saved.provider, saved.default_adapter) != (current.provider, current.default_adapter):
+            self._refresh_connection_profiles(saved)
         return saved.public_dict(
             has_api_key=bool(saved_key), api_key_preview=_api_key_preview(saved_key)
         )
@@ -536,18 +538,28 @@ class ModelSettingsService:
 
     async def update_catalog(self) -> dict[str, Any]:
         state = await self._catalog.update()
-        for connection in self.store.list_connections():
-            for profile in self.store.list_models(connection.id):
-                enriched = self._catalog.enrich(
-                    profile,
-                    provider=connection.provider,
-                    default_adapter=connection.default_adapter,
-                )
-                if profile.user_overrides:
-                    enriched = enriched.with_overrides(profile.user_overrides)
-                self.store.save_model(enriched)
+        self.refresh_cached_profiles()
         self.store.set_catalog_state(updated_at=str(state["updated_at"]))
         return state
+
+    def refresh_cached_profiles(self) -> None:
+        """启动及目录更新时补全已有资料；不联网，不要求重新发现模型。"""
+
+        if not self._catalog.has_data():
+            return
+        for connection in self.store.list_connections():
+            self._refresh_connection_profiles(connection)
+
+    def _refresh_connection_profiles(self, connection: ModelConnection) -> None:
+        for profile in self.store.list_models(connection.id):
+            enriched = self._catalog.enrich(
+                profile, provider=connection.provider, default_adapter=connection.default_adapter,
+            )
+            if profile.user_overrides:
+                enriched = enriched.with_overrides(profile.user_overrides)
+            # 无实际能力变化时不推进 revision，避免每次启动仅因时间戳淘汰客户端。
+            if replace(enriched, metadata_updated_at=profile.metadata_updated_at) != profile:
+                self.store.save_model(enriched)
 
     def _connection(self, connection_id: str) -> ModelConnection:
         connection = self.store.get_connection(connection_id)

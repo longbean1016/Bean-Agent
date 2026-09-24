@@ -512,6 +512,7 @@ def build_core_runtime(
         embedding_dimensions=config.memory.embedding.dimensions,
     )
     _import_legacy_model_settings(model_settings, config)
+    model_settings.refresh_cached_profiles()
     provider_manager = ProviderManager(model_store, secrets, AdapterRegistry(), config.llm)
 
     memory: MemoryEngine | None = None
@@ -733,7 +734,8 @@ def _import_legacy_model_settings(settings: ModelSettingsService, config: Config
         model = settings.save_manual_model(connection["id"], {
             "model_id": config.llm.model,
             "display_name": config.llm.model,
-            "context_window": config.llm.context_window or None,
+            # 未配置容量不等于用户手动清空，不能导入为阻断目录补全的空覆盖。
+            **({"context_window": config.llm.context_window} if config.llm.context_window > 0 else {}),
             "max_output_tokens": config.llm.max_tokens,
             "supports_vision": config.llm.multimodal,
             "adapter": adapter,

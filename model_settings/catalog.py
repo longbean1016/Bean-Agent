@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 
+from agent.model_capabilities import normalize_provider_id
 from model_settings.models import REASONING_EFFORT_ORDER, REASONING_EFFORTS, ModelProfile, utc_now
 
 
@@ -42,8 +43,10 @@ class ModelCatalogService:
         provider: str,
         default_adapter: str,
     ) -> ModelProfile:
-        match = _find_model(self._load_cache(), provider.strip().lower(), profile.model_id)
+        match = _find_model(self._load_cache(), normalize_provider_id(provider), profile.model_id)
         if match is None:
+            # 供应商变化或目录删除时，不能沿用旧目录容量；手动覆盖由应用服务重放。
+            profile = replace(profile, context_window=None, max_output_tokens=None, metadata_updated_at=None)
             if profile.capability_source == "probe":
                 return replace(profile, adapter=default_adapter, metadata_source="unknown")
             return replace(
@@ -243,6 +246,8 @@ def _suggest_adapter(
 
 
 def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
     try:
         parsed = int(value)
     except (TypeError, ValueError):

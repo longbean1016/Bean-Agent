@@ -8,6 +8,7 @@ from time import perf_counter
 from typing import Any
 
 from agent.config_models import LLMConfig
+from agent.model_capabilities import resolve_context_window
 from agent.provider import LLMProvider
 from model_settings.adapters import AdapterRegistry
 from model_settings.models import CapabilityProbe, ModelConnection, ModelProfile, ModelRoute
@@ -287,15 +288,34 @@ class ProviderManager:
             extra_body.pop(key, None)
         if route.reasoning_effort:
             extra_body["reasoning_effort"] = route.reasoning_effort
+        context_source = (
+            "user_override" if "context_window" in profile.user_overrides
+            else profile.metadata_source
+        )
+        capacity = resolve_context_window(
+            provider=connection.provider, model=profile.model_id,
+            configured=profile.context_window or 0, configured_source=context_source,
+        )
+        # 目录 output 是能力上限，不是每次请求的预算；只有显式覆盖才提高请求长度。
+        output_override = profile.user_overrides.get("max_output_tokens")
+        max_tokens = output_override or self._legacy_config.max_tokens
+        if profile.max_output_tokens:
+            max_tokens = min(max_tokens, profile.max_output_tokens)
+        if capacity.context_window:
+            if output_override and output_override >= capacity.context_window:
+                raise ModelSettingsValidationError("手动输出预算必须小于模型上下文窗口")
+            max_tokens = min(max_tokens, capacity.context_window - 1)
+        if max_tokens <= 0:
+            raise ModelSettingsValidationError("模型上下文窗口不足以保留输出预算")
         config = replace(
             self._legacy_config,
             provider=connection.provider,
             model=profile.model_id,
             api_key=api_key,
             base_url=connection.base_url,
-            max_tokens=profile.max_output_tokens or self._legacy_config.max_tokens,
-            context_window=profile.context_window or 0,
-            context_window_source=profile.metadata_source,
+            max_tokens=max_tokens,
+            context_window=capacity.context_window,
+            context_window_source=capacity.source,
             multimodal=bool(profile.supports_vision),
             extra_body=extra_body,
         )
