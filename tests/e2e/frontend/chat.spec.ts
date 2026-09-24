@@ -94,6 +94,21 @@ test("上传文本附件并在断线后自动重连", async ({ page }) => {
   await expect(page.getByText("notes.txt")).toBeVisible();
   await expect(page.getByAltText("photo.png")).toBeVisible();
 
+  const userMessage = page.locator(".user-message").filter({ hasText: "附件测试" });
+  await expect(userMessage.locator(".attachment-gallery")).toHaveCSS("justify-content", "flex-end");
+  // 比较真实布局边界，覆盖桌面横排与移动端换行，避免只检查类名而漏掉样式回归。
+  const alignment = await userMessage.evaluate((message) => {
+    const image = message.querySelector(".image-attachment")!.getBoundingClientRect();
+    const text = message.querySelector(".user-text")!.getBoundingClientRect();
+    const body = message.querySelector(".message-body")!.getBoundingClientRect();
+    return {
+      rightDifference: Math.abs(image.right - text.right),
+      staysInside: image.left >= body.left - 1 && image.right <= body.right + 1,
+    };
+  });
+  expect(alignment.rightDifference).toBeLessThanOrEqual(1);
+  expect(alignment.staysInside).toBe(true);
+
   await expect(page.getByRole("button", { name: "重连中" })).toBeVisible();
   await expect(page.getByRole("button", { name: "已连接" })).toBeVisible({ timeout: 5_000 });
 });
