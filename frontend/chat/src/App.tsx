@@ -52,6 +52,7 @@ import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
 import { ApprovalCard, ApprovalPanel, PermissionSelector, WorkspaceSelector } from "./SandboxControls";
 import { SessionSidebar } from "./SessionSidebar";
+import { ResizableSidebarLayout } from "./ResizableSidebarLayout";
 import type { ApprovalRequest, ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, SandboxMode, SandboxSnapshot, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry, Workspace } from "./types";
 import { ModelSettingsPage } from "./ModelSettingsPage";
 import { ExtensionsPage } from "./ExtensionsPage";
@@ -1420,12 +1421,11 @@ export function App() {
 
   if (activePage === "extensions") {
     return (
-      <div className="app-shell extensions-app-shell">
-        <aside className="desktop-sidebar">{extensionSidebar}</aside>
+      <ResizableSidebarLayout className="extensions-app-shell" sidebar={extensionSidebar}>
         <main className="chat-workspace extensions-workspace">
           <ExtensionsPage kind={activeExtension} onBack={closeExtensions} workspaceId={currentWorkspaceId} sessionId={chat.sessionId} onCountChange={updateExtensionCount} />
         </main>
-      </div>
+      </ResizableSidebarLayout>
     );
   }
 
@@ -1473,8 +1473,7 @@ export function App() {
   );
 
   return (
-    <div className="app-shell">
-      <aside className="desktop-sidebar">{sidebar}</aside>
+    <ResizableSidebarLayout sidebar={sidebar}>
       <main className="chat-workspace">
         <header className="topbar">
           <Dialog.Root open={sidebarOpen} onOpenChange={setSidebarOpen}>
@@ -1634,7 +1633,7 @@ export function App() {
           />
         </div>
       </main>
-    </div>
+    </ResizableSidebarLayout>
   );
 }
 

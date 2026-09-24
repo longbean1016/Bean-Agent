@@ -143,9 +143,21 @@ button { color: inherit; }
 /* 可交互元素统一过渡，避免零散 hover 各自定义。transform 不影响布局断言。 */
 button, .icon-button, .send-button, .new-chat-button, .session-row, .session-menu button, .example-prompts button, .scroll-latest, .memory-citation-chip, .theme-control button, .connection-state, .toggle, .help-button, .mermaid-tabs button, .mermaid-actions button, .mermaid-zoom-controls button, .mermaid-fullscreen-close, [data-streamdown="code-block-copy-button"] { transition: background-color .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease, opacity .15s ease; }
 
-.app-shell { display: grid; grid-template-columns: 272px minmax(0, 1fr); min-height: 0; height: 100%; overflow: hidden; background: var(--bg); }
+.app-shell { position: relative; display: grid; grid-template-columns: var(--desktop-sidebar-width, 272px) 8px minmax(0, 1fr); min-height: 0; height: 100%; overflow: hidden; background: var(--bg); transition: grid-template-columns .16s ease; }
 .settings-app-shell { min-height: 0; height: 100%; overflow: hidden; background: var(--bg); }
 .desktop-sidebar { min-width: 0; min-height: 0; height: 100%; overflow: hidden; border-right: 1px solid var(--border); background: var(--surface-muted); }
+.resizable-desktop-sidebar { position: relative; border-right: 0; }
+.desktop-sidebar-collapse { position: absolute; z-index: 3; top: 16px; right: 10px; }
+.desktop-sidebar-resizer { position: relative; z-index: 4; width: 8px; min-width: 8px; height: 100%; padding: 0; border: 0; outline-offset: -2px; background: transparent; cursor: col-resize; touch-action: none; }
+.desktop-sidebar-resizer > span { position: absolute; inset: 0 auto 0 3px; width: 1px; background: var(--border); transition: width .12s ease, background-color .12s ease; }
+.desktop-sidebar-resizer:hover > span, .desktop-sidebar-resizer:focus-visible > span, .sidebar-resizing .desktop-sidebar-resizer > span { width: 2px; background: var(--primary-border); }
+.desktop-sidebar-expand { position: absolute; z-index: 6; top: 11px; left: 12px; }
+.app-shell.sidebar-collapsed { grid-template-columns: 0 0 minmax(0, 1fr); }
+.sidebar-collapsed .resizable-desktop-sidebar { visibility: hidden; }
+.sidebar-collapsed .desktop-sidebar-resizer { visibility: hidden; }
+.sidebar-collapsed > .chat-workspace > .topbar { padding-left: 58px; }
+.sidebar-collapsed > .extensions-workspace .extensions-header { padding-left: 58px; }
+.app-shell.sidebar-resizing { transition: none; }
 .session-panel { display: flex; min-height: 0; height: 100%; flex-direction: column; overflow: hidden; padding: 18px 14px; }
 .brand-lockup, .brand-compact { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .brand-lockup { padding: 0 6px 18px; }
@@ -1141,8 +1153,11 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
   .model-profile-row { grid-template-columns: minmax(0, 1fr) 48px 66px; }
   .model-source { display: none; }
   .model-override-editor { grid-template-columns: 1fr 1fr; }
-  .app-shell { grid-template-columns: minmax(0, 1fr); }
+  .app-shell, .app-shell.sidebar-collapsed { grid-template-columns: minmax(0, 1fr); }
   .desktop-sidebar { display: none; }
+  .desktop-sidebar-resizer, .desktop-sidebar-expand, .desktop-sidebar-collapse { display: none; }
+  .sidebar-collapsed > .chat-workspace > .topbar { padding-left: 12px; }
+  .sidebar-collapsed > .extensions-workspace .extensions-header { padding-left: 14px; }
   .topbar { padding: 0 12px; }
   .icon-button.mobile-menu { display: inline-grid; }
   .brand-compact { display: flex; flex: 1; margin-left: 8px; }
