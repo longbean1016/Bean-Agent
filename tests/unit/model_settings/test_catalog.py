@@ -1,8 +1,38 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from model_settings.catalog import ModelCatalogService
 from model_settings.models import ModelProfile
+
+
+@pytest.mark.parametrize("provider", ["deepseek", " deep seek ", "DEEP SEEK"])
+def test_known_provider_alias_wins_over_ambiguous_global_matches(tmp_path, provider):
+    catalog = ModelCatalogService(tmp_path / "catalog.json")
+    catalog._catalog = {"providers": {
+        "deepseek": {"models": {"deepseek-flash": {"limit": {"context": 1_000_000, "output": 393_216}}}},
+        "gateway": {"models": {"deepseek-flash": {"limit": {"context": 64_000}}}},
+    }}
+    profile = catalog.enrich(ModelProfile("one", "deepseek-flash", "Flash"),
+                             provider=provider, default_adapter="deepseek")
+    assert profile.context_window == 1_000_000
+    assert profile.max_output_tokens == 393_216
+    assert profile.model_id == "deepseek-flash"
+    assert profile.metadata_source == "models.dev:deepseek"
+    unknown = catalog.enrich(profile, provider="deep-seek-private", default_adapter="generic_openai")
+    assert unknown.context_window is None
+    assert unknown.max_output_tokens is None
+    assert unknown.metadata_source == "unknown"
+
+
+@pytest.mark.parametrize("invalid", [True, False, -10, 0, 1.5, "1.5", None, float("inf")])
+def test_invalid_catalog_capacity_is_unknown(tmp_path, invalid):
+    catalog = ModelCatalogService(tmp_path / "catalog.json")
+    catalog._catalog = {"one": {"models": {"model": {"limit": {"context": invalid, "output": invalid}}}}}
+    result = catalog.enrich(ModelProfile("one", "model", "Model"), provider="one", default_adapter="generic_openai")
+    assert result.context_window is None
+    assert result.max_output_tokens is None
 
 
 def test_catalog_matches_provider_and_exact_model_id(tmp_path: Path) -> None:

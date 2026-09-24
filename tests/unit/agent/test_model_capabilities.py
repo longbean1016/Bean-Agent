@@ -45,6 +45,19 @@ def test_unknown_model_keeps_local_gate_disabled(monkeypatch) -> None:
     assert result.source == "unknown"
 
 
+def test_controlled_provider_alias_uses_same_snapshot(monkeypatch) -> None:
+    _set_registry(monkeypatch, {"deepseek/fixture-model": {"max_input_tokens": 64000}})
+    assert resolve_context_window(provider="deep seek", model="fixture-model").context_window == 64000
+    assert resolve_context_window(provider="private-deep-seek", model="fixture-model").context_window == 0
+
+
+def test_explicit_null_capacity_remains_unknown(monkeypatch) -> None:
+    _set_registry(monkeypatch, {"deepseek/fixture-model": {"max_input_tokens": 64000}})
+    result = resolve_context_window(provider="deepseek", model="fixture-model", configured_source="user_override")
+    assert result.context_window == 0
+    assert result.source == "user_override"
+
+
 def test_deepseek_flash_uses_stable_provider_catalog_capacity(monkeypatch) -> None:
     _set_registry(monkeypatch, {
         "deepseek/deepseek-v4-flash": {

@@ -11,7 +11,16 @@ from typing import Any, Mapping
 _PROVIDER_ALIASES = {
     # 配置使用兼容接口的常用简称，能力快照沿用供应商的标准标识。
     "qwen": "dashscope",
+    "deep seek": "deepseek",
 }
+
+
+def normalize_provider_id(provider: str) -> str:
+    """能力匹配专用受控别名，不改写连接名称、地址或实际请求模型 ID。"""
+
+    normalized = str(provider or "").strip().lower()
+    return _PROVIDER_ALIASES.get(normalized, normalized)
+
 
 # 关键模型的能力在本地固定，避免 LiteLLM 快照把输入上限和输出上限
 # 误合并成一个并不存在的总窗口。未知模型仍然允许显式配置覆盖。
@@ -47,6 +56,10 @@ def resolve_context_window(
         source = str(configured_source or "explicit").strip() or "explicit"
         return ContextWindowResolution(explicit, source)
 
+    # 用户明确清空容量表示未知，不能再被本地快照悄悄覆盖。
+    if configured_source == "user_override":
+        return ContextWindowResolution(0, "user_override")
+
     catalog_window = _find_catalog_window(provider, model)
     if catalog_window:
         return ContextWindowResolution(catalog_window, "provider_catalog")
@@ -65,19 +78,14 @@ def resolve_context_window(
 
 
 def _find_catalog_window(provider: str, model: str) -> int:
-    normalized_provider = str(provider or "").strip().lower()
+    normalized_provider = normalize_provider_id(provider)
     normalized_model = str(model or "").strip().lower()
     if "/" in normalized_model:
         normalized_model = normalized_model.rsplit("/", 1)[-1]
-    aliases = [normalized_provider]
-    canonical = _PROVIDER_ALIASES.get(normalized_provider)
-    if canonical and canonical not in aliases:
-        aliases.append(canonical)
-    for alias in aliases:
-        value = _MODEL_CAPABILITIES.get((alias, normalized_model))
-        if value:
-            return value
-    return _MODEL_CAPABILITIES.get(("", normalized_model), 0)
+    return (
+        _MODEL_CAPABILITIES.get((normalized_provider, normalized_model))
+        or _MODEL_CAPABILITIES.get(("", normalized_model), 0)
+    )
 
 
 @lru_cache(maxsize=1)
@@ -98,10 +106,7 @@ def _find_model_entry(provider: str, model: str) -> Mapping[str, Any] | None:
     normalized_model = str(model or "").strip()
     if not normalized_model:
         return None
-    normalized_provider = _PROVIDER_ALIASES.get(
-        str(provider or "").strip().lower(),
-        str(provider or "").strip().lower(),
-    )
+    normalized_provider = normalize_provider_id(provider)
     candidates: list[str] = []
     if normalized_provider and "/" not in normalized_model:
         candidates.append(f"{normalized_provider}/{normalized_model}")
@@ -118,4 +123,4 @@ def _positive_int(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
-__all__ = ["ContextWindowResolution", "resolve_context_window"]
+__all__ = ["ContextWindowResolution", "normalize_provider_id", "resolve_context_window"]

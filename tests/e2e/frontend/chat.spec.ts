@@ -94,6 +94,21 @@ test("上传文本附件并在断线后自动重连", async ({ page }) => {
   await expect(page.getByText("notes.txt")).toBeVisible();
   await expect(page.getByAltText("photo.png")).toBeVisible();
 
+  const userMessage = page.locator(".user-message").filter({ hasText: "附件测试" });
+  await expect(userMessage.locator(".attachment-gallery")).toHaveCSS("justify-content", "flex-end");
+  // 比较真实布局边界，覆盖桌面横排与移动端换行，避免只检查类名而漏掉样式回归。
+  const alignment = await userMessage.evaluate((message) => {
+    const image = message.querySelector(".image-attachment")!.getBoundingClientRect();
+    const text = message.querySelector(".user-text")!.getBoundingClientRect();
+    const body = message.querySelector(".message-body")!.getBoundingClientRect();
+    return {
+      rightDifference: Math.abs(image.right - text.right),
+      staysInside: image.left >= body.left - 1 && image.right <= body.right + 1,
+    };
+  });
+  expect(alignment.rightDifference).toBeLessThanOrEqual(1);
+  expect(alignment.staysInside).toBe(true);
+
   await expect(page.getByRole("button", { name: "重连中" })).toBeVisible();
   await expect(page.getByRole("button", { name: "已连接" })).toBeVisible({ timeout: 5_000 });
 });
@@ -109,13 +124,113 @@ test("移动端布局没有横向溢出", async ({ page }, testInfo) => {
   await page.screenshot({ path: ".pytest_artifacts/frontend-mobile.png", fullPage: true });
 });
 
+test("品牌 SVG 在网站图标与新对话页正确加载且保留原尺寸", async ({ page }, testInfo) => {
+  const mobile = testInfo.project.name === "mobile";
+  const welcomeLogo = page.locator(".empty-mark");
+  const headerLogo = page.locator(mobile ? ".brand-compact .brand-mark" : ".brand-lockup .brand-mark");
+  await expect(welcomeLogo).toBeVisible();
+  await expect(welcomeLogo).toHaveCSS("width", "42px");
+  await expect(welcomeLogo).toHaveCSS("height", "42px");
+  await expect(headerLogo).toBeVisible();
+  await expect(headerLogo).toHaveCSS("width", mobile ? "30px" : "32px");
+  await expect(headerLogo).toHaveCSS("height", mobile ? "30px" : "32px");
+  await expect(welcomeLogo).toHaveCSS("box-shadow", "none");
+  const mask = await welcomeLogo.evaluate((element) => getComputedStyle(element).maskImage);
+  expect(mask).toContain("svg");
+  const favicon = page.locator('link[rel="icon"]');
+  await expect(favicon).toHaveAttribute("type", "image/svg+xml");
+  // 验证构建后的资源确实可解码，避免只替换入口却遗漏静态文件。
+  const faviconLoaded = await favicon.evaluate((element) => new Promise<boolean>((resolve) => {
+    const image = new Image();
+    image.onload = () => resolve(image.naturalWidth > 0 && image.naturalHeight > 0);
+    image.onerror = () => resolve(false);
+    image.src = (element as HTMLLinkElement).href;
+  }));
+  expect(faviconLoaded).toBe(true);
+  await page.getByRole("button", { name: "浅色", exact: true }).click();
+  await expect(welcomeLogo).toHaveCSS("background-color", "rgb(11, 118, 110)");
+  await page.screenshot({ path: `.pytest_artifacts/beanagent-logo-light-${testInfo.project.name}.png` });
+  await page.getByRole("button", { name: "深色", exact: true }).click();
+  await expect(welcomeLogo).toHaveCSS("background-color", "rgb(98, 184, 170)");
+  await page.screenshot({ path: `.pytest_artifacts/beanagent-logo-dark-${testInfo.project.name}.png` });
+  if (mobile) {
+    await page.getByRole("button", { name: "打开会话列表" }).click();
+    await expect(page.locator(".brand-lockup .brand-mark:visible")).toHaveCSS("width", "32px");
+  }
+});
+
+test("消息阅读排版、过程键盘折叠与长代码复制在窄屏仍可用", async ({ page }, testInfo) => {
+  const source = "const message = '" + "正文与代码分别控制滚动范围".repeat(14) + "';";
+  const content = [
+    "## 聊天界面调整", "", "用户消息与附件靠右，助手正文保持清晰的阅读层次。", "",
+    "- 正文平铺，减少边框", "- 工具过程可以展开", "",
+    "```ts", source, "```", "", "未闭合的代码围栏仍可显示：", "", "```text", "仍在输出",
+  ].join("\n");
+  await page.route("**/api/chat/sessions/*/messages**", async (route) => {
+    await route.fulfill({ json: {
+      session_id: "web:history", total: 2, items: [
+        { id: "reading-user", role: "user", content: "查看聊天区的排版效果", turn_id: "reading-turn" },
+        { id: "reading-answer", role: "assistant", content, turn_id: "reading-turn",
+          reasoning_content: "先检查原有消息结构，再调整展示。",
+          tool_chain: [{ calls: [{ call_id: "reading-tool", name: "read_file", status: "completed", result: "已读取" }] }] },
+      ],
+    } });
+  });
+  if (testInfo.project.name === "mobile") await page.getByRole("button", { name: "打开会话列表" }).click();
+  await page.getByRole("button", { name: "历史问题", exact: true }).click();
+  const summary = page.getByRole("button", { name: /思考完成/ });
+  const tools = page.getByRole("button", { name: /工具调用.*展开工具详情/ });
+  await expect(tools).toHaveAttribute("aria-expanded", "false");
+  await expect(summary).toHaveAttribute("aria-expanded", "false");
+  await summary.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("先检查原有消息结构，再调整展示。")).toBeVisible();
+  await expect(tools).toHaveAttribute("aria-expanded", "false");
+  await page.keyboard.press("Space");
+  await expect(summary).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator('[data-streamdown="code-block"]')).toHaveCount(2);
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: {
+      writeText: async (text: string) => { document.documentElement.dataset.copiedCode = text; },
+    } });
+  });
+  await page.getByTitle("复制代码").first().click();
+  await expect(page.locator("html")).toHaveAttribute("data-copied-code", source + "\n");
+  const geometry = await page.locator('[data-streamdown="code-block"]').first().evaluate((block) => {
+    const bounds = block.getBoundingClientRect();
+    const copy = block.querySelector('[data-streamdown="code-block-copy-button"]')!.getBoundingClientRect();
+    const header = block.querySelector('[data-streamdown="code-block-header"]')!.getBoundingClientRect();
+    const body = block.querySelector('[data-streamdown="code-block-body"]')!;
+    return {
+      viewport: document.documentElement.clientWidth, pageWidth: document.documentElement.scrollWidth,
+      blockWidth: bounds.width, copyRightGap: bounds.right - copy.right,
+      copyInsideHeader: copy.top >= header.top && copy.bottom <= header.bottom,
+      codeScrollable: body.scrollWidth > body.clientWidth,
+      readingWidth: block.closest(".message")!.getBoundingClientRect().width,
+      lineHeight: getComputedStyle(block.closest(".message-body")!).lineHeight,
+    };
+  });
+  expect(geometry.pageWidth).toBeLessThanOrEqual(geometry.viewport);
+  expect(geometry.readingWidth).toBeLessThanOrEqual(720);
+  expect(geometry.lineHeight).toBe("27px");
+  expect(geometry.copyInsideHeader).toBe(true);
+  expect(geometry.copyRightGap).toBeLessThanOrEqual(16);
+  expect(geometry.copyRightGap).toBeGreaterThanOrEqual(0);
+  expect(geometry.codeScrollable).toBe(true);
+  await page.locator(".conversation-scroll").evaluate((element) => { element.scrollTop = 0; });
+  await page.screenshot({ path: `.pytest_artifacts/chat-reading-${testInfo.project.name}.png` });
+  await page.getByRole("button", { name: "深色", exact: true }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.screenshot({ path: `.pytest_artifacts/chat-reading-dark-${testInfo.project.name}.png` });
+});
+
 test("加载历史会话并新建空会话", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "桌面侧栏覆盖即可");
   await expect(page.getByRole("button", { name: "打开会话列表" })).toBeHidden();
   await page.getByRole("button", { name: "历史问题", exact: true }).click();
   await expect(page.getByText("历史回答")).toBeVisible();
-  await page.getByRole("button", { name: "新建会话", exact: true }).click();
-  await expect(page.getByText("从一个具体问题开始")).toBeVisible();
+  await page.getByRole("button", { name: "新对话", exact: true }).click();
+  await expect(page.getByText("今天想让 BeanAgent 帮你做什么？")).toBeVisible();
 });
 
 test("工作目录与会话权限可以在输入框切换", async ({ page }) => {
@@ -126,6 +241,67 @@ test("工作目录与会话权限可以在输入框切换", async ({ page }) => 
 
   await expect(page.getByRole("button", { name: "工作目录：Bean Demo" })).toBeVisible();
   await expect(page.getByRole("button", { name: "权限：工作区可写" })).toBeVisible();
+});
+
+test("侧栏分组和目录独立折叠且不关闭当前会话", async ({ page }, testInfo) => {
+  const mobile = testInfo.project.name === "mobile";
+  const historySession = page.getByRole("navigation", { name: "会话列表" })
+    .getByRole("button", { name: "历史问题", exact: true });
+  if (mobile) await page.getByRole("button", { name: "打开会话列表" }).click();
+  await historySession.click();
+  await expect(page.getByText("历史回答")).toBeVisible();
+  if (mobile) await page.getByRole("button", { name: "打开会话列表" }).click();
+  const directory = page.getByRole("button", { name: "工作目录“Bean Demo”的会话", exact: true });
+  const projects = page.getByRole("button", { name: "项目", exact: true });
+  await directory.click();
+  await expect(directory).toHaveAttribute("aria-expanded", "false");
+  await expect(historySession).toBeHidden();
+  await projects.focus();
+  await page.keyboard.press("Enter");
+  await expect(directory).toBeHidden();
+  await page.keyboard.press("Space");
+  await expect(directory).toBeVisible();
+  await expect(directory).toHaveAttribute("aria-expanded", "false");
+  await page.getByRole("button", { name: "打开工作目录“Bean Demo”的菜单" }).click();
+  await expect(page.getByRole("menuitem", { name: "修改名称" })).toBeVisible();
+  await expect(directory).toHaveAttribute("aria-expanded", "false");
+  await directory.click();
+  await expect(historySession).toBeVisible();
+  await expect(page.getByText("历史回答")).toBeVisible();
+  await expect(page).toHaveURL(/\/chat\/history$/);
+  const recent = page.getByRole("button", { name: "最近", exact: true });
+  await recent.click();
+  await expect(recent).toHaveAttribute("aria-expanded", "false");
+  await page.screenshot({ path: `.pytest_artifacts/sidebar-fold-${testInfo.project.name}.png` });
+  await page.getByRole("button", { name: "在最近中新建会话" }).click();
+  if (mobile) await page.getByRole("button", { name: "打开会话列表" }).click();
+  await expect(recent).toHaveAttribute("aria-expanded", "true");
+});
+
+test("侧栏折叠刷新后保留并在收起时显示数量", async ({ page }, testInfo) => {
+  const mobile = testInfo.project.name === "mobile";
+  if (mobile) await page.getByRole("button", { name: "打开会话列表" }).click();
+  const directory = page.getByRole("button", { name: "工作目录“Bean Demo”的会话", exact: true });
+  const projects = page.getByRole("button", { name: "项目", exact: true });
+  const recent = page.getByRole("button", { name: "最近", exact: true });
+  await directory.click();
+  await expect(directory).toHaveAccessibleDescription("1 个会话");
+  await recent.click();
+  await projects.click();
+  await expect(projects).toHaveAccessibleDescription("1 个目录");
+  await page.reload();
+  await expect(page.getByRole("button", { name: "已连接" })).toBeVisible();
+  if (mobile) await page.getByRole("button", { name: "打开会话列表" }).click();
+  await expect(projects).toHaveAttribute("aria-expanded", "false");
+  await expect(recent).toHaveAttribute("aria-expanded", "false");
+  await expect(projects).toHaveAccessibleDescription("1 个目录");
+  await projects.click();
+  await expect(directory).toHaveAttribute("aria-expanded", "false");
+  await expect(directory.getByText("1 个会话", { exact: true })).toBeVisible();
+  await expect(projects.locator(".sidebar-fold-count")).toHaveCount(0);
+  await page.screenshot({ path: `.pytest_artifacts/sidebar-fold-persist-${testInfo.project.name}.png` });
+  await directory.click();
+  await expect(directory.locator(".sidebar-fold-count")).toHaveCount(0);
 });
 
 test("添加工作目录使用本机选择器返回路径", async ({ page }, testInfo) => {

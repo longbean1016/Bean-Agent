@@ -1,10 +1,13 @@
 from pathlib import Path
+import json
 
 from fastapi.testclient import TestClient
 
 from agent.config_models import Config
-from bootstrap.app import _freeze_web_model_route, build_core_runtime, create_fastapi_app
+from bootstrap.app import _freeze_web_model_route, _import_legacy_model_settings, build_core_runtime, create_fastapi_app
 from model_settings.secrets import MemorySecretStore
+from model_settings.models import ModelConnection, ModelProfile, ModelRoute
+from model_settings.store import ModelSettingsStore
 
 
 class Provider:
@@ -16,6 +19,58 @@ class Provider:
 
     async def close(self):
         return None
+
+
+def test_startup_refresh_returns_catalog_capacity_for_existing_connection(tmp_path):
+    workspace = tmp_path / "workspace"
+    store = ModelSettingsStore(workspace / "model-settings.db")
+    store.save_connection(ModelConnection("one", "我的连接", "deep seek", "https://example.com/v1", "one-key"))
+    store.save_model(ModelProfile("one", "deepseek-flash", "Flash"))
+    store.set_route("global", ModelRoute("one", "deepseek-flash"))
+    store.close()
+    catalog = workspace / "catalog" / "models-dev-catalog.json"
+    catalog.parent.mkdir()
+    catalog.write_text(json.dumps({"providers": {
+        "deepseek": {"models": {"deepseek-flash": {"limit": {"context": 1_000_000, "output": 393_216}}}},
+        "gateway": {"models": {"deepseek-flash": {"limit": {"context": 64000}}}},
+    }}), encoding="utf-8")
+    secrets = MemorySecretStore()
+    secrets.set("one-key", "fixture-key")
+    config = Config()
+    config.memory.enabled = False
+    runtime = build_core_runtime(config, workspace, provider=Provider(), model_secret_store=secrets)
+    with TestClient(create_fastapi_app(runtime)) as test_client:
+        response = test_client.get("/api/settings").json()
+        connection = response["connections"][0]
+        profile = connection["models"][0]
+        assert connection["name"] == "我的连接"
+        assert connection["provider"] == "deep seek"
+        assert profile["model_id"] == "deepseek-flash"
+        assert profile["context_window"] == 1_000_000
+        frozen = runtime.provider_manager.freeze(runtime.model_settings, session_key="web:s", requested=None)
+        provider = runtime.provider_manager._providers[frozen.cache_key]
+        assert provider.context_window == profile["context_window"]
+        assert provider.context_window_source == profile["metadata_source"]
+        assert provider.max_tokens == 8192
+
+
+def test_legacy_import_does_not_treat_missing_capacity_as_manual_null(tmp_path):
+    from tests.unit.model_settings.test_service import service
+
+    settings = service(tmp_path)
+    config = Config()
+    config.llm.provider = "deep seek"
+    config.llm.model = "deepseek-flash"
+    config.llm.base_url = "https://example.com/v1"
+    config.llm.api_key = "fixture-key"
+    settings._catalog._catalog = {"deepseek": {"models": {"deepseek-flash": {
+        "limit": {"context": 1_000_000, "output": 393_216},
+    }}}}
+    _import_legacy_model_settings(settings, config)
+    profile = settings.list_connections()[0]["models"][0]
+    assert "context_window" not in profile["user_overrides"]
+    assert profile["context_window"] == 1_000_000
+    assert profile["user_overrides"]["max_output_tokens"] == 8192
 
 
 def client(tmp_path: Path):

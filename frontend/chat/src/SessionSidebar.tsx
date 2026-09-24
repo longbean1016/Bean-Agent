@@ -8,21 +8,20 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
-  MessageSquarePlus,
   MoreHorizontal,
   Pencil,
   Pin,
   PinOff,
   PlugZap,
-  Plus,
   Puzzle,
   Settings,
   Sparkles,
+  SquarePen,
   Trash2,
   Unlink,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import {
@@ -39,6 +38,8 @@ import type {
   Workspace,
 } from "./types";
 import type { ExtensionKind } from "./chatRoute";
+import { SidebarFoldToggle } from "./SidebarFoldToggle";
+import { useSidebarFoldState } from "./useSidebarFoldState";
 
 export function SessionSidebar(props: {
   sessions: SessionSummary[];
@@ -78,6 +79,33 @@ export function SessionSidebar(props: {
   const [registeringWorkspace, setRegisteringWorkspace] = useState(false);
   const [scrollbarVisible, setScrollbarVisible] = useState(false);
   const [extensionsExpanded, setExtensionsExpanded] = useState(true);
+  // 分组与目录使用独立键；刷新列表、重命名和置顶移动不重置目录选择。
+  const [collapsedGroups, setCollapsedGroups] = useSidebarFoldState();
+  const foldId = useId();
+  const panelId = (key: string) => `${foldId}-${encodeURIComponent(key)}`;
+  const isExpanded = (key: string) => !collapsedGroups.has(key);
+  const toggleGroup = (key: string) => {
+    setMenuSessionId("");
+    setMenuWorkspaceId("");
+    setCollapsedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+  const createInGroup = (workspaceId: string | null) => {
+    const section = workspaceId
+      ? (props.workspaces.find((workspace) => workspace.id === workspaceId)?.pinned_at ? "pinned" : "projects")
+      : "recent";
+    setCollapsedGroups((current) => {
+      const next = new Set(current);
+      next.delete(section);
+      if (workspaceId) next.delete(`workspace:${workspaceId}`);
+      return next;
+    });
+    props.onCreate(workspaceId);
+  };
   const [activePrimaryAction, setActivePrimaryAction] = useState<"new-chat" | "add-workspace" | null>(null);
   const scrollbarHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionListRef = useRef<HTMLElement>(null);
@@ -85,7 +113,7 @@ export function SessionSidebar(props: {
   useEffect(() => {
     // 新会话发送消息后出现在侧栏时，自动滚动定位到该会话。
     const activeRow = sessionListRef.current?.querySelector(".session-row.active");
-    if (activeRow && typeof activeRow.scrollIntoView === "function") {
+    if (activeRow && !activeRow.closest("[hidden]") && typeof activeRow.scrollIntoView === "function") {
       try {
         activeRow.scrollIntoView({ behavior: "smooth", block: "nearest" });
       } catch {
@@ -290,33 +318,41 @@ export function SessionSidebar(props: {
     ? knownExtensionCounts.reduce((total, count) => total + (count ?? 0), 0)
     : null;
 
-  const renderWorkspace = (workspace: Workspace) => (
-    <section className="workspace-group" key={workspace.id} data-workspace-id={workspace.id}>
-      <header className="workspace-group-header" data-workspace-menu-owner={workspace.id}>
-        <span className={`workspace-group-icon${workspace.valid ? "" : " invalid"}`}><Folder size={15} /></span>
-        <span className="workspace-group-copy" title={workspace.canonical_path}>
-          <strong>{workspace.title || workspaceName(workspace.canonical_path)}</strong>
-          <small>{workspace.valid ? workspace.canonical_path : "目录不可用"}</small>
-        </span>
-        <button className="workspace-header-action" aria-label={`在“${workspace.title || workspaceName(workspace.canonical_path)}”中新建会话`} title="新建会话" disabled={!workspace.valid} onClick={() => props.onCreate(workspace.id)}><MessageSquarePlus size={15} /></button>
-        <button className="workspace-header-action" aria-label={`打开工作目录“${workspace.title || workspaceName(workspace.canonical_path)}”的菜单`} aria-expanded={menuWorkspaceId === workspace.id} title="工作目录菜单" onClick={() => setMenuWorkspaceId((current) => current === workspace.id ? "" : workspace.id)}><MoreHorizontal size={16} /></button>
-        {menuWorkspaceId === workspace.id ? (
-          <div className="workspace-menu" role="menu">
-            <button role="menuitem" onClick={() => { setMenuWorkspaceId(""); void props.onUpdateWorkspace(workspace.id, { pinned: !workspace.pinned_at }).catch(() => undefined); }}>{workspace.pinned_at ? <PinOff size={15} /> : <Pin size={15} />}{workspace.pinned_at ? "取消置顶" : "置顶项目"}</button>
-            <button role="menuitem" onClick={() => { setMenuWorkspaceId(""); setWorkspaceTitleDraft(workspace.title); setRenameWorkspaceTarget(workspace); }}><Pencil size={15} />修改名称</button>
-            <button role="menuitem" disabled={!workspace.valid} onClick={() => { setMenuWorkspaceId(""); void props.onOpenWorkspace(workspace.id).catch(() => undefined); }}><FolderOpen size={15} />在资源管理器中打开</button>
-            <button className="danger" role="menuitem" onClick={() => { setMenuWorkspaceId(""); setDeleteWorkspaceTarget(workspace); }}><Unlink size={15} />移除工作目录</button>
-          </div>
-        ) : null}
-      </header>
-      <div className="workspace-sessions">{renderSessions(props.sessions.filter((session) => session.workspace_id === workspace.id))}</div>
-    </section>
-  );
+  const renderWorkspace = (workspace: Workspace) => {
+    const sessions = props.sessions.filter((session) => session.workspace_id === workspace.id);
+    return (
+      <section className="workspace-group" key={workspace.id} data-workspace-id={workspace.id}>
+        <header className="workspace-group-header" data-workspace-menu-owner={workspace.id}>
+          <SidebarFoldToggle className="workspace-fold-toggle" expanded={isExpanded(`workspace:${workspace.id}`)}
+            collapsedSummary={`${sessions.length} 个会话`}
+            controls={panelId(`workspace:${workspace.id}`)} label={`工作目录“${workspace.title || workspaceName(workspace.canonical_path)}”的会话`}
+            onToggle={() => toggleGroup(`workspace:${workspace.id}`)}>
+            <span className={`workspace-group-icon${workspace.valid ? "" : " invalid"}`}><Folder size={15} /></span>
+            <span className="workspace-group-copy" title={workspace.canonical_path}>
+              <strong>{workspace.title || workspaceName(workspace.canonical_path)}</strong>
+              <small>{workspace.valid ? workspace.canonical_path : "目录不可用"}</small>
+            </span>
+          </SidebarFoldToggle>
+          <button className="workspace-header-action" aria-label={`在“${workspace.title || workspaceName(workspace.canonical_path)}”中新建会话`} title="新建会话" disabled={!workspace.valid} onClick={() => createInGroup(workspace.id)}><SquarePen size={15} /></button>
+          <button className="workspace-header-action" aria-label={`打开工作目录“${workspace.title || workspaceName(workspace.canonical_path)}”的菜单`} aria-expanded={menuWorkspaceId === workspace.id} title="工作目录菜单" onClick={() => setMenuWorkspaceId((current) => current === workspace.id ? "" : workspace.id)}><MoreHorizontal size={16} /></button>
+          {menuWorkspaceId === workspace.id ? (
+            <div className="workspace-menu" role="menu">
+              <button role="menuitem" onClick={() => { setMenuWorkspaceId(""); void props.onUpdateWorkspace(workspace.id, { pinned: !workspace.pinned_at }).catch(() => undefined); }}>{workspace.pinned_at ? <PinOff size={15} /> : <Pin size={15} />}{workspace.pinned_at ? "取消置顶" : "置顶项目"}</button>
+              <button role="menuitem" onClick={() => { setMenuWorkspaceId(""); setWorkspaceTitleDraft(workspace.title); setRenameWorkspaceTarget(workspace); }}><Pencil size={15} />修改名称</button>
+              <button role="menuitem" disabled={!workspace.valid} onClick={() => { setMenuWorkspaceId(""); void props.onOpenWorkspace(workspace.id).catch(() => undefined); }}><FolderOpen size={15} />在资源管理器中打开</button>
+              <button className="danger" role="menuitem" onClick={() => { setMenuWorkspaceId(""); setDeleteWorkspaceTarget(workspace); }}><Unlink size={15} />移除工作目录</button>
+            </div>
+          ) : null}
+        </header>
+        <div className="workspace-sessions" id={panelId(`workspace:${workspace.id}`)} hidden={!isExpanded(`workspace:${workspace.id}`)}>{renderSessions(sessions)}</div>
+      </section>
+    );
+  };
 
   return (
     <div className="session-panel">
       <div className="brand-lockup">
-        <span className="brand-mark">B</span>
+        <span className="brand-mark" aria-hidden="true" />
         <strong>BeanAgent</strong>
       </div>
       <div className="sidebar-primary-actions">
@@ -325,9 +361,9 @@ export function SessionSidebar(props: {
           aria-pressed={activePrimaryAction === "new-chat"}
           onClick={() => {
             setActivePrimaryAction("new-chat");
-            props.onCreate(null);
+            createInGroup(null);
           }}
-        ><Plus size={15} />新对话</button>
+        ><SquarePen size={15} />新对话</button>
         <button
           className={`add-workspace-button${activePrimaryAction === "add-workspace" ? " active" : ""}`}
           aria-pressed={activePrimaryAction === "add-workspace"}
@@ -361,27 +397,42 @@ export function SessionSidebar(props: {
         onPointerEnter={showSessionScrollbar}
         onPointerLeave={scheduleSessionScrollbarHide}
       >
-        {pinnedWorkspaces.length ? <h2 className="sidebar-section-label">置顶</h2> : null}
-        {pinnedWorkspaces.map(renderWorkspace)}
-        {projectWorkspaces.length || unavailableWorkspaceGroups.length ? <h2 className="sidebar-section-label">项目</h2> : null}
-        {projectWorkspaces.map(renderWorkspace)}
-        {unavailableWorkspaceGroups.map((workspace) => (
-          <section className="workspace-group" key={`unavailable:${workspace.id}`} data-workspace-id={workspace.id}>
-            <header className="workspace-group-header unavailable-header">
-              <span className="workspace-group-icon invalid"><Folder size={15} /></span>
-              <span className="workspace-group-copy" title={workspace.path || undefined}>
-                <strong>{workspace.title}</strong>
-                <small>{workspace.path || "原工作目录未注册或加载失败"}</small>
-              </span>
-            </header>
-            <div className="workspace-sessions">{renderSessions(workspace.sessions)}</div>
-          </section>
-        ))}
-        <div className="sidebar-section-heading recent-heading">
-          <h2 className="sidebar-section-label recent-label">最近</h2>
-          <button className="workspace-header-action" aria-label="在最近中新建会话" title="新建会话" onClick={() => props.onCreate(null)}><MessageSquarePlus size={15} /></button>
+        {pinnedWorkspaces.length ? <>
+          <h2 className="sidebar-section-label">
+            <SidebarFoldToggle expanded={isExpanded("pinned")} collapsedSummary={`${pinnedWorkspaces.length} 个目录`} controls={panelId("pinned")} label="置顶" onToggle={() => toggleGroup("pinned")}>置顶</SidebarFoldToggle>
+          </h2>
+          <div id={panelId("pinned")} hidden={!isExpanded("pinned")}>{pinnedWorkspaces.map(renderWorkspace)}</div>
+        </> : null}
+        {projectWorkspaces.length || unavailableWorkspaceGroups.length ? <h2 className="sidebar-section-label">
+          <SidebarFoldToggle expanded={isExpanded("projects")} collapsedSummary={`${projectWorkspaces.length + unavailableWorkspaceGroups.length} 个目录`} controls={panelId("projects")} label="项目" onToggle={() => toggleGroup("projects")}>项目</SidebarFoldToggle>
+        </h2> : null}
+        <div id={panelId("projects")} hidden={!isExpanded("projects")}>
+          {projectWorkspaces.map(renderWorkspace)}
+          {unavailableWorkspaceGroups.map((workspace) => (
+            <section className="workspace-group" key={`unavailable:${workspace.id}`} data-workspace-id={workspace.id}>
+              <header className="workspace-group-header unavailable-header">
+                <SidebarFoldToggle className="workspace-fold-toggle" expanded={isExpanded(`workspace:${workspace.id}`)}
+                  collapsedSummary={`${workspace.sessions.length} 个会话`}
+                  controls={panelId(`workspace:${workspace.id}`)} label={`工作目录“${workspace.title}”的会话`}
+                  onToggle={() => toggleGroup(`workspace:${workspace.id}`)}>
+                  <span className="workspace-group-icon invalid"><Folder size={15} /></span>
+                  <span className="workspace-group-copy" title={workspace.path || undefined}>
+                    <strong>{workspace.title}</strong>
+                    <small>{workspace.path || "原工作目录未注册或加载失败"}</small>
+                  </span>
+                </SidebarFoldToggle>
+              </header>
+              <div className="workspace-sessions" id={panelId(`workspace:${workspace.id}`)} hidden={!isExpanded(`workspace:${workspace.id}`)}>{renderSessions(workspace.sessions)}</div>
+            </section>
+          ))}
         </div>
-        <div className="recent-sessions" data-workspace-id="none">{renderSessions(unassignedSessions)}</div>
+        <div className="sidebar-section-heading recent-heading">
+          <h2 className="sidebar-section-label recent-label">
+            <SidebarFoldToggle expanded={isExpanded("recent")} collapsedSummary={`${unassignedSessions.length} 个会话`} controls={panelId("recent")} label="最近" onToggle={() => toggleGroup("recent")}>最近</SidebarFoldToggle>
+          </h2>
+          <button className="workspace-header-action" aria-label="在最近中新建会话" title="新建会话" onClick={() => createInGroup(null)}><SquarePen size={15} /></button>
+        </div>
+        <div className="recent-sessions" id={panelId("recent")} hidden={!isExpanded("recent")} data-workspace-id="none">{renderSessions(unassignedSessions)}</div>
       </nav>
       <button className="sidebar-settings-button" onClick={() => { setActivePrimaryAction(null); props.onSettings(); }} title="模型与连接设置"><Settings size={17} />设置</button>
       <Dialog.Root open={deleteTarget !== null} onOpenChange={(open) => { if (!open && !deleting) setDeleteTarget(null); }}>

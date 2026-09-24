@@ -3,6 +3,21 @@ import type { CapabilityRouteState, ExtensionScope, McpExtensionRecord, MessageP
 // 仅控制聊天页面的滚动分页，不参与模型上下文 token gate 或 checkpoint 边界。
 const MESSAGE_WINDOW_LIMIT = 60;
 
+export class ApiRequestError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+  }
+}
+
+async function responseError(response: Response, fallback: string): Promise<ApiRequestError> {
+  const payload = await response.json().catch(() => ({})) as { detail?: string };
+  return new ApiRequestError(payload.detail || fallback, response.status);
+}
+
 export async function fetchSessions(): Promise<SessionSummary[]> {
   const response = await fetch("/api/chat/sessions?page=1&page_size=100");
   if (!response.ok) throw new Error("无法加载会话列表");
@@ -78,7 +93,7 @@ export async function fetchMessages(sessionId: string): Promise<MessageRow[]> {
 
 export async function fetchMessagePage(sessionId: string): Promise<MessagePage> {
   const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages`);
-  if (!response.ok) throw new Error("无法加载会话历史");
+  if (!response.ok) throw await responseError(response, "无法加载会话历史");
   return response.json() as Promise<MessagePage>;
 }
 
@@ -101,7 +116,7 @@ export async function fetchMessagesAroundPage(sessionId: string, anchorSeq: numb
 
 export async function fetchTurns(sessionId: string): Promise<TurnNavigationEntry[]> {
   const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/turns`);
-  if (!response.ok) throw new Error("无法加载会话导航");
+  if (!response.ok) throw await responseError(response, "无法加载会话导航");
   const payload = await response.json() as { items?: Array<{ id?: string; seq?: number; turn_index?: number; question?: string; preview?: string; duration_ms?: number; started_at?: string; ended_at?: string }> };
   return (payload.items ?? []).filter((item) => typeof item.id === "string").map((item) => ({
     id: String(item.id),
@@ -117,7 +132,7 @@ export async function fetchTurns(sessionId: string): Promise<TurnNavigationEntry
 
 export async function fetchNotifications(sessionId: string): Promise<ProactiveNotificationRow[]> {
   const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sessionId)}/notifications`);
-  if (!response.ok) throw new Error("无法加载提醒通知");
+  if (!response.ok) throw await responseError(response, "无法加载提醒通知");
   return ((await response.json()) as { items?: ProactiveNotificationRow[] }).items ?? [];
 }
 

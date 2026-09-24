@@ -15,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from session.chunk_index import initialize_chunk_index
 from session.model_surface import INTERRUPTED_TOOL_RESULT_CONTENT
 
 logger = logging.getLogger(__name__)
@@ -168,7 +169,11 @@ class SessionStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._has_fts = False
-        self._init_schema()
+        try:
+            self._init_schema()
+        except Exception:
+            self._conn.close()
+            raise
 
     def create_session(
         self,
@@ -1579,6 +1584,7 @@ class SessionStore:
                 logger.info("FTS5 trigram 不可用，消息搜索退化为 LIKE: %s", error)
             self._backfill_default_titles_locked()
             self._conn.commit()
+            initialize_chunk_index(self._conn, self._decode_chunk_row)
 
     def _backfill_default_titles_locked(self) -> None:
         """幂等补齐旧会话标题，不改变原创建时间、更新时间和手动标题。"""
@@ -1961,9 +1967,6 @@ class SessionStore:
     def _append_session_event_sync(self, event: NewSessionEvent) -> dict[str, Any]:
         """在 SQLite 事务中追加不可变事件，并按 operation_key 幂等返回。"""
 
-        if str(event.event_type).strip() == "assistant/chunk":
-            return self._append_chunk_event_sync(event)
-
         key = self._validate_session_key(event.session_key)
         event_type = str(event.event_type).strip()
         turn_id = str(event.turn_id).strip()
@@ -2004,18 +2007,18 @@ class SessionStore:
                     (key, now, now),
                 )
                 if refs:
+                    # 每个来源只查询索引，不能为了校验少数引用加载整个会话。
                     found = {
-                        int(row["event_seq"])
-                        for row in self._conn.execute(
-                            "SELECT event_seq FROM session_events WHERE session_key = ?",
-                            (key,),
-                        ).fetchall()
+                        ref for ref in refs
+                        if self._conn.execute(
+                            """SELECT 1 FROM session_events
+                               WHERE session_key = ? AND event_seq = ?
+                               UNION ALL
+                               SELECT 1 FROM session_chunk_index_v1
+                               WHERE session_key = ? AND event_seq = ? LIMIT 1""",
+                            (key, ref, key, ref),
+                        ).fetchone() is not None
                     }
-                    for row in self._conn.execute(
-                        "SELECT session_key, row_seq, chunks FROM session_chunk_rows WHERE session_key = ?",
-                        (key,),
-                    ).fetchall():
-                        found.update(int(item["event_seq"]) for item in self._decode_chunk_row(row))
                     if any(ref not in found for ref in refs):
                         raise ValueError(
                             f"session event provenance 不属于当前会话: {key}"
@@ -2029,8 +2032,11 @@ class SessionStore:
                     """,
                     (key, operation_key),
                 ).fetchone()
-                if existing is not None:
-                    current = self._row_to_session_event(existing)
+                current = (
+                    self._row_to_session_event(existing) if existing is not None
+                    else self._legacy_chunk_by_operation_locked(key, operation_key)
+                )
+                if current is not None:
                     if (
                         current["event_type"] != event_type
                         or current["turn_id"] != turn_id
@@ -2042,18 +2048,19 @@ class SessionStore:
                         raise ValueError(f"session event operation_key 已绑定不同事件: {key}:{operation_key}")
                     self._conn.commit()
                     return current
+                # 两种物理格式共用序号空间；MAX 利用联合主键，只访问各自尾部。
                 seq_row = self._conn.execute(
-                    "SELECT COALESCE(MAX(event_seq), -1) + 1 AS next_event_seq FROM session_events WHERE session_key = ?",
-                    (key,),
+                    """SELECT MAX(value) + 1 AS next_event_seq FROM (
+                        SELECT COALESCE(MAX(event_seq), -1) AS value
+                        FROM session_events WHERE session_key = ?
+                        UNION ALL
+                        SELECT COALESCE(MAX(event_seq), -1) AS value
+                        FROM session_chunk_index_v1 WHERE session_key = ?
+                    )""",
+                    (key, key),
                 ).fetchone()
-                event_seq = int(seq_row["next_event_seq"] if seq_row else 0)
-                for chunk_row in self._conn.execute(
-                    "SELECT session_key, row_seq, chunks FROM session_chunk_rows WHERE session_key = ?",
-                    (key,),
-                ).fetchall():
-                    decoded = self._decode_chunk_row(chunk_row)
-                    if decoded:
-                        event_seq = max(event_seq, max(int(item["event_seq"]) for item in decoded) + 1)
+                event_seq = int(seq_row["next_event_seq"])
+                # 一个新分片就是一条不可变记录；只序列化当前载荷，不重写增长中的尾行。
                 self._conn.execute(
                     """
                     INSERT INTO session_events (
@@ -2084,111 +2091,23 @@ class SessionStore:
             raise RuntimeError(f"session event 写入后无法读取: {key}:{event_seq}")
         return self._row_to_session_event(row)
 
-    def _append_chunk_event_sync(self, event: NewSessionEvent) -> dict[str, Any]:
-        """把连续 assistant chunk 合并到物理行，同时保留可无损展开的逻辑事件。"""
-
-        key = self._validate_session_key(event.session_key)
-        turn_id = str(event.turn_id).strip()
-        operation_key = str(event.operation_key).strip()
-        status = str(event.status).strip().lower() or "committed"
-        if not turn_id or not operation_key:
-            raise ValueError("assistant/chunk 必须包含 turn_id 和 operation_key")
-        if not isinstance(event.data, dict):
-            raise TypeError("assistant/chunk data 必须是对象")
-        refs = None
-        if event.source_event_seqs is not None:
-            refs = [int(item) for item in event.source_event_seqs]
-        with self._lock:
-            self._ensure_open()
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                now = _now_iso()
-                self._conn.execute(
-                    """
-                    INSERT OR IGNORE INTO sessions (
-                        key, created_at, updated_at, last_consolidated,
-                        next_seq, metadata
-                    ) VALUES (?, ?, ?, 0, 0, '{}')
-                    """,
-                    (key, now, now),
-                )
-                for row in self._conn.execute(
-                    "SELECT session_key, row_seq, chunks FROM session_chunk_rows WHERE session_key = ?",
-                    (key,),
-                ).fetchall():
-                    for current in self._decode_chunk_row(row):
-                        if current["operation_key"] == operation_key:
-                            if current["data"] != event.data or current["turn_id"] != turn_id:
-                                raise ValueError(f"session event operation_key 已绑定不同事件: {key}:{operation_key}")
-                            self._conn.commit()
-                            return current
-                existing = self._conn.execute(
-                    "SELECT session_key, event_seq, event_type, turn_id, step, data, operation_key, status, source_event_seqs, created_at FROM session_events WHERE session_key = ? AND operation_key = ?",
-                    (key, operation_key),
-                ).fetchone()
-                if existing is not None:
-                    current = self._row_to_session_event(existing)
-                    if current["event_type"] != "assistant/chunk" or current["data"] != event.data:
-                        raise ValueError(f"session event operation_key 已绑定不同事件: {key}:{operation_key}")
-                    self._conn.commit()
-                    return current
-                max_event = self._conn.execute(
-                    "SELECT COALESCE(MAX(event_seq), -1) AS value FROM session_events WHERE session_key = ?",
-                    (key,),
-                ).fetchone()
-                event_seq = int(max_event["value"] if max_event else -1) + 1
-                for row in self._conn.execute(
-                    "SELECT chunks FROM session_chunk_rows WHERE session_key = ?", (key,)
-                ).fetchall():
-                    decoded = self._decode_chunk_row(row)
-                    if decoded:
-                        event_seq = max(event_seq, max(int(item["event_seq"]) for item in decoded) + 1)
-                logical = {
-                    "session_key": key,
-                    "event_seq": event_seq,
-                    "event_type": "assistant/chunk",
-                    "turn_id": turn_id,
-                    "step": int(event.step),
-                    "data": deepcopy(event.data),
-                    "operation_key": operation_key,
-                    "status": status,
-                    "source_event_seqs": refs,
-                    "created_at": now,
-                }
-                tail = self._conn.execute(
-                    "SELECT row_seq, turn_id, step, chunks FROM session_chunk_rows WHERE session_key = ? ORDER BY row_seq DESC LIMIT 1",
-                    (key,),
-                ).fetchone()
-                tail_items = self._decode_chunk_row(tail) if tail is not None else []
-                if (
-                    tail is not None
-                    and tail_items
-                    and str(tail["turn_id"]) == turn_id
-                    and int(tail["step"]) == int(event.step)
-                    and int(tail_items[-1]["event_seq"]) + 1 == event_seq
-                ):
-                    packed = json.loads(str(tail["chunks"]))
-                    packed.setdefault("items", []).append(logical)
-                    self._conn.execute(
-                        "UPDATE session_chunk_rows SET chunks = ? WHERE session_key = ? AND row_seq = ?",
-                        (json.dumps(packed, ensure_ascii=False, separators=(",", ":")), key, int(tail["row_seq"])),
-                    )
-                else:
-                    row_seq = int(self._conn.execute(
-                        "SELECT COALESCE(MAX(row_seq), -1) + 1 AS value FROM session_chunk_rows WHERE session_key = ?",
-                        (key,),
-                    ).fetchone()["value"])
-                    packed = {"event_type": "assistant/chunk", "turn_id": turn_id, "step": int(event.step), "items": [logical]}
-                    self._conn.execute(
-                        "INSERT INTO session_chunk_rows (session_key, row_seq, turn_id, step, chunks, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        (key, row_seq, turn_id, int(event.step), json.dumps(packed, ensure_ascii=False, separators=(",", ":")), now),
-                    )
-                self._conn.execute("UPDATE sessions SET updated_at = ? WHERE key = ?", (now, key))
-                self._conn.commit()
-                return logical
-            except Exception:
-                self._conn.rollback()
-                raise
+    def _legacy_chunk_by_operation_locked(
+        self, session_key: str, operation_key: str,
+    ) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """SELECT packed.* FROM session_chunk_index_v1 AS indexed
+               JOIN session_chunk_rows AS packed
+                 ON packed.session_key = indexed.session_key AND packed.row_seq = indexed.row_seq
+               WHERE indexed.session_key = ? AND indexed.operation_key = ?""",
+            (session_key, operation_key),
+        ).fetchone()
+        if row is None:
+            return None
+        # 只有重试旧事件才解码其所在行；新分片追加从不读取历史 JSON。
+        return next(
+            item for item in self._decode_chunk_row(row)
+            if item["operation_key"] == operation_key
+        )
 
     def _fetch_surface_events_sync(
         self,
