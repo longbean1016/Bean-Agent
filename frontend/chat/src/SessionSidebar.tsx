@@ -8,16 +8,15 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
-  MessageSquarePlus,
   MoreHorizontal,
   Pencil,
   Pin,
   PinOff,
   PlugZap,
-  Plus,
   Puzzle,
   Settings,
   Sparkles,
+  SquarePen,
   Trash2,
   Unlink,
   X,
@@ -334,7 +333,7 @@ export function SessionSidebar(props: {
               <small>{workspace.valid ? workspace.canonical_path : "目录不可用"}</small>
             </span>
           </SidebarFoldToggle>
-          <button className="workspace-header-action" aria-label={`在“${workspace.title || workspaceName(workspace.canonical_path)}”中新建会话`} title="新建会话" disabled={!workspace.valid} onClick={() => createInGroup(workspace.id)}><MessageSquarePlus size={15} /></button>
+          <button className="workspace-header-action" aria-label={`在“${workspace.title || workspaceName(workspace.canonical_path)}”中新建会话`} title="新建会话" disabled={!workspace.valid} onClick={() => createInGroup(workspace.id)}><SquarePen size={15} /></button>
           <button className="workspace-header-action" aria-label={`打开工作目录“${workspace.title || workspaceName(workspace.canonical_path)}”的菜单`} aria-expanded={menuWorkspaceId === workspace.id} title="工作目录菜单" onClick={() => setMenuWorkspaceId((current) => current === workspace.id ? "" : workspace.id)}><MoreHorizontal size={16} /></button>
           {menuWorkspaceId === workspace.id ? (
             <div className="workspace-menu" role="menu">
@@ -364,7 +363,7 @@ export function SessionSidebar(props: {
             setActivePrimaryAction("new-chat");
             createInGroup(null);
           }}
-        ><Plus size={15} />新对话</button>
+        ><SquarePen size={15} />新对话</button>
         <button
           className={`add-workspace-button${activePrimaryAction === "add-workspace" ? " active" : ""}`}
           aria-pressed={activePrimaryAction === "add-workspace"}
@@ -431,7 +430,7 @@ export function SessionSidebar(props: {
           <h2 className="sidebar-section-label recent-label">
             <SidebarFoldToggle expanded={isExpanded("recent")} collapsedSummary={`${unassignedSessions.length} 个会话`} controls={panelId("recent")} label="最近" onToggle={() => toggleGroup("recent")}>最近</SidebarFoldToggle>
           </h2>
-          <button className="workspace-header-action" aria-label="在最近中新建会话" title="新建会话" onClick={() => createInGroup(null)}><MessageSquarePlus size={15} /></button>
+          <button className="workspace-header-action" aria-label="在最近中新建会话" title="新建会话" onClick={() => createInGroup(null)}><SquarePen size={15} /></button>
         </div>
         <div className="recent-sessions" id={panelId("recent")} hidden={!isExpanded("recent")} data-workspace-id="none">{renderSessions(unassignedSessions)}</div>
       </nav>

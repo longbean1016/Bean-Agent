@@ -57,6 +57,16 @@ it("快捷入口默认中性且点击后保持互斥选中", () => {
   expect(workspaceButton).toHaveAttribute("aria-pressed", "true");
 });
 
+it("各新建会话入口统一使用方框笔图标并保留原尺寸", () => {
+  renderSidebar({ workspaces: [workspace("demo"), workspace("pinned", true)] });
+  for (const name of ["新对话", "在“demo”中新建会话", "在“pinned”中新建会话", "在最近中新建会话"]) {
+    const icon = screen.getByRole("button", { name }).querySelector("svg");
+    expect(icon).toHaveClass("lucide-square-pen");
+    expect(icon).toHaveAttribute("width", "15");
+    expect(icon).toHaveAttribute("height", "15");
+  }
+});
+
 it("扩展父栏可收起并按路由标记当前子项", () => {
   const onExtension = vi.fn();
   const { rerender, props } = renderSidebar({
