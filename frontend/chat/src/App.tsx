@@ -37,7 +37,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { ComponentPropsWithoutRef, CSSProperties } from "react";
 import { Streamdown } from "streamdown";
@@ -1803,7 +1803,7 @@ function isApprovalTerminalToolStatus(status: ToolActivity["status"]): boolean {
     || status === "rejected";
 }
 
-function MessageView({ message, navigationTurnId, turnDurationMs, approvals = [], approvalDecisionRequests = {}, onApprovalDecision }: {
+export const MessageView = memo(function MessageView({ message, navigationTurnId, turnDurationMs, approvals = [], approvalDecisionRequests = {}, onApprovalDecision }: {
   message: ChatMessage;
   navigationTurnId: string;
   turnDurationMs?: number;
@@ -1813,6 +1813,7 @@ function MessageView({ message, navigationTurnId, turnDurationMs, approvals = []
 }) {
   const isUser = message.role === "user";
   const parsed = useMemo(() => parseMemoryCitations(message.content), [message.content]);
+  const markdown = useMemo(() => prepareMessageMarkdown(parsed.markdown), [parsed.markdown]);
   const messageApprovals = approvals.filter((approval) => approval.turn_id === message.turnId);
   const [copied, setCopied] = useState(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1877,7 +1878,6 @@ function MessageView({ message, navigationTurnId, turnDurationMs, approvals = []
         {isUser ? <p className="user-text">{message.content}</p> : message.content && message.content !== "[用户已停止生成]" ? (
           <div className="beanagent-markdown">
             <Streamdown
-              key={`${message.id}-${message.streaming ? "stream" : "final"}`}
               plugins={markdownPlugins}
               components={markdownComponents}
               controls={markdownControls}
@@ -1886,7 +1886,7 @@ function MessageView({ message, navigationTurnId, turnDurationMs, approvals = []
               linkSafety={markdownLinkSafety}
               translations={markdownTranslations}
             >
-              {prepareMessageMarkdown(parsed.markdown)}
+              {markdown}
             </Streamdown>
           </div>
         ) : message.streaming ? <span className="stream-caret" aria-label="正在生成" /> : null}
@@ -1927,7 +1927,16 @@ function MessageView({ message, navigationTurnId, turnDurationMs, approvals = []
       </div>
     </article>
   );
-}
+}, (previous, next) => {
+  if (previous.message !== next.message || previous.navigationTurnId !== next.navigationTurnId
+    || previous.turnDurationMs !== next.turnDurationMs
+    || previous.onApprovalDecision !== next.onApprovalDecision) return false;
+  const relevant = (items: ApprovalRequest[] = []) => items.filter((item) => item.turn_id === next.message.turnId);
+  const before = relevant(previous.approvals);
+  const after = relevant(next.approvals);
+  return before.length === after.length && before.every((approval, index) => approval === after[index]
+    && previous.approvalDecisionRequests?.[approval.id] === next.approvalDecisionRequests?.[approval.id]);
+});
 
 function formatMessageTime(timestamp?: string): string | null {
   if (!timestamp) return null;
@@ -2034,7 +2043,7 @@ function MemoryCitationList({ citations }: { citations: MemoryCitation[] }) {
   );
 }
 
-function Thinking({ content, streaming, status }: { content: string; streaming: boolean; status?: "running" | "completed" | "interrupted" }) {
+const Thinking = memo(function Thinking({ content, streaming, status }: { content: string; streaming: boolean; status?: "running" | "completed" | "interrupted" }) {
   const visibleStatus = status ?? (streaming ? "running" : "completed");
   return (
     <Collapsible.Root className={`thinking ${visibleStatus}`} defaultOpen={streaming}>
@@ -2050,7 +2059,7 @@ function Thinking({ content, streaming, status }: { content: string; streaming: 
       </Collapsible.Content>
     </Collapsible.Root>
   );
-}
+});
 
 /**
  * 工具活动行使用“动作图标 + 语义文案”表达调用类型，状态图标只在
