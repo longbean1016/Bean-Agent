@@ -1,0 +1,41 @@
+/* 仅约束消息阅读区，不把正文令牌扩散到输入区、侧栏或设置页。 */
+.message {
+  --message-reading-width: 720px;
+  --message-leading: 1.8;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  max-width: var(--message-reading-width);
+  margin: 0 auto 32px;
+}
+.message > .message-label { padding-top: 0; text-align: left; }
+.message .message-body { width: 100%; max-width: 100%; line-height: var(--message-leading); }
+.user-message .message-body { grid-column: 1; }
+.message .user-text { margin-top: 8px; line-height: 1.7; white-space: pre-wrap; }
+.assistant-message .beanagent-markdown { overflow-wrap: anywhere; }
+.assistant-message .beanagent-markdown :where(p, ul, ol, blockquote, table) { margin-block: 0 16px; }
+.assistant-message .beanagent-markdown :where(ul, ol) { padding-left: 1.5em; }
+.assistant-message .beanagent-markdown li { margin-block: 5px; }
+.assistant-message .beanagent-markdown li > p { margin-block: 0 6px; }
+.assistant-message .beanagent-markdown :where(h1, h2, h3, h4, h5, h6) { margin-block: 24px 12px; line-height: 1.5; font-weight: 600; }
+.assistant-message .beanagent-markdown h1 { font-size: 1.5em; }
+.assistant-message .beanagent-markdown h2 { font-size: 1.3em; }
+.assistant-message .beanagent-markdown h3 { font-size: 1.15em; }
+.assistant-message .beanagent-markdown > div > :first-child { margin-top: 0; }
+.assistant-message .beanagent-markdown > div > :last-child { margin-bottom: 0; }
+
+
+/* 复用代码渲染器和复制行为，仅覆盖消息内的表面与头部留白。 */
+.assistant-message [data-streamdown="code-block"] { margin-block: 18px; border-color: var(--border-soft); border-radius: 9px; background: var(--primary-soft-2); }
+.assistant-message [data-streamdown="code-block-header"] { min-height: 38px; padding: 0 52px 0 14px; border-color: var(--border-soft); background: var(--primary-soft); overflow-wrap: anywhere; }
+.assistant-message [data-streamdown="code-block-body"] { padding: 15px 16px; background: var(--primary-soft-2); }
+.assistant-message [data-streamdown="code-block-actions"] { top: 6px; right: 10px; }
+.assistant-message [data-streamdown="code-block-copy-button"] { color: var(--text-muted); }
+.assistant-message [data-streamdown="code-block-copy-button"]:hover { color: var(--primary); background: var(--primary-wash); }
+:root[data-theme="dark"] .assistant-message [data-streamdown="code-block"],
+:root[data-theme="dark"] .assistant-message [data-streamdown="code-block-body"] { background: var(--code-body-bg); }
+:root[data-theme="dark"] .assistant-message [data-streamdown="code-block-header"] { background: var(--code-header-bg); }
+
+@media (max-width: 640px) {
+  .message { gap: 8px; margin-bottom: 26px; }
+}
