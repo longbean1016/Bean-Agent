@@ -29,9 +29,7 @@ export function deriveToolSummary(tools: ToolActivity[], approvals: ApprovalRequ
     counts.unknown ? `${counts.unknown} 项状态未知` : "",
     `${counts.completed} / ${total} 已完成`,
   ].filter(Boolean);
-  const errors = tools.filter((tool) => toolDisplayStatus(tool) === "error").map((tool) => ({
-    callId: tool.callId,
-    text: `${tool.name}：${(tool.resultPreview || tool.errorCode || "执行失败，展开查看详情").replace(/\s+/gu, " ").slice(0, 180)}`,
-  }));
-  return { status, label: notes.join(" · "), counts, errors };
+  // 失败结果与成功结果一样，仅在对应单项详情展示；主状态已提示失败时不重复计数文案。
+  const displayNotes = status === "error" ? notes.filter((note) => note !== `${counts.error} 项失败`) : notes;
+  return { status, label: notes.join(" · "), displayLabel: displayNotes.join(" · "), counts };
 }

@@ -3,7 +3,7 @@
 .tool-group .tool-group-trigger { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 34px; padding: 4px 0; border: 0; background: transparent; color: var(--text-muted); text-align: left; cursor: pointer; }
 .tool-group .tool-group-icon, .tool-group .tool-icon { display: inline-grid; flex: 0 0 20px; width: 20px; height: 20px; place-items: center; color: var(--text-subtle); }
 .tool-group .tool-group-icon { flex-basis: 22px; width: 22px; height: 22px; border-radius: 6px; background: var(--primary-soft); color: var(--primary-icon); }
-.tool-group .tool-group-errors, .tool-group .tool-status-error { color: var(--danger-text); }
+.tool-group .tool-status-error { color: var(--danger-text); }
 .tool-group .tool-status-pending, .tool-group .tool-status-unknown { color: var(--warning-text); }
 .tool-group .tool-group-summary { display: flex; flex: 1; align-items: baseline; flex-wrap: wrap; gap: 3px 14px; min-width: 0; }
 .tool-group .tool-group-summary strong { flex: 0 0 auto; color: var(--text); font-size: 14px; font-weight: 500; }
@@ -30,8 +30,6 @@
 .tool-group .tool-detail-grid dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--text); font-variant-numeric: tabular-nums; }
 .tool-group .tool-result-preview, .tool-group .tool-unknown-note { margin: 7px 0 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .tool-group .tool-unknown-note { color: var(--warning-text); }
-.tool-group .tool-group-errors { margin: 2px 0 8px 29px; font-size: 12px; overflow-wrap: anywhere; }
-.tool-group .tool-group-errors p { margin: 2px 0; }
 .tool-group .tool-orphan-approval { padding: 4px 0; }
 .tool-group .tool-running-spinner { animation: tool-running-rotate 1s linear infinite; }
 @keyframes tool-running-rotate { to { transform: rotate(360deg); } }

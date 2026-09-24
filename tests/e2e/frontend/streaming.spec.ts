@@ -24,7 +24,7 @@ async function openSimulation(page: Page, historyTurns = 0): Promise<WebSocketRo
   return socket;
 }
 
-test("工具默认收起、转圈和手动展开保持，审批原卡片与错误在收起时可见", async ({ page }, testInfo) => {
+test("工具默认收起并保留审批，失败输出只在对应单项展开后显示", async ({ page }, testInfo) => {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   const socket = await openSimulation(page);
@@ -70,13 +70,22 @@ test("工具默认收起、转圈和手动展开保持，审批原卡片与错�
   send({ type: "approval.resolved", approval_id: "approval", decision: "allowed-once", call_id: "weather", request_id: "mock" });
   send({ type: "react.tool.completed", call_id: "weather", tool_name: "web_search", status: "error", result_preview: "测试错误：天气服务暂时不可用", duration_ms: 500 });
   await expect(page.getByLabel("待处理权限审批")).toHaveCount(0);
-  await expect(page.locator(".tool-group-errors")).toContainText("天气服务暂时不可用");
+  await expect(page.getByText("测试错误：天气服务暂时不可用", { exact: true })).toHaveCount(0);
+  await expect(group.locator(".tool-group-state")).toHaveText("1 / 2 已完成");
   await expect(group.locator(".tool-status-error")).toHaveText("1 项失败");
   await expect(group.locator(".tool-status-error .lucide-x")).toBeVisible();
   await expect(group.locator(".lucide-check")).toHaveCount(0);
   await page.screenshot({ path: `.pytest_artifacts/tools-error-${testInfo.project.name}.png`, animations: "disabled" });
   await expect(group).toHaveAttribute("aria-expanded", "false");
   await expect(page.locator(".tool-running-spinner")).toHaveCount(0);
+  await group.click();
+  await expect(tool).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByText("测试错误：天气服务暂时不可用", { exact: true })).toHaveCount(0);
+  await tool.click();
+  await expect(tool.locator("..").locator(".tool-result-preview")).toHaveText("测试错误：天气服务暂时不可用");
+  await expect(page.getByText("已读取查询配置", { exact: true })).toHaveCount(0);
+  await tool.click();
+  await expect(page.getByText("测试错误：天气服务暂时不可用", { exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   expect(errors).toEqual([]);
 });

@@ -120,14 +120,11 @@ export const ToolTimeline = memo(function ToolTimeline({
         </span>
         <span className="tool-group-summary">
           <strong>工具调用</strong>
-          <span className="tool-group-state" aria-live="polite" aria-atomic="true">{summary.label}</span>
+          <span className="tool-group-state" aria-live="polite" aria-atomic="true">{summary.displayLabel}</span>
         </span>
         <ToolStatus status={summary.status} label={summary.status === "error" ? `${summary.counts.error} 项失败` : undefined} />
         <ChevronDown size={14} aria-hidden="true" />
       </Collapsible.Trigger>
-      {summary.errors.length ? <div className="tool-group-errors" role="status">
-        {summary.errors.map((error) => <p key={error.callId}>{error.text}</p>)}
-      </div> : null}
       {/* 审批沿用原卡片和消息内位置，独立于两层折叠，收起或懒挂载均不影响操作。 */}
       {approvals.map((approval, index) => (
         <div className="tool-orphan-approval" key={approval.id}>

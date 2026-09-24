@@ -60,12 +60,39 @@ it("组和单项都收起时保留原审批卡且不转圈，提交锁即时更�
   expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
 });
 
-it("错误摘要不因默认收起而隐藏，不挂载参数详情", () => {
+it("成功和失败输出均只在对应单项展开后展示，收起工具组后隐藏", () => {
   const initial = props();
-  render(<ToolTimeline {...initial} tools={[{ ...running, status: "error", resultPreview: "读取失败：文件不存在" }]} />);
-  expect(screen.getByRole("button", { name: /工具调用/ })).toHaveAttribute("aria-expanded", "false");
-  expect(screen.getByText(/读取失败：文件不存在/)).toBeVisible();
+  const firstError = '{"exit_code":1,"output":"第一个命令失败"}';
+  const secondError = '{"exit_code":2,"output":"第二个命令失败"}';
+  render(<ToolTimeline {...initial} tools={[
+    { ...running, status: "completed", resultPreview: "读取成功" },
+    { ...running, name: "shell", callId: "first", arguments: { command: "first" }, status: "error", resultPreview: firstError },
+    { ...running, name: "shell", callId: "second", arguments: { command: "second" }, status: "error", resultPreview: secondError },
+  ]} />);
+  const group = screen.getByRole("button", { name: /工具调用/ });
+  expect(group).toHaveAttribute("aria-expanded", "false");
+  expect(group.querySelector(".tool-group-state")).toHaveTextContent("1 / 3 已完成");
+  expect(group.querySelector(".tool-group-state")).not.toHaveTextContent("失败");
+  expect(group.querySelector(".tool-status-error")).toHaveTextContent("2 项失败");
+  expect(screen.queryByText(firstError)).not.toBeInTheDocument();
   expect(screen.queryByText("目标")).not.toBeInTheDocument();
+  fireEvent.click(group);
+  expect(screen.queryByText(firstError)).not.toBeInTheDocument();
+  expect(screen.queryByText(secondError)).not.toBeInTheDocument();
+  const first = screen.getByRole("button", { name: /^shell first/ });
+  fireEvent.click(first);
+  expect(screen.getByText(firstError)).toBeVisible();
+  expect(screen.queryByText(secondError)).not.toBeInTheDocument();
+  expect(screen.queryByText("读取成功")).not.toBeInTheDocument();
+  fireEvent.click(first);
+  fireEvent.click(screen.getByRole("button", { name: /^shell second/ }));
+  expect(screen.queryByText(firstError)).not.toBeInTheDocument();
+  expect(screen.getByText(secondError)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: /^read_file/ }));
+  expect(screen.getByText("读取成功")).toBeVisible();
+  fireEvent.click(group);
+  expect(screen.queryByText(secondError)).not.toBeInTheDocument();
+  expect(screen.queryByText("读取成功")).not.toBeInTheDocument();
 });
 
 it("工具类型图标不随状态替换，右侧独立展示转圈和完成勾", () => {
@@ -97,7 +124,7 @@ it("部分失败时摘要显示失败数量，失败叉不覆盖浏览器图标"
   expect(trigger.querySelector(".tool-status-error")).toHaveTextContent("1 项失败");
   expect(trigger.querySelector(".lucide-check")).toBeNull();
   expect(trigger.querySelector(".tool-group-icon .lucide-wrench")).not.toBeNull();
-  expect(screen.getByText(/网络暂时不可用/)).toBeVisible();
+  expect(screen.queryByText(/网络暂时不可用/)).not.toBeInTheDocument();
   fireEvent.click(trigger);
   const step = screen.getByRole("button", { name: /^web_search/ });
   expect(step.querySelector(".tool-icon .lucide-earth")).not.toBeNull();
