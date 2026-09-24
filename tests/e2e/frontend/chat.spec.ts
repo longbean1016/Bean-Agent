@@ -111,6 +111,46 @@ test("上传文本附件并在断线后自动重连", async ({ page }) => {
 
   await expect(page.getByRole("button", { name: "重连中" })).toBeVisible();
   await expect(page.getByRole("button", { name: "已连接" })).toBeVisible({ timeout: 5_000 });
+  await page.getByRole("button", { name: "深色", exact: true }).click();
+  await expect(userMessage.locator(".message-body")).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  await expect(userMessage.locator(".attachment-gallery")).toHaveCSS("justify-content", "flex-end");
+});
+
+test("深色模式用户消息只有气泡着色且切换刷新不出现整行背景", async ({ page }, testInfo) => {
+  await page.route("**/api/chat/sessions/*/messages**", async (route) => {
+    await route.fulfill({ json: {
+      session_id: "web:history", total: 2, items: [
+        { id: "theme-user", role: "user", content: "2", turn_id: "theme-turn" },
+        { id: "theme-answer", role: "assistant", content: "收到，消息显示正常。", turn_id: "theme-turn" },
+      ],
+    } });
+  });
+  if (testInfo.project.name === "mobile") await page.getByRole("button", { name: "打开会话列表" }).click();
+  await page.getByRole("navigation", { name: "会话列表" }).getByRole("button", { name: "历史问题", exact: true }).click();
+  const user = page.locator(".user-message");
+  const body = user.locator(".message-body");
+  const bubble = user.locator(".user-text");
+  await expect(bubble).toHaveText("2");
+  for (const theme of ["浅色", "深色", "浅色", "深色"]) {
+    await page.getByRole("button", { name: theme, exact: true }).click();
+    await expect(body).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+    await expect(user).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+    await expect(bubble).not.toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+    await expect(bubble).toHaveCSS("border-radius", "20px");
+  }
+  // 容器继续承担阅读宽度和右对齐，不通过缩窄容器掩盖错误背景。
+  const geometry = await body.evaluate((element) => {
+    const outer = element.getBoundingClientRect();
+    const inner = element.querySelector(".user-text")!.getBoundingClientRect();
+    return { rightGap: Math.abs(outer.right - inner.right), bubbleWidth: inner.width, bodyWidth: outer.width };
+  });
+  expect(geometry.rightGap).toBeLessThanOrEqual(1);
+  expect(geometry.bubbleWidth).toBeLessThan(geometry.bodyWidth / 2);
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect(bubble).toHaveText("2");
+  await expect(body).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  await page.screenshot({ path: `.pytest_artifacts/user-message-dark-${testInfo.project.name}.png`, animations: "disabled" });
 });
 
 test("移动端布局没有横向溢出", async ({ page }, testInfo) => {

@@ -1133,7 +1133,6 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 :root[data-theme="dark"] .memory-citations { border-color: var(--border-soft); color: var(--text-subtle); }
 :root[data-theme="dark"] .memory-citation-detail { border-color: var(--border-soft); background: #1d2421; color: #b5c0bc; }
 :root[data-theme="dark"] .memory-citation-id code { color: #d3ddd9; }
-:root[data-theme="dark"] .user-message .message-body { border-color: var(--border-soft); background: var(--surface-3); }
 :root[data-theme="dark"] .session-row:hover { background: var(--surface-hover); }
 :root[data-theme="dark"] .session-row.active { background: var(--primary-wash); }
 :root[data-theme="dark"] .session-menu,

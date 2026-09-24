@@ -39,6 +39,13 @@ def index() -> FileResponse:
     return FileResponse(STATIC / "index.html")
 
 
+@app.get("/chat/{session_id}")
+def chat_index(session_id: str) -> FileResponse:
+    """与正式服务保持一致，让会话地址刷新也能加载前端入口。"""
+
+    return FileResponse(STATIC / "index.html")
+
+
 @app.get("/api/chat/sessions")
 def sessions() -> dict[str, object]:
     return {
