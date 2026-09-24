@@ -44,7 +44,7 @@ import { Streamdown } from "streamdown";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import type { StickToBottomContext } from "use-stick-to-bottom";
 
-import { deleteSession, deleteWorkspace, fetchMessagePage, fetchMessagesAroundPage, fetchModelSettings, fetchNotifications, fetchOlderMessages, fetchSessionModelRoute, fetchSessions, fetchTurns, fetchWorkspaces, mediaUrl, openWorkspaceDirectory, registerWorkspace, renameSession, saveSessionModelRoute, setSessionPinned, updateWorkspace, uploadAttachment } from "./api";
+import { ApiRequestError, deleteSession, deleteWorkspace, fetchMessagePage, fetchMessagesAroundPage, fetchModelSettings, fetchNotifications, fetchOlderMessages, fetchSessionModelRoute, fetchSessions, fetchTurns, fetchWorkspaces, mediaUrl, openWorkspaceDirectory, registerWorkspace, renameSession, saveSessionModelRoute, setSessionPinned, updateWorkspace, uploadAttachment } from "./api";
 import { idleTurnState, initialChatState, notificationRowsToMessages, reduceChatFrame, rowsToMessages } from "./chatReducer";
 import { composeTimeline, reconcileMessages } from "./timeline";
 import { parseMemoryCitations } from "./citations";
@@ -770,6 +770,38 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat.sessionId]);
 
+  const recoverMissingSession = useCallback((sessionId: string) => {
+    if (routeSessionRef.current !== sessionId) return;
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+    window.history.replaceState({}, "", "/");
+    activePageRef.current = "chat";
+    routeSessionRef.current = "";
+    setActivePage("chat");
+    setRouteSession("");
+    setNotificationsBySession((current) => {
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+    setTurnsBySession((current) => {
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+    setMessageWindows((current) => {
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+    setInput("");
+    setFiles([]);
+    setNewSessionWorkspaceId(null);
+    setNewSessionMode("read-only");
+    setSidebarOpen(false);
+    dispatch({ type: "ui.session.select", sessionId: "", messages: [] });
+    dispatch({ type: "error", request_id: "", code: "session_not_found", message: "该会话不存在或已被删除" });
+  }, []);
+
   const loadSession = async (sessionId: string, closeSidebar = true) => {
     const loadVersion = (sessionLoadVersionsRef.current[sessionId] ?? 0) + 1;
     sessionLoadVersionsRef.current[sessionId] = loadVersion;
@@ -777,7 +809,7 @@ export function App() {
     try {
       const [page, notifications, turns] = await Promise.all([
         fetchMessagePage(sessionId),
-        fetchNotifications(sessionId),
+        fetchOptionalNotifications(sessionId, true),
         fetchTurns(sessionId),
       ]);
       const rows = page.items ?? [];
@@ -801,6 +833,11 @@ export function App() {
       dispatch({ type: "ui.session.select", sessionId, messages });
       if (closeSidebar) setSidebarOpen(false);
     } catch (error) {
+      if (sessionLoadVersionsRef.current[sessionId] !== loadVersion || routeSessionRef.current !== sessionId) return;
+      if (isMissingSessionError(error)) {
+        recoverMissingSession(sessionId);
+        return;
+      }
       dispatch(errorFrame(error));
     } finally {
       setLoadingSessionId((current) => current === sessionId ? "" : current);
@@ -1055,7 +1092,7 @@ export function App() {
     try {
       const [page, notifications] = await Promise.all([
         fetchMessagesAroundPage(sessionId, Math.max(0, turn.seq - TURN_CONTEXT_BEFORE_MESSAGES)),
-        fetchNotifications(sessionId),
+        fetchOptionalNotifications(sessionId),
       ]);
       const rows = page.items ?? [];
       const notificationMessages = notificationRowsToMessages(notifications);
@@ -1155,7 +1192,7 @@ export function App() {
     try {
       const [page, notifications] = await Promise.all([
         fetchMessagePage(sessionId),
-        fetchNotifications(sessionId),
+        fetchOptionalNotifications(sessionId),
       ]);
       if (chatRef.current.sessionId !== sessionId) return;
       const rows = page.items ?? [];
@@ -3086,6 +3123,21 @@ function ConversationSkeleton() {
 
 function errorFrame(error: unknown): ChatFrame {
   return { type: "error", request_id: "", code: "client_error", message: error instanceof Error ? error.message : "发生未知错误" };
+}
+
+function isMissingSessionError(error: unknown): boolean {
+  return error instanceof ApiRequestError && error.status === 404 && error.message === "会话不存在";
+}
+
+async function fetchOptionalNotifications(sessionId: string, missingSessionIsFatal = false) {
+  try {
+    return await fetchNotifications(sessionId);
+  } catch (error) {
+    if (missingSessionIsFatal && isMissingSessionError(error)) throw error;
+    // 通知是会话时间线的附加数据；加载失败不能阻断历史消息和导航恢复。
+    console.warn("提醒通知加载失败，已继续加载会话", error);
+    return [];
+  }
 }
 
 function readThemePreference(): ThemePreference {

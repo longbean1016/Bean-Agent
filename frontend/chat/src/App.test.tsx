@@ -267,6 +267,59 @@ it("响应浏览器历史事件在会话和独立设置页之间切换", async (
   expect(screen.queryByRole("navigation", { name: "会话列表" })).not.toBeInTheDocument();
 });
 
+it("失效会话链接会回到新对话并展示准确提示", async () => {
+  localStorage.setItem("beanagent.session_id", "web:missing");
+  window.history.replaceState({}, "", "/chat/missing");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/chat/sessions/web%3Amissing/notifications")) {
+      return {
+        ok: false,
+        status: 404,
+        json: async () => ({ detail: "会话不存在" }),
+      } as Response;
+    }
+    return { ok: true, status: 200, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+
+  render(<App />);
+
+  expect(await screen.findByText("该会话不存在或已被删除")).toBeVisible();
+  expect(window.location.pathname).toBe("/");
+  expect(localStorage.getItem("beanagent.session_id")).toBeNull();
+  expect(screen.getByRole("heading", { name: "今天想让 BeanAgent 帮你做什么？" })).toBeVisible();
+  expect(screen.queryByText("无法加载提醒通知")).not.toBeInTheDocument();
+});
+
+it("提醒通知加载失败时仍正常恢复会话历史", async () => {
+  window.history.replaceState({}, "", "/chat/available");
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/chat/sessions/web%3Aavailable/messages")) {
+      return { ok: true, status: 200, json: async () => ({
+        items: [{ id: "web:available:0", role: "user", content: "历史消息正常", tool_chain: [] }],
+        total: 1,
+      }) } as Response;
+    }
+    if (url.endsWith("/api/chat/sessions/web%3Aavailable/notifications")) {
+      return {
+        ok: false,
+        status: 500,
+        json: async () => ({ detail: "通知服务暂时不可用" }),
+      } as Response;
+    }
+    return { ok: true, status: 200, json: async () => ({ items: [], total: 0 }) } as Response;
+  }));
+
+  render(<App />);
+
+  expect(await screen.findByText("历史消息正常", { selector: ".user-text" })).toBeVisible();
+  expect(window.location.pathname).toBe("/chat/available");
+  expect(screen.queryByText("通知服务暂时不可用")).not.toBeInTheDocument();
+  expect(warn).toHaveBeenCalledWith("提醒通知加载失败，已继续加载会话", expect.any(Error));
+});
+
 it("首条消息发送后创建 Session 并保留用户消息", async () => {
   render(<App />);
 
