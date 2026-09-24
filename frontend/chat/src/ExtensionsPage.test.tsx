@@ -164,7 +164,12 @@ it("展示插件来源和覆盖原因并支持状态筛选", async () => {
   expect(await screen.findByText("Demo")).toBeInTheDocument();
   expect(screen.getByText("local-catalog")).toBeInTheDocument();
   expect(screen.getByText(/插件已停用 · 1 个 Skill/)).toBeInTheDocument();
-  fireEvent.change(screen.getByLabelText("Skill 状态筛选"), { target: { value: "overridden" } });
+  fireEvent.click(screen.getByRole("button", { name: "Skill 状态筛选：全部" }));
+  const statusOptions = screen.getByRole("listbox", { name: "Skill 状态筛选选项" });
+  expect(within(statusOptions).getByRole("option", { name: "全部 3" })).toHaveAttribute("aria-selected", "true");
+  expect(within(statusOptions).getByRole("option", { name: "已覆盖 1" })).toBeVisible();
+  fireEvent.click(within(statusOptions).getByRole("option", { name: "已覆盖 1" }));
   expect(await screen.findByText("被更高优先级来源 workspace 覆盖")).toBeInTheDocument();
   expect(screen.queryByText("Demo")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Skill 状态筛选：已覆盖" })).toHaveAttribute("aria-expanded", "false");
 });

@@ -102,6 +102,28 @@ it("明确显示密钥状态并反馈模型列表和所选模型测试结果", a
   await waitFor(() => expect(screen.getByText(/公司 API \/ Model A.*调用成功/)).toBeVisible());
 });
 
+it("默认适配器使用主题化选择器并保持受控值同步", () => {
+  render(<ModelSettingsPage
+    settings={settings}
+    onBack={vi.fn()}
+    onRefresh={vi.fn(async () => settings)}
+    onDefaultRoute={vi.fn()}
+  />);
+
+  const trigger = screen.getByRole("button", { name: "默认适配器：通用 OpenAI" });
+  expect(trigger).toHaveAttribute("aria-expanded", "false");
+  expect(screen.queryByRole("combobox", { name: "默认适配器" })).not.toBeInTheDocument();
+
+  fireEvent.click(trigger);
+  expect(trigger).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByRole("listbox", { name: "默认适配器选项" })).toBeVisible();
+  expect(screen.getByRole("option", { name: "通用 OpenAI" })).toHaveAttribute("aria-selected", "true");
+
+  fireEvent.click(screen.getByRole("option", { name: "DeepSeek" }));
+  expect(screen.getByRole("button", { name: "默认适配器：DeepSeek" })).toHaveAttribute("aria-expanded", "false");
+  expect(screen.queryByRole("listbox", { name: "默认适配器选项" })).not.toBeInTheDocument();
+});
+
 it("Embedding 与视觉入口默认跟随主模型，独立模式隐藏手动适配器并支持能力测试", async () => {
   const capabilitySettings: ModelSettingsPayload = {
     ...settings,

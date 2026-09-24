@@ -1,7 +1,9 @@
 import {
   AlertTriangle,
   ArrowLeft,
+  Check,
   CheckCircle2,
+  ChevronDown,
   FileDiff,
   FolderOpen,
   Globe2,
@@ -18,7 +20,7 @@ import {
   Upload,
   Wrench,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { createMcpExtension, createSkillExtension, discoverMcpSources, discoverSkillSources, fetchDefaultSkillDiff, fetchDefaultSkillStatuses, fetchMcpExtensions, fetchPluginExtensions, fetchSkillDetail, fetchSkillExtensions, fetchSkillRevision, importDiscoveredMcpExtensions, importMcpExtensions, importSkillExtension, importSkillSelections, openSkillDirectory, preflightSkillSelections, refreshMcpExtension, refreshSessionSkills, refreshSkillExtension, removeMcpExtension, removeSkillExtension, restoreDefaultSkill, setMcpEnabled, setSkillEnabled, updateDefaultSkill, updateMcpExtension, updateSkillExtension } from "./api";
 import type { DefaultSkillDiff, DefaultSkillStatus, DiscoveredSkillSource, SkillImportPlan, SkillImportResult } from "./api";
@@ -27,6 +29,102 @@ import type { ExtensionScope, McpExtensionRecord, PluginExtensionRecord, SkillEx
 import type { ExtensionKind } from "./chatRoute";
 
 type ExtensionRecord = PluginExtensionRecord | McpExtensionRecord | SkillExtensionRecord;
+
+const skillStatusOptions = [
+  { value: "all", label: "全部" },
+  { value: "available", label: "可用" },
+  { value: "disabled", label: "已停用" },
+  { value: "missing_dependency", label: "缺少依赖" },
+  { value: "invalid", label: "无效" },
+  { value: "overridden", label: "已覆盖" },
+] as const;
+
+type SkillStatusFilter = (typeof skillStatusOptions)[number]["value"];
+
+function skillMatchesStatus(skill: SkillExtensionRecord, status: SkillStatusFilter) {
+  if (status === "all") return true;
+  if (status === "overridden") return skill.active === false;
+  if (status === "available") return skill.active !== false && skill.status === "available";
+  return skill.status === status;
+}
+
+function SkillStatusSelect({
+  value,
+  counts,
+  onChange,
+}: {
+  value: SkillStatusFilter;
+  counts: Record<SkillStatusFilter, number>;
+  onChange: (value: SkillStatusFilter) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuId = useId();
+  const selected = skillStatusOptions.find((option) => option.value === value) ?? skillStatusOptions[0];
+
+  useEffect(() => {
+    if (!open) return;
+    const closeWhenOutside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !rootRef.current?.contains(event.target)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeWhenOutside);
+    return () => document.removeEventListener("pointerdown", closeWhenOutside);
+  }, [open]);
+
+  return (
+    <div
+      className="extensions-status-filter"
+      ref={rootRef}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || !open) return;
+        event.preventDefault();
+        setOpen(false);
+        triggerRef.current?.focus();
+      }}
+    >
+      <span className="extensions-status-label">状态</span>
+      <button
+        type="button"
+        className="extensions-status-trigger"
+        ref={triggerRef}
+        aria-label={`Skill 状态筛选：${selected.label}`}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={menuId}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span>{selected.label}</span>
+        <small>{counts[selected.value]}</small>
+        <ChevronDown size={15} aria-hidden="true" />
+      </button>
+      {open ? (
+        <div className="extensions-status-menu" id={menuId} role="listbox" aria-label="Skill 状态筛选选项">
+          {skillStatusOptions.map((option) => (
+            <div className="extensions-status-option-wrap" key={option.value} role="presentation">
+              {option.value === "overridden" ? <span className="extensions-status-separator" aria-hidden="true" /> : null}
+              <button
+                type="button"
+                role="option"
+                aria-label={`${option.label} ${counts[option.value]}`}
+                aria-selected={option.value === value}
+                onClick={() => {
+                  onChange(option.value);
+                  setOpen(false);
+                  triggerRef.current?.focus();
+                }}
+              >
+                <span>{option.label}</span>
+                <small>{counts[option.value]}</small>
+                <Check size={14} aria-hidden="true" />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 const pageMeta: Record<ExtensionKind, { title: string; subtitle: string; icon: typeof Puzzle; empty: string }> = {
   plugins: { title: "插件", subtitle: "安装和管理可扩展能力；插件可以提供 Skills、MCP 和 Commands。", icon: Puzzle, empty: "尚未安装插件" },
@@ -51,7 +149,7 @@ export function ExtensionsPage({
     kind === "mcp" && !workspaceId ? "user" : "workspace"
   ));
   const [query, setQuery] = useState("");
-  const [skillStatusFilter, setSkillStatusFilter] = useState("all");
+  const [skillStatusFilter, setSkillStatusFilter] = useState<SkillStatusFilter>("all");
   const [records, setRecords] = useState<ExtensionRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -172,20 +270,28 @@ export function ExtensionsPage({
     return () => { disposed = true; window.clearInterval(timer); };
   }, [kind, workspaceId]);
 
-  const filtered = useMemo(() => {
+  const searchedRecords = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
-    const searched = !normalized ? records : records.filter((record) => {
+    return !normalized ? records : records.filter((record) => {
       const source = "source" in record ? record.source : "transport" in record ? record.transport : "";
       return `${record.name} ${record.description} ${source}`.toLocaleLowerCase().includes(normalized);
     });
-    if (kind !== "skills" || skillStatusFilter === "all") return searched;
-    return searched.filter((record) => {
+  }, [query, records]);
+  const skillStatusCounts = useMemo(() => {
+    const counts: Record<SkillStatusFilter, number> = { all: searchedRecords.length, available: 0, disabled: 0, missing_dependency: 0, invalid: 0, overridden: 0 };
+    if (kind !== "skills") return counts;
+    searchedRecords.forEach((record) => {
       const skill = record as SkillExtensionRecord;
-      if (skillStatusFilter === "overridden") return skill.active === false;
-      if (skillStatusFilter === "available") return skill.active !== false && skill.status === "available";
-      return skill.status === skillStatusFilter;
+      skillStatusOptions.slice(1).forEach((option) => {
+        if (skillMatchesStatus(skill, option.value)) counts[option.value] += 1;
+      });
     });
-  }, [kind, query, records, skillStatusFilter]);
+    return counts;
+  }, [kind, searchedRecords]);
+  const filtered = useMemo(() => {
+    if (kind !== "skills" || skillStatusFilter === "all") return searchedRecords;
+    return searchedRecords.filter((record) => skillMatchesStatus(record as SkillExtensionRecord, skillStatusFilter));
+  }, [kind, searchedRecords, skillStatusFilter]);
   const defaultStatusByName = useMemo(
     () => new Map(defaultSkillStatuses.map((item) => [item.name, item])),
     [defaultSkillStatuses],
@@ -241,7 +347,7 @@ export function ExtensionsPage({
       <main className="extensions-content">
         <div className="extensions-toolbar">
           <label className="extensions-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`搜索${meta.title}…`} aria-label={`搜索${meta.title}`} /></label>
-          {kind === "skills" ? <label className="extensions-status-filter">状态<select value={skillStatusFilter} onChange={(event) => setSkillStatusFilter(event.target.value)} aria-label="Skill 状态筛选"><option value="all">全部</option><option value="available">可用</option><option value="disabled">已停用</option><option value="missing_dependency">缺少依赖</option><option value="invalid">无效</option><option value="overridden">已覆盖</option></select></label> : null}
+          {kind === "skills" ? <SkillStatusSelect value={skillStatusFilter} counts={skillStatusCounts} onChange={setSkillStatusFilter} /> : null}
         </div>
 
         <div className="extensions-actions-row">
