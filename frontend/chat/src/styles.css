@@ -660,55 +660,6 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .thinking-trigger > svg:last-child, .tool-trigger > svg:last-child { margin-left: auto; transition: transform .15s ease; }
 [data-state="open"] > .thinking-trigger > svg:last-child, [data-state="open"] > .tool-trigger > svg:last-child { transform: rotate(180deg); }
 .thinking-content { color: #5d6965; font-size: 13px; }
-.tool-timeline { margin: 10px 0 13px; }
-.tool-group { padding: 3px 5px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--surface-2); }
-.tool-group.running { border-color: var(--primary-border); background: var(--primary-soft-2); }
-.tool-group.pending { border-color: var(--warning-border); background: var(--warning-soft); }
-.tool-group.error { border-color: var(--danger-border); background: var(--danger-soft); }
-.tool-group.unknown { border-color: var(--warning-border); background: var(--warning-soft); }
-.tool-group-trigger { display: flex; min-height: 28px; align-items: center; gap: 7px; width: 100%; padding: 2px; border: 0; background: transparent; color: var(--text-muted); cursor: pointer; font-size: 12px; text-align: left; }
-.tool-group-trigger:focus-visible, .tool-trigger:focus-visible { outline: 2px solid var(--primary-border); outline-offset: 2px; border-radius: 4px; }
-.tool-group-trigger > svg:last-child { margin-left: 3px; transition: transform .15s ease; }
-.tool-group[data-state="open"] > .tool-group-trigger > svg:last-child, .tool-step[data-state="open"] > .tool-trigger > svg:last-child { transform: rotate(180deg); }
-.tool-group-icon { display: inline-grid; flex: 0 0 22px; width: 22px; height: 22px; place-items: center; border-radius: 6px; background: var(--surface-3); color: var(--text-subtle); }
-.tool-group.completed .tool-group-icon { background: var(--primary-soft); color: var(--primary-icon); }
-.tool-group.running .tool-group-icon { color: var(--primary-active); }
-.tool-group.error .tool-group-icon { color: var(--danger-text); }
-.tool-group.pending .tool-group-icon { color: var(--warning-text); }
-.tool-group.unknown .tool-group-icon { color: var(--warning-text); }
-.tool-group-summary { display: flex; flex: 1 1 auto; min-width: 0; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap; }
-.tool-group-summary strong { flex: 0 0 auto; color: var(--text-strong); font-size: 12px; font-weight: 650; }
-.tool-group-separator { flex: 0 0 auto; color: var(--text-faint); }
-.tool-group-state { min-width: 0; overflow: hidden; color: var(--text-muted); text-overflow: ellipsis; }
-.tool-group-duration { flex: 0 0 auto; margin-left: auto; color: var(--text-subtle); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.tool-group-content { display: grid; gap: 2px; padding: 3px 0 1px; }
-.tool-step { min-width: 0; border-radius: 5px; }
-.tool-trigger { display: flex; min-height: 30px; align-items: center; gap: 8px; width: 100%; padding: 4px 6px; border: 0; border-radius: 6px; background: transparent; color: var(--text-muted); cursor: pointer; font-size: 12px; text-align: left; }
-.tool-trigger:hover { background: var(--surface-hover); }
-.tool-trigger strong { flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--text-strong); font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-.tool-icon { display: inline-grid; flex: 0 0 20px; width: 20px; height: 20px; place-items: center; color: var(--text-subtle); }
-.tool-step.completed .tool-icon, .tool-step.running .tool-icon { color: var(--text-subtle); }
-.tool-step.error .tool-icon, .tool-step.rejected .tool-icon { color: var(--danger); }
-.tool-step.approval-pending .tool-icon { color: var(--warning-text); }
-.tool-action { flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--text-muted); font-size: 13px; font-weight: 520; text-overflow: ellipsis; white-space: nowrap; }
-.tool-name { flex: 0 1 auto; max-width: min(180px, 24vw); color: var(--text-subtle) !important; font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 10px !important; font-weight: 500 !important; text-overflow: ellipsis; }
-.tool-name::before { content: "·"; margin-right: 6px; color: var(--text-faint); font-family: inherit; }
-.tool-target { min-width: 0; overflow: hidden; color: var(--text-subtle); text-overflow: ellipsis; white-space: nowrap; }
-.tool-status-label { margin-left: auto; color: var(--text-subtle); white-space: nowrap; }
-.tool-step.running .tool-status-label { color: var(--primary-active); }
-.tool-step.error .tool-status-label, .tool-step.rejected .tool-status-label { color: var(--danger-text); }
-.tool-step.approval-pending .tool-status-label { color: var(--warning-text); }
-.tool-duration { color: var(--text-faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.tool-trigger > svg:last-child { flex: 0 0 auto; color: var(--text-faint); transition: transform .15s ease; }
-.tool-detail { max-height: min(240px, 32vh); margin: 0 0 4px 27px; padding: 7px 9px; overflow-y: auto; border: 1px solid var(--border-soft); border-radius: 5px; background: var(--surface-2); color: var(--text-muted); font-size: 11px; }
-.tool-detail-grid { display: grid; gap: 4px; margin: 0; }
-.tool-detail-grid > div { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 8px; align-items: baseline; }
-.tool-detail-grid dt { color: var(--text-subtle); }
-.tool-detail-grid dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--text); font-variant-numeric: tabular-nums; }
-.tool-result-preview, .tool-unknown-note { margin: 7px 0 0; overflow-wrap: anywhere; white-space: pre-wrap; }
-.tool-result-preview { color: var(--text-muted); }
-.tool-unknown-note { color: var(--warning-text); }
-.tool-orphan-approval { padding: 4px 0; }
 .approval-inline { margin: 5px 0 4px; box-shadow: none; }
 
 .attachment-gallery { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
@@ -1199,12 +1150,6 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
   .approval-wrap { padding-top: 6px; }
   .approval-body { max-height: min(190px, 28vh); }
   .approval-arguments > div { grid-template-columns: 76px minmax(0, 1fr); }
-  .tool-group { padding: 3px 4px; }
-  .tool-group-content { padding-left: 0; }
-  .tool-group-trigger, .tool-trigger { min-height: 36px; }
-  .tool-target { max-width: 32vw; }
-  .tool-detail { margin-left: 22px; }
-  .tool-status-label { display: none; }
   .composer-actions { flex-wrap: wrap; }
   .model-route-control { order: -1; width: 100%; max-width: 100%; justify-content: center; margin-left: 0; }
   .model-route-control + .send-button { margin-left: auto; }

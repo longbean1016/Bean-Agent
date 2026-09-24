@@ -9,9 +9,10 @@ afterEach(() => { cleanup(); markdownRender.mockClear(); });
 
 it("活动消息更新 20 次时，100 条未变化历史正文不重复解析", () => {
   const history: ChatMessage[] = Array.from({ length: 100 }, (_, index) => ({ id: `message-${index}`, role: "assistant", content: `历史 ${index}`, thinking: "", media: [], tools: [] }));
+  const store = new Map<string, boolean>();
   const active: ChatMessage = { id: "active", turnId: "turn", role: "assistant", content: "起始", thinking: "", media: [], tools: [], streaming: true };
   const tree = (message: ChatMessage) => <>{[...history, message].map((item) => <MessageView key={item.id} message={item}
-    navigationTurnId="" approvals={[]} approvalDecisionRequests={{}} />)}</>;
+    sessionId="web:test" toolDisclosure={store} navigationTurnId="" approvals={[]} approvalDecisionRequests={{}} />)}</>;
   const view = render(tree(active));
   expect(markdownRender).toHaveBeenCalledTimes(101);
   markdownRender.mockClear();

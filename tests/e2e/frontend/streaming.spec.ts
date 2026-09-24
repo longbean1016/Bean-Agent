@@ -24,6 +24,63 @@ async function openSimulation(page: Page, historyTurns = 0): Promise<WebSocketRo
   return socket;
 }
 
+test("工具默认收起、转圈和手动展开保持，审批原卡片与错误在收起时可见", async ({ page }, testInfo) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const socket = await openSimulation(page);
+  const send = (frame: object) => socket.send(JSON.stringify({ session_id: sessionId, turn_id: turnId, ...frame }));
+  send({ type: "react.tool.started", call_id: "read", tool_name: "read_file", arguments: { path: "weather.json" } });
+  send({ type: "react.tool.completed", call_id: "read", tool_name: "read_file", status: "completed", result_preview: "已读取查询配置", duration_ms: 100 });
+  send({ type: "react.tool.started", call_id: "weather", tool_name: "web_search", arguments: { query: "深圳南山天气" } });
+  const group = page.locator(".tool-group-trigger");
+  await expect(group).toHaveAttribute("aria-expanded", "false");
+  await expect(group).toContainText("1 / 2 已完成");
+  await expect(group.locator(".tool-group-icon .lucide-wrench")).toBeVisible();
+  await expect(page.locator(".tool-group")).toHaveCSS("border-top-width", "0px");
+  await expect(page.locator(".tool-group")).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  await expect(page.locator(".tool-running-spinner")).toBeVisible();
+  await group.focus();
+  await page.keyboard.press("Enter");
+  const tool = page.locator(".tool-trigger").filter({ hasText: "web_search" });
+  await expect(tool).toHaveAttribute("aria-expanded", "false");
+  await expect(tool.locator(".tool-status-label")).toBeVisible();
+  await expect(tool.locator(".tool-icon .lucide-earth")).toBeVisible();
+  await expect(tool.locator(".tool-status-label .tool-running-spinner")).toBeVisible();
+  await expect(page.locator(".tool-trigger").filter({ hasText: "read_file" }).locator(".tool-status-label .lucide-check")).toBeVisible();
+  await tool.click();
+  await expect(tool).toHaveAttribute("aria-expanded", "true");
+  send({ type: "answer.delta", delta: "正在整理天气信息。" });
+  await expect(page.getByText("正在整理天气信息。", { exact: true })).toBeVisible();
+  await expect(group).toHaveAttribute("aria-expanded", "true");
+  await expect(tool).toHaveAttribute("aria-expanded", "true");
+  await tool.click();
+  await page.screenshot({ path: `.pytest_artifacts/tools-running-${testInfo.project.name}.png`, animations: "disabled" });
+  await page.getByRole("button", { name: "深色", exact: true }).click();
+  await page.screenshot({ path: `.pytest_artifacts/tools-dark-${testInfo.project.name}.png`, animations: "disabled" });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect(group.locator(".tool-running-spinner")).toHaveCSS("animation-name", "none");
+  await expect(tool.locator(".tool-running-spinner")).toHaveCSS("animation-name", "none");
+  await group.click();
+  send({ type: "approval.requested", approval: { id: "approval", call_id: "weather", session_id: sessionId, turn_id: turnId,
+    tool_name: "web_search", operation: "联网查询", arguments: {}, summary: "允许本次联网查询", reason: "测试审批", requested_mode: "read-only", state: "pending", created_at: "2026-09-25T00:00:00Z" } });
+  await expect(group).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator(".tool-running-spinner")).toHaveCount(0);
+  await expect(page.getByLabel("待处理权限审批")).toBeVisible();
+  await expect(page.getByRole("button", { name: "仅允许本次" })).toBeEnabled();
+  send({ type: "approval.resolved", approval_id: "approval", decision: "allowed-once", call_id: "weather", request_id: "mock" });
+  send({ type: "react.tool.completed", call_id: "weather", tool_name: "web_search", status: "error", result_preview: "测试错误：天气服务暂时不可用", duration_ms: 500 });
+  await expect(page.getByLabel("待处理权限审批")).toHaveCount(0);
+  await expect(page.locator(".tool-group-errors")).toContainText("天气服务暂时不可用");
+  await expect(group.locator(".tool-status-error")).toHaveText("1 项失败");
+  await expect(group.locator(".tool-status-error .lucide-x")).toBeVisible();
+  await expect(group.locator(".lucide-check")).toHaveCount(0);
+  await page.screenshot({ path: `.pytest_artifacts/tools-error-${testInfo.project.name}.png`, animations: "disabled" });
+  await expect(group).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator(".tool-running-spinner")).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(errors).toEqual([]);
+});
+
 test("长历史流式输出尾字完整，向上阅读不被拉回，结束后代码复制可用", async ({ page }) => {
   const socket = await openSimulation(page, 30);
   const send = (frame: object) => socket.send(JSON.stringify({ session_id: sessionId, turn_id: turnId, ...frame }));
