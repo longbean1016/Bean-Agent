@@ -612,6 +612,7 @@ def build_core_runtime(
         SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
         MessageEnvelopeBuilder(),
     )
+    shell_tool = tools.get_tool("shell")
     pipeline = Pipeline(
         main_provider,
         tools,
@@ -646,6 +647,7 @@ def build_core_runtime(
         skill_snapshot_loader=sessions.load_skill_snapshot,
         skill_snapshot_writer=sessions.save_skill_snapshot,
         mcp_tool_names_loader=load_session_project_mcp_tools,
+        shell_environment_loader=getattr(shell_tool, "environment_context", None),
     )
     agent_loop = AgentLoop(
         messages,

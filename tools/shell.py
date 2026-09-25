@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import os
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path, PureWindowsPath
@@ -17,9 +19,12 @@ from urllib.parse import urlparse
 
 from sandbox.errors import SandboxError
 from sandbox.guard import SandboxGuard
-from sandbox.runtime import SandboxProcessRuntime
+from sandbox.runtime import SandboxProcessRuntime, SandboxRunResult
 from sandbox.shell import SandboxShellBroker
+from sandbox.environment_probe import shell_executable
+from sandbox.shell_environment import ShellEnvironmentCache
 from tools.base import Tool
+from tools.shell_diagnostics import allows_permission_retry, command_name, diagnose
 
 _DEFAULT_TIMEOUT = 60
 _MAX_TIMEOUT = 600
@@ -47,8 +52,8 @@ _RESTRICTED_SHELL_RUNNERS = frozenset(
 )
 
 
-def _err(message: str) -> str:
-    return json.dumps({"error": message}, ensure_ascii=False)
+def _err(message: str, code: str = "shell_validation_rejected") -> str:
+    return json.dumps({"error": message, "diagnostic_code": code}, ensure_ascii=False)
 
 
 def _split_command(command: str) -> list[str]:
@@ -93,7 +98,7 @@ def _validate_network_command(command: str) -> str | None:
         tokens = _split_command(command)
     except ValueError:
         return "命令解析失败，请检查引号是否匹配"
-    if not tokens or tokens[0].lower() not in _NETWORK_CMDS:
+    if not tokens or command_name(tokens[0]) not in _NETWORK_CMDS:
         return None
     for token in tokens[1:]:
         lowered = token.lower()
@@ -151,7 +156,7 @@ def _validate_command(
         return "命令解析失败，请检查引号是否匹配"
     if not tokens:
         return None
-    base_command = tokens[0].lower()
+    base_command = command_name(tokens[0])
     if not allow_network and base_command in _NETWORK_CMDS:
         return "当前 shell 配置禁止网络访问"
 
@@ -164,7 +169,7 @@ def _validate_command(
         # 受限模式禁止 Shell 元字符，因为它们会产生无法逐 token 审计的第二条命令。
         if any(marker in command for marker in _RESTRICTED_META_CHARS):
             return "受限 shell 禁止管道、重定向或串联命令"
-        if base_command in _RESTRICTED_SHELL_RUNNERS:
+        if tokens[0].lower() in _RESTRICTED_SHELL_RUNNERS:
             return f"受限 shell 禁止启动解释器或二级 shell：{base_command}"
         for token in tokens[1:]:
             if token.startswith("-") or token == "--":
@@ -261,6 +266,38 @@ class ShellTool(Tool):
             if sandbox_runtime is not None
             else None
         )
+        self._environment_cache = ShellEnvironmentCache()
+
+    async def environment_context(self, session_key: str) -> str:
+        try:
+            policy = self._sandbox_guard.policy(session_key) if self._sandbox_guard is not None else None
+            cwd = (policy.cwd if policy is not None else self._working_dir or self._restricted_dir or Path.cwd()).resolve()
+        except (SandboxError, OSError, ValueError):
+            return "命令环境不可用：无法解析当前会话权限，请勿猜测解释器路径。"
+        environment = os.environ.copy()
+        # 仅把摘要用于缓存隔离，绝不将完整环境或凭据写入提示。
+        fingerprint = hashlib.sha256(json.dumps(environment, sort_keys=True).encode()).hexdigest()
+        key = (session_key, str(cwd), policy.mode if policy else "standalone", str(policy.temp_dir) if policy else "", fingerprint)
+
+        async def probe() -> SandboxRunResult:
+            argv = [sys.executable, "-I", "-S", str(Path(__file__).resolve().parents[1] / "sandbox" / "environment_probe.py")]
+            if policy is not None:
+                if self._sandbox_runtime is None:
+                    raise ValueError("缺少受控执行环境")
+                return await self._sandbox_runtime.run(policy, argv, cwd=cwd, env=environment, timeout=8)
+            process = await asyncio.create_subprocess_exec(*argv, **_subprocess_options(cwd, environment))
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=8)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                try:
+                    _kill_process_tree(process)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                await process.communicate()
+                raise
+            return SandboxRunResult(stdout, stderr, process.returncode or 0, False)
+
+        return (await self._environment_cache.get(key, probe)).text
 
     @property
     def description(self) -> str:
@@ -268,6 +305,9 @@ class ShellTool(Tool):
             "在 shell 中执行前台命令并返回结构化输出。使用绝对路径，避免依赖 cd。"
             "网络命令仅允许公网 HTTP(S) 且禁止上传和写文件；输出超过 30000 字符自动截断。"
             "不得用 shell 替代 read_file、web_fetch、list_dir 等专用工具。"
+            "Windows 使用 CMD 语法，curl.exe 请求必须显式带 https://，用 -sS 保留错误并设置超时。"
+            "解释器使用本轮已验证的绝对路径，不假定 python/py 可用；组合命令的退出码不能代表每一步。"
+            "删除或移动失败可能已部分完成，检查目标后再决定下一步，不盲目重试。"
         )
 
     @property
@@ -318,7 +358,7 @@ class ShellTool(Tool):
             tokens = _split_command(command)
         except ValueError:
             return _err("命令解析失败，请检查引号是否匹配")
-        base_command = tokens[0].lower() if tokens else ""
+        base_command = command_name(tokens[0]) if tokens else ""
         if base_command in _BANNED:
             return _err(f"命令 '{base_command}' 不被允许（安全限制）")
         validation_error = _validate_command(
@@ -350,6 +390,7 @@ class ShellTool(Tool):
                     exit_code != 0
                     and policy.mode != "danger-full-access"
                     and _looks_access_denied(stdout, stderr)
+                    and allows_permission_retry(command)
                     and self._sandbox_guard is not None
                 ):
                     authorized = await self._sandbox_guard.authorize_shell_retry(
@@ -376,6 +417,7 @@ class ShellTool(Tool):
             else:
                 process = await asyncio.create_subprocess_shell(
                     command,
+                    executable=shell_executable(),
                     **_subprocess_options(cwd, os.environ.copy()),
                 )
                 interrupted = False
@@ -396,9 +438,13 @@ class ShellTool(Tool):
                     raise
                 exit_code = -1 if interrupted else (process.returncode or 0)
         except SandboxError as error:
-            return _err(str(error))
+            return _err(str(error), "shell_sandbox_error")
+        except OSError:
+            return json.dumps({"error": "无法启动命令，请检查实际 Shell、工作目录及执行权限。", "diagnostic_code": "shell_launch_failed"}, ensure_ascii=False)
 
-        output = _decode_process_output(stdout) + _decode_process_output(stderr)
+        stdout_text, stderr_text = _decode_process_output(stdout), _decode_process_output(stderr)
+        diagnostic = diagnose(command, exit_code, interrupted, stdout_text, stderr_text, windows=_IS_WINDOWS)
+        output = stdout_text + stderr_text
         if not output:
             output = "（无输出）"
         elif exit_code != 0 and not interrupted:
@@ -425,6 +471,12 @@ class ShellTool(Tool):
                 "truncation": truncation,
                 "full_output_path": full_output_path,
                 "description": description,
+                **({
+                    "diagnostic_code": diagnostic.code,
+                    "diagnostic_message": diagnostic.message,
+                    # 非零退出和中断沿用现有终态码；只为零退出假成功补充 error。
+                    **({"error": diagnostic.message} if exit_code == 0 and not interrupted else {}),
+                } if diagnostic else {}),
             },
             ensure_ascii=False,
         )

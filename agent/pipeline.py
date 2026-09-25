@@ -226,6 +226,7 @@ class Pipeline:
         skill_snapshot_loader: SkillSnapshotLoader | None = None,
         skill_snapshot_writer: SkillSnapshotWriter | None = None,
         mcp_tool_names_loader: McpToolNamesLoader | None = None,
+        shell_environment_loader: Callable[[str], Awaitable[str]] | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -256,6 +257,7 @@ class Pipeline:
         self._skill_snapshot_loader = skill_snapshot_loader
         self._skill_snapshot_writer = skill_snapshot_writer
         self._mcp_tool_names_loader = mcp_tool_names_loader
+        self._shell_environment_loader = shell_environment_loader
         # 中断快照只服务于当前进程内的停止/续跑语义，不进入 Session 或长期记忆。
         self._interrupt_snapshots: dict[str, dict[str, Any]] = {}
         # 工具起点的单调时钟只保存在进程内，用于取消/异常时补算终态耗时；
@@ -429,6 +431,11 @@ class Pipeline:
             skills=turn_skills,
             active_skill_names=active_skills,
             deferred_tools_hint=deferred_hint,
+            shell_environment=(
+                await self._shell_environment_loader(message.session_key)
+                if self._shell_environment_loader is not None and "shell" in names
+                else ""
+            ),
         )
         current_content = await build_current_user_content(
             message.content,

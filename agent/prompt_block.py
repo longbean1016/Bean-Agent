@@ -33,6 +33,7 @@ class TurnContext:
     skills: SkillsPromptApi | None = None
     active_skill_names: list[str] = field(default_factory=list)
     deferred_tools_hint: str = ""
+    shell_environment: str = ""
 
 
 class PromptBlock(Protocol):
@@ -148,7 +149,8 @@ class SessionContextPromptBlock(_Block):
     priority, label = 40, "session_context"
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str:
         # 当前时间放在消息信封中，避免每轮改变 system 前缀并破坏供应商 Prompt Cache。
-        return f"## 会话环境\n- 通道: {ctx.channel}\n- 会话 ID: {ctx.chat_id}"
+        session = f"## 会话环境\n- 通道: {ctx.channel}\n- 会话 ID: {ctx.chat_id}"
+        return f"{session}\n\n{ctx.shell_environment}" if ctx.shell_environment else session
 
 
 class ActiveToolsPromptBlock(_Block):

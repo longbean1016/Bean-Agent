@@ -144,3 +144,34 @@ async def test_shell_retries_exact_command_after_allowed_once(tmp_path: Path) ->
     assert target.read_text(encoding="utf-8").strip() == "approved"
     assert len(published) == 1
     assert published[0].arguments["command"] == command
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL 后端只在 Windows 验证")
+@pytest.mark.asyncio
+async def test_environment_probe_uses_real_read_only_sandbox(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    store = SessionStore(data_root / "sessions.db")
+    store.create_session("web:probe")
+    resolver = SandboxPolicyResolver(store, data_root=data_root, runtime_temp_root=tmp_path / "runtime")
+    runtime = SandboxProcessRuntime(resolver)
+    approvals = ApprovalCoordinator(store)
+    tool = ShellTool(sandbox_guard=SandboxGuard(resolver, approvals), sandbox_runtime=runtime)
+    protected = tmp_path / "protected.txt"
+    protected.write_text("keep", encoding="utf-8")
+    try:
+        text = await tool.environment_context("web:probe")
+        assert "cmd.exe" in text
+        assert "已验证 python" in text
+        assert json.dumps(str(resolver.resolve("web:probe").cwd), ensure_ascii=False) in text
+        deletion = json.loads(await tool.execute(
+            command=f'del /q "{protected}"', description="验证受限删除", session_key="web:probe",
+            turn_id="probe-turn", call_id="delete-call",
+        ))
+        assert deletion["diagnostic_code"] in {"shell_partial_failure", "shell_access_denied"}
+        assert protected.read_text(encoding="utf-8") == "keep"
+        if deletion["exit_code"] == 0:
+            assert deletion["error"]
+    finally:
+        await approvals.close()
+        await runtime.close()
+        store.close()

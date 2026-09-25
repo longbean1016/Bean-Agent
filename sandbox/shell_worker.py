@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from environment_probe import shell_executable
+
 
 def main() -> int:
     if len(sys.argv) != 2:
@@ -14,7 +16,7 @@ def main() -> int:
     try:
         command = Path(sys.argv[1]).read_text(encoding="utf-8")
         # worker 已处于受限 Token 和 Job 中，系统 Shell 及其后代会继承两者。
-        return int(subprocess.run(command, shell=True, check=False).returncode)
+        return int(subprocess.run(command, shell=True, executable=shell_executable(), check=False).returncode)
     except Exception as error:
         print(f"bean-sandbox-shell: {error}", file=sys.stderr)
         return 127
