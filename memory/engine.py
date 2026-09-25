@@ -34,6 +34,7 @@ from memory.injection_planner import InjectionPlanner
 from memory.implicit_extractor import ImplicitLongTermExtractor, ImplicitMemoryDraft
 from memory.md_store import MarkdownMemoryStore
 from memory.memorizer import Memorizer
+from memory.metadata import serialize_memory_metadata
 from memory.optimizer import MemoryOptimizer
 from memory.post_response_worker import PostResponseMemoryWorker
 from memory.query_builder import build_memory_queries, build_procedure_queries
@@ -283,6 +284,8 @@ class MemoryEngine:
         summary = mutation.summary.strip()
         if not summary:
             return MemoryMutationResult(status="ignored", actual_kind=mutation.memory_kind)
+        # 非工具入口也必须先校验，避免向量化、去重决策之后才发现元数据不能落库。
+        serialize_memory_metadata(mutation.metadata)
         metadata = dict(mutation.metadata)
         actual_kind = mutation.memory_kind.strip() or "preference"
         if actual_kind == "procedure":

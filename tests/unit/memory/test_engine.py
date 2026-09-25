@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -88,6 +89,93 @@ async def test_engine_remember_query_evidence_and_forget(tmp_path: Path) -> None
     assert recalled.records[0].evidence[0].source_ref == "web:c:0"
     assert forgotten.affected_ids == [written.item_id]
     assert after.records == []
+
+
+@pytest.mark.asyncio
+async def test_engine_validates_metadata_before_embedding_or_write(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    embedder = Embedder()
+    embedder.embed = AsyncMock(return_value=[1.0, 0.0])
+    engine = MemoryEngine(tmp_path, embedder, Provider(), sessions, config=config)
+    try:
+        with pytest.raises(ValueError, match="记忆元数据"):
+            await engine.mutate(MemoryMutation(kind="remember", summary="模拟记忆", metadata={"runtime": object()}))
+        embedder.embed.assert_not_awaited()
+        assert engine._store._db.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0] == 0
+    finally:
+        await engine.close()
+        sessions.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("memory_kind", ["event", "profile", "preference", "procedure"])
+async def test_pipeline_memorize_with_skill_snapshot_persists_only_business_metadata(tmp_path: Path, memory_kind: str) -> None:
+    from agent.event_bus import EventBus
+    from agent.pipeline import Pipeline
+    from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
+    from agent.prompt_block import SectionCache, SystemPromptBuilder, default_prompt_blocks
+    from agent.provider import LLMResponse, ToolCall
+    from agent.skills import SkillsLoader, SkillSnapshotView
+    from tools.memorize import MemorizeTool
+    from tools.registry import ToolRegistry
+
+    class ToolProvider:
+        calls = 0
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(None, [ToolCall("memory-call", "memorize", {
+                    "summary": "用户要求发布前运行测试", "memory_kind": memory_kind,
+                    "tool_requirement": "pytest", "steps": ["执行测试"],
+                })])
+            return LLMResponse("完成")
+
+    class CheckedMemorizeTool(MemorizeTool):
+        async def execute(self, **kwargs):
+            assert isinstance(kwargs.get("_skills_view"), SkillSnapshotView)
+            return await super().execute(**kwargs)
+
+    async def load_snapshot(session_key):
+        return {"revision": "test", "skills": []}
+
+    async def save_snapshot(session_key, snapshot):
+        return snapshot
+
+    sessions = SessionStore(tmp_path / "sessions.db")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    try:
+        tools = ToolRegistry()
+        tools.register(CheckedMemorizeTool(engine, engine.tool_profile().memorize))
+        pipeline = Pipeline(
+            ToolProvider(), tools, EventBus(),
+            PromptAssembler(SystemPromptBuilder(default_prompt_blocks(), SectionCache()), MessageEnvelopeBuilder()),
+            workspace=str(tmp_path), skills=SkillsLoader(tmp_path, builtin_skills_dir=None),
+            skill_snapshot_loader=load_snapshot, skill_snapshot_writer=save_snapshot,
+        )
+        result = await pipeline.process(InboundMessage("web", "u", "c", "请记住发布前运行测试", metadata={
+            "current_user_source_ref": "web:c:8",
+        }), turn_id="memory-turn")
+        call = result.tool_chain[0]["calls"][0]
+        assert call["status"] == "ok"
+        assert "已记住" in call["result"]
+        row = engine._store._db.execute("SELECT id FROM memory_items").fetchone()
+        item = engine._store.get_items_by_ids([row[0]])[0]
+        assert item["memory_type"] == memory_kind
+        assert item["source_ref"] == "web:c:8"
+        metadata = item["extra_json"]
+        assert metadata["tool_requirement"] == "pytest"
+        assert metadata["steps"] == ["执行测试"]
+        assert metadata["scope_channel"] == "web"
+        assert metadata["scope_chat_id"] == "c"
+        assert set(metadata) <= {"tool_requirement", "steps", "rule_schema", "scope_channel", "scope_chat_id"}
+    finally:
+        await engine.close()
+        sessions.close()
 
 
 @pytest.mark.asyncio

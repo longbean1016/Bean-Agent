@@ -28,6 +28,24 @@ def test_upsert_reinforces_duplicate_and_preserves_single_item(store: MemoryStor
     assert item["reinforcement"] == 2
 
 
+@pytest.mark.parametrize("operation", ["insert", "reinforce", "replace", "merge"])
+def test_invalid_metadata_cannot_change_existing_memory(store: MemoryStore2, operation: str) -> None:
+    saved = store.upsert_item("preference", "模拟原记忆", [1.0, 0.0, 0.0], extra={"valid": True})
+    item_id = saved.split(":", 1)[1]
+    before = store.get_items_by_ids([item_id])[0]
+    invalid = {"runtime": object()}
+    with pytest.raises(ValueError, match="记忆元数据"):
+        if operation in {"insert", "reinforce"}:
+            summary = "模拟原记忆" if operation == "reinforce" else "模拟新记忆"
+            store.upsert_item("preference", summary, [1.0, 0.0, 0.0], extra=invalid)
+        elif operation == "replace":
+            store.replace_item_atomic(item_id, "preference", "模拟新记忆", [1.0, 0.0, 0.0], "test", extra=invalid)
+        else:
+            store.merge_item_raw(item_id, "模拟新记忆", [1.0, 0.0, 0.0], invalid)
+    assert store.get_items_by_ids([item_id])[0] == before
+    assert store._db.execute("SELECT COUNT(*) FROM memory_items").fetchone()[0] == 1
+
+
 def test_vector_and_keyword_search_enforce_scope(store: MemoryStore2) -> None:
     store.upsert_item("event", "上海旅行计划", [1.0, 0.0, 0.0], "web:a:0", extra={"scope_channel": "web", "scope_chat_id": "a"})
     store.upsert_item("event", "上海天气记录", [0.9, 0.1, 0.0], "web:b:0", extra={"scope_channel": "web", "scope_chat_id": "b"})

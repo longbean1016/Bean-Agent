@@ -15,6 +15,7 @@ from typing import Any
 import sqlite_vec
 
 from memory.ranker import combine_scores, hotness_score
+from memory.metadata import serialize_memory_metadata
 
 
 class MemoryStore2:
@@ -94,6 +95,7 @@ class MemoryStore2:
         summary = str(summary).strip()
         if not memory_type or not summary:
             raise ValueError("memory_type 和 summary 不能为空")
+        extra_json = serialize_memory_metadata(extra if extra is not None else {})
         vector = self._validate_vector(embedding)
         digest = hashlib.sha256(summary.encode("utf-8")).hexdigest()[:16]
         now = datetime.now(timezone.utc).isoformat()
@@ -118,7 +120,7 @@ class MemoryStore2:
                 (id,memory_type,summary,content_hash,embedding,reinforcement,emotional_weight,
                  extra_json,source_ref,happened_at,status,created_at,updated_at)
                 VALUES (?,?,?,?,?,1,?,?,?,?, 'active',?,?)""",
-                (item_id, memory_type, summary, digest, json.dumps(vector), max(0, min(int(emotional_weight), 10)), json.dumps(extra or {}, ensure_ascii=False), source_ref, happened_at, now, now),
+                (item_id, memory_type, summary, digest, json.dumps(vector), max(0, min(int(emotional_weight), 10)), extra_json, source_ref, happened_at, now, now),
             )
             self._vec_insert(int(cursor.lastrowid), vector)
             self._db.commit()
@@ -408,6 +410,7 @@ class MemoryStore2:
     ) -> str:
         """在同一 SQLite 事务内插入新记忆并将旧记忆标记为 superseded。"""
 
+        extra_json = serialize_memory_metadata(extra if extra is not None else {})
         vector = self._validate_vector(embedding)
         digest = hashlib.sha256(summary.strip().encode("utf-8")).hexdigest()[:16]
         now = datetime.now(timezone.utc).isoformat()
@@ -427,7 +430,7 @@ class MemoryStore2:
                      extra_json,source_ref,happened_at,status,created_at,updated_at)
                     VALUES (?,?,?,?,?,1,?,?,?,?, 'active',?,?)""",
                     (new_item_id, memory_type, summary.strip(), digest, json.dumps(vector),
-                     max(0, min(int(emotional_weight), 10)), json.dumps(extra or {}, ensure_ascii=False),
+                     max(0, min(int(emotional_weight), 10)), extra_json,
                      source_ref, happened_at, now, now),
                 )
                 self._vec_insert(int(cursor.lastrowid), vector)
@@ -454,6 +457,7 @@ class MemoryStore2:
     def merge_item_raw(self, item_id: str, new_summary: str, new_embedding: list[float], new_extra: dict[str, object]) -> None:
         """原子更新合并目标，并同步主表与 vec 索引。"""
 
+        extra_json = serialize_memory_metadata(new_extra)
         vector = self._validate_vector(new_embedding)
         with self._lock:
             self._ensure_open()
@@ -466,7 +470,7 @@ class MemoryStore2:
             self._db.execute(
                 """UPDATE memory_items SET summary=?,content_hash=?,embedding=?,extra_json=?,
                    reinforcement=reinforcement+1,updated_at=? WHERE id=?""",
-                (new_summary.strip(), digest, json.dumps(vector), json.dumps(new_extra, ensure_ascii=False), datetime.now(timezone.utc).isoformat(), item_id),
+                (new_summary.strip(), digest, json.dumps(vector), extra_json, datetime.now(timezone.utc).isoformat(), item_id),
             )
             self._vec_delete([int(row["rowid"])])
             self._vec_insert(int(row["rowid"]), vector)
