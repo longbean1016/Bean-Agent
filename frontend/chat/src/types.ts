@@ -10,7 +10,8 @@ export type ToolStatus =
   | "unavailable"
   | "rejected"
   | "unknown";
-export type ApprovalState = "none" | "pending" | "submitting" | "allowed-once" | "rejected" | "cancelled" | "expired" | "unavailable";
+export type ApprovalState = "none" | "pending" | "submitting" | "allowed-once" | "allowed-session" | "rejected" | "cancelled" | "expired" | "unavailable";
+export type ApprovalDecision = "allowed-once" | "allowed-session" | "rejected";
 export type ThinkingStatus = "running" | "completed" | "interrupted";
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 
@@ -131,7 +132,12 @@ export interface ApprovalRequest {
   created_at: string;
   /** 后端可选的脱敏展示投影；前端不应自行解析原始 arguments。 */
   summary?: string;
+  category?: string;
+  action?: string;
+  scope_kind?: "paths" | "prefix" | "exact" | string;
+  display_scope?: string;
   scope?: string;
+  allow_session?: boolean;
   reason_code?: string;
   expires_at?: string;
   requested_at?: string;
@@ -146,7 +152,7 @@ export interface ResolvedApproval {
   session_id: string;
   turn_id?: string;
   call_id?: string;
-  decision?: "allowed-once" | "rejected" | "cancelled" | "expired" | "unavailable" | null;
+  decision?: ApprovalDecision | "cancelled" | "expired" | "unavailable" | null;
   state: ApprovalState;
   requested_at?: string;
   decided_at?: string;
@@ -154,6 +160,7 @@ export interface ResolvedApproval {
 }
 
 export interface ToolActivity {
+  memoryResult?: import("./turnPresentation").MemoryResult;
   callId: string;
   name: string;
   status: ToolStatus;
@@ -177,6 +184,7 @@ export interface ToolActivity {
 }
 
 export interface ChatMessage {
+  presentation?: import("./turnPresentation").TurnPresentation;
   id: string;
   seq?: number;
   role: "user" | "assistant";
@@ -475,13 +483,14 @@ export interface ModelSettingsPayload {
 }
 
 export type ChatFrame =
+  | { type: "turn.presentation"; session_id: string; turn_id: string; presentation: unknown }
   | { type: "session.created"; request_id: string; session_id: string }
   | { type: "session.updated"; session: SessionSummary }
   | { type: "session.subscribed"; request_id: string; session_id: string }
   | { type: "sandbox.updated"; request_id: string; sandbox: SandboxSnapshot }
   | { type: "approval.requested"; session_id: string; approval: ApprovalRequest }
-  | { type: "approval.resolved"; request_id: string; session_id: string; approval_id: string; decision?: "allowed-once" | "rejected" | "cancelled" | "expired" | "unavailable" | null; turn_id?: string; call_id?: string; state?: ApprovalState | string | null; decided_at?: string; error_code?: string }
-  | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; user_message?: string; user_media?: string[]; content?: string; thinking?: string; tools?: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments?: unknown; result_preview?: string; started_at?: string | null; ended_at?: string | null; duration_ms?: number | string | null; approval_id?: string | null; approval_state?: ApprovalState | string | null; approval_requested_at?: string | null; approval_resolved_at?: string | null; approval_wait_ms?: number | string | null; execution_ms?: number | string | null; group_duration_ms?: number | string | null; result_kind?: string | null; is_truncated?: boolean | null; exit_code?: number | string | null; error_code?: string | null }>; started_at?: string; status: "running" }
+  | { type: "approval.resolved"; request_id: string; session_id: string; approval_id: string; decision?: ApprovalDecision | "cancelled" | "expired" | "unavailable" | null; turn_id?: string; call_id?: string; state?: ApprovalState | string | null; decided_at?: string; error_code?: string }
+  | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; presentation?: unknown; user_message?: string; user_media?: string[]; content?: string; thinking?: string; tools?: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments?: unknown; result_preview?: string; started_at?: string | null; ended_at?: string | null; duration_ms?: number | string | null; approval_id?: string | null; approval_state?: ApprovalState | string | null; approval_requested_at?: string | null; approval_resolved_at?: string | null; approval_wait_ms?: number | string | null; execution_ms?: number | string | null; group_duration_ms?: number | string | null; result_kind?: string | null; is_truncated?: boolean | null; exit_code?: number | string | null; error_code?: string | null }>; started_at?: string; status: "running" }
   | { type: "turn.queued"; request_id: string; session_id: string; position: number }
   | { type: "turn.started"; request_id?: string; session_id: string; turn_id: string }
   | { type: "context.compaction.started"; session_id: string; turn_id: string; trigger: string; estimated_tokens: number }
@@ -490,8 +499,8 @@ export type ChatFrame =
   | { type: "context.usage.reset"; session_id: string }
   | { type: "context.usage.updated"; session_id: string; turn_id: string; used_tokens: number; context_window: number; soft_limit_tokens: number; hard_input_tokens: number; context_window_source: string; estimate_source: string; breakdown: Record<string, number>; sections: Array<{ name: string; estimated_tokens: number; static: boolean; cache_hit: boolean }>; pressure_tokens?: number; projected_tokens?: number; surface_tokens?: number; system_tokens?: number; tools_tokens?: number; message_tokens?: number; as_of_seq?: number; model_runtime_id?: string; model?: string }
   | { type: "session.usage.updated"; session_id: string; turn_id: string; total_uncached_input_tokens: number; total_cache_read_tokens: number; total_cache_write_tokens: number; total_input_tokens: number; cache_hit_rate: number | null; total_output_tokens: number }
-  | { type: "answer.delta"; session_id: string; turn_id: string; delta: string }
-  | { type: "react.thinking.delta"; session_id: string; turn_id: string; delta: string }
+  | { type: "answer.delta"; session_id: string; turn_id: string; delta: string; part_id?: string }
+  | { type: "react.thinking.delta"; session_id: string; turn_id: string; delta: string; part_id?: string }
   | { type: "react.tool.started"; session_id: string; turn_id: string; call_id: string; tool_name: string; arguments: unknown; started_at?: string; approval_id?: string; approval_state?: ApprovalState | string; approval_requested_at?: string | null }
   | { type: "react.tool.completed"; session_id: string; turn_id: string; call_id: string; tool_name: string; status: string; result_preview: string; started_at?: string; ended_at?: string; duration_ms?: number | string | null; approval_requested_at?: string; approval_resolved_at?: string; approval_wait_ms?: number | string | null; execution_ms?: number | string | null; group_duration_ms?: number | string | null; result_kind?: string; is_truncated?: boolean; exit_code?: number | string | null; error_code?: string }
   | { type: "message.final"; request_id?: string; session_id: string; turn_id: string; content: string; thinking?: string; media?: string[]; message_id?: string; metadata?: Record<string, unknown> }

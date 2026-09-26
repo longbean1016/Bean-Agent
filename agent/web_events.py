@@ -17,6 +17,7 @@ from agent.event_bus import (
     SessionUsageUpdated,
     SessionUpdated,
     StreamDeltaReady,
+    TurnPresentationUpdated,
     ToolCallCompleted,
     ToolCallStarted,
     TurnQueued,
@@ -42,6 +43,7 @@ WebLifecycleEvent: TypeAlias = (
     | TurnQueued
     | TurnQueueRejected
     | StreamDeltaReady
+    | TurnPresentationUpdated
     | ToolCallStarted
     | ToolCallCompleted
     | SandboxApprovalRequested
@@ -171,6 +173,11 @@ class WebEventMapper:
                 "code": event.reason,
                 "message": messages.get(event.reason, "消息暂时无法处理"),
             })
+        if isinstance(event, TurnPresentationUpdated):
+            return _mapped(event.session_key, {
+                "type": "turn.presentation", "session_id": event.session_key,
+                "turn_id": event.turn_id, "presentation": event.presentation,
+            })
         if isinstance(event, StreamDeltaReady):
             payloads: list[JsonPayload] = []
             # 同一事件含双 delta 时正文必须先到，保持前端 reducer 的既有时序。
@@ -180,6 +187,7 @@ class WebEventMapper:
                     "session_id": event.session_key,
                     "turn_id": event.turn_id,
                     "delta": event.content_delta,
+                    **({"part_id": event.content_part_id} if event.content_part_id else {}),
                 })
             if event.thinking_delta:
                 payloads.append({
@@ -187,6 +195,7 @@ class WebEventMapper:
                     "session_id": event.session_key,
                     "turn_id": event.turn_id,
                     "delta": event.thinking_delta,
+                    **({"part_id": event.thinking_part_id} if event.thinking_part_id else {}),
                 })
             return MappedWebEvent(event.session_key, tuple(payloads))
         if isinstance(event, ToolCallStarted):
@@ -359,6 +368,8 @@ class WebEventMapper:
                 if text:
                     payload[key] = text
         raw_media = snapshot.get("user_media")
+        if isinstance(snapshot.get("presentation"), dict):
+            payload["presentation"] = snapshot["presentation"]
         if isinstance(raw_media, list):
             payload["user_media"] = [str(item) for item in raw_media if isinstance(item, str)]
         raw_tools = snapshot.get("tools")
@@ -532,7 +543,12 @@ _APPROVAL_PUBLIC_FIELDS = (
     "requested_at",
     "expires_at",
     "summary",
+    "category",
+    "action",
+    "scope_kind",
+    "display_scope",
     "scope",
+    "allow_session",
     "reason_code",
 )
 
@@ -561,7 +577,10 @@ def _project_approval_request(value: object) -> dict[str, Any]:
             continue
         if raw is None:
             continue
-        if key in {"operation", "reason", "summary", "scope", "reason_code"}:
+        if key in {
+            "operation", "reason", "summary", "category", "action",
+            "scope_kind", "display_scope", "scope", "reason_code",
+        }:
             text = str(raw).strip()
             if text:
                 projected[key] = project_result_preview(text)

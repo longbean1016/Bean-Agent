@@ -20,6 +20,7 @@ from agent.event_bus import (
     SessionUsageUpdated,
     SessionUpdated,
     StreamDeltaReady,
+    TurnPresentationUpdated,
     ToolCallCompleted,
     ToolCallStarted,
     TurnQueued,
@@ -58,6 +59,7 @@ _WEB_EVENT_TYPES = (
     TurnQueued,
     TurnQueueRejected,
     StreamDeltaReady,
+    TurnPresentationUpdated,
     ToolCallStarted,
     ToolCallCompleted,
     SandboxApprovalRequested,
@@ -255,7 +257,7 @@ class WebChannel:
                     "request_id": request_id,
                     "session_id": session_key,
                     "approval_id": approval_id,
-                    "decision": outcome if outcome in {"allowed-once", "rejected"} else None,
+                    "decision": outcome if outcome in {"allowed-once", "allowed-session", "rejected"} else None,
                     "state": outcome,
                 })
             return

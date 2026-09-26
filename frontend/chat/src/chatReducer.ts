@@ -1,5 +1,6 @@
 import type { ApprovalRequest, ChatAction, ChatMessage, ChatState, ContextUsage, MessageRow, ModelAdapterId, ProactiveNotificationRow, ResolvedApproval, SessionUsage, ToolActivity, ToolStatus, TurnRuntimeState } from "./types";
 import { reconcileMessages } from "./timeline";
+import { appendProcessDelta, readPresentation } from "./turnPresentation";
 
 export const idleTurnState: TurnRuntimeState = {
   status: "idle",
@@ -417,6 +418,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
         : existingAssistant?.thinkingStatus,
       media: existingAssistant?.media ?? [],
       tools: mergeTools(existingAssistant?.tools ?? [], incomingTools),
+      presentation: readPresentation(action.presentation) ?? existingAssistant?.presentation,
       streaming: true,
       timestamp: existingAssistant?.timestamp ?? snapshotTimestamp,
     };
@@ -438,12 +440,19 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       error: current ? "" : state.error,
     };
   }
+  if (action.type === "turn.presentation") {
+    const presentation = readPresentation(action.presentation);
+    if (!presentation) return state;
+    return updateSessionTurn(state, action.session_id, action.turn_id, (message) =>
+      isClosedMessage(message) ? message : { ...message, presentation, streaming: true });
+  }
   if (action.type === "answer.delta") {
     return updateSessionTurn(state, action.session_id, action.turn_id, (message) => {
       if (isClosedMessage(message)) return message;
       return {
         ...message,
         content: message.content + action.delta,
+        presentation: appendProcessDelta(message.presentation, action.part_id, "text", action.delta),
         streaming: true,
       };
     });
@@ -454,6 +463,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       return {
         ...message,
         thinking: message.thinking + action.delta,
+        presentation: appendProcessDelta(message.presentation, action.part_id, "thinking", action.delta),
         streaming: true,
         thinkingStatus: message.thinkingStatus === "completed" ? "completed" : "running",
       };
@@ -647,12 +657,13 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     const next = updateSessionTurn(state, action.session_id, finalTurnId, (message) => {
       const timestamp = String(action.metadata?.generated_at || "")
         || (message.streaming ? finalReceivedAt : message.timestamp);
-      const durationMs = message.durationMs
-        ?? metadataDuration
+      const durationMs = metadataDuration
+        ?? message.durationMs
         ?? (isRuntimeMessage(turnUser) ? elapsedDurationMs(turnUser?.timestamp, timestamp) : undefined);
       return {
         ...message,
         content: action.content || message.content,
+        presentation: readPresentation(action.metadata?.presentation) ?? message.presentation,
         thinking: action.thinking || message.thinking,
         thinkingStatus: (action.thinking || message.thinking) ? "completed" : message.thinkingStatus,
         media: action.media ?? message.media,
@@ -845,7 +856,7 @@ function isTerminalApprovalState(state: ToolActivity["approvalState"]): boolean 
 
 function normalizeApprovalState(value: unknown): NonNullable<ToolActivity["approvalState"]> {
   const state = String(value ?? "").trim().toLowerCase();
-  if (state === "pending" || state === "submitting" || state === "allowed-once"
+  if (state === "pending" || state === "submitting" || state === "allowed-once" || state === "allowed-session"
     || state === "rejected" || state === "cancelled" || state === "expired" || state === "unavailable") {
     return state;
   }
@@ -866,7 +877,7 @@ function normalizeApprovalDecision(
   // 保留 null 让诊断层能区分“没有用户决定”和明确 rejected。
   if (state === "cancelled" || state === "expired" || state === "unavailable") return null;
   // 没有可识别的 state/decision 时只记录未知回执，不把它伪装成放行。
-  return state === "allowed-once" ? "allowed-once" : null;
+  return state === "allowed-once" || state === "allowed-session" ? state : null;
 }
 
 function normalizeResolutionState(state: unknown, decision: unknown): NonNullable<ToolActivity["approvalState"]> {
@@ -874,13 +885,13 @@ function normalizeResolutionState(state: unknown, decision: unknown): NonNullabl
   const fromDecision = normalizeApprovalState(decision);
   // 旧服务端可能同时携带 state=pending 与明确 decision；合法 decision
   // 优先，避免 UI 在已决定后继续显示等待授权。
-  if (decision === "allowed-once" || decision === "rejected" || decision === "cancelled"
+  if (decision === "allowed-once" || decision === "allowed-session" || decision === "rejected" || decision === "cancelled"
     || decision === "expired" || decision === "unavailable") {
     return fromDecision;
   }
   // resolved 只能携带终态；pending/submitting 即使来自旧服务端也不能
   // 让前端移除审批卡后继续显示一个没有操作入口的永久等待状态。
-  if (fromState === "allowed-once" || fromState === "rejected"
+  if (fromState === "allowed-once" || fromState === "allowed-session" || fromState === "rejected"
     || fromState === "cancelled" || fromState === "expired" || fromState === "unavailable") {
     return fromState;
   }
@@ -1139,6 +1150,7 @@ export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {
       status: row.status,
       timestamp: row.timestamp,
       durationMs: durationFromRow(row),
+      presentation: row.proactive ? undefined : readPresentation(row.metadata?.presentation),
       proactive: Boolean(row.proactive),
       source: row.proactive
         ? (String(row.metadata?.source || "proactive_conversation") as ChatMessage["source"])

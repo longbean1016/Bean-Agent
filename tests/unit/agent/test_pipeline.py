@@ -20,6 +20,7 @@ from agent.event_bus import (
     ContextUsageUpdated,
     EventBus,
     StreamDeltaReady,
+    TurnPresentationUpdated,
     ToolCallCompleted,
     ToolCallStarted,
 )
@@ -92,6 +93,56 @@ class Memory:
     def read_self(self): return ""
     def get_memory_context(self): return ""
     def read_recent_context(self): return ""
+
+
+@pytest.mark.asyncio
+async def test_empty_answer_retry_does_not_replace_initial_thinking_projection(tmp_path: Path) -> None:
+    class RetryProvider:
+        calls = 0
+
+        async def chat(self, messages, tools=None, on_content_delta=None, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                if on_content_delta:
+                    await on_content_delta({"thinking_delta": "第一段真实思考"})
+                return LLMResponse("", thinking="第一段真实思考")
+            return LLMResponse("补充回答", thinking="补答思考")
+
+    pipeline = Pipeline(RetryProvider(), ToolRegistry(), EventBus(), _assembler(tmp_path), workspace=str(tmp_path))
+    result = await pipeline.process(InboundMessage("web", "u", "retry-ui", "你好"), turn_id="retry-ui")
+    assert [p["text"] for p in result.presentation["parts"] if p["kind"] == "thinking"] == ["第一段真实思考", "补答思考"]
+    assert result.presentation["parts"][-1]["text"] == "补充回答"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hit", [True, False])
+async def test_turn_presentation_uses_single_real_retrieval_and_keeps_tool_storage(tmp_path: Path, hit: bool) -> None:
+    class DetailedMemory(Memory):
+        calls = 0
+
+        async def retrieve_for_turn_with_details(self, message):
+            self.calls += 1
+            return "真实召回内容", {"query": message.content, "items": [{"id": "m1", "summary": "喜欢夜跑"}] if hit else []}
+
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    events = EventBus()
+    seen = []
+    events.on(TurnPresentationUpdated, seen.append)
+    memory = DetailedMemory()
+    pipeline = Pipeline(Provider(), registry, events, _assembler(tmp_path), workspace=str(tmp_path), memory=memory)
+    result = await pipeline.process(InboundMessage("web", "u", "test", "查天气"), turn_id="turn-ui")
+    assert memory.calls == 1
+    assert seen[0].presentation["parts"] == []
+    assert result.presentation["final"] is True
+    parts = result.presentation["parts"]
+    assert sum(part["kind"] == "memory" for part in parts) == int(hit)
+    assert next(part for part in parts if part["kind"] == "tool")["call_id"] == "call-1"
+    assert next(part for part in parts if part["kind"] == "answer")["text"] == "完成"
+    assert result.tool_chain[0]["calls"][0]["name"] == "echo"
+    assert result.final_reasoning == "推理"
+    assert result.duration_ms is not None
+    assert seen[-1].presentation == result.presentation
 
 
 @pytest.mark.asyncio

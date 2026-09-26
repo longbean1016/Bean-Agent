@@ -68,6 +68,7 @@ class PipelineResult:
     duration_ms: int | None = None
     turn_started_at: str = ""
     turn_ended_at: str = ""
+    presentation: dict[str, Any] = field(default_factory=dict)
 
 
 OutboundCallback: TypeAlias = Callable[[OutboundMessage], Awaitable[None] | None]

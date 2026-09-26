@@ -187,7 +187,12 @@ class WebCommandService:
         if self._session_busy(session_key):
             raise WebCommandError("session_busy", "会话运行或排队期间不能切换权限")
         try:
-            return await self._sandbox_mode_writer(session_key, sandbox_mode)
+            snapshot = await self._sandbox_mode_writer(session_key, sandbox_mode)
+            if self._approvals is not None:
+                clearer = getattr(self._approvals, "clear_session_grants", None)
+                if callable(clearer):
+                    await clearer(session_key)
+            return snapshot
         except (KeyError, ValueError) as error:
             raise WebCommandError("invalid_sandbox", str(error)) from error
 
@@ -201,7 +206,12 @@ class WebCommandService:
         if self._session_busy(session_key):
             raise WebCommandError("session_busy", "会话运行期间不能切换工作目录")
         try:
-            return await self._workspace_writer(session_key, workspace_id)
+            snapshot = await self._workspace_writer(session_key, workspace_id)
+            if self._approvals is not None:
+                clearer = getattr(self._approvals, "clear_session_grants", None)
+                if callable(clearer):
+                    await clearer(session_key)
+            return snapshot
         except (KeyError, ValueError) as error:
             raise WebCommandError("invalid_workspace", str(error)) from error
 
@@ -215,7 +225,7 @@ class WebCommandService:
     ) -> str:
         if self._approvals is None:
             raise WebCommandError("approval_unavailable", "审批服务不可用")
-        if decision not in {"allowed-once", "rejected"}:
+        if decision not in {"allowed-once", "allowed-session", "rejected"}:
             raise WebCommandError("invalid_approval", "审批结果无效")
         try:
             decider = self._approvals.decide

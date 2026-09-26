@@ -490,7 +490,7 @@ def build_core_runtime(
             turn_id=request.turn_id,
             call_id=request.call_id,
             state=state,
-            decision=state if state in {"allowed-once", "rejected"} else None,
+            decision=state if state in {"allowed-once", "allowed-session", "rejected"} else None,
             decided_at=decided_at,
             error_code=error_code,
             client_request_id=client_request_id,
@@ -612,6 +612,7 @@ def build_core_runtime(
         SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
         MessageEnvelopeBuilder(),
     )
+    shell_tool = tools.get_tool("shell")
     pipeline = Pipeline(
         main_provider,
         tools,
@@ -646,6 +647,7 @@ def build_core_runtime(
         skill_snapshot_loader=sessions.load_skill_snapshot,
         skill_snapshot_writer=sessions.save_skill_snapshot,
         mcp_tool_names_loader=load_session_project_mcp_tools,
+        shell_environment_loader=getattr(shell_tool, "environment_context", None),
     )
     agent_loop = AgentLoop(
         messages,
@@ -2258,6 +2260,7 @@ def create_fastapi_app(
         if not session_key.startswith(f"{channel}:"):
             raise HTTPException(status_code=404, detail="会话不存在")
         await application.core.sandbox_approvals.cancel_session(session_key)
+        await application.core.sandbox_approvals.clear_session_grants(session_key)
         if not await application.core.sessions.delete(session_key):
             raise HTTPException(status_code=404, detail="会话不存在")
         await application.core.sandbox_runtime.close_session(session_key)
@@ -2449,7 +2452,7 @@ def _append_running_snapshot(
             "turn_id": turn_id,
             "reasoning_content": str(snapshot.get("thinking") or ""),
             "status": "running",
-            "metadata": metadata,
+            "metadata": {**metadata, **({"presentation": snapshot["presentation"]} if snapshot.get("presentation") else {})},
             "media": [],
         },
     ]

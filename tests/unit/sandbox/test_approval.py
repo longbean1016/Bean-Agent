@@ -74,6 +74,11 @@ async def test_approval_allowed_once_is_bound_and_idempotent() -> None:
     ))
     request = await _wait_for_request(published)
 
+    assert request.category == "临时权限"
+    assert request.action == "执行完整 Shell 命令"
+    assert request.scope_kind == "exact"
+    assert request.display_scope == "仅此操作"
+
     first, duplicate = await asyncio.gather(
         coordinator.decide(request.id, "web:a", "allowed-once"),
         coordinator.decide(request.id, "web:a", "rejected"),
@@ -441,6 +446,77 @@ async def test_five_argument_resolution_callback_receives_client_request_id() ->
     ) == "allowed-once"
     assert await waiting == "allowed-once"
     assert client_ids == ["decision-42"]
+
+
+@pytest.mark.asyncio
+async def test_session_grant_is_reused_in_memory_and_cleared_explicitly() -> None:
+    store = AuditStore()
+    published: list[ApprovalRequest] = []
+    coordinator: ApprovalCoordinator
+
+    async def publish(request: ApprovalRequest) -> None:
+        published.append(request)
+        await coordinator.decide(request.id, request.session_id, "allowed-session")
+
+    coordinator = ApprovalCoordinator(store, publisher=publish)
+    await coordinator.set_session_available("web:a", True)
+
+    async def request(call_id: str) -> str:
+        return await coordinator.request(
+            session_id="web:a",
+            turn_id=f"turn-{call_id}",
+            call_id=call_id,
+            tool_name="shell",
+            operation="删除文件",
+            arguments={"command": "del D:\\test\\a.txt"},
+            reason="删除测试文件",
+            grant_key="delete:D:/test",
+            scope="删除文件 · 目标目录：D:\\test",
+        )
+
+    assert await request("call-1") == "allowed-session"
+    assert await request("call-2") == "allowed-session"
+    assert len(published) == 1
+    assert published[0].allow_session is True
+    assert published[0].to_wire()["scope"] == "删除文件 · 目标目录：D:\\test"
+    assert "grant_key" not in published[0].to_wire()
+
+    await coordinator.clear_session_grants("web:a")
+    assert await request("call-3") == "allowed-session"
+    assert len(published) == 2
+
+
+@pytest.mark.asyncio
+async def test_session_grant_is_not_restored_by_new_coordinator() -> None:
+    store = AuditStore()
+    first: ApprovalCoordinator
+
+    async def allow_session(request: ApprovalRequest) -> None:
+        await first.decide(request.id, request.session_id, "allowed-session")
+
+    first = ApprovalCoordinator(store, publisher=allow_session)
+    await first.set_session_available("web:a", True)
+    assert await first.request(
+        session_id="web:a", turn_id="turn-1", call_id="call-1", tool_name="shell",
+        operation="执行命令", arguments={"command": "git pull"}, reason="更新代码",
+        grant_key="prefix:git-pull", scope="命令前缀：git pull",
+    ) == "allowed-session"
+
+    restarted_requests: list[ApprovalRequest] = []
+    restarted: ApprovalCoordinator
+
+    async def allow_once(request: ApprovalRequest) -> None:
+        restarted_requests.append(request)
+        await restarted.decide(request.id, request.session_id, "allowed-once")
+
+    restarted = ApprovalCoordinator(store, publisher=allow_once)
+    await restarted.set_session_available("web:a", True)
+    assert await restarted.request(
+        session_id="web:a", turn_id="turn-2", call_id="call-2", tool_name="shell",
+        operation="执行命令", arguments={"command": "git pull"}, reason="更新代码",
+        grant_key="prefix:git-pull", scope="命令前缀：git pull",
+    ) == "allowed-once"
+    assert len(restarted_requests) == 1
 
 
 @pytest.mark.asyncio

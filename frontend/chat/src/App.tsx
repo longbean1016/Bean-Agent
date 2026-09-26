@@ -1,10 +1,8 @@
-import * as Collapsible from "@radix-ui/react-collapsible";
 import * as Dialog from "@radix-ui/react-dialog";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { code } from "@streamdown/code";
 import {
   AlertCircle,
-  Atom,
   ArrowDown,
   Bell,
   Check,
@@ -46,11 +44,12 @@ import { parseMemoryCitations } from "./citations";
 import type { MemoryCitation } from "./citations";
 import { MermaidBlock } from "./MermaidBlock";
 import { ApprovalPanel, PermissionSelector, WorkspaceSelector } from "./SandboxControls";
-import { ToolTimeline } from "./ToolTimeline";
+import { TurnProcess } from "./TurnProcess";
+import { messageProcess } from "./turnPresentation";
 import type { ToolDisclosureState } from "./ToolTimeline";
 import { SessionSidebar } from "./SessionSidebar";
 import { ResizableSidebarLayout } from "./ResizableSidebarLayout";
-import type { ApprovalRequest, ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, SandboxMode, SandboxSnapshot, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry, Workspace } from "./types";
+import type { ApprovalDecision, ApprovalRequest, ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, SandboxMode, SandboxSnapshot, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry, Workspace } from "./types";
 import { ModelSettingsPage } from "./ModelSettingsPage";
 import { ExtensionsPage } from "./ExtensionsPage";
 import { extensionKindFromPath, EXTENSION_PATHS, isModelSettingsPath, MODEL_SETTINGS_PATH, pathForSession, routeKey, sessionFromPath } from "./chatRoute";
@@ -844,7 +843,7 @@ export function App() {
     void loadSession(sessionId, false);
   };
 
-  const decideApproval = useCallback((approval: ApprovalRequest, decision: "allowed-once" | "rejected") => {
+  const decideApproval = useCallback((approval: ApprovalRequest, decision: ApprovalDecision) => {
     const sessionRequests = approvalDecisionRequestsRef.current[approval.session_id] ?? {};
     if (sessionRequests[approval.id]) return;
     const requestId = crypto.randomUUID();
@@ -1808,10 +1807,12 @@ export const MessageView = memo(function MessageView({ message, navigationTurnId
   sessionId: string;
   approvals?: ApprovalRequest[];
   approvalDecisionRequests?: Record<string, string>;
-  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
+  onApprovalDecision?: (approval: ApprovalRequest, decision: ApprovalDecision) => void;
 }) {
   const isUser = message.role === "user";
-  const parsed = useMemo(() => parseMemoryCitations(message.content), [message.content]);
+  const process = useMemo(() => messageProcess(message), [message]);
+  const body = isUser ? message.content : process.body;
+  const parsed = useMemo(() => parseMemoryCitations(body), [body]);
   const markdown = useMemo(() => prepareMessageMarkdown(parsed.markdown), [parsed.markdown]);
   const messageApprovals = approvals.filter((approval) => approval.turn_id === message.turnId);
   const [copied, setCopied] = useState(false);
@@ -1846,7 +1847,7 @@ export const MessageView = memo(function MessageView({ message, navigationTurnId
   }, []);
   // Streamdown 在 isAnimating 期间会禁用复制和全屏按钮。Mermaid fence 一旦
   // 闭合就已经具备稳定源码，应立即放开查看大图，而不必等待 final 帧。
-  const markdownAnimating = Boolean(message.streaming && !containsClosedMermaidFence(message.content));
+  const markdownAnimating = Boolean(message.streaming && !containsClosedMermaidFence(body));
 
   return (
     <article
@@ -1865,19 +1866,13 @@ export const MessageView = memo(function MessageView({ message, navigationTurnId
         ) : null}
         {!isUser && message.source ? <MessageSourceBadge message={message} /> : null}
         {message.media.length ? <AttachmentGallery paths={message.media} /> : null}
-        {message.thinking ? <Thinking content={message.thinking} streaming={Boolean(message.streaming)} status={message.thinkingStatus} /> : null}
-        {!isUser && (message.tools.length || messageApprovals.length) ? (
-          <ToolTimeline
-            key={JSON.stringify([sessionId, message.turnId, message.tools[0]?.callId ?? message.id])}
-            disclosure={toolDisclosure}
-            disclosureKey={JSON.stringify([sessionId, message.turnId, message.tools[0]?.callId ?? message.id])}
-            tools={message.tools}
-            approvals={messageApprovals}
-            approvalDecisionRequests={approvalDecisionRequests}
-            onApprovalDecision={onApprovalDecision}
-          />
+        {!isUser && (process.parts.length > 0 || message.streaming || messageApprovals.length > 0) ? (
+          <TurnProcess message={message} parts={process.parts} disclosure={toolDisclosure}
+            disclosureKey={JSON.stringify([sessionId, message.turnId ?? message.id])}
+            approvals={messageApprovals} approvalDecisionRequests={approvalDecisionRequests}
+            onApprovalDecision={onApprovalDecision} renderText={renderProcessText} />
         ) : null}
-        {isUser ? <p className="user-text">{message.content}</p> : message.content && message.content !== "[用户已停止生成]" ? (
+        {isUser ? <p className="user-text">{message.content}</p> : body && body !== "[用户已停止生成]" ? (
           <div className="beanagent-markdown">
             <Streamdown
               plugins={markdownPlugins}
@@ -2045,23 +2040,13 @@ function MemoryCitationList({ citations }: { citations: MemoryCitation[] }) {
   );
 }
 
-const Thinking = memo(function Thinking({ content, streaming, status }: { content: string; streaming: boolean; status?: "running" | "completed" | "interrupted" }) {
-  const visibleStatus = status ?? (streaming ? "running" : "completed");
-  return (
-    <Collapsible.Root className={`thinking ${visibleStatus}`} defaultOpen={streaming}>
-      <Collapsible.Trigger className="thinking-trigger">
-        <Atom size={16} />
-        <span>{visibleStatus === "interrupted" ? "已停止" : visibleStatus === "running" ? "正在思考…" : "思考完成"}</span>
-        <ChevronDown size={14} />
-      </Collapsible.Trigger>
-      <Collapsible.Content className="thinking-content beanagent-markdown">
-        <Streamdown plugins={markdownPlugins} controls={markdownControls} lineNumbers={false} linkSafety={markdownLinkSafety} translations={markdownTranslations}>
-          {prepareMessageMarkdown(content)}
-        </Streamdown>
-      </Collapsible.Content>
-    </Collapsible.Root>
-  );
-});
+function renderProcessText(content: string, streaming: boolean) {
+  return <div className="beanagent-markdown"><Streamdown plugins={markdownPlugins} components={markdownComponents}
+    controls={markdownControls} lineNumbers={false} isAnimating={streaming}
+    linkSafety={markdownLinkSafety} translations={markdownTranslations}>
+    {prepareMessageMarkdown(parseMemoryCitations(content).markdown)}
+  </Streamdown></div>;
+}
 
 
 function AttachmentGallery({ paths }: { paths: string[] }) {
@@ -2671,7 +2656,7 @@ function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositio
   onVisibleApprovalIdsChange: (sessionId: string, approvalIds: string[]) => void;
   approvals?: ApprovalRequest[];
   approvalDecisionRequests?: Record<string, string>;
-  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
+  onApprovalDecision?: (approval: ApprovalRequest, decision: ApprovalDecision) => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const toolDisclosure = useRef<ToolDisclosureState>(new Map());

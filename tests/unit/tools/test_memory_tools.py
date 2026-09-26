@@ -16,6 +16,8 @@ from memory.contracts import (
 from tools.forget_memory import ForgetMemoryTool
 from tools.memorize import MemorizeTool
 from tools.recall_memory import RecallMemoryTool
+from agent.skills import SkillSnapshotView
+from tools.registry import ToolRegistry
 
 
 class FakeMemory:
@@ -109,6 +111,43 @@ async def test_memorize_uses_explicit_fallback_when_user_source_is_missing() -> 
     await tool.execute(summary="用户使用中文回答", memory_kind="preference")
 
     assert memory.mutations[0].source_ref == "memorize_tool"
+
+
+@pytest.mark.asyncio
+async def test_memorize_ignores_runtime_context_and_keeps_explicit_metadata() -> None:
+    memory = FakeMemory()
+    registry = ToolRegistry()
+    registry.register(MemorizeTool(memory, spec("写入")))
+    metadata = {"scenario": "发布", "emotional_weight": 2, "nested": {"enabled": True}}
+    result = await registry.execute("memorize", {
+        "summary": "发布前运行测试", "memory_kind": "procedure",
+        "tool_requirement": "pytest", "steps": ["执行测试"], "metadata": metadata,
+        "current_user_source_ref": "伪造来源",
+    }, context={
+        "_skills_view": SkillSnapshotView({}), "session_key": "web:c", "turn_id": "turn",
+        "call_id": "call", "request_time": "2026-01-01", "channel": "web", "chat_id": "c",
+        "current_user_source_ref": "web:c:8", "future_runtime_object": object(),
+    })
+    mutation = memory.mutations[0]
+    assert result.startswith("已记住")
+    assert mutation.source_ref == "web:c:8"
+    assert mutation.scope.session_key == "web:c"
+    assert mutation.metadata == {**metadata, "tool_requirement": "pytest", "steps": ["执行测试"]}
+    assert json.loads(json.dumps(mutation.metadata)) == mutation.metadata
+    assert "steps" not in metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [
+    [], "invalid", {"runtime": SkillSnapshotView({})}, {"nested": [object()]}, {"weight": float("nan")},
+])
+async def test_memorize_rejects_invalid_metadata_before_mutation(metadata) -> None:
+    memory = FakeMemory()
+    result = await MemorizeTool(memory, spec("写入")).execute(summary="模拟记忆", metadata=metadata)
+    assert result.startswith("错误：")
+    assert "未写入记忆" in result
+    assert "已记住" not in result
+    assert memory.mutations == []
 
 
 @pytest.mark.asyncio

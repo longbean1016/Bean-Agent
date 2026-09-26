@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 from agent.skills import BUILTIN_SKILLS_DIR, SkillsLoader
+from tools.shell import _validate_command
 
 
 def test_builtin_skill_catalog_contains_expected_three_skills(tmp_path: Path) -> None:
@@ -28,6 +30,17 @@ def test_builtin_skills_keep_akashic_behavior_boundaries() -> None:
     assert "下一轮" in bodies["skill-creator"]
     assert 'bins: ["summarize"]' in bodies["summarize"]
     assert "--extract-only" in bodies["summarize"]
-    assert 'bins: ["curl"]' in bodies["weather"]
+    assert "web_fetch" in bodies["weather"]
+    assert "bins:" not in bodies["weather"]
     assert "wttr.in" in bodies["weather"]
     assert "Open-Meteo" in bodies["weather"]
+
+
+def test_weather_commands_match_network_guard_and_keep_errors() -> None:
+    body = (BUILTIN_SKILLS_DIR / "weather" / "SKILL.md").read_text(encoding="utf-8")
+    examples = re.findall(r"^curl .+$", body, re.MULTILINE)
+    assert examples
+    for example in examples:
+        assert "-sS" in example and "--max-time" in example
+        assert _validate_command(example, allow_network=True, restricted_dir=None) is None
+        assert _validate_command(example.replace("curl ", "curl.exe ", 1), allow_network=True, restricted_dir=None) is None

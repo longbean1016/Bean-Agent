@@ -43,7 +43,7 @@ def test_static_prefix_cache_and_dynamic_context_frame_are_separated() -> None:
     assert "你是 BeanAgent" not in str(first.messages[0]["content"])
     assert "会话近期摘要" not in str(first.messages[0]["content"])
     assert {item.name for item in second.debug_breakdown if item.cache_hit} == {
-        "behavior_rules"
+        "behavior_rules", "process_communication"
     }
     reminder = first.messages[-2]["content"]
     assert reminder.startswith('<system-reminder data-system-context-frame="true">')
@@ -157,6 +157,24 @@ def test_stable_behavior_rules_request_chinese_answer_and_reasoning() -> None:
 
     system_prompt = str(result.messages[0]["content"])
     assert "最终回复与思考过程使用简体中文" in system_prompt
+
+
+def test_stable_process_communication_rules_request_real_tool_preambles() -> None:
+    assembler = PromptAssembler(
+        SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
+        MessageEnvelopeBuilder(),
+    )
+    result = assembler.assemble(
+        turn_ctx=TurnContext(workspace="D:/workspace", channel="web", chat_id="c"),
+        history=[],
+        current_message="请查询最新天气",
+    )
+
+    system_prompt = str(result.messages[0]["content"])
+    assert "在首次工具调用前" in system_prompt
+    assert "连续执行同一目的的工具时不要重复说明" in system_prompt
+    assert "不展示内部推理" in system_prompt
+    assert "必须提供独立、完整的最终回答" in system_prompt
 
 
 def test_skill_catalog_is_stable_while_active_skill_body_stays_in_frame() -> None:

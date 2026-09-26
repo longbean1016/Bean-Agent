@@ -36,7 +36,7 @@ async def test_shell_rejects_empty_and_banned_commands(tmp_path: Path) -> None:
     empty = json.loads(await tool.execute(command="", description="空命令"))
     banned = json.loads(await tool.execute(command="nc localhost 80", description="测试"))
 
-    assert empty == {"error": "命令不能为空"}
+    assert empty == {"error": "命令不能为空", "diagnostic_code": "shell_validation_rejected"}
     assert "命令 'nc' 不被允许" in banned["error"]
 
 

@@ -834,11 +834,15 @@ button, .icon-button, .send-button, .new-chat-button, .session-row, .session-men
 .approval-body > strong { color: var(--text-strong); font-size: 14px; line-height: 1.5; }
 .approval-reason { overflow-wrap: anywhere; color: var(--text-muted); font-size: 11px; line-height: 1.45; }
 .approval-operation { overflow-wrap: anywhere; word-break: break-word; color: var(--text-muted); font-size: 12px; }
+.approval-permission { display: flex; align-items: center; gap: 6px; min-height: 24px; color: var(--text-muted); font-size: 12px; }
+.approval-permission-category { font-weight: 600; color: var(--text); }
+.approval-permission-separator { color: var(--text-subtle); }
+.approval-permission strong { padding: 2px 7px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); color: var(--text); font-size: 11px; font-weight: 600; line-height: 1.45; }
 .approval-arguments { display: grid; gap: 7px; margin: 2px 0 0; }
 .approval-arguments > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; align-items: start; }
 .approval-arguments dt { color: var(--text-subtle); font-size: 11px; }
 .approval-arguments dd { margin: 0; overflow-wrap: anywhere; color: var(--text); font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
-.approval-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 0 14px 13px; }
+.approval-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 0 14px 13px; }
 .approval-reject:hover:not(:disabled) { border-color: var(--danger-border); background: var(--danger-soft); color: var(--danger-text); }
 
 .dialog-overlay { position: fixed; inset: 0; z-index: 20; background: var(--overlay-color); }
