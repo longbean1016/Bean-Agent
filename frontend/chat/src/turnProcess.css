@@ -13,8 +13,11 @@
 .process-row > svg:last-child { margin-left: auto; }
 .process-success { color: var(--primary); }
 .process-details { max-height: min(360px, 45vh); overflow: auto; padding: 8px 12px; margin: 0 0 10px 27px; border-left: 1px solid var(--border); font-size: 13px; overflow-wrap: anywhere; }
-.process-details .beanagent-markdown, .process-intermediate .beanagent-markdown { color: var(--text-muted); }
-.process-intermediate { padding: 3px 6px; }
+.process-details .beanagent-markdown { color: var(--text-muted); }
+.process-intermediate { padding: 5px 6px 8px 30px; color: var(--text-strong); font-size: 15px; line-height: 1.72; }
+.process-intermediate .beanagent-markdown { color: inherit; }
+.process-intermediate .beanagent-markdown > :first-child { margin-top: 0; }
+.process-intermediate .beanagent-markdown > :last-child { margin-bottom: 0; }
 .memory-results p { margin: 4px 0 8px; }
 .memory-results ul { padding-left: 18px; }
 .memory-results li { margin-bottom: 12px; }
@@ -24,5 +27,5 @@
 .tool-inline-list .tool-name { font-size: 12px; }
 .turn-process .tool-group .tool-trigger .tool-name { color: var(--text-muted); }
 .turn-work-spinner { animation: tool-running-rotate 1s linear infinite; }
-@media (max-width: 640px) { .process-details { margin-left: 8px; } .tool-inline-list .tool-name { max-width: 160px; } }
+@media (max-width: 640px) { .process-details { margin-left: 8px; } .process-intermediate { padding-left: 14px; } .tool-inline-list .tool-name { max-width: 160px; } }
 @media (prefers-reduced-motion: reduce) { .turn-work-spinner { animation: none; } }

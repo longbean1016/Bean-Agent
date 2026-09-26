@@ -1137,7 +1137,7 @@ it("刷新已有会话时显示骨架并通过消息接口恢复运行中 turn",
   expect(await screen.findByText("fresh question", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByText("fresh partial")).toBeVisible();
   expect(screen.queryByText("fresh thinking")).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: /思考过程/ }));
+  fireEvent.click(screen.getByRole("button", { name: /^思考$/ }));
   expect(screen.getByText("fresh thinking")).toBeVisible();
   expect(screen.getByText("read_file")).toBeVisible();
   expect(container.querySelector(".conversation-skeleton")).toBeNull();

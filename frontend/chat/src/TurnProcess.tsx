@@ -62,7 +62,7 @@ const ProcessItem = memo(function ProcessItem({ part, tool, disclosure, disclosu
     {part.duration_ms !== undefined ? <p className="process-detail-time">检索耗时 {formatCompactDuration(part.duration_ms)}</p> : null}
   </ProcessDisclosure>;
   if (part.kind === "thinking") return <ProcessDisclosure id={`${disclosureKey}:${part.id}`} disclosure={disclosure}
-    label={thinkingRunning ? "正在思考…" : interrupted ? "思考已停止" : "思考过程"} icon={<Atom size={16} />}>
+    label={thinkingRunning ? "正在思考…" : interrupted ? "思考已停止" : "思考"} icon={<Atom size={16} />}>
     {renderText(part.text, false)}
   </ProcessDisclosure>;
   return part.text ? <div className="process-intermediate">{renderText(part.text, false)}</div> : null;

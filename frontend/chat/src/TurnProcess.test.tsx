@@ -25,7 +25,7 @@ it("过程按顺序显示且思考/记忆/技能均默认收起，终答时统�
   expect(screen.queryByText("先查看天气")).not.toBeInTheDocument();
   expect(screen.queryByText("喜欢晚上跑步")).not.toBeInTheDocument();
   expect(screen.queryByText("天气指引")).not.toBeInTheDocument();
-  expect(container.textContent!.indexOf("已检索记忆")).toBeLessThan(container.textContent!.indexOf("思考过程"));
+  expect(container.textContent!.indexOf("已检索记忆")).toBeLessThan(container.textContent!.indexOf("思考"));
   expect(container.textContent!.indexOf("先查实时信息")).toBeLessThan(container.textContent!.indexOf("使用了技能"));
   fireEvent.click(screen.getByRole("button", { name: /已检索记忆/ }));
   expect(screen.getByText("喜欢晚上跑步")).toBeVisible();

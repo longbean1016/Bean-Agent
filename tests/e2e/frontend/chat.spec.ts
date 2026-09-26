@@ -32,7 +32,7 @@ test("聚合流式回复、工具状态并用 final 覆盖草稿", async ({ page
   await expect(page.getByText("最终内容", { exact: true })).toBeVisible();
   await expect(page.getByText("流式草稿", { exact: true })).toHaveCount(0);
   await expect(page.locator("pre code")).toContainText("print");
-  await page.getByRole("button", { name: /思考过程/ }).click();
+  await page.getByRole("button", { name: /^思考$/ }).click();
   await expect(page.getByText("已经分析用户请求")).toBeVisible();
   const codeLayout = await page.locator("pre code").evaluate((codeElement) => {
     const lines = Array.from(codeElement.children);
@@ -219,7 +219,7 @@ test("消息阅读排版、过程键盘折叠与长代码复制在窄屏仍可�
   if (testInfo.project.name === "mobile") await page.getByRole("button", { name: "打开会话列表" }).click();
   await page.getByRole("button", { name: "历史问题", exact: true }).click();
   await ensureToolGroupExpanded(page, /已工作/);
-  const summary = page.getByRole("button", { name: /思考过程/ });
+  const summary = page.getByRole("button", { name: /^思考$/ });
   const tools = page.getByRole("button", { name: /read_file.*完成/ });
   await expect(tools).toHaveAttribute("aria-expanded", "false");
   await expect(summary).toHaveAttribute("aria-expanded", "false");
