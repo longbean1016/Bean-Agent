@@ -9,125 +9,98 @@ const approval: ApprovalRequest = { id: "approval", call_id: "call", turn_id: "t
   operation: "读取文件", arguments: {}, reason: "需要确认", requested_mode: "read-only", state: "pending", created_at: "2026-01-01T00:00:00Z" };
 function props() { return { tools: [running], approvals: [] as ApprovalRequest[], approvalDecisionRequests: {}, disclosure: new Map<string, boolean>(), disclosureKey: "test" }; }
 
-it("执行中默认收起且显示转圈，手动选择在完成和新增工具后保持", () => {
+it("每项直接可见，默认收起，完成与新增工具不改变手动选择", () => {
   const initial = props();
   const { container, rerender } = render(<ToolTimeline {...initial} />);
-  const trigger = screen.getByRole("button", { name: /工具调用/ });
-  expect(trigger).toHaveAttribute("aria-expanded", "false");
-  expect(container.querySelector(".tool-running-spinner")).not.toBeNull();
-  expect(screen.queryByText("sample.txt")).not.toBeInTheDocument();
-  fireEvent.click(trigger);
+  expect(screen.queryByRole("button", { name: /工具调用/ })).not.toBeInTheDocument();
   const step = screen.getByRole("button", { name: /^read_file/ });
   expect(step).toHaveAttribute("aria-expanded", "false");
+  expect(container.querySelector(".tool-running-spinner")).not.toBeNull();
   fireEvent.click(step);
-  rerender(<ToolTimeline {...initial} tools={[{ ...running, status: "completed", durationMs: 100, resultPreview: "完成结果" }]} />);
-  expect(trigger).toHaveAttribute("aria-expanded", "true");
+  rerender(<ToolTimeline {...initial} tools={[{ ...running, status: "completed", resultPreview: "完成结果" }, { ...running, callId: "second" }]} />);
   expect(step).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByText("完成结果")).toBeVisible();
-  expect(container.querySelector(".tool-running-spinner")).toBeNull();
-  fireEvent.click(trigger);
-  rerender(<ToolTimeline {...initial} tools={[{ ...running, status: "completed" }, { ...running, callId: "second" }]} />);
-  expect(trigger).toHaveAttribute("aria-expanded", "false");
-  fireEvent.click(trigger);
-  expect(screen.getAllByRole("button", { name: /^read_file/ })[0]).toHaveAttribute("aria-expanded", "true");
   expect(screen.getAllByRole("button", { name: /^read_file/ })[1]).toHaveAttribute("aria-expanded", "false");
 });
 
-it("虚拟列表卸载再挂载后恢复手动展开，其他会话不继承", () => {
+it("卸载再挂载恢复单项选择，其他会话不继承", () => {
   const initial = props();
   const first = render(<ToolTimeline {...initial} />);
-  fireEvent.click(screen.getByRole("button", { name: /工具调用/ }));
   fireEvent.click(screen.getByRole("button", { name: /^read_file/ }));
   first.unmount();
   const second = render(<ToolTimeline {...initial} />);
-  expect(screen.getByRole("button", { name: /工具调用/ })).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByRole("button", { name: /^read_file/ })).toHaveAttribute("aria-expanded", "true");
   second.unmount();
   render(<ToolTimeline {...initial} disclosureKey="other-session" />);
-  expect(screen.getByRole("button", { name: /工具调用/ })).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByRole("button", { name: /^read_file/ })).toHaveAttribute("aria-expanded", "false");
 });
 
-it("组和单项都收起时保留原审批卡且不转圈，提交锁即时更新", () => {
+it("单项收起时保留原审批卡且不转圈，提交锁即时更新", () => {
   const initial = props();
   const decide = vi.fn();
   const { container, rerender } = render(<ToolTimeline {...initial} approvals={[approval]} onApprovalDecision={decide} />);
-  expect(screen.getByRole("button", { name: /工具调用/ })).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByRole("button", { name: /^read_file/ })).toHaveAttribute("aria-expanded", "false");
   expect(container.querySelector(".tool-running-spinner")).toBeNull();
-  expect(screen.getByLabelText("待处理权限审批")).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "仅允许本次" }));
   expect(decide).toHaveBeenCalledExactlyOnceWith(approval, "allowed-once");
   rerender(<ToolTimeline {...initial} approvals={[approval]} onApprovalDecision={decide} approvalDecisionRequests={{ approval: "request" }} />);
   expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
 });
 
-it("成功和失败输出均只在对应单项展开后展示，收起工具组后隐藏", () => {
-  const initial = props();
-  const firstError = '{"exit_code":1,"output":"第一个命令失败"}';
-  const secondError = '{"exit_code":2,"output":"第二个命令失败"}';
-  render(<ToolTimeline {...initial} tools={[
+it("失败和成功详情仅在各自展开时出现", () => {
+  render(<ToolTimeline {...props()} tools={[
     { ...running, status: "completed", resultPreview: "读取成功" },
-    { ...running, name: "shell", callId: "first", arguments: { command: "first" }, status: "error", resultPreview: firstError },
-    { ...running, name: "shell", callId: "second", arguments: { command: "second" }, status: "error", resultPreview: secondError },
+    { ...running, name: "shell", callId: "failed", arguments: { command: "first" }, status: "error", resultPreview: "命令失败详情" },
   ]} />);
-  const group = screen.getByRole("button", { name: /工具调用/ });
-  expect(group).toHaveAttribute("aria-expanded", "false");
-  expect(group.querySelector(".tool-group-state")).toHaveTextContent("1 / 3 已完成");
-  expect(group.querySelector(".tool-group-state")).not.toHaveTextContent("失败");
-  expect(group.querySelector(".tool-status-error")).toHaveTextContent("2 项失败");
-  expect(screen.queryByText(firstError)).not.toBeInTheDocument();
-  expect(screen.queryByText("目标")).not.toBeInTheDocument();
-  fireEvent.click(group);
-  expect(screen.queryByText(firstError)).not.toBeInTheDocument();
-  expect(screen.queryByText(secondError)).not.toBeInTheDocument();
-  const first = screen.getByRole("button", { name: /^shell first/ });
-  fireEvent.click(first);
-  expect(screen.getByText(firstError)).toBeVisible();
-  expect(screen.queryByText(secondError)).not.toBeInTheDocument();
+  expect(screen.queryByText("命令失败详情")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: /^shell/ }));
+  expect(screen.getByText("命令失败详情")).toBeVisible();
   expect(screen.queryByText("读取成功")).not.toBeInTheDocument();
-  fireEvent.click(first);
-  fireEvent.click(screen.getByRole("button", { name: /^shell second/ }));
-  expect(screen.queryByText(firstError)).not.toBeInTheDocument();
-  expect(screen.getByText(secondError)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: /^shell/ }));
   fireEvent.click(screen.getByRole("button", { name: /^read_file/ }));
+  expect(screen.queryByText("命令失败详情")).not.toBeInTheDocument();
   expect(screen.getByText("读取成功")).toBeVisible();
-  fireEvent.click(group);
-  expect(screen.queryByText(secondError)).not.toBeInTheDocument();
-  expect(screen.queryByText("读取成功")).not.toBeInTheDocument();
 });
 
-it("工具类型图标不随状态替换，右侧独立展示转圈和完成勾", () => {
+it("工具图标不随状态替换，右侧展示转圈、勾或失败叉", () => {
   const initial = props();
   const { container, rerender } = render(<ToolTimeline {...initial} />);
-  const trigger = screen.getByRole("button", { name: /工具调用/ });
-  expect(trigger.querySelector(".tool-group-icon .lucide-wrench")).not.toBeNull();
-  expect(trigger.querySelector(".tool-status-label .tool-running-spinner")).not.toBeNull();
-  fireEvent.click(trigger);
-  const step = screen.getByRole("button", { name: /^read_file/ });
-  expect(step.querySelector(".tool-icon .lucide-file-text")).not.toBeNull();
-  expect(step.querySelector(".tool-status-label .tool-running-spinner")).not.toBeNull();
+  expect(container.querySelector(".tool-icon .lucide-file-text")).not.toBeNull();
+  expect(container.querySelector(".tool-status-label .tool-running-spinner")).not.toBeNull();
   rerender(<ToolTimeline {...initial} tools={[{ ...running, status: "completed" }]} />);
-  expect(trigger.querySelector(".tool-group-icon .lucide-wrench")).not.toBeNull();
-  expect(step.querySelector(".tool-icon .lucide-file-text")).not.toBeNull();
-  expect(container.querySelectorAll(".tool-status-completed .lucide-check")).toHaveLength(2);
-  expect(container.querySelector(".tool-running-spinner")).toBeNull();
-  expect(screen.queryByText("完成态 · 展开预览")).not.toBeInTheDocument();
-  expect(screen.queryByText("执行中 · 默认收起")).not.toBeInTheDocument();
+  expect(container.querySelector(".tool-icon .lucide-file-text")).not.toBeNull();
+  expect(container.querySelectorAll(".tool-status-completed .lucide-check")).toHaveLength(1);
+  rerender(<ToolTimeline {...initial} tools={[{ ...running, name: "web_search", status: "error" }]} />);
+  expect(container.querySelector(".tool-icon .lucide-earth")).not.toBeNull();
+  expect(container.querySelector(".tool-status-error .lucide-x")).not.toBeNull();
 });
 
-it("部分失败时摘要显示失败数量，失败叉不覆盖浏览器图标", () => {
+it("技能只展示技能名与专属图标，生命周期文案真实", () => {
   const initial = props();
-  const { container } = render(<ToolTimeline {...initial} tools={[
-    { ...running, status: "completed" },
-    { ...running, callId: "failed", name: "web_search", status: "error", resultPreview: "网络暂时不可用" },
-  ]} />);
-  const trigger = screen.getByRole("button", { name: /工具调用/ });
-  expect(trigger.querySelector(".tool-status-error")).toHaveTextContent("1 项失败");
-  expect(trigger.querySelector(".lucide-check")).toBeNull();
-  expect(trigger.querySelector(".tool-group-icon .lucide-wrench")).not.toBeNull();
-  expect(screen.queryByText(/网络暂时不可用/)).not.toBeInTheDocument();
-  fireEvent.click(trigger);
-  const step = screen.getByRole("button", { name: /^web_search/ });
-  expect(step.querySelector(".tool-icon .lucide-earth")).not.toBeNull();
-  expect(step.querySelector(".tool-status-error .lucide-x")).not.toBeNull();
-  expect(container.querySelector(".tool-running-spinner")).toBeNull();
+  const tool: ToolActivity = { ...running, name: "load_skill", arguments: { name: "weather" } };
+  const { container, rerender } = render(<ToolTimeline {...initial} tools={[tool]} />);
+  expect(screen.getByText("正在加载技能")).toBeVisible();
+  expect(container.querySelector(".lucide-wand-sparkles")).not.toBeNull();
+  rerender(<ToolTimeline {...initial} tools={[{ ...tool, status: "completed", resultPreview: "技能正文" }]} />);
+  expect(screen.getByText("使用了技能")).toBeVisible();
+  expect(screen.getByText("weather")).toBeVisible();
+  expect(screen.queryByText("load_skill")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: /使用了技能/ }));
+  expect(screen.getByText("技能正文")).toBeVisible();
+  rerender(<ToolTimeline {...initial} tools={[{ ...tool, status: "error", resultPreview: "加载失败详情" }]} />);
+  expect(screen.getByText("技能加载失败")).toBeVisible();
+});
+
+it("显式记忆空检索保留真实调用，结构化摘要不受原输出截断影响", () => {
+  const initial = props();
+  const tool: ToolActivity = { ...running, name: "recall_memory", status: "completed", arguments: { query: "跑步" },
+    resultPreview: '{"count":0,"items":[]}' };
+  const { rerender } = render(<ToolTimeline {...initial} tools={[tool]} />);
+  expect(screen.getByText("找到 0 条")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: /^recall_memory/ }));
+  expect(screen.getByText("未找到相关记忆")).toBeVisible();
+  rerender(<ToolTimeline {...initial} tools={[{ ...tool, resultPreview: '{"items":[已截断',
+    memoryResult: { count: 1, items: [{ id: "m1", summary: "喜欢夜跑" }] } }]} />);
+  expect(screen.getByText("喜欢夜跑")).toBeVisible();
+  expect(screen.queryByText(/已截断/)).not.toBeInTheDocument();
 });

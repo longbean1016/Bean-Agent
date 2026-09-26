@@ -26,13 +26,13 @@ test("聚合流式回复、工具状态并用 final 覆盖草稿", async ({ page
   await page.getByPlaceholder("输入消息，或附加文本与图片").fill("执行完整前端测试");
   await page.getByRole("button", { name: "发送" }).click();
 
-  await ensureToolGroupExpanded(page, /工具调用 · 1 \/ 1 已完成/);
+  await ensureToolGroupExpanded(page, /已工作/);
   await expect(page.getByText("list_dir")).toBeVisible();
   await expect(page.getByRole("button", { name: /list_dir.*完成/ })).toBeVisible();
   await expect(page.getByText("最终内容", { exact: true })).toBeVisible();
   await expect(page.getByText("流式草稿", { exact: true })).toHaveCount(0);
   await expect(page.locator("pre code")).toContainText("print");
-  await page.getByRole("button", { name: /思考完成/ }).click();
+  await page.getByRole("button", { name: /思考过程/ }).click();
   await expect(page.getByText("已经分析用户请求")).toBeVisible();
   const codeLayout = await page.locator("pre code").evaluate((codeElement) => {
     const lines = Array.from(codeElement.children);
@@ -45,7 +45,7 @@ test("聚合流式回复、工具状态并用 final 覆盖草稿", async ({ page
   expect(codeLayout.lineDisplays.length).toBeGreaterThan(1);
   expect(codeLayout.lineDisplays.every((display) => display === "block")).toBe(true);
   await expect(page.getByTitle("复制代码")).toBeVisible();
-  const thinkingIconMargin = await page.locator(".thinking-trigger > svg").first().evaluate(
+  const thinkingIconMargin = await page.locator(".process-row > svg").first().evaluate(
     (icon) => getComputedStyle(icon).marginLeft,
   );
   expect(thinkingIconMargin).toBe("0px");
@@ -218,8 +218,9 @@ test("消息阅读排版、过程键盘折叠与长代码复制在窄屏仍可�
   });
   if (testInfo.project.name === "mobile") await page.getByRole("button", { name: "打开会话列表" }).click();
   await page.getByRole("button", { name: "历史问题", exact: true }).click();
-  const summary = page.getByRole("button", { name: /思考完成/ });
-  const tools = page.getByRole("button", { name: /工具调用.*展开工具详情/ });
+  await ensureToolGroupExpanded(page, /已工作/);
+  const summary = page.getByRole("button", { name: /思考过程/ });
+  const tools = page.getByRole("button", { name: /read_file.*完成/ });
   await expect(tools).toHaveAttribute("aria-expanded", "false");
   await expect(summary).toHaveAttribute("aria-expanded", "false");
   await summary.focus();
@@ -377,7 +378,7 @@ test("越权请求在对应工具行内显示审批卡并只允许单次决定",
   await expect(page.getByText("playwright-fingerprint")).toHaveCount(0);
   await page.getByRole("button", { name: "仅允许本次" }).click();
   await expect(page.getByText("审批流程已结束")).toBeVisible();
-  await ensureToolGroupExpanded(page, /工具调用 · 1 \/ 1 已完成/);
+  await ensureToolGroupExpanded(page, /已工作/);
   await expect(page.getByRole("button", { name: /shell.*完成/ })).toBeVisible();
   await expect(page.getByPlaceholder("输入消息，或附加文本与图片")).toBeVisible();
 });
@@ -390,8 +391,8 @@ test("拒绝审批后工具进入失败终态并清理等待卡", async ({ page 
   await expect(page.getByLabel("待处理权限审批")).toBeVisible();
   await page.getByRole("button", { name: "拒绝" }).click();
   await expect(page.getByText("审批流程已结束")).toBeVisible();
-  // 失败组默认保持可见，但工具详情仍遵循完成组的折叠策略；先展开组再断言单行状态。
-  await ensureToolGroupExpanded(page, /工具调用 · 1 项失败/);
+  // 完成后过程默认收起；失败结果也保留在各自工具行内。
+  await ensureToolGroupExpanded(page, /已工作/);
   await expect(page.getByRole("button", { name: /shell.*已拒绝/ })).toBeVisible();
   await expect(page.getByLabel("待处理权限审批")).toHaveCount(0);
 });

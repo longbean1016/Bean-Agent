@@ -57,6 +57,7 @@ function mergeLogicalMessage(current: ChatMessage, incoming: ChatMessage): ChatM
     tools: mergeTools(preferred.tools, fallback.tools),
     streaming: incomingPersisted ? Boolean(incoming.streaming) : Boolean(preferred.streaming),
     durationMs: preferred.durationMs ?? fallback.durationMs,
+    presentation: preferred.presentation ?? fallback.presentation,
   };
 }
 

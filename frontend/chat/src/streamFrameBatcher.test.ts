@@ -19,7 +19,7 @@ it("按绘制帧合并中文和跨分片 Markdown，不添加逐字延迟", () =
   expect(emit).toHaveBeenCalledTimes(1);
 });
 
-it.each(["message.final", "turn.interrupted", "approval.requested", "react.tool.started", "error", "turn.snapshot"])("%s 即时处理，先补齐文本且旧批次不能覆盖终态", (type) => {
+it.each(["message.final", "turn.interrupted", "approval.requested", "react.tool.started", "error", "turn.snapshot", "turn.presentation"])("%s 即时处理，先补齐文本且旧批次不能覆盖终态", (type) => {
   const emit = vi.fn();
   const batcher = new StreamFrameBatcher(emit);
   batcher.push(delta("尾字"));
@@ -53,6 +53,17 @@ it("绘制暂停时有定时回退，取消后旧帧不会再更新页面", () =
   vi.advanceTimersByTime(100);
   expect(emit).toHaveBeenCalledTimes(1);
   raf.mockRestore();
+});
+
+it("相邻正文属于不同段落时不能合并", () => {
+  const emit = vi.fn();
+  const batcher = new StreamFrameBatcher(emit);
+  const frames: ChatFrame[] = [
+    { type: "answer.delta", session_id: "web:test", turn_id: "turn", part_id: "first", delta: "中间说明" },
+    { type: "answer.delta", session_id: "web:test", turn_id: "turn", part_id: "second", delta: "后续正文" },
+  ];
+  frames.forEach((frame) => batcher.push(frame)); batcher.flush();
+  expect(emit.mock.calls.map(([frame]) => frame)).toEqual(frames);
 });
 
 it("模拟长历史：320 个分片合并为不超过 22 次状态更新，结果与逐片处理一致", () => {

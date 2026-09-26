@@ -18,7 +18,8 @@ export class StreamFrameBatcher {
       return;
     }
     if (this.pending && (this.pending.type !== frame.type
-      || this.pending.session_id !== frame.session_id || this.pending.turn_id !== frame.turn_id)) {
+      || this.pending.session_id !== frame.session_id || this.pending.turn_id !== frame.turn_id
+      || this.pending.part_id !== frame.part_id)) {
       this.flush();
     }
     this.pending = frame;

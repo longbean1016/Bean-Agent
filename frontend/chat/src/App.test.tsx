@@ -658,7 +658,7 @@ it("工具行审批链按 call 关联且允许本次后保留输入区", async (
     },
   }) } as MessageEvent));
 
-  expect(screen.getByRole("button", { name: /工具调用.*等待授权/ })).toBeVisible();
+  expect(screen.getByRole("button", { name: /write_file.*等待授权/ })).toBeVisible();
   expect(screen.getByText("原因：超出范围")).toBeVisible();
   expect(screen.getAllByLabelText("待处理权限审批")).toHaveLength(1);
   expect(screen.getByPlaceholderText("输入消息，或附加文本与图片")).toBeVisible();
@@ -738,8 +738,8 @@ it("工具完成后显示完成勾并保留语义动作文案", async () => {
     }) } as MessageEvent);
   });
 
-  const group = screen.getByRole("button", { name: /工具调用 · 4 \/ 4 已完成/ });
-  expect(group.querySelector("svg.lucide-check")).toBeInTheDocument();
+  const group = screen.getByRole("button", { name: /已工作/ });
+  expect(group).toHaveAttribute("aria-expanded", "false");
   expect(group.querySelector("svg.lucide-activity")).not.toBeInTheDocument();
   fireEvent.click(group);
   expect(screen.getByText("运行了命令")).toBeVisible();
@@ -772,9 +772,7 @@ it("收起工具组和工具行后审批保持可操作但不强制展开", asyn
     tool_name: "write_file", arguments: { path: "D:/outside.txt" }, started_at: "2026-09-20T08:00:00.000Z",
   }) } as MessageEvent));
 
-  const groupTrigger = screen.getByRole("button", { name: /工具调用.*正在执行.*展开工具详情/ });
-  expect(groupTrigger).toHaveAttribute("aria-expanded", "false");
-  fireEvent.click(groupTrigger);
+  const groupTrigger = screen.getByRole("button", { name: /工作中/ });
   const toolTrigger = screen.getByRole("button", { name: /write_file.*执行中/ });
   expect(groupTrigger).toHaveAttribute("aria-expanded", "true");
   expect(toolTrigger).toHaveAttribute("aria-expanded", "false");
@@ -794,7 +792,7 @@ it("收起工具组和工具行后审批保持可操作但不强制展开", asyn
   }) } as MessageEvent));
 
   await waitFor(() => {
-    expect(screen.getByRole("button", { name: /工具调用 · 1 项等待授权/ })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByRole("button", { name: /工作中/ })).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByRole("button", { name: /write_file.*等待授权/ })).not.toBeInTheDocument();
   });
   expect(screen.getByRole("button", { name: "仅允许本次" })).toBeVisible();
@@ -1015,6 +1013,7 @@ it("中断消息只显示状态标签，不渲染持久化占位正文", async (
   const stoppedLabels = screen.getAllByText("已停止");
   expect(stoppedLabels).toHaveLength(2);
   fireEvent.click(stoppedLabels.find((label) => label.closest("button"))!.closest("button")!);
+  fireEvent.click(screen.getByRole("button", { name: /思考已停止/ }));
   expect(screen.getByText("partial thinking")).toBeVisible();
   expect(screen.queryByText("[用户已停止生成]")).not.toBeInTheDocument();
 });
@@ -1137,8 +1136,9 @@ it("刷新已有会话时显示骨架并通过消息接口恢复运行中 turn",
 
   expect(await screen.findByText("fresh question", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByText("fresh partial")).toBeVisible();
+  expect(screen.queryByText("fresh thinking")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: /思考过程/ }));
   expect(screen.getByText("fresh thinking")).toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: /工具调用.*展开工具详情/ }));
   expect(screen.getByText("read_file")).toBeVisible();
   expect(container.querySelector(".conversation-skeleton")).toBeNull();
   await waitFor(() => expect(FakeWebSocket.instances[0].sent.some((frame) => (
@@ -1662,7 +1662,7 @@ it("切回后台运行会话时恢复用户问题流式内容和工具状态", a
   fireEvent.click(screen.getByRole("button", { name: "打开会话“新对话”" }));
   expect(await screen.findByText("分析当前项目", { selector: ".user-text" })).toBeVisible();
   expect(screen.getByText("阶段结果")).toBeVisible();
-  const completedTools = screen.getByRole("button", { name: /工具调用 · 1 \/ 1 已完成/ });
+  const completedTools = screen.getByRole("button", { name: /list_dir.*完成/ });
   expect(completedTools).toHaveAttribute("aria-expanded", "false");
   fireEvent.click(completedTools);
   expect(screen.getByText("list_dir")).toBeVisible();

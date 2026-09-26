@@ -1,0 +1,28 @@
+.turn-process { margin: 4px 0 18px; min-width: 0; color: var(--text-muted); }
+.turn-work-trigger, .process-row { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; background: transparent; color: var(--text-muted); text-align: left; cursor: pointer; font: inherit; font-size: 13px; }
+.turn-work-trigger { min-height: 36px; padding: 5px 0 9px; border-bottom: 1px solid var(--border-soft); }
+.turn-work-trigger > svg:last-child { margin-left: 3px; }
+.turn-work-trigger > svg:last-child, .process-row > svg:last-child { flex-shrink: 0; transform: rotate(-90deg); }
+[data-state="open"] > .turn-work-trigger > svg:last-child, [data-state="open"] > .process-row > svg:last-child { transform: rotate(0); }
+.turn-work-trigger:focus-visible, .process-row:focus-visible { outline: 2px solid var(--primary-border); outline-offset: 3px; border-radius: 4px; }
+.turn-process-content { padding: 8px 0; }
+.process-row { min-height: 36px; padding: 6px; border-radius: 5px; }
+.process-row:hover { background: var(--surface-hover); }
+.process-row > span { min-width: 0; overflow-wrap: anywhere; }
+.process-row > svg { flex-shrink: 0; }
+.process-row > svg:last-child { margin-left: auto; }
+.process-success { color: var(--primary); }
+.process-details { max-height: min(360px, 45vh); overflow: auto; padding: 8px 12px; margin: 0 0 10px 27px; border-left: 1px solid var(--border); font-size: 13px; overflow-wrap: anywhere; }
+.process-details .beanagent-markdown, .process-intermediate .beanagent-markdown { color: var(--text-muted); }
+.process-intermediate { padding: 3px 6px; }
+.memory-results p { margin: 4px 0 8px; }
+.memory-results ul { padding-left: 18px; }
+.memory-results li { margin-bottom: 12px; }
+.memory-results small, .process-detail-time, .memory-result-origin { color: var(--text-muted); font-size: 12px; }
+.turn-process .tool-inline-list { margin: 0; }
+.tool-inline-list .tool-action, .tool-inline-list .tool-name, .tool-inline-list .tool-target { color: var(--text-muted); }
+.tool-inline-list .tool-name { font-size: 12px; }
+.turn-process .tool-group .tool-trigger .tool-name { color: var(--text-muted); }
+.turn-work-spinner { animation: tool-running-rotate 1s linear infinite; }
+@media (max-width: 640px) { .process-details { margin-left: 8px; } .tool-inline-list .tool-name { max-width: 160px; } }
+@media (prefers-reduced-motion: reduce) { .turn-work-spinner { animation: none; } }

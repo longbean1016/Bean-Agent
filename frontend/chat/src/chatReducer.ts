@@ -1,5 +1,6 @@
 import type { ApprovalRequest, ChatAction, ChatMessage, ChatState, ContextUsage, MessageRow, ModelAdapterId, ProactiveNotificationRow, ResolvedApproval, SessionUsage, ToolActivity, ToolStatus, TurnRuntimeState } from "./types";
 import { reconcileMessages } from "./timeline";
+import { appendProcessDelta, readPresentation } from "./turnPresentation";
 
 export const idleTurnState: TurnRuntimeState = {
   status: "idle",
@@ -417,6 +418,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
         : existingAssistant?.thinkingStatus,
       media: existingAssistant?.media ?? [],
       tools: mergeTools(existingAssistant?.tools ?? [], incomingTools),
+      presentation: readPresentation(action.presentation) ?? existingAssistant?.presentation,
       streaming: true,
       timestamp: existingAssistant?.timestamp ?? snapshotTimestamp,
     };
@@ -438,12 +440,19 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       error: current ? "" : state.error,
     };
   }
+  if (action.type === "turn.presentation") {
+    const presentation = readPresentation(action.presentation);
+    if (!presentation) return state;
+    return updateSessionTurn(state, action.session_id, action.turn_id, (message) =>
+      isClosedMessage(message) ? message : { ...message, presentation, streaming: true });
+  }
   if (action.type === "answer.delta") {
     return updateSessionTurn(state, action.session_id, action.turn_id, (message) => {
       if (isClosedMessage(message)) return message;
       return {
         ...message,
         content: message.content + action.delta,
+        presentation: appendProcessDelta(message.presentation, action.part_id, "text", action.delta),
         streaming: true,
       };
     });
@@ -454,6 +463,7 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
       return {
         ...message,
         thinking: message.thinking + action.delta,
+        presentation: appendProcessDelta(message.presentation, action.part_id, "thinking", action.delta),
         streaming: true,
         thinkingStatus: message.thinkingStatus === "completed" ? "completed" : "running",
       };
@@ -647,12 +657,13 @@ export function reduceChatFrame(state: ChatState, action: ChatAction): ChatState
     const next = updateSessionTurn(state, action.session_id, finalTurnId, (message) => {
       const timestamp = String(action.metadata?.generated_at || "")
         || (message.streaming ? finalReceivedAt : message.timestamp);
-      const durationMs = message.durationMs
-        ?? metadataDuration
+      const durationMs = metadataDuration
+        ?? message.durationMs
         ?? (isRuntimeMessage(turnUser) ? elapsedDurationMs(turnUser?.timestamp, timestamp) : undefined);
       return {
         ...message,
         content: action.content || message.content,
+        presentation: readPresentation(action.metadata?.presentation) ?? message.presentation,
         thinking: action.thinking || message.thinking,
         thinkingStatus: (action.thinking || message.thinking) ? "completed" : message.thinkingStatus,
         media: action.media ?? message.media,
@@ -1139,6 +1150,7 @@ export function rowsToMessages(rows: MessageRow[]): ChatMessage[] {
       status: row.status,
       timestamp: row.timestamp,
       durationMs: durationFromRow(row),
+      presentation: row.proactive ? undefined : readPresentation(row.metadata?.presentation),
       proactive: Boolean(row.proactive),
       source: row.proactive
         ? (String(row.metadata?.source || "proactive_conversation") as ChatMessage["source"])

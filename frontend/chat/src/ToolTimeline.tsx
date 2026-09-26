@@ -1,9 +1,10 @@
 import * as Collapsible from "@radix-ui/react-collapsible";
-import { Check, ChevronDown, CircleStop, CircleHelp, Clock3, FileText, FilePenLine, FolderOpen, Globe2, LoaderCircle, MessageCircle, PlugZap, SquareTerminal, Wrench, X } from "lucide-react";
+import { Check, ChevronDown, CircleStop, CircleHelp, Clock3, FileText, FilePenLine, FolderOpen, Globe2, LoaderCircle, MessageCircle, PlugZap, Search, SquareTerminal, WandSparkles, Wrench, X } from "lucide-react";
 import { memo, useEffect, useState } from "react";
 import { ApprovalCard } from "./SandboxControls";
 import type { ApprovalRequest, ToolActivity } from "./types";
-import { deriveToolSummary, toolDisplayStatus, type ToolDisplayStatus } from "./toolSummary";
+import { toolDisplayStatus, type ToolDisplayStatus } from "./toolSummary";
+import { MemoryResults, parseMemoryResult } from "./MemoryResults";
 import "./toolTimeline.css";
 
 /**
@@ -91,20 +92,11 @@ type ToolTimelineProps = {
   disclosureKey: string;
 };
 
-// 虚拟列表卸载消息后仍保留当前会话内的手动选择，工具状态变化不改写展开状态。
-function useDisclosure(store: ToolDisclosureState, key: string): [boolean, (open: boolean) => void] {
-  const [open, setOpen] = useState(() => store.get(key) ?? false);
-  return [open, (value) => { store.set(key, value); setOpen(value); }];
-}
-
 export const ToolTimeline = memo(function ToolTimeline({
   tools, approvals, approvalDecisionRequests, onApprovalDecision, disclosure, disclosureKey,
 }: ToolTimelineProps) {
-  const [groupOpen, setGroupOpen] = useDisclosure(disclosure, disclosureKey);
   const [now, setNow] = useState(() => Date.now());
-  const summary = deriveToolSummary(tools, approvals);
-  // 收起时不为隐藏的耗时详情刷新组件；转圈只由 CSS 驱动。
-  const hasRunningTimer = groupOpen && tools.some((tool) => toolDisplayStatus(tool) === "running" && tool.startedAt);
+  const hasRunningTimer = tools.some((tool) => toolDisplayStatus(tool) === "running" && tool.startedAt);
   useEffect(() => {
     if (!hasRunningTimer) return;
     setNow(Date.now());
@@ -113,19 +105,12 @@ export const ToolTimeline = memo(function ToolTimeline({
   }, [hasRunningTimer]);
   const pendingByCall = new Map(approvals.map((approval) => [approval.call_id, approval]));
   return (
-    <Collapsible.Root className={`tool-timeline tool-group ${summary.status}`} open={groupOpen} onOpenChange={setGroupOpen}>
-      <Collapsible.Trigger className="tool-group-trigger" aria-label={`工具调用 · ${summary.label}，${groupOpen ? "收起" : "展开"}工具详情`}>
-        <span className="tool-group-icon" aria-hidden="true">
-          <Wrench size={16} />
-        </span>
-        <span className="tool-group-summary">
-          <strong>工具调用</strong>
-          <span className="tool-group-state" aria-live="polite" aria-atomic="true">{summary.displayLabel}</span>
-        </span>
-        <ToolStatus status={summary.status} label={summary.status === "error" ? `${summary.counts.error} 项失败` : undefined} />
-        <ChevronDown size={14} aria-hidden="true" />
-      </Collapsible.Trigger>
-      {/* 审批沿用原卡片和消息内位置，独立于两层折叠，收起或懒挂载均不影响操作。 */}
+    <div className="tool-timeline tool-group tool-inline-list">
+      {tools.map((tool) => (
+        <ToolStep key={tool.callId} tool={tool} now={now} approval={pendingByCall.get(tool.callId)}
+          open={disclosure.get(`${disclosureKey}:${tool.callId}`) ?? false}
+          onOpenChange={(open) => disclosure.set(`${disclosureKey}:${tool.callId}`, open)} />
+      ))}
       {approvals.map((approval, index) => (
         <div className="tool-orphan-approval" key={approval.id}>
           <ApprovalCard approval={approval} queuePosition={index + 1} queueTotal={approvals.length}
@@ -133,14 +118,7 @@ export const ToolTimeline = memo(function ToolTimeline({
             onDecide={(decision) => onApprovalDecision?.(approval, decision)} inline />
         </div>
       ))}
-      <Collapsible.Content className="tool-group-content">
-        {tools.map((tool) => (
-          <ToolStep key={tool.callId} tool={tool} now={now} approval={pendingByCall.get(tool.callId)}
-            open={disclosure.get(`${disclosureKey}:${tool.callId}`) ?? false}
-            onOpenChange={(open) => disclosure.set(`${disclosureKey}:${tool.callId}`, open)} />
-        ))}
-      </Collapsible.Content>
-    </Collapsible.Root>
+    </div>
   );
 }, (previous, next) => previous.tools === next.tools
   && previous.disclosure === next.disclosure && previous.disclosureKey === next.disclosureKey
@@ -155,7 +133,13 @@ function ToolStep({ tool, now, approval, open, onOpenChange }: {
 }) {
   const [stepOpen, setStepOpen] = useState(open);
   const kind = toolVisualKind(tool.name);
-  const actionLabel = toolActionLabel(tool, kind);
+  const skill = tool.name === "load_skill";
+  const memory = tool.name === "recall_memory";
+  const memoryResult = memory ? tool.memoryResult ?? parseMemoryResult(tool.resultPreview) : null;
+  const actionLabel = skill ? tool.status === "completed" ? "使用了技能" : tool.status === "running" ? "正在加载技能"
+    : tool.status === "interrupted" || tool.status === "cancelled" ? "技能加载已停止" : "技能加载失败"
+    : memory ? tool.status === "completed" ? "已检索记忆" : tool.status === "running" ? "正在检索记忆" : "记忆检索未完成"
+    : toolActionLabel(tool, kind);
   const displayStatus = toolDisplayStatus(tool, Boolean(approval));
   const statusLabel = displayStatus === "pending"
     ? "等待授权"
@@ -181,11 +165,11 @@ function ToolStep({ tool, now, approval, open, onOpenChange }: {
         onOpenChange(nextOpen);
       }}
     >
-      <Collapsible.Trigger className="tool-trigger" aria-label={`${tool.name}${target ? ` ${target}` : ""}，${actionLabel}，${statusLabel}`}>
-        <span className="tool-icon" aria-hidden="true">{toolIcon(kind, 16)}</span>
+      <Collapsible.Trigger className="tool-trigger" aria-label={`${skill ? target || "技能" : tool.name}${!skill && target ? ` ${target}` : ""}，${actionLabel}，${statusLabel}`}>
+        <span className="tool-icon" aria-hidden="true">{skill ? <WandSparkles size={16} /> : memory ? <Search size={16} /> : toolIcon(kind, 16)}</span>
         <span className="tool-action">{actionLabel}</span>
-        <strong className="tool-name">{tool.name}</strong>
-        {target && kind !== "message" ? <span className="tool-target">{target}</span> : null}
+        <strong className="tool-name">{skill ? target || "未知技能" : memory ? memoryResult ? `找到 ${memoryResult.count} 条` : "" : tool.name}</strong>
+        {target && kind !== "message" && !skill && !memory ? <span className="tool-target">{target}</span> : null}
         <ToolStatus status={displayStatus} label={statusLabel} />
         {duration ? <time className="tool-duration">{duration}</time> : null}
         <ChevronDown size={14} aria-hidden="true" />
@@ -204,7 +188,8 @@ function ToolStep({ tool, now, approval, open, onOpenChange }: {
           {tool.exitCode !== undefined ? <div><dt>退出码</dt><dd>{String(tool.exitCode)}</dd></div> : null}
           {tool.errorCode ? <div><dt>错误</dt><dd>{tool.errorCode}</dd></div> : null}
         </dl>
-        {tool.resultPreview ? <p className="tool-result-preview">{truncateToolText(tool.resultPreview)}</p> : null}
+        {memoryResult ? <MemoryResults query={target} items={memoryResult.items} origin="模型主动检索" />
+          : tool.resultPreview ? <p className="tool-result-preview">{tool.resultPreview}</p> : null}
         {tool.status === "unknown" ? <p className="tool-unknown-note" role="status">服务端返回了未识别的工具状态，已按保守状态展示。</p> : null}
       </Collapsible.Content>
     </Collapsible.Root>
@@ -231,7 +216,7 @@ function toolDurationForDisplay(tool: ToolActivity, now: number): string | null 
   return null;
 }
 
-function formatCompactDuration(durationMs: number): string {
+export function formatCompactDuration(durationMs: number): string {
   const milliseconds = Math.max(0, durationMs);
   const seconds = milliseconds / 1000;
   if (seconds < 1) return `${seconds.toFixed(1)} 秒`;
