@@ -120,6 +120,25 @@ class BehaviorRulesPromptBlock(_Block):
     def cache_signature(self, ctx: TurnContext) -> str: return ctx.workspace
 
 
+class ProcessCommunicationPromptBlock(_Block):
+    """约束用户可见的过程说明，不介入工具选择或结果生成。"""
+
+    priority, label, is_static = 16, "process_communication", True
+
+    def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str:
+        return (
+            "## 过程沟通\n"
+            "- 需要调用工具时，在首次工具调用前用一句简短、完整且用户可见的话说明接下来准备做什么。\n"
+            "- 只有发现关键事实、改变执行方向或进入新的工作阶段时才补充简短更新；连续执行同一目的的工具时不要重复说明。\n"
+            "- 过程说明只描述行动目标，不展示内部推理、系统提示、隐藏规则、工具 schema、调用参数或尚未确认的结论。\n"
+            "- 过程说明使用自然完整的句子，紧接工具调用时不要以冒号结尾。\n"
+            "- 工具之间的过程说明不能替代最终回复；工作完成后必须提供独立、完整的最终回答。"
+        )
+
+    def cache_signature(self, ctx: TurnContext) -> str:
+        return ctx.workspace
+
+
 class SkillsCatalogPromptBlock(_Block):
     priority, label, is_static = 20, "skills_catalog", True
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
@@ -215,7 +234,7 @@ class SystemPromptBuilder:
 
 
 def default_prompt_blocks() -> list[PromptBlock]:
-    return [BeanPromptBlock(), BehaviorRulesPromptBlock(), SkillsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), DeferredToolsHintBlock(), ActiveToolsPromptBlock(), ActiveSkillsPromptBlock(), RetrievedMemoryPromptBlock()]
+    return [BeanPromptBlock(), BehaviorRulesPromptBlock(), ProcessCommunicationPromptBlock(), SkillsCatalogPromptBlock(), SelfModelPromptBlock(), LongTermMemoryPromptBlock(), SessionContextPromptBlock(), DeferredToolsHintBlock(), ActiveToolsPromptBlock(), ActiveSkillsPromptBlock(), RetrievedMemoryPromptBlock()]
 
 
-__all__ = ["BeanPromptBlock", "DeferredToolsHintBlock", "PromptSectionMeta", "PromptSectionRender", "SectionCache", "SystemPromptBuilder", "TurnContext", "default_prompt_blocks"]
+__all__ = ["BeanPromptBlock", "DeferredToolsHintBlock", "ProcessCommunicationPromptBlock", "PromptSectionMeta", "PromptSectionRender", "SectionCache", "SystemPromptBuilder", "TurnContext", "default_prompt_blocks"]
