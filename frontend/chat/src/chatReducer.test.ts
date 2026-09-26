@@ -86,6 +86,30 @@ describe("reduceChatFrame", () => {
     expect(state.messages[0].tools[0]).toMatchObject({ status: "rejected", resultPreview: "" });
   });
 
+  it("保留本会话授权终态并从待审批队列移除", () => {
+    let state = reduceChatFrame({ ...initialChatState, sessionId: "web:session-grant" }, {
+      type: "turn.started", request_id: "r-session-grant", session_id: "web:session-grant", turn_id: "turn-session-grant",
+    });
+    state = reduceChatFrame(state, {
+      type: "react.tool.started", session_id: "web:session-grant", turn_id: "turn-session-grant",
+      call_id: "call-session-grant", tool_name: "shell", arguments: {},
+    });
+    const approval = {
+      id: "approval-session-grant", session_id: "web:session-grant", turn_id: "turn-session-grant", call_id: "call-session-grant",
+      tool_name: "shell", operation: "删除文件", arguments: { command: 'del "D:\\test\\a.txt"' }, reason: "需要授权",
+      requested_mode: "danger-full-access" as const, state: "pending" as const, created_at: "2026-09-20T08:00:00.100Z",
+      allow_session: true, scope: "删除文件 · 目标目录：D:\\test",
+    };
+    state = reduceChatFrame(state, { type: "approval.requested", session_id: approval.session_id, approval });
+    state = reduceChatFrame(state, {
+      type: "approval.resolved", request_id: "resolve-session-grant", session_id: approval.session_id,
+      approval_id: approval.id, decision: "allowed-session", state: "allowed-session", decided_at: "2026-09-20T08:00:00.300Z",
+    });
+
+    expect(state.messages[0].tools[0]).toMatchObject({ approvalState: "allowed-session", approvalWaitMs: 200 });
+    expect(state.approvalRequests?.[approval.session_id]?.[approval.id]).toBeUndefined();
+  });
+
   it("未知工具状态收到审批请求时仍保留可操作的审批关联", () => {
     let state = reduceChatFrame({ ...initialChatState, sessionId: "web:unknown-tool-approval" }, {
       type: "turn.started", request_id: "r-unknown-tool", session_id: "web:unknown-tool-approval", turn_id: "turn-unknown-tool",

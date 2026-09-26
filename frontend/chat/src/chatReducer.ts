@@ -856,7 +856,7 @@ function isTerminalApprovalState(state: ToolActivity["approvalState"]): boolean 
 
 function normalizeApprovalState(value: unknown): NonNullable<ToolActivity["approvalState"]> {
   const state = String(value ?? "").trim().toLowerCase();
-  if (state === "pending" || state === "submitting" || state === "allowed-once"
+  if (state === "pending" || state === "submitting" || state === "allowed-once" || state === "allowed-session"
     || state === "rejected" || state === "cancelled" || state === "expired" || state === "unavailable") {
     return state;
   }
@@ -877,7 +877,7 @@ function normalizeApprovalDecision(
   // 保留 null 让诊断层能区分“没有用户决定”和明确 rejected。
   if (state === "cancelled" || state === "expired" || state === "unavailable") return null;
   // 没有可识别的 state/decision 时只记录未知回执，不把它伪装成放行。
-  return state === "allowed-once" ? "allowed-once" : null;
+  return state === "allowed-once" || state === "allowed-session" ? state : null;
 }
 
 function normalizeResolutionState(state: unknown, decision: unknown): NonNullable<ToolActivity["approvalState"]> {
@@ -885,13 +885,13 @@ function normalizeResolutionState(state: unknown, decision: unknown): NonNullabl
   const fromDecision = normalizeApprovalState(decision);
   // 旧服务端可能同时携带 state=pending 与明确 decision；合法 decision
   // 优先，避免 UI 在已决定后继续显示等待授权。
-  if (decision === "allowed-once" || decision === "rejected" || decision === "cancelled"
+  if (decision === "allowed-once" || decision === "allowed-session" || decision === "rejected" || decision === "cancelled"
     || decision === "expired" || decision === "unavailable") {
     return fromDecision;
   }
   // resolved 只能携带终态；pending/submitting 即使来自旧服务端也不能
   // 让前端移除审批卡后继续显示一个没有操作入口的永久等待状态。
-  if (fromState === "allowed-once" || fromState === "rejected"
+  if (fromState === "allowed-once" || fromState === "allowed-session" || fromState === "rejected"
     || fromState === "cancelled" || fromState === "expired" || fromState === "unavailable") {
     return fromState;
   }

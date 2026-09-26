@@ -1,7 +1,7 @@
 import * as Collapsible from "@radix-ui/react-collapsible";
 import { Atom, Check, ChevronDown, LoaderCircle, Search } from "lucide-react";
 import { memo, useEffect, useState, type ReactNode } from "react";
-import type { ApprovalRequest, ChatMessage, ToolActivity } from "./types";
+import type { ApprovalDecision, ApprovalRequest, ChatMessage, ToolActivity } from "./types";
 import type { ProcessPart } from "./turnPresentation";
 import { ToolTimeline, formatCompactDuration, type ToolDisclosureState } from "./ToolTimeline";
 import { MemoryResults } from "./MemoryResults";
@@ -10,7 +10,7 @@ import "./turnProcess.css";
 type Props = {
   message: ChatMessage; parts: ProcessPart[]; disclosure: ToolDisclosureState; disclosureKey: string;
   approvals: ApprovalRequest[]; approvalDecisionRequests: Record<string, string>;
-  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
+  onApprovalDecision?: (approval: ApprovalRequest, decision: ApprovalDecision) => void;
   renderText: (text: string, streaming: boolean) => ReactNode;
 };
 

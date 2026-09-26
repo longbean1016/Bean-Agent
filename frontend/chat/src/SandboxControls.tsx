@@ -3,7 +3,7 @@ import { Check, ChevronDown, Folder, Shield, ShieldAlert } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
-import type { ApprovalRequest, SandboxMode, Workspace } from "./types";
+import type { ApprovalDecision, ApprovalRequest, SandboxMode, Workspace } from "./types";
 
 type ComposerMenuOption = {
   id: string;
@@ -198,7 +198,7 @@ export function PermissionSelector(props: {
 export function ApprovalCard(props: {
   approval: ApprovalRequest;
   submitting: boolean;
-  onDecide: (decision: "allowed-once" | "rejected") => void;
+  onDecide: (decision: ApprovalDecision) => void;
   inline?: boolean;
   queuePosition?: number;
   queueTotal?: number;
@@ -206,6 +206,9 @@ export function ApprovalCard(props: {
   const entries = safeApprovalEntries(props.approval);
   const summary = props.approval.summary?.trim() || "";
   const reason = props.approval.reason?.trim() || "";
+  const scope = props.approval.display_scope?.trim() || props.approval.scope?.trim() || "";
+  const permissionPresentation = approvalPermissionPresentation(props.approval);
+  const sessionApprovalLabel = approvalSessionLabel(props.approval.scope_kind);
   const queueLabel = props.queuePosition && props.queueTotal && props.queueTotal > 1
     ? `队列 ${props.queuePosition}/${props.queueTotal}`
     : "";
@@ -215,7 +218,15 @@ export function ApprovalCard(props: {
         <div className="approval-body" tabIndex={0} role="group" aria-label="越权操作详情">
           <strong>{summary || reason || `${props.approval.tool_name} 请求临时提高权限`}</strong>
           {summary && reason && summary !== reason ? <span className="approval-reason">原因：{reason}</span> : null}
-          <span className="approval-operation">{props.approval.operation}</span>
+          <div
+            className="approval-permission"
+            aria-label={`权限分类：${permissionPresentation.category}，具体操作：${permissionPresentation.action}`}
+          >
+            <span className="approval-permission-category">{permissionPresentation.category}</span>
+            <span className="approval-permission-separator" aria-hidden="true">›</span>
+            <strong>{permissionPresentation.action}</strong>
+          </div>
+          {scope ? <span className="approval-reason">{props.approval.allow_session ? "会话授权范围" : "本次授权范围"}：{scope}</span> : null}
           {entries.length ? (
             <dl className="approval-arguments">
               {entries.map(([key, value]) => (
@@ -226,6 +237,9 @@ export function ApprovalCard(props: {
         </div>
         <div className="approval-actions">
           <button className="secondary-action approval-reject" disabled={props.submitting} onClick={() => props.onDecide("rejected")}>拒绝</button>
+          {props.approval.allow_session ? (
+            <button className="secondary-action" disabled={props.submitting} onClick={() => props.onDecide("allowed-session")}>{sessionApprovalLabel}</button>
+          ) : null}
           <button className="primary-action" disabled={props.submitting} onClick={() => props.onDecide("allowed-once")}>{props.submitting ? "提交中…" : "仅允许本次"}</button>
         </div>
       </section>
@@ -235,7 +249,7 @@ export function ApprovalCard(props: {
 export function ApprovalPanel(props: {
   approval: ApprovalRequest;
   submitting: boolean;
-  onDecide: (decision: "allowed-once" | "rejected") => void;
+  onDecide: (decision: ApprovalDecision) => void;
   queuePosition?: number;
   queueTotal?: number;
 }) {
@@ -266,6 +280,28 @@ function approvalArgumentLabel(key: string): string {
     replace_all: "替换全部匹配",
   };
   return labels[key] ?? key;
+}
+
+/** 新协议直接展示后端语义；中文归纳仅兼容旧审批，不参与授权计算。 */
+function approvalPermissionPresentation(approval: ApprovalRequest): { category: string; action: string } {
+  const category = approval.category?.trim();
+  const action = approval.action?.trim();
+  if (category && action) return { category, action };
+  const normalized = approval.operation.trim();
+  if (/删除/u.test(normalized)) return { category: "文件变更", action: "删除" };
+  if (/移动|重命名/u.test(normalized)) return { category: "文件变更", action: "移动/重命名" };
+  if (/创建|写入|编辑|覆盖|替换/u.test(normalized)) return { category: "文件变更", action: "创建/编辑" };
+  if (/Shell|命令|执行/iu.test(normalized) || approval.tool_name === "shell") {
+    return { category: "命令执行", action: /完整/u.test(normalized) ? "完整 Shell 命令" : "运行命令" };
+  }
+  return { category: "临时权限", action: normalized || "需要确认" };
+}
+
+function approvalSessionLabel(scopeKind: string | undefined): string {
+  if (scopeKind === "paths") return "本会话允许此路径范围";
+  if (scopeKind === "prefix") return "本会话允许此命令前缀";
+  if (scopeKind === "exact") return "本会话允许此完整命令";
+  return "本会话允许同类操作";
 }
 
 function displayApprovalArgument(value: unknown): string {

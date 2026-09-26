@@ -47,6 +47,69 @@ it("单项收起时保留原审批卡且不转圈，提交锁即时更新", () =
   expect(screen.getByRole("button", { name: "提交中…" })).toBeDisabled();
 });
 
+it("可复用审批展示准确范围并提交本会话决定", () => {
+  const initial = props();
+  const decide = vi.fn();
+  const reusable = {
+    ...approval,
+    operation: "删除文件",
+    category: "文件变更",
+    action: "删除",
+    scope_kind: "paths",
+    display_scope: "删除文件 · 目标目录：D:\\test",
+    allow_session: true,
+  };
+  render(<ToolTimeline {...initial} approvals={[reusable]} onApprovalDecision={decide} />);
+
+  expect(screen.getByLabelText("权限分类：文件变更，具体操作：删除")).toBeVisible();
+  expect(screen.getByText("会话授权范围：删除文件 · 目标目录：D:\\test")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "本会话允许此路径范围" }));
+  expect(decide).toHaveBeenCalledExactlyOnceWith(reusable, "allowed-session");
+});
+
+it("命令审批展示后端分类并按范围类型给出准确会话按钮", () => {
+  const initial = props();
+  const { rerender } = render(<ToolTimeline {...initial} approvals={[{
+    ...approval,
+    tool_name: "shell",
+    operation: "执行 Shell 命令",
+    category: "命令执行",
+    action: "命令前缀",
+    scope_kind: "prefix",
+    display_scope: "命令前缀：git pull",
+    allow_session: true,
+  }]} />);
+  expect(screen.getByLabelText("权限分类：命令执行，具体操作：命令前缀")).toBeVisible();
+  expect(screen.getByText("会话授权范围：命令前缀：git pull")).toBeVisible();
+  expect(screen.getByRole("button", { name: "本会话允许此命令前缀" })).toBeVisible();
+
+  rerender(<ToolTimeline {...initial} approvals={[{
+    ...approval,
+    tool_name: "shell",
+    operation: "执行完整 Shell 命令",
+    category: "命令执行",
+    action: "完整 Shell 命令",
+    scope_kind: "exact",
+    display_scope: "仅此完整命令",
+    allow_session: true,
+  }]} />);
+  expect(screen.getByRole("button", { name: "本会话允许此完整命令" })).toBeVisible();
+});
+
+it("文件审批按父类展示并保持操作子类隔离", () => {
+  const initial = props();
+  const { rerender } = render(<ToolTimeline {...initial} approvals={[{
+    ...approval, operation: "完整写入文件", tool_name: "write_file",
+  }]} />);
+  expect(screen.getByLabelText("权限分类：文件变更，具体操作：创建/编辑")).toBeVisible();
+
+  rerender(<ToolTimeline {...initial} approvals={[{
+    ...approval, operation: "移动文件", tool_name: "shell",
+  }]} />);
+  expect(screen.getByLabelText("权限分类：文件变更，具体操作：移动/重命名")).toBeVisible();
+  expect(screen.queryByLabelText("权限分类：文件变更，具体操作：创建/编辑")).not.toBeInTheDocument();
+});
+
 it("失败和成功详情仅在各自展开时出现", () => {
   render(<ToolTimeline {...props()} tools={[
     { ...running, status: "completed", resultPreview: "读取成功" },

@@ -2,7 +2,7 @@ import * as Collapsible from "@radix-ui/react-collapsible";
 import { Check, ChevronDown, CircleStop, CircleHelp, Clock3, FileText, FilePenLine, FolderOpen, Globe2, LoaderCircle, MessageCircle, PlugZap, Search, SquareTerminal, WandSparkles, Wrench, X } from "lucide-react";
 import { memo, useEffect, useState } from "react";
 import { ApprovalCard } from "./SandboxControls";
-import type { ApprovalRequest, ToolActivity } from "./types";
+import type { ApprovalDecision, ApprovalRequest, ToolActivity } from "./types";
 import { toolDisplayStatus, type ToolDisplayStatus } from "./toolSummary";
 import { MemoryResults, parseMemoryResult } from "./MemoryResults";
 import "./toolTimeline.css";
@@ -87,7 +87,7 @@ type ToolTimelineProps = {
   tools: ToolActivity[];
   approvals: ApprovalRequest[];
   approvalDecisionRequests: Record<string, string>;
-  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
+  onApprovalDecision?: (approval: ApprovalRequest, decision: ApprovalDecision) => void;
   disclosure: ToolDisclosureState;
   disclosureKey: string;
 };
@@ -144,6 +144,7 @@ function ToolStep({ tool, now, approval, open, onOpenChange }: {
   const statusLabel = displayStatus === "pending"
     ? "等待授权"
     : tool.approvalState === "allowed-once" && tool.status === "running" ? "执行中 · 已允许本次"
+      : tool.approvalState === "allowed-session" && tool.status === "running" ? "执行中 · 本会话已允许"
       : tool.approvalState === "rejected" ? "已拒绝"
         : tool.approvalState === "cancelled" ? "已取消"
           : tool.approvalState === "expired" ? "授权超时"
@@ -200,6 +201,7 @@ function approvalStateLabel(state: NonNullable<ToolActivity["approvalState"]>): 
   if (state === "pending") return "等待确认";
   if (state === "submitting") return "提交中";
   if (state === "allowed-once") return "已允许本次";
+  if (state === "allowed-session") return "本会话已允许";
   if (state === "rejected") return "已拒绝";
   if (state === "cancelled") return "已取消";
   if (state === "expired") return "已超时";

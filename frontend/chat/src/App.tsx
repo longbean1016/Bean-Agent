@@ -49,7 +49,7 @@ import { messageProcess } from "./turnPresentation";
 import type { ToolDisclosureState } from "./ToolTimeline";
 import { SessionSidebar } from "./SessionSidebar";
 import { ResizableSidebarLayout } from "./ResizableSidebarLayout";
-import type { ApprovalRequest, ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, SandboxMode, SandboxSnapshot, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry, Workspace } from "./types";
+import type { ApprovalDecision, ApprovalRequest, ChatFrame, ChatMessage, ConnectionStatus, ContextUsage, MessageRow, ModelConnection, ModelProfile, ModelRoute, ModelSettingsPayload, SandboxMode, SandboxSnapshot, SessionSummary, SessionUsage, ToolActivity, TurnNavigationEntry, Workspace } from "./types";
 import { ModelSettingsPage } from "./ModelSettingsPage";
 import { ExtensionsPage } from "./ExtensionsPage";
 import { extensionKindFromPath, EXTENSION_PATHS, isModelSettingsPath, MODEL_SETTINGS_PATH, pathForSession, routeKey, sessionFromPath } from "./chatRoute";
@@ -843,7 +843,7 @@ export function App() {
     void loadSession(sessionId, false);
   };
 
-  const decideApproval = useCallback((approval: ApprovalRequest, decision: "allowed-once" | "rejected") => {
+  const decideApproval = useCallback((approval: ApprovalRequest, decision: ApprovalDecision) => {
     const sessionRequests = approvalDecisionRequestsRef.current[approval.session_id] ?? {};
     if (sessionRequests[approval.id]) return;
     const requestId = crypto.randomUUID();
@@ -1807,7 +1807,7 @@ export const MessageView = memo(function MessageView({ message, navigationTurnId
   sessionId: string;
   approvals?: ApprovalRequest[];
   approvalDecisionRequests?: Record<string, string>;
-  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
+  onApprovalDecision?: (approval: ApprovalRequest, decision: ApprovalDecision) => void;
 }) {
   const isUser = message.role === "user";
   const process = useMemo(() => messageProcess(message), [message]);
@@ -2656,7 +2656,7 @@ function VirtualConversation({ groups, sessionId, requestedTurnId, onTurnPositio
   onVisibleApprovalIdsChange: (sessionId: string, approvalIds: string[]) => void;
   approvals?: ApprovalRequest[];
   approvalDecisionRequests?: Record<string, string>;
-  onApprovalDecision?: (approval: ApprovalRequest, decision: "allowed-once" | "rejected") => void;
+  onApprovalDecision?: (approval: ApprovalRequest, decision: ApprovalDecision) => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const toolDisclosure = useRef<ToolDisclosureState>(new Map());

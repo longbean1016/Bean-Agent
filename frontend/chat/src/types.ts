@@ -10,7 +10,8 @@ export type ToolStatus =
   | "unavailable"
   | "rejected"
   | "unknown";
-export type ApprovalState = "none" | "pending" | "submitting" | "allowed-once" | "rejected" | "cancelled" | "expired" | "unavailable";
+export type ApprovalState = "none" | "pending" | "submitting" | "allowed-once" | "allowed-session" | "rejected" | "cancelled" | "expired" | "unavailable";
+export type ApprovalDecision = "allowed-once" | "allowed-session" | "rejected";
 export type ThinkingStatus = "running" | "completed" | "interrupted";
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 
@@ -131,7 +132,12 @@ export interface ApprovalRequest {
   created_at: string;
   /** 后端可选的脱敏展示投影；前端不应自行解析原始 arguments。 */
   summary?: string;
+  category?: string;
+  action?: string;
+  scope_kind?: "paths" | "prefix" | "exact" | string;
+  display_scope?: string;
   scope?: string;
+  allow_session?: boolean;
   reason_code?: string;
   expires_at?: string;
   requested_at?: string;
@@ -146,7 +152,7 @@ export interface ResolvedApproval {
   session_id: string;
   turn_id?: string;
   call_id?: string;
-  decision?: "allowed-once" | "rejected" | "cancelled" | "expired" | "unavailable" | null;
+  decision?: ApprovalDecision | "cancelled" | "expired" | "unavailable" | null;
   state: ApprovalState;
   requested_at?: string;
   decided_at?: string;
@@ -483,7 +489,7 @@ export type ChatFrame =
   | { type: "session.subscribed"; request_id: string; session_id: string }
   | { type: "sandbox.updated"; request_id: string; sandbox: SandboxSnapshot }
   | { type: "approval.requested"; session_id: string; approval: ApprovalRequest }
-  | { type: "approval.resolved"; request_id: string; session_id: string; approval_id: string; decision?: "allowed-once" | "rejected" | "cancelled" | "expired" | "unavailable" | null; turn_id?: string; call_id?: string; state?: ApprovalState | string | null; decided_at?: string; error_code?: string }
+  | { type: "approval.resolved"; request_id: string; session_id: string; approval_id: string; decision?: ApprovalDecision | "cancelled" | "expired" | "unavailable" | null; turn_id?: string; call_id?: string; state?: ApprovalState | string | null; decided_at?: string; error_code?: string }
   | { type: "turn.snapshot"; session_id: string; turn_id: string; request_id: string; presentation?: unknown; user_message?: string; user_media?: string[]; content?: string; thinking?: string; tools?: Array<{ call_id: string; name: string; status: ToolStatus | string; arguments?: unknown; result_preview?: string; started_at?: string | null; ended_at?: string | null; duration_ms?: number | string | null; approval_id?: string | null; approval_state?: ApprovalState | string | null; approval_requested_at?: string | null; approval_resolved_at?: string | null; approval_wait_ms?: number | string | null; execution_ms?: number | string | null; group_duration_ms?: number | string | null; result_kind?: string | null; is_truncated?: boolean | null; exit_code?: number | string | null; error_code?: string | null }>; started_at?: string; status: "running" }
   | { type: "turn.queued"; request_id: string; session_id: string; position: number }
   | { type: "turn.started"; request_id?: string; session_id: string; turn_id: string }
