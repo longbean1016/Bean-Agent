@@ -227,3 +227,18 @@ def test_tool_call_projection_bounds_approval_id() -> None:
 
     assert projected["approval_id"] == "a" * 128
     assert projected["approval_state"] == "allowed-once"
+
+
+def test_tool_call_projection_keeps_session_approval_state() -> None:
+    projected = project_tool_call(
+        {
+            "call_id": "call-approval-session",
+            "name": "shell",
+            "arguments": {"command": 'del "D:\\test\\a.txt"'},
+            "approval_id": "approval-session",
+            "approval_state": "allowed-session",
+        }
+    )
+
+    assert projected["approval_id"] == "approval-session"
+    assert projected["approval_state"] == "allowed-session"

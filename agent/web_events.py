@@ -543,7 +543,12 @@ _APPROVAL_PUBLIC_FIELDS = (
     "requested_at",
     "expires_at",
     "summary",
+    "category",
+    "action",
+    "scope_kind",
+    "display_scope",
     "scope",
+    "allow_session",
     "reason_code",
 )
 
@@ -572,7 +577,10 @@ def _project_approval_request(value: object) -> dict[str, Any]:
             continue
         if raw is None:
             continue
-        if key in {"operation", "reason", "summary", "scope", "reason_code"}:
+        if key in {
+            "operation", "reason", "summary", "category", "action",
+            "scope_kind", "display_scope", "scope", "reason_code",
+        }:
             text = str(raw).strip()
             if text:
                 projected[key] = project_result_preview(text)

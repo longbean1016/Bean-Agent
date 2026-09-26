@@ -178,3 +178,34 @@ async def test_interrupt_and_snapshot_are_delegated_without_transport_types() ->
         "session_id": "web:chat",
         "turn_id": "turn-1",
     }
+
+
+@pytest.mark.asyncio
+async def test_workspace_and_mode_changes_clear_session_grants() -> None:
+    class Approvals:
+        def __init__(self) -> None:
+            self.cleared: list[str] = []
+
+        async def clear_session_grants(self, session_key: str) -> None:
+            self.cleared.append(session_key)
+
+    approvals = Approvals()
+
+    async def write_mode(session_key: str, mode: str) -> dict[str, str]:
+        return {"session_id": session_key, "sandbox_mode": mode}
+
+    async def write_workspace(session_key: str, workspace_id: str | None) -> dict[str, object]:
+        return {"session_id": session_key, "workspace_id": workspace_id}
+
+    service = WebCommandService(
+        MessageBus(),
+        Interrupt(),
+        approvals=approvals,
+        sandbox_mode_writer=write_mode,
+        workspace_writer=write_workspace,
+    )
+
+    await service.set_sandbox_mode("web:chat", "read-only")
+    await service.bind_workspace("web:chat", "workspace-1")
+
+    assert approvals.cleared == ["web:chat", "web:chat"]

@@ -17,12 +17,14 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import urlparse
 
+from sandbox.approval import SessionGrant
 from sandbox.errors import SandboxError
 from sandbox.guard import SandboxGuard
 from sandbox.runtime import SandboxProcessRuntime, SandboxRunResult
 from sandbox.shell import SandboxShellBroker
 from sandbox.environment_probe import shell_executable
 from sandbox.shell_environment import ShellEnvironmentCache
+from sandbox.shell_permissions import classify_shell_permission, requires_preapproval
 from tools.base import Tool
 from tools.shell_diagnostics import allows_permission_retry, command_name, diagnose
 
@@ -307,7 +309,8 @@ class ShellTool(Tool):
             "不得用 shell 替代 read_file、web_fetch、list_dir 等专用工具。"
             "Windows 使用 CMD 语法，curl.exe 请求必须显式带 https://，用 -sS 保留错误并设置超时。"
             "解释器使用本轮已验证的绝对路径，不假定 python/py 可用；组合命令的退出码不能代表每一步。"
-            "删除或移动失败可能已部分完成，检查目标后再决定下一步，不盲目重试。"
+            "删除、移动或工作区外变更应在调用时请求执行前授权；批准后命令只执行一次。"
+            "只有安全、简单且按参数边界明确的命令才能提供 prefix_rule，会话授权不会跨工具或操作复用。"
         )
 
     @property
@@ -327,6 +330,21 @@ class ShellTool(Tool):
                     "default": _DEFAULT_TIMEOUT,
                 },
                 "cwd": {"type": "string", "description": "可选工作目录"},
+                "sandbox_permissions": {
+                    "type": "string",
+                    "enum": ["use_default", "require_escalated"],
+                    "default": "use_default",
+                    "description": "本次命令的权限意图；工作区外变更或受限模式无法完成时使用 require_escalated",
+                },
+                "justification": {
+                    "type": "string",
+                    "description": "require_escalated 时展示给用户的简短授权原因",
+                },
+                "prefix_rule": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选的安全命令参数前缀，仅用于 require_escalated；解释器及删除、移动命令禁止使用",
+                },
             },
             "required": ["command", "description"],
         }
@@ -335,8 +353,20 @@ class ShellTool(Tool):
         command = str(kwargs.get("command", "")).strip()
         description = str(kwargs.get("description", ""))
         timeout = min(int(kwargs.get("timeout", _DEFAULT_TIMEOUT)), _MAX_TIMEOUT)
+        sandbox_permissions = str(kwargs.get("sandbox_permissions") or "use_default").strip()
+        justification = str(kwargs.get("justification") or "").strip()
+        raw_prefix_rule = kwargs.get("prefix_rule")
         if not command:
             return _err("命令不能为空")
+        if sandbox_permissions not in {"use_default", "require_escalated"}:
+            return _err("sandbox_permissions 只能是 use_default 或 require_escalated")
+        if raw_prefix_rule is not None and not isinstance(raw_prefix_rule, list):
+            return _err("prefix_rule 必须是字符串数组")
+        prefix_rule = [str(value) for value in raw_prefix_rule] if isinstance(raw_prefix_rule, list) else None
+        if prefix_rule and sandbox_permissions != "require_escalated":
+            return _err("prefix_rule 只能与 require_escalated 一起使用")
+        if sandbox_permissions == "require_escalated" and not justification:
+            return _err("require_escalated 必须提供用户可见的 justification")
         session_key = str(kwargs.get("session_key") or "")
         turn_id = str(kwargs.get("turn_id") or "")
         call_id = str(kwargs.get("call_id") or "")
@@ -377,11 +407,66 @@ class ShellTool(Tool):
             if policy is not None and self._sandbox_shell is not None:
                 if cwd is None:
                     return _err("沙箱 Shell 缺少工作目录")
+                try:
+                    permission_scope = classify_shell_permission(
+                        command,
+                        cwd,
+                        prefix_rule=prefix_rule,
+                        windows=_IS_WINDOWS,
+                    )
+                except ValueError as error:
+                    return _err(str(error))
+                session_grant = SessionGrant(
+                    key=permission_scope.grant_key,
+                    tool_name="shell",
+                    operation=permission_scope.operation_code,
+                    scope_kind=permission_scope.scope_kind,
+                    roots=tuple(str(path) for path in permission_scope.grant_roots),
+                    targets=tuple(str(path) for path in permission_scope.target_paths),
+                )
+                preapproval_required = (
+                    sandbox_permissions == "require_escalated"
+                    or requires_preapproval(
+                        permission_scope,
+                        mode=policy.mode,
+                        workspace=getattr(policy, "workspace_path", None),
+                    )
+                )
+                execution_mode = None
+                if preapproval_required and policy.mode != "danger-full-access":
+                    if self._sandbox_guard is None:
+                        return _err("当前执行环境缺少审批服务，不能申请更高权限")
+                    reason = justification or (
+                        "当前会话为只读，文件变更需要执行前授权"
+                        if policy.mode == "read-only"
+                        else "命令将修改工作区外路径，需要执行前授权"
+                    )
+                    authorized = await self._sandbox_guard.authorize_shell_execution(
+                        policy=policy,
+                        turn_id=turn_id,
+                        call_id=call_id,
+                        arguments={
+                            "command": command,
+                            "description": description,
+                            "timeout": timeout,
+                            **({"cwd": str(cwd)} if cwd is not None else {}),
+                        },
+                        operation=permission_scope.operation_label,
+                        reason=reason,
+                        grant_key=permission_scope.grant_key,
+                        scope=permission_scope.display_scope,
+                        category=permission_scope.category,
+                        action=permission_scope.action,
+                        scope_kind=permission_scope.scope_kind,
+                        session_grant=session_grant,
+                    )
+                    execution_mode = authorized.mode
                 run = await self._sandbox_shell.execute(
                     policy,
                     command,
                     cwd=cwd,
                     timeout=timeout,
+                    execution_mode=execution_mode,
                 )
                 stdout, stderr = run.stdout, run.stderr
                 interrupted = run.interrupted
@@ -403,6 +488,12 @@ class ShellTool(Tool):
                             "timeout": timeout,
                             **({"cwd": str(cwd)} if cwd is not None else {}),
                         },
+                        grant_key=permission_scope.grant_key,
+                        scope=permission_scope.display_scope,
+                        category=permission_scope.category,
+                        action=permission_scope.action,
+                        scope_kind=permission_scope.scope_kind,
+                        session_grant=session_grant,
                     )
                     run = await self._sandbox_shell.execute(
                         policy,

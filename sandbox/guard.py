@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sandbox.approval import ApprovalCoordinator
+from sandbox.approval import ApprovalCoordinator, SessionGrant
 from sandbox.errors import SandboxAccessDenied
 from sandbox.policy import SandboxMode, SandboxPolicy, SandboxPolicyResolver
 
@@ -62,10 +65,12 @@ class SandboxGuard:
         if policy.mode == "workspace-write" and policy.contains_workspace_path(target):
             return AuthorizedExecution(policy, "workspace-write")
         reason = (
-            "当前会话为只读，文件写入需要单次授权"
+            "当前会话为只读，文件写入需要授权"
             if policy.mode == "read-only"
-            else "目标位于工作区外，写入需要单次授权"
+            else "目标位于工作区外，写入需要授权"
         )
+        target_root = target.parent.resolve(strict=False)
+        display_scope = f"{operation} · 目标目录：{target_root}"
         return await self._request_once(
             policy=policy,
             session_key=session_key,
@@ -75,6 +80,56 @@ class SandboxGuard:
             operation=operation,
             arguments=arguments,
             reason=reason,
+            grant_key=_grant_key(tool_name, tool_name, [target_root]),
+            scope=display_scope,
+            category="文件变更",
+            action="创建/编辑",
+            scope_kind="paths",
+            display_scope=display_scope,
+            session_grant=SessionGrant(
+                key=_grant_key(tool_name, tool_name, [target_root]),
+                tool_name=tool_name,
+                operation="write",
+                scope_kind="paths",
+                roots=(str(target_root),),
+                targets=(str(target),),
+            ),
+        )
+
+    async def authorize_shell_execution(
+        self,
+        *,
+        policy: SandboxPolicy,
+        turn_id: str,
+        call_id: str,
+        arguments: dict[str, Any],
+        operation: str,
+        reason: str,
+        grant_key: str,
+        scope: str,
+        category: str,
+        action: str,
+        scope_kind: str,
+        session_grant: SessionGrant | None = None,
+    ) -> AuthorizedExecution:
+        """在启动 Shell 前完成审批或命中当前进程内的会话授权。"""
+
+        return await self._request_once(
+            policy=policy,
+            session_key=policy.session_key,
+            turn_id=turn_id,
+            call_id=call_id,
+            tool_name="shell",
+            operation=operation,
+            arguments=arguments,
+            reason=reason,
+            grant_key=grant_key,
+            scope=scope,
+            category=category,
+            action=action,
+            scope_kind=scope_kind,
+            display_scope=scope,
+            session_grant=session_grant,
         )
 
     async def authorize_shell_retry(
@@ -84,6 +139,12 @@ class SandboxGuard:
         turn_id: str,
         call_id: str,
         arguments: dict[str, Any],
+        grant_key: str | None = None,
+        scope: str | None = None,
+        category: str = "命令执行",
+        action: str = "完整 Shell 命令",
+        scope_kind: str = "exact",
+        session_grant: SessionGrant | None = None,
     ) -> AuthorizedExecution:
         return await self._request_once(
             policy=policy,
@@ -93,7 +154,14 @@ class SandboxGuard:
             tool_name="shell",
             operation="执行完整 Shell 命令",
             arguments=arguments,
-            reason="命令在当前写入边界内被 Windows 拒绝，可仅对这次完整命令放宽限制",
+            reason="命令在当前写入边界内被 Windows 拒绝，需要授权后放宽本次执行限制",
+            grant_key=grant_key,
+            scope=scope,
+            category=category,
+            action=action,
+            scope_kind=scope_kind,
+            display_scope=scope,
+            session_grant=session_grant,
         )
 
     async def _request_once(
@@ -107,6 +175,13 @@ class SandboxGuard:
         operation: str,
         arguments: dict[str, Any],
         reason: str,
+        grant_key: str | None = None,
+        scope: str | None = None,
+        category: str | None = None,
+        action: str | None = None,
+        scope_kind: str | None = None,
+        display_scope: str | None = None,
+        session_grant: SessionGrant | None = None,
     ) -> AuthorizedExecution:
         if not turn_id or not call_id:
             raise SandboxAccessDenied("缺少 Turn 或工具调用身份，不能申请越权授权")
@@ -118,8 +193,15 @@ class SandboxGuard:
             operation=operation,
             arguments=dict(arguments),
             reason=reason,
+            grant_key=grant_key,
+            scope=scope,
+            category=category,
+            action=action,
+            scope_kind=scope_kind,
+            display_scope=display_scope,
+            session_grant=session_grant,
         )
-        if outcome != "allowed-once":
+        if outcome not in {"allowed-once", "allowed-session"}:
             messages = {
                 "rejected": "用户拒绝了本次越权操作",
                 "cancelled": "本次越权授权已取消",
@@ -135,6 +217,19 @@ def resolve_tool_target(raw_path: str, policy: SandboxPolicy) -> Path:
     if not candidate.is_absolute():
         candidate = policy.cwd / candidate
     return candidate.resolve()
+
+
+def _grant_key(tool_name: str, operation: str, roots: list[Path]) -> str:
+    normalized = [
+        os.path.normcase(os.path.normpath(str(root.resolve(strict=False))))
+        for root in roots
+    ]
+    payload = json.dumps(
+        [tool_name, operation, *sorted(normalized)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 __all__ = ["AuthorizedExecution", "SandboxGuard", "resolve_tool_target"]

@@ -96,6 +96,7 @@ _APPROVAL_STATES = frozenset({
     "pending",
     "submitting",
     "allowed-once",
+    "allowed-session",
     "rejected",
     "cancelled",
     "expired",

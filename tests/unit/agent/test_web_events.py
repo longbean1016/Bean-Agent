@@ -461,6 +461,21 @@ def test_approval_resolution_uses_client_request_id_without_losing_approval_id()
     assert mapped.payloads[0]["approval_id"] == "approval-1"
 
 
+def test_session_approval_resolution_preserves_decision() -> None:
+    mapped = WebEventMapper().map_event(SandboxApprovalResolved(
+        session_key="web:chat",
+        request_id="approval-session",
+        turn_id="turn-1",
+        call_id="call-1",
+        state="allowed-session",
+        decision="allowed-session",
+        decided_at="2026-09-20T10:00:00+08:00",
+    ))
+
+    assert mapped.payloads[0]["state"] == "allowed-session"
+    assert mapped.payloads[0]["decision"] == "allowed-session"
+
+
 def test_approval_request_projection_omits_fingerprint_and_unknown_fields() -> None:
     mapped = WebEventMapper().map_event(SandboxApprovalRequested(
         session_key="web:chat",
@@ -480,6 +495,10 @@ def test_approval_request_projection_omits_fingerprint_and_unknown_fields() -> N
             "state": "pending",
             "created_at": "2026-09-20T10:00:00+08:00",
             "expires_at": "2026-09-20T10:05:00+08:00",
+            "category": "命令执行",
+            "action": "命令前缀",
+            "scope_kind": "prefix",
+            "display_scope": "命令前缀：curl",
             "fingerprint": "internal-fingerprint",
             "schema": {"secret": "must-not-leak"},
         },
@@ -492,6 +511,10 @@ def test_approval_request_projection_omits_fingerprint_and_unknown_fields() -> N
         "command": "curl --token=[已脱敏] https://example.test",
         "cwd": "[已隐藏]",
     }
+    assert approval["category"] == "命令执行"
+    assert approval["action"] == "命令前缀"
+    assert approval["scope_kind"] == "prefix"
+    assert approval["display_scope"] == "命令前缀：curl"
 
 
 def test_tool_event_mapper_redacts_sensitive_arguments_and_result() -> None:

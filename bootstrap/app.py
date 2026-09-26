@@ -490,7 +490,7 @@ def build_core_runtime(
             turn_id=request.turn_id,
             call_id=request.call_id,
             state=state,
-            decision=state if state in {"allowed-once", "rejected"} else None,
+            decision=state if state in {"allowed-once", "allowed-session", "rejected"} else None,
             decided_at=decided_at,
             error_code=error_code,
             client_request_id=client_request_id,
@@ -2260,6 +2260,7 @@ def create_fastapi_app(
         if not session_key.startswith(f"{channel}:"):
             raise HTTPException(status_code=404, detail="会话不存在")
         await application.core.sandbox_approvals.cancel_session(session_key)
+        await application.core.sandbox_approvals.clear_session_grants(session_key)
         if not await application.core.sessions.delete(session_key):
             raise HTTPException(status_code=404, detail="会话不存在")
         await application.core.sandbox_runtime.close_session(session_key)

@@ -1,4 +1,4 @@
-"""单次越权审批的并发状态机。"""
+"""越权审批与进程内会话授权的并发状态机。"""
 
 from __future__ import annotations
 
@@ -7,9 +7,11 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Literal, Protocol
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -20,16 +22,57 @@ from sandbox.errors import ApprovalUnavailable, SandboxAccessDenied
 ApprovalState = Literal[
     "pending",
     "allowed-once",
+    "allowed-session",
     "rejected",
     "cancelled",
     "expired",
     "unavailable",
 ]
-ApprovalDecision = Literal["allowed-once", "rejected"]
+ApprovalDecision = Literal["allowed-once", "allowed-session", "rejected"]
 
 _LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionGrant:
+    """仅在当前进程内参与匹配的结构化短期授权。"""
+
+    key: str
+    tool_name: str
+    operation: str
+    scope_kind: str = "exact"
+    roots: tuple[str, ...] = ()
+    targets: tuple[str, ...] = ()
+
+    def allows(self, candidate: "SessionGrant") -> bool:
+        """判断已批准范围是否覆盖本次请求，不依赖显示文案或哈希碰撞。"""
+
+        if self.tool_name != candidate.tool_name or self.operation != candidate.operation:
+            return False
+        if self.scope_kind == "paths" and candidate.scope_kind == "paths":
+            if self.targets == candidate.targets:
+                return True
+            if not self.roots or not candidate.targets:
+                return False
+            # move 的最后一个目标可能是“接收目录”而不是被移动对象，因此允许
+            # 它等于授权根；删除和重命名仍要求严格后代，避免触及根本身。
+            return all(
+                any(
+                    _path_is_covered(
+                        root,
+                        target,
+                        allow_root=(
+                            candidate.operation == "move"
+                            and index == len(candidate.targets) - 1
+                        ),
+                    )
+                    for root in self.roots
+                )
+                for index, target in enumerate(candidate.targets)
+            )
+        return self.key == candidate.key
 
 
 class ApprovalAuditStore(Protocol):
@@ -57,9 +100,22 @@ class ApprovalRequest:
     state: ApprovalState
     created_at: str
     expires_at: str | None = None
+    category: str | None = None
+    action: str | None = None
+    scope_kind: str | None = None
+    display_scope: str | None = None
+    scope: str | None = None
+    allow_session: bool = False
+    grant_key: str | None = None
+    session_grant: SessionGrant | None = None
 
     def to_wire(self) -> dict[str, object]:
-        return asdict(self)
+        value = asdict(self)
+        # 匹配键只在当前进程内使用，不能通过 Web 事件或数据库审计暴露为
+        # 客户端可伪造的权限标识；UI 只需要人类可读范围和可选项开关。
+        value.pop("grant_key", None)
+        value.pop("session_grant", None)
+        return value
 
 
 ApprovalPublisher = Callable[[ApprovalRequest], Awaitable[None]]
@@ -117,6 +173,9 @@ class ApprovalCoordinator:
         # 同时不会再次发布 approval.resolved。
         self._resolved: dict[str, ApprovalResolution] = {}
         self._available_sessions: set[str] = set()
+        # 会话授权是当前进程内的短期能力，数据库中的审批审计永远不能
+        # 在重启后恢复成有效权限。
+        self._session_grants: dict[str, list[SessionGrant]] = {}
         self._lock = asyncio.Lock()
 
     def set_publisher(self, publisher: ApprovalPublisher) -> None:
@@ -159,7 +218,29 @@ class ApprovalCoordinator:
         arguments: dict[str, object],
         reason: str,
         requested_mode: str = "danger-full-access",
+        grant_key: str | None = None,
+        scope: str | None = None,
+        category: str | None = None,
+        action: str | None = None,
+        scope_kind: str | None = None,
+        display_scope: str | None = None,
+        session_grant: SessionGrant | None = None,
     ) -> ApprovalState:
+        normalized_grant_key = str(grant_key or "").strip() or None
+        candidate_grant = session_grant
+        if candidate_grant is None and normalized_grant_key is not None:
+            candidate_grant = SessionGrant(
+                key=normalized_grant_key,
+                tool_name=tool_name,
+                operation=operation,
+            )
+        if candidate_grant is not None:
+            async with self._lock:
+                if any(
+                    grant.allows(candidate_grant)
+                    for grant in self._session_grants.get(session_id, ())
+                ):
+                    return "allowed-session"
         fingerprint = operation_fingerprint(tool_name, arguments, requested_mode)
         now = datetime.now(tz=_LOCAL_TZ).isoformat()
         expires_at = (
@@ -179,6 +260,15 @@ class ApprovalCoordinator:
             state="pending",
             created_at=now,
             expires_at=expires_at,
+            category=str(category or "临时权限").strip() or "临时权限",
+            action=str(action or operation).strip() or operation,
+            scope_kind=str(scope_kind or "exact").strip() or "exact",
+            display_scope=str(display_scope or scope or "仅此操作").strip() or "仅此操作",
+            # scope 保留给旧客户端；新客户端读取 display_scope。
+            scope=str(scope or display_scope or "").strip() or None,
+            allow_session=candidate_grant is not None,
+            grant_key=(candidate_grant.key if candidate_grant is not None else None),
+            session_grant=candidate_grant,
         )
         loop = asyncio.get_running_loop()
         future: asyncio.Future[ApprovalState] = loop.create_future()
@@ -259,6 +349,7 @@ class ApprovalCoordinator:
             # “发送失败”兜底，避免把一次明确允许误报成 unavailable。
             if outcome in {
                 "allowed-once",
+                "allowed-session",
                 "rejected",
                 "cancelled",
                 "expired",
@@ -288,8 +379,8 @@ class ApprovalCoordinator:
         *,
         client_request_id: str | None = None,
     ) -> ApprovalState:
-        if decision not in ("allowed-once", "rejected"):
-            raise ValueError("审批结果只能是 allowed-once 或 rejected")
+        if decision not in ("allowed-once", "allowed-session", "rejected"):
+            raise ValueError("审批结果只能是 allowed-once、allowed-session 或 rejected")
         async with self._lock:
             current = self._pending.get(request_id)
             if current is None:
@@ -304,6 +395,8 @@ class ApprovalCoordinator:
             request, _ = current
             if request.session_id != session_id:
                 raise PermissionError("审批请求不属于当前会话")
+            if decision == "allowed-session" and request.session_grant is None:
+                raise ValueError("当前审批不支持会话授权")
         # 把 request_id 一起交给 _finish；最终抢到锁的决定才会写入回执，
         # 并发点击不会出现“状态由 A 决定、request_id 却来自 B”的错配。
         outcome = await self._finish(
@@ -311,7 +404,7 @@ class ApprovalCoordinator:
             decision,
             client_request_id=client_request_id,
         )
-        if outcome in ("allowed-once", "rejected"):
+        if outcome in ("allowed-once", "allowed-session", "rejected"):
             return outcome
         # 竞态下可能由 timeout/disconnect 先收敛；返回其真实终态，保持
         # approval.decide 的幂等语义，不把迟到点击伪装成协议错误。
@@ -388,10 +481,17 @@ class ApprovalCoordinator:
         for request_id in request_ids:
             await self._finish(request_id, "cancelled", error_code="cancelled")
 
+    async def clear_session_grants(self, session_id: str) -> None:
+        """清除工作区、基础模式或会话生命周期变化前获得的短期能力。"""
+
+        async with self._lock:
+            self._session_grants.pop(session_id, None)
+
     async def close(self) -> None:
         async with self._lock:
             request_ids = list(self._pending)
             self._available_sessions.clear()
+            self._session_grants.clear()
         for request_id in request_ids:
             await self._finish(request_id, "unavailable", error_code="unavailable")
 
@@ -416,7 +516,7 @@ class ApprovalCoordinator:
             effective_error_code = error_code or ("user_rejected" if state == "rejected" else None)
             try:
                 persisted = self._store.resolve_sandbox_approval(request_id, state, decided_at)
-                if not persisted and state == "allowed-once":
+                if not persisted and state in {"allowed-once", "allowed-session"}:
                     raise RuntimeError("审批审计行未更新")
             except Exception:
                 # 审计写入失败不能让 pending Future 永久悬挂或把权限放开；
@@ -428,7 +528,7 @@ class ApprovalCoordinator:
                 )
                 # 审计事实无法确认时绝不能继续放行一次性越权操作；其它拒绝类
                 # 终态本身已经是安全收敛，保留原状态但记录错误码。
-                if state == "allowed-once":
+                if state in {"allowed-once", "allowed-session"}:
                     effective_state = "unavailable"
                 effective_error_code = effective_error_code or "audit_unavailable"
             approval_wait_ms: int | None = None
@@ -446,11 +546,19 @@ class ApprovalCoordinator:
                 decided_at=decided_at,
                 requested_at=request.created_at,
                 approval_wait_ms=approval_wait_ms,
-                decision=effective_state if effective_state in ("allowed-once", "rejected") else None,
+                decision=(
+                    effective_state
+                    if effective_state in ("allowed-once", "allowed-session", "rejected")
+                    else None
+                ),
                 error_code=effective_error_code,
                 client_request_id=client_request_id,
             )
             self._resolved[request_id] = resolution_value
+            if effective_state == "allowed-session" and request.session_grant is not None:
+                grants = self._session_grants.setdefault(request.session_id, [])
+                if request.session_grant not in grants:
+                    grants.append(request.session_grant)
             # 终态只服务于短期迟到/重复决议幂等；限制内存窗口，避免长时间运行的
             # Agent 因历史审批数量无限增长。审计事实仍完整保存在 sandbox_approvals。
             if len(self._resolved) > 1024:
@@ -568,6 +676,27 @@ def operation_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _is_strict_descendant(root: str, target: str) -> bool:
+    """路径树授权覆盖后代但不覆盖根本身，避免把清理子项扩大成删根。"""
+
+    normalized_root = Path(os.path.normcase(os.path.normpath(root)))
+    normalized_target = Path(os.path.normcase(os.path.normpath(target)))
+    try:
+        relative = normalized_target.relative_to(normalized_root)
+    except ValueError:
+        return False
+    return bool(relative.parts)
+
+
+def _path_is_covered(root: str, target: str, *, allow_root: bool) -> bool:
+    if allow_root:
+        normalized_root = os.path.normcase(os.path.normpath(root))
+        normalized_target = os.path.normcase(os.path.normpath(target))
+        if normalized_root == normalized_target:
+            return True
+    return _is_strict_descendant(root, target)
+
+
 def _elapsed_iso_ms(started_at: str, ended_at: str) -> int | None:
     """仅用已记录的两端时间计算审批等待，不以读取时刻补算。"""
 
@@ -595,5 +724,6 @@ __all__ = [
     "ApprovalResolution",
     "ApprovalResolutionPublisher",
     "ApprovalState",
+    "SessionGrant",
     "operation_fingerprint",
 ]

@@ -56,8 +56,12 @@ def test_existing_single_command_approval_remains_available():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_code", [0, 1])
 async def test_delete_failure_is_reported_without_automatic_retry(tmp_path, exit_code):
-    policy = SimpleNamespace(cwd=tmp_path, mode="read-only")
-    guard = SimpleNamespace(policy=lambda key: policy, authorize_shell_retry=AsyncMock())
+    policy = SimpleNamespace(cwd=tmp_path, mode="read-only", workspace_path=None)
+    guard = SimpleNamespace(
+        policy=lambda key: policy,
+        authorize_shell_execution=AsyncMock(return_value=SimpleNamespace(mode="danger-full-access")),
+        authorize_shell_retry=AsyncMock(),
+    )
     tool = ShellTool(sandbox_guard=guard, sandbox_runtime=object())
     tool._sandbox_shell = SimpleNamespace(execute=AsyncMock(return_value=SandboxRunResult(b"Access is denied.\n", b"", exit_code, False)))
     result = json.loads(await tool.execute(command="del file.txt", description="删除文件", session_key="test", turn_id="turn", call_id="call"))
@@ -67,5 +71,6 @@ async def test_delete_failure_is_reported_without_automatic_retry(tmp_path, exit
         assert result["error"]
     else:
         assert _classify_tool_result(ToolResult(json.dumps(result))) == ("error", "tool_exit_nonzero", exit_code)
+    guard.authorize_shell_execution.assert_awaited_once()
     guard.authorize_shell_retry.assert_not_awaited()
     assert tool._sandbox_shell.execute.await_count == 1
