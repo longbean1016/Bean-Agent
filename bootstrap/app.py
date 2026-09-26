@@ -2451,7 +2451,7 @@ def _append_running_snapshot(
             "turn_id": turn_id,
             "reasoning_content": str(snapshot.get("thinking") or ""),
             "status": "running",
-            "metadata": metadata,
+            "metadata": {**metadata, **({"presentation": snapshot["presentation"]} if snapshot.get("presentation") else {})},
             "media": [],
         },
     ]

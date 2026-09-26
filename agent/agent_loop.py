@@ -94,6 +94,7 @@ class TurnInterruptState:
     llm_surface_messages: list[dict[str, Any]] = field(default_factory=list)
     llm_surface_persisted: bool = False
     turn_started_at: str = ""
+    presentation: dict[str, Any] = field(default_factory=dict)
     iteration: int = 0
 
 
@@ -252,6 +253,7 @@ class AgentLoop:
                     "turn_id": turn_id,
                     "request_id": request_id,
                     "status": "error",
+                    "presentation": deepcopy(snapshot.get("presentation", {})),
                     **({"model_route": route_metadata} if route_metadata else {}),
                     **({"duration_ms": terminal_timing.get("duration_ms")} if terminal_timing.get("duration_ms") is not None else {}),
                     **({"generated_at": terminal_timing.get("ended_at")} if terminal_timing.get("ended_at") else {}),
@@ -303,6 +305,8 @@ class AgentLoop:
             "user", message.content, media=message.media, **user_fields,
         )
         assistant_metadata: dict[str, Any] = {"context_retry": context_retry}
+        if result.presentation:
+            assistant_metadata["presentation"] = result.presentation
         route_metadata = _public_model_route(message.metadata.get("model_route"))
         if route_metadata:
             assistant_metadata["model_route"] = route_metadata
@@ -350,6 +354,7 @@ class AgentLoop:
                 "request_id": request_id,
                 "status": "ok",
                 "context_retry": context_retry,
+                **({"presentation": result.presentation} if result.presentation else {}),
                 **({"model_route": route_metadata} if route_metadata else {}),
                 **({"duration_ms": duration_ms} if duration_ms is not None else {}),
                 **({"generated_at": turn_ended_at} if turn_ended_at else {}),
@@ -431,6 +436,8 @@ class AgentLoop:
             "tool_chain": tool_chain,
         }
         assistant_metadata: dict[str, Any] = {}
+        if snapshot and snapshot.get("presentation"):
+            assistant_metadata["presentation"] = deepcopy(snapshot["presentation"])
         route_metadata = _public_model_route(message.metadata.get("model_route"))
         if route_metadata:
             assistant_metadata["model_route"] = route_metadata
@@ -516,6 +523,7 @@ class AgentLoop:
                 tools_used=list(snapshot.get("tools_used") or []),
                 tools=list(snapshot.get("tools") or []),
                 tool_chain_partial=list(snapshot.get("tool_chain_partial") or []),
+                presentation=deepcopy(snapshot.get("presentation") or {}),
                 llm_user_content=deepcopy(snapshot.get("llm_user_content")),
                 llm_context_frame=str(snapshot.get("llm_context_frame") or ""),
                 llm_message_timestamp=str(snapshot.get("llm_message_timestamp") or ""),
@@ -609,7 +617,10 @@ class AgentLoop:
             status="interrupted",
             tools_used=tools_used,
             tool_chain=tool_chain,
-            **({"metadata": {"duration_ms": duration_ms}} if duration_ms is not None else {}),
+            metadata={
+                **({"duration_ms": duration_ms} if duration_ms is not None else {}),
+                **({"presentation": state.presentation} if state.presentation else {}),
+            },
             **({"timestamp": ended_at} if ended_at else {}),
             interrupted_display_content=state.partial_reply,
             interrupted_display_reasoning=state.partial_thinking or "",
@@ -893,6 +904,7 @@ class AgentLoop:
             "thinking": str(snapshot.get("partial_thinking") or ""),
             "tools": tools,
             "started_at": str(snapshot.get("turn_started_at") or ""),
+            "presentation": deepcopy(snapshot.get("presentation") or {}),
             "status": "running",
         }
 

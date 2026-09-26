@@ -119,6 +119,15 @@ class StreamDeltaReady:
     turn_id: str
     content_delta: str = ""
     thinking_delta: str = ""
+    content_part_id: str = ""
+    thinking_part_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TurnPresentationUpdated:
+    session_key: str
+    turn_id: str
+    presentation: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +264,7 @@ __all__ = [
     "SandboxApprovalRequested",
     "SandboxApprovalResolved",
     "StreamDeltaReady",
+    "TurnPresentationUpdated",
     "ToolCallCompleted",
     "ToolCallStarted",
     "TurnCommitted",

@@ -544,18 +544,26 @@ class MemoryEngine:
         return summary or conversation[-12_000:]
 
     async def retrieve_for_turn(self, message: Any) -> str:
+        block, _ = await self.retrieve_for_turn_with_details(message)
+        return block
+
+    async def retrieve_for_turn_with_details(self, message: Any) -> tuple[str, dict[str, Any]]:
+        """同一次召回提供安全的展示摘要，不把内部检索上下文送入前端。"""
         text = str(getattr(message, "content", getattr(message, "text", "")) or "")
         channel = str(getattr(message, "channel", "") or "")
         chat_id = str(getattr(message, "chat_id", "") or "")
         if not text.strip():
-            return ""
+            return "", {"query": text, "items": []}
         # 每轮自动召回只使用当前问题做低延迟检索；LLM 改写和 HyDE 由显式 answer 查询按需承担。
         result = await self.query(MemoryQuery(
             text,
             intent="context",
             scope=_scope(channel, chat_id),
         ))
-        return _injection_block(result.records)
+        return _injection_block(result.records), {
+            "query": text,
+            "items": [{"id": record.id, "summary": record.summary} for record in result.records],
+        }
 
     async def ingest(self, request: MemoryIngestRequest) -> MemoryIngestResult:
         """接受标准化摄入请求；当前最小闭环只处理完整 Turn。"""

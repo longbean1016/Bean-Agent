@@ -28,6 +28,7 @@ from agent.event_bus import (
     EventBus,
     SessionUsageUpdated,
     StreamDeltaReady,
+    TurnPresentationUpdated,
     ToolCallCompleted,
     ToolCallStarted,
 )
@@ -48,6 +49,7 @@ from agent.tool_projection import (
     project_tool_chain,
 )
 from agent.tool_runtime import ToolRuntimeView
+from agent.turn_presentation import TurnPresentation
 from sandbox.guard import SandboxGuard
 from session.store import NewSessionEvent, NewSurfaceEvent
 from tools.base import ToolResult, normalize_tool_result
@@ -322,6 +324,7 @@ class Pipeline:
         provider: ProviderApi,
     ) -> PipelineResult:
         turn_started_at = datetime.now(_LOCAL_TZ).isoformat()
+        presentation = TurnPresentation(turn_started_at)
         turn_started_monotonic = time.perf_counter()
         self._interrupt_snapshots[turn_id] = {
             "partial_reply": "",
@@ -336,6 +339,7 @@ class Pipeline:
             "llm_epoch_id": "",
             "llm_surface_persisted": False,
             "turn_started_at": turn_started_at,
+            "presentation": presentation.data,
         }
         self._tool_monotonic_starts[turn_id] = {}
         if self._event_appender is not None:
@@ -401,7 +405,23 @@ class Pipeline:
                 else []
             )
         measurement = await self._load_context_measurement(message.session_key)
-        retrieved = await self._memory.retrieve_for_turn(message) if self._memory and not skip_memory else ""
+        async def publish_presentation() -> None:
+            if not suppress_stream:
+                await self._events.emit(TurnPresentationUpdated(
+                    message.session_key, turn_id, presentation.snapshot(),
+                ))
+
+        await publish_presentation()
+        retrieved = ""
+        if self._memory and not skip_memory:
+            retrieval_started = time.perf_counter()
+            retrieve_details = getattr(self._memory, "retrieve_for_turn_with_details", None)
+            if callable(retrieve_details):
+                retrieved, details = await retrieve_details(message)
+                presentation.add_memory(details, _elapsed_monotonic_ms(retrieval_started))
+                await publish_presentation()
+            else:
+                retrieved = await self._memory.retrieve_for_turn(message)
         names = list(tool_view.visible_order)
         turn_skills, turn_workspace = await self._resolve_turn_skills(message.session_key)
         available_skills = (
@@ -672,6 +692,10 @@ class Pipeline:
 
         async def on_delta(delta: dict[str, str]) -> None:
             iteration = max(0, int(self._interrupt_snapshots[turn_id].get("iteration") or 0))
+            content_delta = str(delta.get("content_delta") or "")
+            thinking_delta = str(delta.get("thinking_delta") or "")
+            content_part_id = presentation.append_text(iteration, "text", content_delta) if content_delta else ""
+            thinking_part_id = presentation.append_text(iteration, "thinking", thinking_delta) if thinking_delta else ""
             index = chunk_index.get(iteration, 0)
             chunk_index[iteration] = index + 1
             snapshot = self._interrupt_snapshots[turn_id]
@@ -696,6 +720,8 @@ class Pipeline:
                 turn_id=turn_id,
                 content_delta=str(delta.get("content_delta") or ""),
                 thinking_delta=str(delta.get("thinking_delta") or ""),
+                content_part_id=content_part_id,
+                thinking_part_id=thinking_part_id,
             ))
 
         async def chat_with_context_retry() -> tuple[LLMResponse, PromptCacheRequestDiagnostics]:
@@ -1085,10 +1111,13 @@ class Pipeline:
                         error,
                     )
             if not response.tool_calls:
+                presentation_iteration = iteration
                 # 模型只输出了 thinking 但没有正文时，重试一次催出正式回复。
                 content = str(response.content or "").strip()
                 thinking = str(response.thinking or "")
                 if not content and thinking:
+                    presentation.resolve_response(iteration, "", thinking, final=False)
+                    await publish_presentation()
                     logger.warning(
                         "空回复重试: session=%s iteration=%d content 为空但 thinking 非空",
                         message.session_key,
@@ -1166,6 +1195,8 @@ class Pipeline:
                         sync_surface_snapshot()
                     if retry.content:
                         response = retry
+                        # 补答是独立的一次模型响应，不能覆盖此前已经展示的思考。
+                        presentation_iteration = -iteration
                         append_turn_thinking(response.thinking)
                         content = str(retry.content or "").strip()
                     else:
@@ -1191,9 +1222,12 @@ class Pipeline:
                     data={"status": "completed", "reason": "assistant_final"},
                     operation_suffix=f"{iteration}:step-end",
                 )
+                presentation.resolve_response(presentation_iteration, content, str(response.thinking or ""), final=True)
+                await publish_presentation()
                 timing = await append_turn_end(iteration=iteration, status="completed")
                 return PipelineResult(
                     content=str(content or ""),
+                    presentation=presentation.snapshot(),
                     thinking=merged_turn_thinking(),
                     # 终答轮思考：取当前 ``response.thinking``，可能来自原始终答 chat，
                     # 也可能来自上面"空回复重试"分支成功后的 retry chat。无论哪种情况，
@@ -1232,7 +1266,10 @@ class Pipeline:
             )
             sync_surface_snapshot()
             group: dict[str, Any] = {"iteration": iteration, "text": response.content or "", "calls": [], "provider_fields": dict(response.provider_fields)}
+            presentation.resolve_response(iteration, str(response.content or ""), str(response.thinking or ""), final=False)
             for call in response.tool_calls:
+                presentation.add_tool(call.id)
+                await publish_presentation()
                 # 起点必须在任何执行或授权等待之前记录；后续审批不会重置计时。
                 tool_started_at = datetime.now(_LOCAL_TZ).isoformat()
                 tool_started_monotonic = time.perf_counter()
@@ -1441,6 +1478,8 @@ class Pipeline:
                         project_mcp_tools,
                     )
                 result = normalize_tool_result(raw_result)
+                if call.name == "recall_memory" and presentation.complete_memory_tool(call.id, result.text):
+                    await publish_presentation()
                 if call.name == "tool_search":
                     try:
                         payload = json.loads(result.text)
@@ -1606,6 +1645,8 @@ class Pipeline:
             iteration=self._max_iterations,
             tools_used=tools_used,
         )
+        presentation.resolve_response(self._max_iterations + 1, summary, "", final=True)
+        await publish_presentation()
         timing = await append_turn_end(
             iteration=self._max_iterations,
             status="incomplete",
@@ -1613,6 +1654,7 @@ class Pipeline:
         )
         return PipelineResult(
             content=summary,
+            presentation=presentation.snapshot(),
             thinking=merged_turn_thinking(),
             # 达到最大迭代次数的 fallback 路径没有真正完成终答，没有单轮终答
             # 思考可记录。留空时持久化为空字符串，下次重建历史走 fallback 机制

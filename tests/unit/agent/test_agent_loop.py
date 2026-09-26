@@ -28,6 +28,32 @@ class Pipeline:
         return PipelineResult("回答", thinking="思考", tool_chain=[{"iteration": 1, "calls": []}], tools_used=["echo"])
 
 
+@pytest.mark.asyncio
+async def test_presentation_is_optional_metadata_in_history_and_final_frame(tmp_path: Path) -> None:
+    presentation = {"version": 1, "started_at": "2026-09-25T10:00:00Z", "final": True,
+                    "parts": [{"id": "r", "kind": "thinking", "text": "思考"}]}
+
+    class PresentedPipeline:
+        async def process(self, message, *, turn_id):
+            return PipelineResult("回答", thinking="思考", presentation=presentation, duration_ms=1234)
+
+    sessions = SessionManager(tmp_path)
+    bus = MessageBus()
+    try:
+        loop = AgentLoop(bus, EventBus(), PresentedPipeline(), sessions)
+        await bus.publish_inbound(InboundMessage("web", "u", "ui", "问题"))
+        await loop.run_once()
+        rows = sessions.store.fetch_session_messages("web:ui")
+        outbound = await bus.consume_outbound()
+        assert len(rows) == 2
+        assert rows[1]["content"] == "回答"
+        assert rows[1]["metadata"]["presentation"] == presentation
+        assert outbound.metadata["presentation"] == presentation
+        assert rows[1]["metadata"]["duration_ms"] == 1234
+    finally:
+        await sessions.close()
+
+
 class BlockingContextGuard:
     def __init__(self, ready: bool) -> None:
         self.ready = ready
@@ -642,7 +668,8 @@ async def test_interrupt_persists_duration_from_turn_boundaries(tmp_path: Path) 
             await asyncio.Event().wait()
 
         def snapshot_interrupt_state(self, turn_id: str):
-            return {"partial_reply": "半截", "turn_started_at": "2026-09-02T10:00:00+08:00"}
+            return {"partial_reply": "半截", "turn_started_at": "2026-09-02T10:00:00+08:00",
+                    "presentation": {"version": 1, "parts": [{"id": "t1", "kind": "text", "text": "半截"}]}}
 
         def discard_interrupt_snapshot(self, turn_id: str) -> None:
             pass
@@ -662,6 +689,7 @@ async def test_interrupt_persists_duration_from_turn_boundaries(tmp_path: Path) 
     ends = [event for event in events if event["event_type"] == "turn/end"]
     assert result.duration_ms is not None and result.duration_ms >= 0
     assert rows[1]["metadata"]["duration_ms"] == result.duration_ms
+    assert rows[1]["metadata"]["presentation"]["parts"][0]["text"] == "半截"
     assert ends[0]["data"]["status"] == "interrupted"
     assert ends[0]["data"]["duration_ms"] == result.duration_ms
     await sessions.close()

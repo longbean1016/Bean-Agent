@@ -455,6 +455,7 @@ def test_chat_api_messages_appends_running_snapshot_without_persisting(tmp_path:
             "user_media": [],
             "content": "partial answer",
             "thinking": "partial thinking",
+            "presentation": {"version": 1, "parts": [{"id": "r", "kind": "thinking", "text": "partial thinking"}]},
             "tools": [{
                 "call_id": "call-1",
                 "name": "shell",
@@ -480,6 +481,7 @@ def test_chat_api_messages_appends_running_snapshot_without_persisting(tmp_path:
     assert messages["items"][1]["content"] == "partial answer"
     assert messages["items"][1]["reasoning_content"] == "partial thinking"
     assert messages["items"][1]["metadata"]["running"] is True
+    assert messages["items"][1]["metadata"]["presentation"]["parts"][0]["text"] == "partial thinking"
     running_tool = messages["items"][1]["tool_chain"][0]["calls"][0]
     assert "live-secret" not in str(running_tool)
     assert running_tool["arguments"]["cwd"] == "[已隐藏]"

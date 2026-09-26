@@ -250,7 +250,7 @@ async def test_turn_context_retrieval_can_recall_event_from_another_session(
             extra={"scope_channel": "web", "scope_chat_id": "session-a"},
         )
 
-        block = await engine.retrieve_for_turn(SimpleNamespace(
+        block, details = await engine.retrieve_for_turn_with_details(SimpleNamespace(
             content="之前完成了什么验证",
             channel="web",
             chat_id="session-b",
@@ -260,6 +260,9 @@ async def test_turn_context_retrieval_can_recall_event_from_another_session(
         sessions.close()
 
     assert "用户完成了 WebSocket 启动验证" in block
+    assert details["query"] == "之前完成了什么验证"
+    assert details["items"][0]["summary"] == "用户完成了 WebSocket 启动验证"
+    assert set(details["items"][0]) == {"id", "summary"}
 
 
 @pytest.mark.asyncio
