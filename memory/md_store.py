@@ -71,6 +71,23 @@ class MarkdownMemoryStore:
     def read_bean(self) -> str: return self._read(self.bean_file)
     def read_pending(self) -> str: return self._read(self.pending_file)
 
+    def prompt_signature(self) -> tuple[tuple[int, int], ...]:
+        """返回人格、自我与长期记忆文件的轻量签名。
+
+        首个压缩代之前没有 generation 可冻结，只能用文件签名判断快照是否需要重建；
+        进入正式 generation 后由 generation 本身负责冻结，不再依赖文件签名。
+        """
+
+        signatures: list[tuple[int, int]] = []
+        for path in (self.bean_file, self.self_file, self.memory_file):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                signatures.append((0, 0))
+            else:
+                signatures.append((int(stat.st_mtime_ns), int(stat.st_size)))
+        return tuple(signatures)
+
     def write_long_term(self, content: str) -> None:
         """原子替换 MEMORY.md，供 Optimizer 提交合并结果。"""
 

@@ -1336,3 +1336,48 @@ async def test_consolidation_saves_all_implicit_memory_types(tmp_path: Path) -> 
     assert procedure["extra_json"]["tool_requirement"] == "shell"
     assert procedure["extra_json"]["steps"] == ["运行测试"]
     assert checkpoint is not None
+
+
+@pytest.mark.asyncio
+async def test_prompt_snapshot_rebuilds_before_first_generation(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    sessions.create_session("web:c")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    try:
+        engine._markdown.write_long_term("## Long-term Memory\n第一版")
+        first = engine.prompt_snapshot("web:c")
+        engine._markdown.write_long_term("## Long-term Memory\n第二版，内容更长")
+        second = engine.prompt_snapshot("web:c")
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert first.generation == 0
+    assert "第一版" in first.long_term_memory
+    assert "第二版" in second.long_term_memory
+
+
+@pytest.mark.asyncio
+async def test_prompt_snapshot_freezes_until_next_generation(tmp_path: Path) -> None:
+    sessions = SessionStore(tmp_path / "sessions.db")
+    sessions.create_session("web:c")
+    config = MemoryConfig(enabled=True)
+    config.embedding.dimensions = 2
+    engine = MemoryEngine(tmp_path, Embedder(), Provider(), sessions, config=config)
+    try:
+        engine._markdown.write_long_term("## Long-term Memory\n第一版")
+        sessions.get_active_compaction = lambda key: SimpleNamespace(generation=3)
+        first = engine.prompt_snapshot("web:c")
+        engine._markdown.write_long_term("## Long-term Memory\n第二版，内容更长")
+        frozen = engine.prompt_snapshot("web:c")
+        sessions.get_active_compaction = lambda key: SimpleNamespace(generation=4)
+        refreshed = engine.prompt_snapshot("web:c")
+    finally:
+        await engine.close()
+        sessions.close()
+
+    assert "第一版" in first.long_term_memory
+    assert "第一版" in frozen.long_term_memory
+    assert "第二版" in refreshed.long_term_memory

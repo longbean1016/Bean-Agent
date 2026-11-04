@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -59,6 +60,24 @@ if TYPE_CHECKING:
     from agent.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryPromptSnapshot:
+    """同一压缩代内复用的人格与长期记忆文本。
+
+    generation 大于 0 时完全按代冻结，后台 Optimizer 的写入在下一代才可见；
+    generation 为 0 时还没有 checkpoint 边界，只能用文件签名决定是否重建。
+    """
+
+    generation: int
+    bean: str
+    self_model: str
+    long_term_memory: str
+    signature: tuple[tuple[int, int], ...] = ()
+
+
+_PROMPT_SNAPSHOT_LIMIT = 256
 
 
 class MemoryEngine:
@@ -130,6 +149,9 @@ class MemoryEngine:
             self._process_compaction_payload,
             max_concurrency=2,
         )
+        # Prompt 前缀按会话和 active generation 冻结；同一代内即使后台改写
+        # MEMORY/SELF，模型看到的仍然是同一份文本，避免整段 system 前缀失效。
+        self._prompt_snapshots: dict[tuple[str, str, int], MemoryPromptSnapshot] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._accepting = True
         self._closed = False
@@ -322,6 +344,41 @@ class MemoryEngine:
         """返回可直接注入稳定 Prompt 前缀的 Markdown 长期记忆。"""
 
         return self._markdown.get_memory_context()
+
+    def prompt_snapshot(self, session_key: str) -> MemoryPromptSnapshot:
+        """返回按 active generation 冻结的人格与长期记忆快照。
+
+        同一代内复用同一份文本；后台 Optimizer 的写入只有在下一个 checkpoint
+        提交后才进入 Prompt。还没有 checkpoint 时用文件签名兜底，避免首次压缩
+        之前永远看不到新记忆。
+        """
+
+        key = str(session_key or "").strip()
+        checkpoint = self._sessions.get_active_compaction(key) if key else None
+        generation = max(0, int(getattr(checkpoint, "generation", 0) or 0))
+        incarnation = str(getattr(checkpoint, "session_created_at", "") or "")
+        signature = () if generation > 0 else self._markdown.prompt_signature()
+        cache_key = (key, incarnation, generation)
+        cached = self._prompt_snapshots.get(cache_key)
+        if (
+            cached is not None
+            and cached.generation == generation
+            and (generation > 0 or cached.signature == signature)
+        ):
+            return cached
+        snapshot = MemoryPromptSnapshot(
+            generation=generation,
+            bean=self._markdown.read_bean(),
+            self_model=self._markdown.read_self(),
+            long_term_memory=self._markdown.get_memory_context(),
+            signature=signature,
+        )
+        # 每个会话只保留当前 generation 的快照；切换代或重建会话后旧快照不再复用。
+        self._prompt_snapshots.pop(cache_key, None)
+        self._prompt_snapshots[cache_key] = snapshot
+        while len(self._prompt_snapshots) > _PROMPT_SNAPSHOT_LIMIT:
+            self._prompt_snapshots.pop(next(iter(self._prompt_snapshots)))
+        return snapshot
 
     def read_checkpoint_summary(self, session_key: str = "") -> str:
         """读取 active generation 摘要，作为下一轮的动态 system context。"""
@@ -1255,4 +1312,4 @@ def _tool_profile() -> MemoryToolProfile:
     return MemoryToolProfile(recall=recall, memorize=memorize, forget=forget)
 
 
-__all__ = ["MemoryEngine"]
+__all__ = ["MemoryEngine", "MemoryPromptSnapshot"]

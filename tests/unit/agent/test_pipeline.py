@@ -506,6 +506,46 @@ async def test_allowed_tools_do_not_change_system_prompt(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_pipeline_uses_frozen_memory_prompt_snapshot(tmp_path: Path) -> None:
+    class SnapshotMemory(Memory):
+        def prompt_snapshot(self, session_key):
+            return SimpleNamespace(
+                generation=2,
+                bean="# Bean\n快照人格",
+                self_model="快照自我",
+                long_term_memory="## Long-term Memory\n快照记忆",
+            )
+
+    class FinalProvider:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] = []
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages = messages
+            return LLMResponse("完成")
+
+    provider = FinalProvider()
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        memory=SnapshotMemory(),
+    )
+
+    await pipeline.process(
+        InboundMessage("web", "u", "snapshot", "你好"),
+        turn_id="snapshot-turn",
+    )
+
+    system_prompt = str(provider.messages[0]["content"])
+    assert "快照人格" in system_prompt
+    assert "快照自我" in system_prompt
+    assert "快照记忆" in system_prompt
+
+
+@pytest.mark.asyncio
 async def test_pipeline_injects_explicit_skill_mention_into_dynamic_frame(
     tmp_path: Path,
 ) -> None:
@@ -1131,6 +1171,70 @@ async def test_pipeline_emits_compaction_lifecycle_events(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_pipeline_refreshes_memory_snapshot_after_compaction(
+    tmp_path: Path,
+) -> None:
+    class GateProvider:
+        context_window = 100
+        max_tokens = 10
+
+        def __init__(self) -> None:
+            self.compacted = False
+            self.messages: list[list[dict[str, object]]] = []
+
+        def estimate_context_tokens(self, messages, tools):
+            return 10 if self.compacted else 80
+
+        async def chat(self, messages, tools=None, **kwargs):
+            self.messages.append([dict(item) for item in messages])
+            return LLMResponse("完成")
+
+    class SnapshotMemory:
+        def __init__(self) -> None:
+            self.generation = 0
+
+        async def retrieve_for_turn(self, message):
+            return ""
+
+        def prompt_snapshot(self, session_key):
+            return SimpleNamespace(
+                generation=self.generation,
+                bean=f"第 {self.generation} 代人格",
+                self_model="",
+                long_term_memory="",
+            )
+
+    provider = GateProvider()
+    memory = SnapshotMemory()
+
+    async def compact(_session_key: str, **kwargs) -> bool:
+        provider.compacted = True
+        memory.generation += 1
+        return True
+
+    async def load_history(_session_key: str, _limit: int | None) -> list[dict[str, object]]:
+        return []
+
+    pipeline = Pipeline(
+        provider,
+        ToolRegistry(),
+        EventBus(),
+        _assembler(tmp_path),
+        workspace=str(tmp_path),
+        memory=memory,
+        history_loader=load_history,
+        context_compactor=compact,
+    )
+
+    await pipeline.process(
+        InboundMessage("web", "u", "c", "当前问题"),
+        turn_id="snapshot-compaction",
+    )
+
+    assert "第 1 代人格" in str(provider.messages[-1][0]["content"])
+
+
+@pytest.mark.asyncio
 async def test_surface_compaction_reload_does_not_duplicate_current_turn(
     tmp_path: Path,
 ) -> None:
@@ -1187,7 +1291,8 @@ async def test_surface_compaction_reload_does_not_duplicate_current_turn(
         )
     ]
     assert len(current_user) == 1
-    assert len(frames) == 1
+    # 没有工具、激活 Skill 或检索记忆时动态帧可以为空；关键是压缩重载不能复制当前 Turn。
+    assert len(frames) <= 1
 
 
 @pytest.mark.asyncio

@@ -436,15 +436,20 @@ class Pipeline:
             allowed_names=allowed_tool_catalog,
         )
         checkpoint_summary = ""
-        if self._memory and not skip_memory and self._surface_loader is None:
+        memory_snapshot = None
+        if self._memory and not skip_memory:
             read_checkpoint = getattr(self._memory, "read_checkpoint_summary", None)
-            if callable(read_checkpoint):
+            if callable(read_checkpoint) and self._surface_loader is None:
                 checkpoint_summary = str(read_checkpoint(message.session_key) or "")
+            read_snapshot = getattr(self._memory, "prompt_snapshot", None)
+            if callable(read_snapshot):
+                memory_snapshot = read_snapshot(message.session_key)
         context = TurnContext(
             workspace=turn_workspace,
             channel=message.channel,
             chat_id=message.chat_id,
             memory=None if skip_memory else self._memory,
+            memory_snapshot=memory_snapshot,
             retrieved_memory_block=retrieved,
             checkpoint_summary=checkpoint_summary,
             active_tool_names=names,
@@ -924,6 +929,12 @@ class Pipeline:
                         estimated_tokens=gate_tokens,
                         force=False,
                     )
+                    # 新一代 checkpoint 已提交，人格/长期记忆快照也要换代；
+                    # 即使当前没有历史加载器，下一轮也不能继续用旧快照。
+                    if compacted:
+                        read_snapshot = getattr(self._memory, "prompt_snapshot", None)
+                        if callable(read_snapshot):
+                            context.memory_snapshot = read_snapshot(message.session_key)
                     if compacted and (self._surface_loader or self._history_loader) is not None:
                         history = (
                             await self._surface_loader(message.session_key)
@@ -1050,6 +1061,10 @@ class Pipeline:
                             estimated_tokens=estimate,
                             force=True,
                         )
+                        if compacted:
+                            read_snapshot = getattr(self._memory, "prompt_snapshot", None)
+                            if callable(read_snapshot):
+                                context.memory_snapshot = read_snapshot(message.session_key)
                         if compacted and (self._surface_loader or self._history_loader) is not None:
                             history = (
                                 await self._surface_loader(message.session_key)

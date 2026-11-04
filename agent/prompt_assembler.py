@@ -8,13 +8,10 @@ from zoneinfo import ZoneInfo
 
 from agent.prompt_block import PromptSectionMeta, PromptSectionRender, SystemPromptBuilder, TurnContext
 
-# 这些区块可能随记忆、会话或工具状态变化，必须作为本轮 frame 追加并持久化；
-# system 只保留跨请求稳定的规则和 Skill 目录，避免变化内容截断缓存前缀。
+# 工具、激活 Skill 与检索结果会随本轮变化，必须作为本轮 frame 追加并持久化。
+# 人格、规则、Skill 目录、自我认知、长期记忆和会话环境属于低频变化，
+# 放在 system 前缀里复用；它们变化时只重建一次前缀，频率远低于每轮动态内容。
 _FRAME_SECTIONS = {
-    "bean",
-    "self_model",
-    "long_term_memory",
-    "session_context",
     "deferred_tools_hint",
     "active_tools",
     "active_skills",

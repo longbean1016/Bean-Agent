@@ -1,4 +1,4 @@
-"""环境摘要经动态上下文进入模型，不修改静态前缀或工具存储协议。"""
+"""环境摘要随会话环境下沉到 system 前缀，不进入每轮动态帧。"""
 
 from unittest.mock import AsyncMock
 from types import SimpleNamespace
@@ -16,7 +16,7 @@ from tools.shell import ShellTool
 
 
 @pytest.mark.asyncio
-async def test_pipeline_injects_environment_in_dynamic_frame(tmp_path):
+async def test_pipeline_injects_environment_in_system_prompt(tmp_path):
     provider = SimpleNamespace(chat=AsyncMock(return_value=LLMResponse("完成")))
     registry = ToolRegistry()
     registry.register(ShellTool(working_dir=tmp_path))
@@ -25,8 +25,7 @@ async def test_pipeline_injects_environment_in_dynamic_frame(tmp_path):
     await pipeline.process(InboundMessage("web", "user", "test", "查看环境"), turn_id="turn-test")
     loader.assert_awaited_once_with("web:test")
     messages = provider.chat.call_args.args[0]
-    assert "test-python" not in messages[0]["content"]
-    assert any("test-python" in str(message.get("content")) for message in messages[1:])
+    assert "test-python" in messages[0]["content"]
 
 
 @pytest.mark.asyncio

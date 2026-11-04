@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from agent.prompt_assembler import MessageEnvelopeBuilder, PromptAssembler
 from agent.prompt_block import SectionCache, SystemPromptBuilder, TurnContext, default_prompt_blocks
@@ -40,20 +41,57 @@ def test_static_prefix_cache_and_dynamic_context_frame_are_separated() -> None:
 
     assert first.messages[0]["role"] == "system"
     assert first.messages[0]["content"] == second.messages[0]["content"]
-    assert "你是 BeanAgent" not in str(first.messages[0]["content"])
-    assert "会话近期摘要" not in str(first.messages[0]["content"])
+    system_prompt = str(first.messages[0]["content"])
+    assert "你是 BeanAgent" in system_prompt
+    assert "保持直接" in system_prompt
+    assert "用户是开发者" in system_prompt
+    assert "## 会话环境" in system_prompt
+    assert "会话近期摘要" not in system_prompt
     assert {item.name for item in second.debug_breakdown if item.cache_hit} == {
         "behavior_rules", "process_communication"
     }
     reminder = first.messages[-2]["content"]
     assert reminder.startswith('<system-reminder data-system-context-frame="true">')
-    assert "你是 BeanAgent" in str(reminder)
-    assert "保持直接" in str(reminder)
-    assert "用户是开发者" in str(reminder)
-    assert "## 会话环境" in str(reminder)
+    assert "你是 BeanAgent" not in str(reminder)
+    assert "保持直接" not in str(reminder)
+    assert "用户是开发者" not in str(reminder)
+    assert "## 会话环境" not in str(reminder)
     assert "用户偏好中文" in reminder
+    assert "read_file" in reminder
     assert "项目开发" not in reminder
     assert "重复消息" not in reminder
+
+
+def test_memory_prompt_snapshot_overrides_live_markdown_readers() -> None:
+    assembler = PromptAssembler(
+        SystemPromptBuilder(default_prompt_blocks(), cache=SectionCache()),
+        MessageEnvelopeBuilder(),
+    )
+    snapshot = SimpleNamespace(
+        generation=7,
+        bean="# Bean\n快照人格",
+        self_model="快照自我",
+        long_term_memory="## Long-term Memory\n快照长期记忆",
+    )
+    result = assembler.assemble(
+        turn_ctx=TurnContext(
+            workspace="D:/workspace",
+            channel="web",
+            chat_id="c",
+            memory=Memory(),
+            memory_snapshot=snapshot,
+        ),
+        history=[],
+        current_message="你好",
+    )
+
+    system_prompt = str(result.messages[0]["content"])
+    assert "快照人格" in system_prompt
+    assert "快照自我" in system_prompt
+    assert "快照长期记忆" in system_prompt
+    assert "你是 BeanAgent" not in system_prompt
+    assert "保持直接" not in system_prompt
+    assert "用户是开发者" not in system_prompt
 
 
 def test_visible_tools_only_change_dynamic_frame_not_system_prompt() -> None:

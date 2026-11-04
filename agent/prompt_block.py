@@ -13,6 +13,15 @@ class MemoryPromptApi(Protocol):
     def read_checkpoint_summary(self, session_key: str = "") -> str: ...
 
 
+class MemoryPromptSnapshotApi(Protocol):
+    """同一压缩代内复用的人格与长期记忆快照。"""
+
+    generation: int
+    bean: str
+    self_model: str
+    long_term_memory: str
+
+
 class SkillsPromptApi(Protocol):
     """Prompt 组装只依赖 Skill 目录与正文读取，不感知磁盘扫描实现。"""
 
@@ -27,6 +36,7 @@ class TurnContext:
     channel: str
     chat_id: str
     memory: MemoryPromptApi | None = None
+    memory_snapshot: MemoryPromptSnapshotApi | None = None
     retrieved_memory_block: str = ""
     checkpoint_summary: str = ""
     active_tool_names: list[str] = field(default_factory=list)
@@ -91,6 +101,9 @@ class BeanPromptBlock(_Block):
     priority, label = 5, "bean"
 
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
+        if ctx.memory_snapshot is not None:
+            content = str(ctx.memory_snapshot.bean or "").strip()
+            return content or None
         if not ctx.memory:
             return None
         # 兼容尚未升级的 Memory 实现；正式 Store 会提供 read_bean。
@@ -153,14 +166,20 @@ class SkillsCatalogPromptBlock(_Block):
 class SelfModelPromptBlock(_Block):
     priority, label = 30, "self_model"
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
-        content = ctx.memory.read_self().strip() if ctx.memory else ""
+        if ctx.memory_snapshot is not None:
+            content = str(ctx.memory_snapshot.self_model or "").strip()
+        else:
+            content = ctx.memory.read_self().strip() if ctx.memory else ""
         return f"## 自我认知\n{content}" if content else None
 
 
 class LongTermMemoryPromptBlock(_Block):
     priority, label = 35, "long_term_memory"
     def render(self, ctx: TurnContext, cached_signature: str | None = None) -> str | None:
-        content = ctx.memory.get_memory_context().strip() if ctx.memory else ""
+        if ctx.memory_snapshot is not None:
+            content = str(ctx.memory_snapshot.long_term_memory or "").strip()
+        else:
+            content = ctx.memory.get_memory_context().strip() if ctx.memory else ""
         return f"## 长期记忆\n{content}" if content else None
 
 
